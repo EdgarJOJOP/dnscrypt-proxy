@@ -1,0 +1,1 @@
+openssl req -x509 -nodes -days 365 -newkey rsa:4096 -keyout certs/localhost.key -out certs/localhost.crt -config openssl.conf -extensions v3_req

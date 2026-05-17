@@ -1,0 +1,131 @@
+# ============================================================
+# DNS 加密代理 - 全局配置文件（支持热加载）
+# 修改文件后自动检测变更并应用
+# ============================================================
+
+server:
+  # 本地 DoH 服务（HTTPS 加密 DNS）
+  doh:
+    enabled: true
+    host: "127.0.0.1"            # IPv4 监听地址
+    port: 8443                  # DoH 端口
+    path: "/dns-query"
+    cert_path: "certs/localhost.crt"
+    key_path: "certs/localhost.key"
+    # IPv6 支持（同时监听 IPv6）
+    ipv6:
+      enabled: true
+      host: "::1"
+      port: 8443
+
+  # 本地纯 DNS 服务器（UDP 53，不加密，默认关闭）
+  plain_dns:
+    enabled: false               # 默认关闭，设为 true 开启
+    host: "127.0.0.1"           # IPv4 监听地址
+    port: 53                    # 标准 DNS 端口（需要管理员权限）
+    ipv6:
+      enabled: false
+      host: "::1"
+
+# ============================================================
+# 上游 DNS 服务器
+# 并行查询所有启用的上游，取最快响应
+# ============================================================
+upstream:
+  # bootstrap DNS：仅用于解析 DoH/DoT/DoQ 服务器的 IP 地址
+  # 包含 IPv4 + IPv6 双栈 DNS 服务器
+  bootstrap_resolvers:
+    - "223.5.5.5"               # 阿里 DNS (IPv4)
+    - "114.114.114.114"         # 114 DNS (IPv4)
+    - "119.29.29.29"            # 腾讯 DNS (IPv4)
+    - "2400:3200::1"            # 阿里 DNS (IPv6)
+    - "2400:da00::6666"         # 114 DNS (IPv6)
+
+  # DNS over HTTPS
+  doh:
+    - "https://dns.alidns.com/dns-query"
+    - "https://doh.pub/dns-query"
+    - "https://dns.adguard-dns.com/dns-query"
+    - "https://dns.cloudflare.com/dns-query"
+
+  # DNS over TLS
+  dot:
+    - "dns.alidns.com"
+    - "dns.pub"
+    - "dns.adguard-dns.com"
+    - "one.one.one.one"
+
+  # DNS over QUIC
+  doq:
+    - "quic://dns9.quad9.net:853"         # Quad9 DoQ（已验证可用）
+    - "quic://unfiltered.adguard-dns.com"  # AdGuard DoQ（无端口则默认 853）
+    - "quic://dns.alidns.com:853"         # 阿里 DNS（部分环境可能不支持）
+
+# ============================================================
+# DNS 缓存配置
+# ============================================================
+cache:
+  enabled: true
+  max_size: 10000           # 最大缓存条目数，超限 LRU 淘汰
+  default_ttl: 300          # 默认缓存时间（秒）
+  min_ttl: 30               # 最小缓存时间（秒）
+  max_ttl: 86400            # 最大缓存时间（秒）
+  negative_ttl: 60          # 负面应答缓存时间（秒）
+  cleanup_interval: 60      # 过期清理间隔（秒）
+
+# ============================================================
+# DNSSEC 验证配置
+# ============================================================
+dnssec:
+  enabled: true                     # 全局 DNSSEC 验证开关
+  # 验证模式:
+  #   ad_check       - 仅检查 AD 位（快速，依赖上游验证）
+  #   strict         - 严格本地验证 RRSIG 签名链（安全但较慢）
+  mode: "ad_check"
+  # 是否丢弃验证失败的响应（bogus）
+  drop_bogus: false
+
+# ============================================================
+# 域名过滤规则（AdGuard Home 语法）
+# ============================================================
+filter:
+  enabled: true
+  # 规则文件路径（支持本地文件和远程 URL）
+  rules_files:
+  # 远程规则列表（定时自动更新）
+  rules_urls:
+    - "https://proxy.gitwarp.top/https://raw.githubusercontent.com/hululu1068/AdGuard-Rule/main/rule/all.txt"
+    # AdGuard 官方推荐规则列表（按需启用）
+    # - "https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt"
+    # - "https://raw.githubusercontent.com/AdguardTeam/FiltersRegistry/master/filters/filter_2_Chinese/filter.txt"
+    # - "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
+  # 远程规则更新间隔（小时，0=不自动更新）
+  update_interval: 24
+  # 是否拦截后返回 NXDOMAIN
+  block_nxdomain: true
+  # 自定义拦截页面 IP（NXDOMAIN 模式下无效）
+  block_ip: "0.0.0.0"
+
+# ============================================================
+# 请求日志（异步缓冲写入）
+# ============================================================
+logging:
+  enabled: true
+  buffer_size: 500          # 内存缓冲条目数，达到后写入文件并清空
+  flush_interval: 10        # 定时刷新间隔（秒）
+  log_dir: "logs"
+  log_file: "dns_queries.log"
+  detailed: true
+
+# ============================================================
+# 性能与资源优化
+# ============================================================
+performance:
+  parallel_timeout: 2.0     # 并行查询超时（秒）
+  max_concurrent: 100       # 最大并发查询数
+  connection_pool_size: 50  # 连接池大小
+  memory_limit_mb: 512      # 内存软限制（MB）
+  cpu_usage_limit: 70       # CPU 使用率软限制（%）
+  monitor_interval: 30      # 资源监控间隔（秒）
+  aggressive_gc: true       # 低负载时主动 GC
+  gc_interval: 60           # GC 触发间隔（秒）
