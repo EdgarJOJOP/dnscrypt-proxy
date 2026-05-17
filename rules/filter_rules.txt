@@ -1,0 +1,61 @@
+! AdGuard Home 过滤规则示例
+! 注释行以 ! 或 # 开头
+!
+! 拦截广告域名
+||doubleclick.net^
+||googlesyndication.com^
+||googleadservices.com^
+||googletagmanager.com^
+||googleanalytics.com^
+||adservice.google.com^
+||adsrvr.org^
+||adnxs.com^
+||rubiconproject.com^
+||criteo.com^
+||criteo.net^
+||casalemedia.com^
+||moatads.com^
+||adsafeprotected.com^
+||scorecardresearch.com^
+||outbrain.com^
+||taboola.com^
+||amazon-adsystem.com^
+||advertising.com^
+||turn.com^
+||pubmatic.com^
+||openx.net^
+||appnexus.com^
+||ads.yahoo.com^
+||advertising.yahoo.com^
+
+! 拦截恶意软件/钓鱼域名
+||example-malware.com^
+||phishing-example.com^
+
+! 拦截跟踪器
+||facebook.com/tr^
+||google-analytics.com^
+||analytics.google.com^
+||stats.g.doubleclick.net^
+||pixel.quantserve.com^
+
+! 拦截中国大陆常见的广告联盟
+||pos.baidu.com^
+||cpro.baidu.com^
+||hm.baidu.com^
+||ssp.bdstatic.com^
+||dup.baidustatic.com^
+||adsame.com^
+||cnzz.com^
+||cnzz.mmstat.com^
+||g.click.taobao.com^
+||simba.taobao.com^
+||tansuo.taobao.com^
+||ad.qq.com^
+||qzs.qq.com^
+||btrace.qq.com^
+||pingjs.qq.com^
+
+! 简单域名规则（匹配域名本身及其子域名）
+example-tracker.com
+example-ad.com
