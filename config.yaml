@@ -116,6 +116,7 @@ logging:
   log_dir: "logs"
   log_file: "dns_queries.log"
   detailed: true
+  max_log_size_mb: 10      # 日志文件最大大小（MB），超限自动裁剪保留后半部分
 
 # ============================================================
 # 性能与资源优化
