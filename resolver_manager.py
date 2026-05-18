@@ -137,25 +137,39 @@ class ResolverManager:
                 logger.warning("  无法解析 %s", hostname)
 
     async def _bootstrap_resolve(self, hostname: str) -> List[str]:
-        """通过 bootstrap DNS 解析域名（A + AAAA 双栈）"""
-        # 并行查询 A 和 AAAA 记录
+        """
+        通过 bootstrap DNS 解析域名（A + AAAA 双栈独立查询）
+        单栈环境下（IPv4-only / IPv6-only），一种查询失败不影响另一种
+        """
         queries = {}
-        for qtype, qname_attr in [(dns.rdatatype.A, "A"), (dns.rdatatype.AAAA, "AAAA")]:
+        for qtype in (dns.rdatatype.A, dns.rdatatype.AAAA):
             q = dns.message.make_query(hostname, qtype)
-            queries[qname_attr] = q.to_wire()
+            queries[qtype] = q.to_wire()
 
-        async def try_resolver(qbytes: bytes, bs: UpstreamServer) -> Optional[bytes]:
+        async def try_resolver(qbytes: bytes, bs: UpstreamServer, addr_family: str) -> Optional[bytes]:
             try:
-                return await bs.resolver.resolve(qbytes)
+                return await bs.resolver.resolve(qbytes, prefer_family=addr_family)
             except Exception:
                 return None
 
-        for _ in range(2):  # 重试一次
+        for attempt in range(3):  # 重试最多 3 次
             ips = []
-            for qtype_name in ("A", "AAAA"):
-                qbytes = queries[qtype_name]
+            # A 和 AAAA 独立查询，一个失败不影响另一个
+            for qtype in (dns.rdatatype.A, dns.rdatatype.AAAA):
+                qbytes = queries[qtype]
+                addr_family = "v4" if qtype == dns.rdatatype.A else "v6"
+                # 只选择与查询类型匹配的 bootstrap 解析器地址族
+                suitable_bs = []
+                for bs in self._bootstrap_resolvers:
+                    bs_addr = bs.name
+                    is_v6 = ":" in bs_addr
+                    if (addr_family == "v4" and not is_v6) or (addr_family == "v6" and is_v6):
+                        suitable_bs.append(bs)
+                # 如果没有匹配地址族的 bootstrap，尝试所有
+                if not suitable_bs:
+                    suitable_bs = self._bootstrap_resolvers
                 results = await asyncio.gather(
-                    *[try_resolver(qbytes, bs) for bs in self._bootstrap_resolvers],
+                    *[try_resolver(qbytes, bs, addr_family) for bs in suitable_bs],
                     return_exceptions=True,
                 )
                 for result in results:
@@ -164,17 +178,15 @@ class ResolverManager:
                             response = dns.message.from_wire(result)
                             for rrset in response.answer:
                                 for rd in rrset:
-                                    if qtype_name == "A" and rd.rdtype == dns.rdatatype.A:
-                                        ips.append(str(rd.address))
-                                    elif qtype_name == "AAAA" and rd.rdtype == dns.rdatatype.AAAA:
+                                    if rd.rdtype == qtype:
                                         ips.append(str(rd.address))
                         except Exception:
                             continue
 
             if ips:
                 return ips
-
-            await asyncio.sleep(0.5)
+            # 快速重试，间隔递增
+            await asyncio.sleep(0.2 * (attempt + 1))
 
         return []
 
