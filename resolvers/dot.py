@@ -36,19 +36,21 @@ class DoTResolver(BaseResolver):
         return ctx
 
     async def resolve(self, query_bytes: bytes) -> Optional[bytes]:
-        """通过 TLS 加密连接解析 DNS（先 hostname 直连，再 fallback bootstrap IP）"""
-        # 连接目标：hostname 优先（系统 DNS），bootstrap IP 作为 fallback
+        """通过 TLS 加密连接解析 DNS（先 hostname 直连，再 fallback bootstrap IP）
+
+        单栈兼容：如果系统没有 IPv6 栈，连接 IPv6 bootstrap 地址会超时失败并自动 fallback。
+        """
+        # 构建连接目标列表：hostname 优先，bootstrap IP 作为 fallback
         connect_targets = [self.host]
         if self._connect_ips:
             for ip in self._connect_ips:
-                if ip != self.host:  # 避免 hostname 同时也是 IP 时重复
+                if ip != self.host:
                     connect_targets.append(ip)
 
         async with self._semaphore:
             last_error = None
-            is_ip_connect = bool(self._connect_ips)
-
             for target in connect_targets:
+                # server_hostname 始终使用主机名（TLS SNI 需要）
                 reader: Optional[asyncio.StreamReader] = None
                 writer: Optional[asyncio.StreamWriter] = None
                 try:
@@ -57,7 +59,7 @@ class DoTResolver(BaseResolver):
                             target,
                             self.port,
                             ssl=self._ssl_context,
-                            server_hostname=self.host if is_ip_connect else None,
+                            server_hostname=self.host,
                         ),
                         timeout=self.timeout,
                     )
