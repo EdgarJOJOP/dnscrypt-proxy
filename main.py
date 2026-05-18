@@ -25,7 +25,7 @@ import asyncio
 import signal
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 # 确保项目根目录在 sys.path 中
 PROJECT_ROOT = Path(__file__).parent.absolute()
@@ -101,6 +101,8 @@ class DNSProxyApp:
         self._config_reload_task: Optional[asyncio.Task] = None
         self._cache_cleanup_task: Optional[asyncio.Task] = None
         self._filter_update_task: Optional[asyncio.Task] = None
+        self._filter_reload_task: Optional[asyncio.Task] = None  # 跟踪后台过滤规则重载
+        self._filter_reload_gen = 0  # 递增 generation，防止过期重载覆盖
         self._running = False
 
     async def initialize(self):
@@ -154,7 +156,14 @@ class DNSProxyApp:
             rule_files = self.config.filter_rules_files
             full_paths = [str(PROJECT_ROOT / f) for f in rule_files]
             rule_urls = self.config.filter_rules_urls
-            await self.filter_engine.async_reload(full_paths, urls=rule_urls)
+            # 先加载本地规则（快速，不阻塞启动）
+            for fp in full_paths:
+                self.filter_engine.load_rules_from_file(fp)
+            # 远程 URL 规则后台原子加载（内部使用 async_reload 清除旧规则+重载全部）
+            if rule_urls:
+                self._filter_reload_task = asyncio.create_task(
+                    self._filter_reload_safe(full_paths, rule_urls)
+                )
 
         # 4. 日志记录器
         logger.info("[4/8] 初始化异步日志记录器...")
@@ -165,6 +174,7 @@ class DNSProxyApp:
             flush_interval=self.config.logging_flush_interval,
             enabled=self.config.logging_enabled,
             detailed=self.config.logging_detailed,
+            max_log_size_mb=self.config.logging_max_log_size_mb,
         )
         await self.request_logger.start()
 
@@ -213,10 +223,66 @@ class DNSProxyApp:
         logger.info("初始化完成！")
         logger.info("=" * 60)
 
-    async def _on_config_reload(self, new_config: dict):
-        """配置热加载回调"""
+    async def _filter_reload_safe(self, files: List[str], urls: List[str]):
+        """
+        安全地原子重载全部过滤规则（本地+远程）。
+        - 先清空旧规则再加载新规则，不会重复叠加
+        - 适用于启动后台加载和热加载
+        - 使用 generation 计数器防止过期加载覆盖
+        """
+        gen = self._filter_reload_gen + 1
+        self._filter_reload_gen = gen
         logger = logging.getLogger("dns-proxy.app")
-        logger.info("配置已热加载，应用新配置...")
+        logger.info("后台加载过滤规则 #%d (本地:%d 远程:%d)...",
+                     gen, len(files), len(urls))
+        try:
+            await self.filter_engine.async_reload(files, urls=urls if urls else None)
+            # generation 不匹配说明有更新的重载任务已开始，丢弃本次结果
+            if self._filter_reload_gen != gen:
+                logger.info("过滤规则 #%d 已过期（新重载 #%d 已开始），丢弃", gen, self._filter_reload_gen)
+                return
+            logger.info("过滤规则加载完成 #%d，共 %d 条规则",
+                         gen, self.filter_engine.stats["total_rules"])
+            logger.info("  拦截索引域名: %d, 白名单域名: %d",
+                         self.filter_engine.stats["block_index_domains"],
+                         self.filter_engine.stats["allow_index_domains"])
+        except asyncio.CancelledError:
+            logger.info("过滤规则加载 #%d 被取消", gen)
+            self.filter_engine._filter_cache.clear()
+            raise
+        except Exception as e:
+            logger.error("过滤规则加载 #%d 失败: %s", gen, e)
+
+    async def _on_config_reload(self, new_config: dict):
+        """配置热加载回调 - 检测远程规则 URL 变更并重新加载"""
+        logger = logging.getLogger("dns-proxy.app")
+        logger.info("配置已热加载，检查远程规则变更...")
+
+        if not self.config.filter_enabled or not self.filter_engine:
+            return
+
+        # 获取新配置中的 rules_urls
+        new_urls = new_config.get("filter", {}).get("rules_urls", [])
+        if not isinstance(new_urls, list):
+            new_urls = []
+
+        old_loaded = set(self.filter_engine._loaded_urls)
+        new_set = set(new_urls)
+
+        # 只有 URL 真正变更时才触发重载
+        if old_loaded == new_set:
+            logger.debug("远程规则 URL 未变更，跳过重载")
+            return
+
+        logger.info("远程规则 URL 已变更 (%d → %d)，开始重载...",
+                     len(old_loaded), len(new_set))
+
+        rule_files = self.config.filter_rules_files
+        full_paths = [str(PROJECT_ROOT / f) for f in rule_files]
+        # generation 机制确保先完成的重载不会覆盖后完成的
+        self._filter_reload_task = asyncio.create_task(
+            self._filter_reload_safe(full_paths, list(new_set))
+        )
 
     async def _config_reload_loop(self):
         """定期检查配置文件变更"""
@@ -293,7 +359,8 @@ class DNSProxyApp:
         self._running = False
 
         # 取消后台任务
-        for task in [self._config_reload_task, self._cache_cleanup_task, self._filter_update_task]:
+        for task in [self._config_reload_task, self._cache_cleanup_task,
+                     self._filter_update_task, self._filter_reload_task]:
             if task:
                 task.cancel()
                 try:
