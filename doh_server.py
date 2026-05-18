@@ -18,6 +18,9 @@ from aiohttp import web
 
 import dns.message
 import dns.rdatatype
+import dns.rdtypes.IN.A
+import dns.rdtypes.IN.AAAA
+import dns.rrset
 
 from config import Config
 from cache import DNSCache
@@ -359,6 +362,7 @@ class DoHServer:
             question = query.question[0]
             qname = str(question.name).rstrip(".")
             qtype = QTYPE_NAMES.get(question.rdtype, str(question.rdtype))
+            cache_key = (question.name, question.rdtype, question.rdclass)
 
             # 1. 检查域名过滤
             if self.config.filter_enabled:
@@ -366,21 +370,35 @@ class DoHServer:
                 if blocked:
                     block_reason = reason
                     status = "blocked"
-                    if self.config.filter_block_nxdomain:
-                        response = dns.message.make_response(query)
-                        response.set_rcode(dns.rcode.NXDOMAIN)
-                        response_wire = response.to_wire()
+                    # 像 AdGuard 一样重写 IP：A → 0.0.0.0，AAAA → ::，其他类型 → NXDOMAIN
+                    response = dns.message.make_response(query)
+                    rdtype = question.rdtype
+                    if rdtype == dns.rdatatype.A:
+                        response.answer.append(
+                            dns.rrset.RRset(question.name, question.rdclass, dns.rdatatype.A)
+                        )
+                        response.answer[0].add(dns.rdtypes.IN.A.A(question.name, 3600, "0.0.0.0"))
+                        response.set_rcode(dns.rcode.NOERROR)
+                    elif rdtype == dns.rdatatype.AAAA:
+                        response.answer.append(
+                            dns.rrset.RRset(question.name, question.rdclass, dns.rdatatype.AAAA)
+                        )
+                        response.answer[0].add(dns.rdtypes.IN.AAAA.AAAA(question.name, 3600, "::"))
+                        response.set_rcode(dns.rcode.NOERROR)
                     else:
-                        response = dns.message.make_response(query)
-                        response_wire = response.to_wire()
+                        response.set_rcode(dns.rcode.NXDOMAIN)
+                    response_wire = response.to_wire()
+                    # 缓存拦截结果
+                    if self.config.cache_enabled:
+                        await self.cache.set(cache_key, response)
                     elapsed = asyncio.get_event_loop().time() - start_time
                     await self._log_query(
-                        client_ip, qname, qtype, elapsed, status, upstream, block_reason
+                        client_ip, qname, QTYPE_NAMES.get(question.rdtype, str(question.rdtype)),
+                        elapsed, status, upstream, block_reason
                     )
                     return self._make_response(response_wire, response_format)
 
             # 2. 检查缓存
-            cache_key = (question.name, question.rdtype, question.rdclass)
             cached_response = None
             if self.config.cache_enabled:
                 cached_response = await self.cache.get(cache_key)
