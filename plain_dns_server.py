@@ -11,6 +11,9 @@ from typing import Optional
 
 import dns.message
 import dns.rdatatype
+import dns.rdtypes.IN.A
+import dns.rdtypes.IN.AAAA
+import dns.rrset
 
 from config import Config
 from resolver_manager import ResolverManager
@@ -97,6 +100,7 @@ class PlainDNSServer:
             question = query.question[0]
             qname = str(question.name).rstrip(".")
             qtype_str = dns.rdatatype.to_text(question.rdtype)
+            cache_key = (question.name, question.rdtype, question.rdclass)
 
             # 1. 检查域名过滤
             if self.config.filter_enabled:
@@ -104,16 +108,31 @@ class PlainDNSServer:
                 if blocked:
                     block_reason = reason
                     status = "blocked"
+                    # 像 AdGuard 一样重写 IP：A → 0.0.0.0，AAAA → ::，其他类型 → NXDOMAIN
                     response = dns.message.make_response(query)
-                    if self.config.filter_block_nxdomain:
+                    if question.rdtype == dns.rdatatype.A:
+                        response.answer.append(
+                            dns.rrset.RRset(question.name, question.rdclass, dns.rdatatype.A)
+                        )
+                        response.answer[0].add(dns.rdtypes.IN.A.A(question.name, 3600, "0.0.0.0"))
+                        response.set_rcode(dns.rcode.NOERROR)
+                    elif question.rdtype == dns.rdatatype.AAAA:
+                        response.answer.append(
+                            dns.rrset.RRset(question.name, question.rdclass, dns.rdatatype.AAAA)
+                        )
+                        response.answer[0].add(dns.rdtypes.IN.AAAA.AAAA(question.name, 3600, "::"))
+                        response.set_rcode(dns.rcode.NOERROR)
+                    else:
                         response.set_rcode(dns.rcode.NXDOMAIN)
+                    # 缓存拦截结果
+                    if self.config.cache_enabled:
+                        await self.cache.set(cache_key, response)
                     self._send_raw_response(response.to_wire(), addr, transport)
                     elapsed = asyncio.get_event_loop().time() - start_time
                     await self._log_query(client_ip, qname, qtype_str, elapsed, status, block_reason)
                     return
 
             # 2. 检查缓存
-            cache_key = (question.name, question.rdtype, question.rdclass)
             if self.config.cache_enabled:
                 cached = await self.cache.get(cache_key)
                 if cached is not None:
