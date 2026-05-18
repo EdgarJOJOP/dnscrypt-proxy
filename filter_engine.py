@@ -581,6 +581,9 @@ class FilterEngine:
         self._loaded_urls: List[str] = []
         self._rule_count = 0
         self._title = ""
+        # 过滤结果缓存 {domain: (blocked, reason)} — 避免重复匹配，大幅提升效率
+        self._filter_cache: Dict[str, Tuple[bool, str]] = {}
+        self._filter_cache_timeout: float = 5.0
         self._update_callback: Optional[Callable] = None
         # 校验和缓存（类似 Go 的 checksum）
         self._file_checksums: dict = {}
@@ -597,6 +600,9 @@ class FilterEngine:
     @property
     def title(self) -> str:
         return self._title
+
+    # 过滤结果缓存 TTL（秒）
+    FILTER_CACHE_TTL = 5.0
 
     @staticmethod
     def _extract_index_domain(rule_text: str) -> Optional[str]:
@@ -769,14 +775,15 @@ class FilterEngine:
             logger.error("读取规则文件 %s 失败: %s", filepath, e)
             return False
 
-    async def _fetch_url_async(self, url: str, max_size: int = DEFAULT_MAX_SIZE) -> Optional[str]:
+    async def _fetch_url_async(self, url: str, max_size: int = DEFAULT_MAX_SIZE,
+                               timeout: int = 30) -> Optional[str]:
         """异步获取远程 URL 内容"""
         try:
             async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=120),
+                timeout=aiohttp.ClientTimeout(total=timeout),
                 headers={"User-Agent": "SecureDNS-Proxy/1.0"},
             ) as session:
-                async with session.get(url) as resp:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
                     if resp.status != 200:
                         logger.error("获取 URL %s 失败: HTTP %d", url, resp.status)
                         return None
@@ -792,7 +799,7 @@ class FilterEngine:
                         return None
             return raw.decode("utf-8", errors="replace")
         except asyncio.TimeoutError:
-            logger.error("获取 URL %s 超时 (120s)", url)
+            logger.error("获取 URL %s 超时 (%ds)", url, timeout)
             return None
         except Exception as e:
             logger.error("从 URL %s 加载规则失败: %s", url, e)
@@ -800,10 +807,16 @@ class FilterEngine:
 
     async def load_rules_from_url_async(self, url: str) -> bool:
         """
-        异步从远程 URL 加载规则
+        异步从远程 URL 加载规则（带总超时防止阻塞）
         """
-        content = await self._fetch_url_async(url)
-        if content is None:
+        try:
+            content = await asyncio.wait_for(
+                self._fetch_url_async(url), timeout=35
+            )
+            if content is None:
+                return False
+        except asyncio.TimeoutError:
+            logger.error("从 URL %s 加载规则超时 (35s)", url)
             return False
 
         loop = asyncio.get_event_loop()
@@ -821,6 +834,7 @@ class FilterEngine:
         self._loaded_files.clear()
         self._loaded_urls.clear()
         self._rule_count = 0
+        self._filter_cache.clear()
 
         for filepath in files:
             self.load_rules_from_file(filepath)
@@ -852,6 +866,7 @@ class FilterEngine:
         self._loaded_files.clear()
         self._loaded_urls.clear()
         self._rule_count = 0
+        self._filter_cache.clear()
 
         for filepath in files:
             self.load_rules_from_file(filepath)
@@ -885,6 +900,7 @@ class FilterEngine:
         检查域名是否被拦截（Go 风格的匹配流程）
 
         匹配顺序:
+        0. 过滤结果缓存（避免重复匹配，大幅提升效率）
         1. 重要规则 (不受白名单影响)
         2. 白名单索引 (Go: filteringEngineAllow)
         3. 黑名单索引 (Go: filteringEngine)
@@ -893,22 +909,39 @@ class FilterEngine:
         """
         domain = domain.lower().rstrip(".")
 
+        # 0. 检查过滤结果缓存
+        now = time.monotonic()
+        cached = self._filter_cache.get(domain)
+        if cached is not None:
+            result, reason, ts = cached
+            if now - ts < self._filter_cache_timeout:
+                return result, reason
+            # 缓存过期，删除并重新匹配
+            del self._filter_cache[domain]
+
         # 1. 重要规则优先匹配
         for rule in self._important_rules:
             if rule.matches(domain):
-                return True, f"重要规则拦截: {rule.raw}"
+                result = (True, f"重要规则拦截: {rule.raw}")
+                self._filter_cache[domain] = (True, result[1], now)
+                return result
 
         # 2. 白名单索引 — 类似 Go 的 filteringEngineAllow.MatchRequest()
         match = self._allow_index.match(domain)
         if match is not None:
+            self._filter_cache[domain] = (False, "", now)
             return False, ""
 
         # 3. 黑名单索引 — 类似 Go 的 filteringEngine.MatchRequest()
         match = self._block_index.match(domain)
         if match is not None:
             rule, method = match
-            return True, f"{method}: {rule.raw}"
+            reason = f"{method}: {rule.raw}"
+            self._filter_cache[domain] = (True, reason, now)
+            return True, reason
 
+        # 未匹配：缓存并放行
+        self._filter_cache[domain] = (False, "", now)
         return False, ""
 
     # ======================== 定时更新 ========================
@@ -981,6 +1014,7 @@ class FilterEngine:
             "important_rules": len(self._important_rules),
             "block_index_domains": self._block_index.domain_count,
             "allow_index_domains": self._allow_index.domain_count,
+            "filter_cache_size": len(self._filter_cache),
             "loaded_files": self._loaded_files,
             "loaded_urls": self._loaded_urls,
             "title": self._title,
