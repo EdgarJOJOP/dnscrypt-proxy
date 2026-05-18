@@ -88,6 +88,7 @@ class Config:
                 "log_dir": "logs",
                 "log_file": "dns_queries.log",
                 "detailed": True,
+                "max_log_size_mb": 100,
             },
             "performance": {
                 "parallel_timeout": 3.0,
@@ -255,6 +256,10 @@ class Config:
     @property
     def logging_detailed(self) -> bool:
         return self._data.get("logging", {}).get("detailed", True)
+
+    @property
+    def logging_max_log_size_mb(self) -> int:
+        return int(self._data.get("logging", {}).get("max_log_size_mb", 100))
 
     @property
     def parallel_timeout(self) -> float:
