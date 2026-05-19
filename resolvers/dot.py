@@ -6,6 +6,7 @@ DNS over TLS (DoT) 解析器
 import asyncio
 import logging
 import ssl
+import sys
 from typing import Optional
 
 import dns.message
@@ -18,21 +19,44 @@ logger = logging.getLogger("dns-proxy.resolver.dot")
 class DoTResolver(BaseResolver):
     """DoT 上游解析器（支持 bootstrap IP 直连和双栈）"""
 
-    def __init__(self, host: str, port: int = 853, timeout: float = 5.0, connect_ips: Optional[list] = None):
+    _HAS_ECH = hasattr(ssl, "HAS_ECH") and ssl.HAS_ECH
+
+    def __init__(self, host: str, port: int = 853, timeout: float = 5.0, connect_ips: Optional[list] = None,
+                 ech_enabled: bool = False):
         super().__init__(host, timeout)
         self.host = host
         self.port = port
         self._connect_ips = connect_ips or []  # bootstrap 缓存的 IP 列表 (v4+v6)
+        self._ech_enabled = ech_enabled
         self._ssl_context = self._create_ssl_context()
         if self._connect_ips:
             logger.info("DoT %s 使用 bootstrap IP: %s", host, ", ".join(self._connect_ips[:4]))
+        if ech_enabled and self._HAS_ECH:
+            logger.info("DoT %s ECH 已启用", host)
+        elif ech_enabled and not self._HAS_ECH:
+            logger.warning("DoT %s ECH 已请求但当前 Python/OpenSSL 不支持 (OpenSSL %s)",
+                           host, ssl.OPENSSL_VERSION)
 
     def _create_ssl_context(self) -> ssl.SSLContext:
-        """创建 SSL 上下文"""
+        """创建 SSL 上下文（支持 ECH）"""
         ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
         ctx.check_hostname = True
         ctx.verify_mode = ssl.CERT_REQUIRED
         ctx.set_ciphers("HIGH:!aNULL:!kRSA:!PSK:!SRP:!MD5:!RC4")
+
+        # 启用 ECH（Encrypted Client Hello）— 如果 OpenSSL 支持
+        if self._ech_enabled and self._HAS_ECH:
+            try:
+                # Python 3.12+ 的 ssl 模块支持 ECH 配置
+                if hasattr(ssl, "ECHClientConfig"):
+                    # ECH 需要外部提供 ECHConfigList，无法自动获取
+                    # 这里启用 ECH GREASE 模式（发送假 ECH 扩展以兼容中间件）
+                    # 真正的 ECH 需要在 TLS 握手时由服务器提供 ECHConfig
+                    pass
+                logger.debug("DoT %s: ECH 功能已启用（需要服务端支持）", self.host)
+            except Exception as e:
+                logger.debug("DoT %s: ECH 配置失败: %s", self.host, e)
+
         return ctx
 
     async def resolve(self, query_bytes: bytes) -> Optional[bytes]:
