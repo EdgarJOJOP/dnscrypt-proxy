@@ -81,6 +81,10 @@ class Config:
                 "block_nxdomain": True,
                 "block_ip": "0.0.0.0",
             },
+            "hosts": {
+                "enabled": True,
+                "mappings": {},
+            },
             "logging": {
                 "enabled": True,
                 "buffer_size": 500,
@@ -99,6 +103,20 @@ class Config:
                 "monitor_interval": 30,
                 "aggressive_gc": True,
                 "gc_interval": 60,
+            },
+            "network_monitor": {
+                "enabled": True,
+                "ping_interval": 15,
+                "ping_timeout": 5,
+                "ping_targets_v4": ["223.5.5.5", "114.114.114.114"],
+                "ping_targets_v6": ["2400:3200::1", "2400:da00::6666"],
+                "dns_probe_domains": ["www.baidu.com", "www.qq.com"],
+                "failure_threshold": 3,
+                "recovery_check_count": 2,
+            },
+            "tls": {
+                "ech_enabled": False,
+                "ciphers": "HIGH:!aNULL:!kRSA:!PSK:!SRP:!MD5:!RC4",
             },
         }
 
@@ -350,6 +368,29 @@ class Config:
     def filter_update_interval(self) -> int:
         """返回更新间隔（小时），0 表示不自动更新"""
         return self._data.get("filter", {}).get("update_interval", 0)
+
+    # --- 自定义 hosts ---
+    @property
+    def hosts_config(self) -> dict:
+        return self._data.get("hosts", {})
+
+    # --- TLS/ECH ---
+    @property
+    def ech_enabled(self) -> bool:
+        return self._data.get("tls", {}).get("ech_enabled", False)
+
+    @property
+    def tls_ciphers(self) -> str:
+        return self._data.get("tls", {}).get("ciphers", "HIGH:!aNULL:!kRSA:!PSK:!SRP:!MD5:!RC4")
+
+    # --- 网络监控 ---
+    @property
+    def network_monitor_enabled(self) -> bool:
+        return self._data.get("network_monitor", {}).get("enabled", True)
+
+    @property
+    def network_monitor_config(self) -> dict:
+        return self._data.get("network_monitor", {})
 
     def get_raw(self) -> Dict[str, Any]:
         """获取原始配置数据"""
