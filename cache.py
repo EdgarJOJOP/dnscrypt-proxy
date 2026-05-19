@@ -138,6 +138,24 @@ class DNSCache:
     def current_size(self) -> int:
         return len(self._cache)
 
+    async def get_all_keys(self) -> list:
+        """获取所有缓存的 key 列表（用于缓存扫描）"""
+        async with self._lock:
+            return list(self._cache.keys())
+
+    async def peek(self, key: Tuple) -> Optional[dns.message.Message]:
+        """
+        查看缓存条目但不更新 LRU 位置（用于缓存扫描）
+        """
+        async with self._lock:
+            entry = self._cache.get(key)
+            if entry is None:
+                return None
+            if entry.is_expired():
+                del self._cache[key]
+                return None
+            return entry.get_adjusted_response()
+
 
 class CacheEntry:
     """缓存条目"""
