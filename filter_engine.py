@@ -563,6 +563,7 @@ class FilterEngine:
     - 黑名单引擎 (block_index) — 拦截匹配规则的域名
     - 白名单引擎 (allow_index) — 先于黑名单检查，匹配则放行
     - 重要规则 (important_rules) — 不受白名单影响
+    - 自定义 hosts 映射 — 类似 Windows hosts 文件，可自定义域名指向 IP
     """
 
     def __init__(self, cache_dir: Optional[str] = None):
@@ -581,8 +582,8 @@ class FilterEngine:
         self._loaded_urls: List[str] = []
         self._rule_count = 0
         self._title = ""
-        # 过滤结果缓存 {domain: (blocked, reason)} — 避免重复匹配，大幅提升效率
-        self._filter_cache: Dict[str, Tuple[bool, str]] = {}
+        # 过滤结果缓存 {domain: (blocked, reason, timestamp)} — 避免重复匹配，大幅提升效率
+        self._filter_cache: Dict[str, Tuple[bool, str, float]] = {}
         self._filter_cache_timeout: float = 5.0
         self._update_callback: Optional[Callable] = None
         # 校验和缓存（类似 Go 的 checksum）
@@ -596,6 +597,13 @@ class FilterEngine:
         self._update_task: Optional[asyncio.Task] = None
         self._running = False
         self._update_interval_hours = 0
+
+        # ========== 自定义 hosts 映射 ==========
+        # 格式: {domain: [(ip, rdtype), ...]}
+        # 例如: {"my.dns": [("127.0.0.1", dns.rdatatype.A), ("192.168.1.1", dns.rdatatype.A)]}
+        self._custom_hosts: Dict[str, List[Tuple[str, int]]] = {}
+        self._custom_hosts_cache: Dict[str, Tuple[bool, str, float]] = {}
+        self._custom_hosts_enabled = True
 
     @property
     def title(self) -> str:
@@ -835,6 +843,7 @@ class FilterEngine:
         self._loaded_urls.clear()
         self._rule_count = 0
         self._filter_cache.clear()
+        self._custom_hosts_cache.clear()
 
         for filepath in files:
             self.load_rules_from_file(filepath)
@@ -867,6 +876,7 @@ class FilterEngine:
         self._loaded_urls.clear()
         self._rule_count = 0
         self._filter_cache.clear()
+        self._custom_hosts_cache.clear()
 
         for filepath in files:
             self.load_rules_from_file(filepath)
@@ -900,17 +910,23 @@ class FilterEngine:
         检查域名是否被拦截（Go 风格的匹配流程）
 
         匹配顺序:
-        0. 过滤结果缓存（避免重复匹配，大幅提升效率）
-        1. 重要规则 (不受白名单影响)
-        2. 白名单索引 (Go: filteringEngineAllow)
-        3. 黑名单索引 (Go: filteringEngine)
+        0. 自定义 hosts 映射（最高优先级）
+        1. 过滤结果缓存（避免重复匹配，大幅提升效率）
+        2. 重要规则 (不受白名单影响)
+        3. 白名单索引 (Go: filteringEngineAllow)
+        4. 黑名单索引 (Go: filteringEngine)
 
         返回: (是否拦截, 原因)
         """
         domain = domain.lower().rstrip(".")
-
-        # 0. 检查过滤结果缓存
         now = time.monotonic()
+
+        # 0. 检查自定义 hosts 映射（最高优先级）
+        if self._custom_hosts_enabled and domain in self._custom_hosts:
+            self._custom_hosts_cache[domain] = (True, "custom_hosts", now)
+            return True, "custom_hosts"
+
+        # 1. 检查过滤结果缓存
         cached = self._filter_cache.get(domain)
         if cached is not None:
             result, reason, ts = cached
@@ -919,20 +935,20 @@ class FilterEngine:
             # 缓存过期，删除并重新匹配
             del self._filter_cache[domain]
 
-        # 1. 重要规则优先匹配
+        # 2. 重要规则优先匹配
         for rule in self._important_rules:
             if rule.matches(domain):
                 result = (True, f"重要规则拦截: {rule.raw}")
                 self._filter_cache[domain] = (True, result[1], now)
                 return result
 
-        # 2. 白名单索引 — 类似 Go 的 filteringEngineAllow.MatchRequest()
+        # 3. 白名单索引 — 类似 Go 的 filteringEngineAllow.MatchRequest()
         match = self._allow_index.match(domain)
         if match is not None:
             self._filter_cache[domain] = (False, "", now)
             return False, ""
 
-        # 3. 黑名单索引 — 类似 Go 的 filteringEngine.MatchRequest()
+        # 4. 黑名单索引 — 类似 Go 的 filteringEngine.MatchRequest()
         match = self._block_index.match(domain)
         if match is not None:
             rule, method = match
@@ -943,6 +959,74 @@ class FilterEngine:
         # 未匹配：缓存并放行
         self._filter_cache[domain] = (False, "", now)
         return False, ""
+
+    # ======================== 自定义 hosts 管理 ========================
+
+    def load_custom_hosts(self, hosts_config: dict):
+        """
+        从配置加载自定义 hosts 映射。
+        配置格式（类似 Windows hosts 文件）:
+          hosts:
+            enabled: true
+            mappings:
+              - "my.dns 127.0.0.1,192.168.1.1"
+              - "router.local 192.168.1.1"
+              - "ipv6test.local ::1,fe80::1"
+        """
+        self._custom_hosts.clear()
+        self._custom_hosts_cache.clear()
+
+        if not hosts_config:
+            return
+
+        enabled = hosts_config.get("enabled", True)
+        self._custom_hosts_enabled = enabled
+        if not enabled:
+            return
+
+        mappings = hosts_config.get("mappings", [])
+        if not isinstance(mappings, list):
+            return
+
+        import dns.rdatatype
+        for entry in mappings:
+            if not isinstance(entry, str):
+                continue
+            entry = entry.strip()
+            if not entry:
+                continue
+            # 格式: "domain ip1,ip2,ip3"
+            parts = entry.split(None, 1)  # 用空白分割，只切第一段
+            if len(parts) != 2:
+                continue
+            domain, ip_str = parts
+            domain = domain.strip().lower()
+            if not domain:
+                continue
+            ips = []
+            for ip in ip_str.split(","):
+                ip = ip.strip()
+                if not ip:
+                    continue
+                if ":" in ip:
+                    ips.append((ip, dns.rdatatype.AAAA))
+                else:
+                    ips.append((ip, dns.rdatatype.A))
+            if ips:
+                self._custom_hosts[domain] = ips
+
+        logger.info("自定义 hosts 映射已加载: %d 条", len(self._custom_hosts))
+
+    def get_custom_hosts_ips(self, domain: str) -> Optional[List[Tuple[str, int]]]:
+        """获取自定义 hosts 中域名对应的 IP 列表"""
+        domain = domain.lower().rstrip(".")
+        return self._custom_hosts.get(domain)
+
+    def clear_filter_cache(self):
+        """清除过滤结果缓存 - 让所有域名重新匹配规则"""
+        self._filter_cache.clear()
+        self._custom_hosts_cache.clear()
+        logger.debug("过滤缓存已清除 (%d 条)", len(self._filter_cache))
 
     # ======================== 定时更新 ========================
 
@@ -1020,4 +1104,6 @@ class FilterEngine:
             "title": self._title,
             "update_interval_hours": self._update_interval_hours,
             "auto_update_running": self._running,
+            "custom_hosts_count": len(self._custom_hosts),
+            "custom_hosts_enabled": self._custom_hosts_enabled,
         }
