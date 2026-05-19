@@ -1,0 +1,253 @@
+"""
+网络连通性监控器
+- 定期 ping/探测网络连通性（IPv4 + IPv6 双栈）
+- 检测网络中断/恢复，自动重新启用上游服务器
+- 支持 ICMP ping 和 DNS 探测两种检测方式
+"""
+
+import sys
+import asyncio
+import logging
+from typing import List, Optional
+
+import dns.message
+import dns.rdatatype
+import dns.asyncquery
+
+logger = logging.getLogger("dns-proxy.network")
+
+
+class NetworkMonitor:
+    """
+    网络连通性监控器
+
+    在网络中断时自动检测，网络恢复后自动：
+    1. 重新启用所有被禁用的上游 DNS 服务器
+    2. 刷新 bootstrap DNS 缓存（重新解析上游域名 → IP）
+    """
+
+    def __init__(self, config, resolver_manager):
+        self.config = config
+        self.resolver_manager = resolver_manager
+
+        # 运行状态
+        self._running = False
+        self._task: Optional[asyncio.Task] = None
+
+        # 降级状态追踪
+        self._degraded = False          # 是否处于降级模式（网络异常）
+        self._consecutive_failures = 0  # 连续检测失败次数
+        self._last_recovery_time = 0.0  # 上次恢复时间戳
+
+        # 从配置读取
+        nm = config.get_raw().get("network_monitor", {})
+        self._enabled = nm.get("enabled", True)
+        self._interval = nm.get("ping_interval", 15)  # 检测间隔（秒）
+        self._ping_timeout = nm.get("ping_timeout", 5)  # ping 超时（秒）
+        self._ping_targets_v4 = nm.get("ping_targets_v4", ["223.5.5.5", "114.114.114.114"])
+        self._ping_targets_v6 = nm.get("ping_targets_v6", ["2400:3200::1", "2400:da00::6666"])
+        self._dns_probe_domains = nm.get("dns_probe_domains", ["www.baidu.com", "www.qq.com"])
+        self._failure_threshold = nm.get("failure_threshold", 3)  # 连续多少次失败后进入降级
+        self._recovery_check_count = nm.get("recovery_check_count", 2)  # 恢复需要连续成功次数
+        self._recovery_successes = 0  # 恢复检测连续成功计数
+
+    @property
+    def enabled(self) -> bool:
+        """监控器是否启用"""
+        return self._enabled
+
+    @property
+    def is_degraded(self) -> bool:
+        """是否处于降级模式"""
+        return self._degraded
+
+    async def start(self):
+        """启动监控循环"""
+        if not self._enabled:
+            logger.info("网络连通性监控已禁用")
+            return
+        self._running = True
+        self._task = asyncio.create_task(self._monitor_loop())
+        logger.info("网络连通性监控已启动 (间隔=%ds, ping目标=%s)",
+                     self._interval, self._ping_targets_v4 + self._ping_targets_v6)
+
+    async def stop(self):
+        """停止监控循环"""
+        self._running = False
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+
+    # ======================== 主循环 ========================
+
+    async def _monitor_loop(self):
+        """监控主循环"""
+        while self._running:
+            try:
+                healthy = await self._check_connectivity()
+
+                if healthy:
+                    self._consecutive_failures = 0
+                    if self._degraded:
+                        # 降级模式：需要连续成功 recovery_check_count 次才算恢复
+                        self._recovery_successes += 1
+                        if self._recovery_successes >= self._recovery_check_count:
+                            logger.info("网络已恢复（连续 %d 次检测成功），开始恢复上游...",
+                                         self._recovery_successes)
+                            await self._recover()
+                            self._recovery_successes = 0
+                    else:
+                        self._recovery_successes = 0
+                else:
+                    self._consecutive_failures += 1
+                    self._recovery_successes = 0
+                    if not self._degraded and self._consecutive_failures >= self._failure_threshold:
+                        self._degraded = True
+                        logger.warning("网络连通性异常（连续 %d 次检测失败），进入降级模式",
+                                        self._consecutive_failures)
+
+                await asyncio.sleep(self._interval)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("网络监控异常: %s", e)
+                await asyncio.sleep(10)
+
+    # ======================== 连通性检测 ========================
+
+    async def _check_connectivity(self) -> bool:
+        """
+        综合检测网络连通性
+        检测方式（任一成功即视为连通）：
+        1. ICMP ping 检测（IPv4 + IPv6 双栈）
+        2. DNS 探测（向公共 DNS 发送 A/AAAA 查询）
+        """
+        results = await asyncio.gather(
+            self._ping_check_v4(),
+            self._ping_check_v6(),
+            self._dns_probe_check(),
+            return_exceptions=True,
+        )
+
+        successes = sum(1 for r in results if r is True)
+        if successes > 0:
+            logger.debug("网络连通性检测: %d/3 成功 (ping4=%s, ping6=%s, dns=%s)",
+                         successes, results[0], results[1], results[2])
+            return True
+        else:
+            logger.debug("网络连通性检测: 全部失败")
+            return False
+
+    async def _ping_check_v4(self) -> bool:
+        """ICMP ping IPv4 目标"""
+        if not self._ping_targets_v4:
+            return False
+        for target in self._ping_targets_v4:
+            if await self._ping(target):
+                return True
+        return False
+
+    async def _ping_check_v6(self) -> bool:
+        """ICMP ping IPv6 目标"""
+        if not self._ping_targets_v6:
+            return False
+        for target in self._ping_targets_v6:
+            if await self._ping(target):
+                return True
+        return False
+
+    async def _ping(self, target: str) -> bool:
+        """
+        使用系统 ping 命令检测连通性
+        跨平台支持 Windows / Linux
+        """
+        is_ipv6 = ":" in target
+        if sys.platform == "win32":
+            cmd = ["ping", "-n", "1", "-w", str(int(self._ping_timeout * 1000))]
+            if is_ipv6:
+                cmd.append("-6")
+            cmd.append(target)
+        else:
+            cmd = ["ping", "-c", "1", "-W", str(self._ping_timeout)]
+            cmd.append(target)
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=self._ping_timeout + 2)
+            return proc.returncode == 0
+        except (asyncio.TimeoutError, FileNotFoundError, OSError):
+            return False
+
+    async def _dns_probe_check(self) -> bool:
+        """
+        DNS 探测：向 bootstrap 公共 DNS 发送 A/AAAA 查询
+        验证 DNS 协议栈是否正常工作
+        """
+        if not self._dns_probe_domains:
+            return False
+        bootstrap_addrs = self.resolver_manager.get_bootstrap_addresses()
+        if not bootstrap_addrs:
+            # 回退到配置中的 ping targets
+            bootstrap_addrs = self._ping_targets_v4 + self._ping_targets_v6
+            if not bootstrap_addrs:
+                return False
+
+        for domain in self._dns_probe_domains:
+            for addr in bootstrap_addrs:
+                try:
+                    q = dns.message.make_query(domain, dns.rdatatype.A)
+                    qbytes = q.to_wire()
+                    is_ipv6 = ":" in addr
+                    family = "v6" if is_ipv6 else "v4"
+                    from resolvers.plain import PlainDNSResolver
+                    resolver = PlainDNSResolver(addr, timeout=self._ping_timeout)
+                    result = await asyncio.wait_for(
+                        resolver.resolve(qbytes, prefer_family=family),
+                        timeout=self._ping_timeout,
+                    )
+                    if result is not None:
+                        return True
+                except Exception:
+                    continue
+        return False
+
+    # ======================== 自动恢复 ========================
+
+    async def _recover(self):
+        """
+        网络恢复后的自动恢复操作：
+        1. 重新启用所有上游服务器（包括 bootstrap）
+        2. 刷新所有上游域名 → IP 的 bootstrap 缓存
+        3. 重置降级状态
+        """
+        logger.info("=" * 50)
+        logger.info("网络已恢复，执行自动恢复...")
+
+        # 1. 重新启用所有上游
+        self.resolver_manager.reenable_all()
+        logger.info("  已重新启用所有上游服务器")
+
+        # 2. 刷新所有 bootstrap IP 缓存
+        refreshed = await self.resolver_manager.refresh_all_upstream_ips()
+        logger.info("  已刷新 %d 个上游域名的 bootstrap IP 缓存", refreshed)
+
+        # 3. 标记恢复
+        self._degraded = False
+        self._consecutive_failures = 0
+        self._recovery_successes = 0
+        self._last_recovery_time = asyncio.get_event_loop().time()
+
+        # 重新统计可用上游
+        enabled = sum(1 for s in self.resolver_manager._upstream_servers if s.enabled)
+        total = len(self.resolver_manager._upstream_servers)
+        logger.info("自动恢复完成: %d/%d 个上游可用", enabled, total)
+        logger.info("=" * 50)
