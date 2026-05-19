@@ -32,6 +32,9 @@ linux上就简单了。。。。。。。
 
 <img width="833" height="457" alt="图片" src="https://github.com/user-attachments/assets/9aa0cbee-0e6c-4913-bb14-b7dac47b18ab" />
 
+为什么不用单个加密dns？
+答：单个加密dns不支持全链路tls加密非常容易被中间人攻击。
+
 ## 1. IPV4设置参考：
 
 首选DNS：127.0.0.1
