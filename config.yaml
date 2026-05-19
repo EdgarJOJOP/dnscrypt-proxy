@@ -54,6 +54,7 @@ upstream:
     - "dns.pub"
     - "dns.adguard-dns.com"
     - "one.one.one.one"
+    - "1dot1dot1dot1.cloudflare-dns.com"
 
   # DNS over QUIC
   doq:
@@ -84,6 +85,18 @@ dnssec:
   mode: "ad_check"
   # 是否丢弃验证失败的响应（bogus）
   drop_bogus: false
+
+# ============================================================
+# 自定义域名 IP 映射（类似 Windows hosts 文件）
+# 格式: "域名 IP1,IP2" (域名和IP用空格分隔,多IP用逗号)
+# 支持 IPv4 和 IPv6
+# ============================================================
+hosts:
+  enabled: false
+  mappings:
+    # - "my.dns 127.0.0.1,192.168.1.1"
+    # - "router.local 192.168.1.1"
+    # - "ipv6test.local ::1"
 
 # ============================================================
 # 域名过滤规则（AdGuard Home 语法）
@@ -117,6 +130,41 @@ logging:
   log_file: "dns_queries.log"
   detailed: true
   max_log_size_mb: 10      # 日志文件最大大小（MB），超限自动裁剪保留后半部分
+
+# ============================================================
+# TLS/SSL 配置（加密连接参数）
+# ============================================================
+tls:
+  # Encrypted Client Hello（加密客户端问候）
+  # 防止 SNI 明文泄露导致的域名嗅探和干扰
+  # 注意：需要 OpenSSL 3.2+ 且编译时启用 ECH 支持
+  ech_enabled: true
+  # 密码套件（默认安全配置）
+  ciphers: "HIGH:!aNULL:!kRSA:!PSK:!SRP:!MD5:!RC4"
+
+# ============================================================
+# 网络连通性监控（自动恢复上游服务器连接）
+# 多IP/多网关场景下，IP/网关变更后自动检测并恢复
+# ============================================================
+network_monitor:
+  enabled: true
+  ping_interval: 15        # 检测间隔（秒）
+  ping_timeout: 1          # ping 超时（秒）
+  # ICMP ping 检测目标（IPv4 + IPv6 双栈）
+  ping_targets_v4:
+    - "223.5.5.5"
+    - "114.114.114.114"
+  ping_targets_v6:
+    - "2400:3200::1"
+    - "2400:da00::6666"
+  # DNS 探测域名（向公共 DNS 发送 DNS 查询验证）
+  dns_probe_domains:
+    - "www.baidu.com"
+    - "www.qq.com"
+  # 连续检测失败多少次后进入降级模式
+  failure_threshold: 3
+  # 退出降级需要连续成功检测次数
+  recovery_check_count: 2
 
 # ============================================================
 # 性能与资源优化
