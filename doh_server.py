@@ -18,6 +18,7 @@ from aiohttp import web
 
 import dns.message
 import dns.rdatatype
+import dns.rdataclass
 import dns.rdtypes.IN.A
 import dns.rdtypes.IN.AAAA
 import dns.rrset
@@ -201,6 +202,28 @@ class DoHServer:
             result["Question"] = [{"name": qname, "type": qtype}]
             result["CD"] = bool(query.flags & dns.flags.CD)
 
+            # 0. 检查自定义 hosts 映射（JSON API）
+            custom_ips = self.filter_engine.get_custom_hosts_ips(qname)
+            if custom_ips:
+                qrdtype = question.rdtype
+                answer_entries = []
+                for ip, ip_rdtype in custom_ips:
+                    if qrdtype == dns.rdatatype.A and ip_rdtype == dns.rdatatype.AAAA:
+                        continue
+                    if qrdtype == dns.rdatatype.AAAA and ip_rdtype == dns.rdatatype.A:
+                        continue
+                    answer_entries.append({
+                        "name": qname,
+                        "type": QTYPE_NAMES.get(ip_rdtype, str(ip_rdtype)),
+                        "TTL": 3600,
+                        "data": ip,
+                    })
+                if answer_entries:
+                    result["Status"] = 0  # NOERROR
+                    result["Answer"] = answer_entries
+                    result["Comment"] = "自定义 hosts 映射"
+                    return result
+
             # 1. 检查域名过滤
             if self.config.filter_enabled:
                 blocked, reason = self.filter_engine.check_domain(qname)
@@ -274,11 +297,13 @@ class DoHServer:
 
         # Answer 部分
         for rrset in response.answer:
+            # dnspython v2.x: TTL 存储在 RRset 上，rdata 对象可能没有 ttl 属性
+            ttl = max(0, rrset.ttl) if hasattr(rrset, 'ttl') and rrset.ttl is not None else 3600
             for rd in rrset:
                 entry = {
                     "name": str(rrset.name).rstrip("."),
                     "type": QTYPE_NAMES.get(rd.rdtype, str(rd.rdtype)),
-                    "TTL": max(0, rd.ttl),
+                    "TTL": ttl,
                 }
                 if rd.rdtype == dns.rdatatype.A:
                     entry["data"] = str(rd.address)
@@ -309,11 +334,12 @@ class DoHServer:
 
         # Authority 部分
         for rrset in response.authority:
+            ttl = max(0, rrset.ttl) if hasattr(rrset, 'ttl') and rrset.ttl is not None else 3600
             for rd in rrset:
                 result["Authority"].append({
                     "name": str(rrset.name).rstrip("."),
                     "type": QTYPE_NAMES.get(rd.rdtype, str(rd.rdtype)),
-                    "TTL": max(0, rd.ttl),
+                    "TTL": ttl,
                     "data": str(rd),
                 })
 
@@ -344,7 +370,7 @@ class DoHServer:
     async def _process_query(
         self, wire_data: bytes, request: web.Request, response_format: str = "wire"
     ) -> web.Response:
-        """DNS 查询处理（含缓存、过滤、DNSSEC 验证）"""
+        """DNS 查询处理（含缓存、过滤、DNSSEC 验证、自定义 hosts）"""
         client_ip = request.remote or "unknown"
         response_wire: Optional[bytes] = None
         upstream = ""
@@ -364,6 +390,44 @@ class DoHServer:
             qtype = QTYPE_NAMES.get(question.rdtype, str(question.rdtype))
             cache_key = (question.name, question.rdtype, question.rdclass)
 
+            # 0. 检查自定义 hosts 映射（最高优先级）
+            custom_ips = self.filter_engine.get_custom_hosts_ips(qname)
+            if custom_ips:
+                response = dns.message.make_response(query)
+                rdtype = question.rdtype
+                matched = False
+                for ip, ip_rdtype in custom_ips:
+                    if rdtype == dns.rdatatype.A and ip_rdtype == dns.rdatatype.AAAA:
+                        continue
+                    if rdtype == dns.rdatatype.AAAA and ip_rdtype == dns.rdatatype.A:
+                        continue
+                    if rdtype == dns.rdatatype.A and ip_rdtype == dns.rdatatype.A:
+                        if not response.answer or response.answer[0].rdtype != dns.rdatatype.A:
+                            response.answer.append(
+                                dns.rrset.RRset(question.name, question.rdclass, dns.rdatatype.A)
+                            )
+                        response.answer[-1].add(dns.rdtypes.IN.A.A(dns.rdataclass.IN, dns.rdatatype.A, ip), ttl=3600)
+                        matched = True
+                    elif rdtype == dns.rdatatype.AAAA and ip_rdtype == dns.rdatatype.AAAA:
+                        if not response.answer or response.answer[0].rdtype != dns.rdatatype.AAAA:
+                            response.answer.append(
+                                dns.rrset.RRset(question.name, question.rdclass, dns.rdatatype.AAAA)
+                            )
+                        response.answer[-1].add(dns.rdtypes.IN.AAAA.AAAA(dns.rdataclass.IN, dns.rdatatype.AAAA, ip), ttl=3600)
+                        matched = True
+                if matched:
+                    response.set_rcode(dns.rcode.NOERROR)
+                    response_wire = response.to_wire()
+                    status = "custom_hosts"
+                    block_reason = f"自定义 hosts 映射"
+                    if self.config.cache_enabled:
+                        await self.cache.set(cache_key, response)
+                    elapsed = asyncio.get_event_loop().time() - start_time
+                    await self._log_query(
+                        client_ip, qname, qtype, elapsed, status, "", block_reason
+                    )
+                    return self._make_response(response_wire, response_format)
+
             # 1. 检查域名过滤
             if self.config.filter_enabled:
                 blocked, reason = self.filter_engine.check_domain(qname)
@@ -377,13 +441,13 @@ class DoHServer:
                         response.answer.append(
                             dns.rrset.RRset(question.name, question.rdclass, dns.rdatatype.A)
                         )
-                        response.answer[0].add(dns.rdtypes.IN.A.A(question.name, 3600, "0.0.0.0"))
+                        response.answer[0].add(dns.rdtypes.IN.A.A(dns.rdataclass.IN, dns.rdatatype.A, "0.0.0.0"), ttl=3600)
                         response.set_rcode(dns.rcode.NOERROR)
                     elif rdtype == dns.rdatatype.AAAA:
                         response.answer.append(
                             dns.rrset.RRset(question.name, question.rdclass, dns.rdatatype.AAAA)
                         )
-                        response.answer[0].add(dns.rdtypes.IN.AAAA.AAAA(question.name, 3600, "::"))
+                        response.answer[0].add(dns.rdtypes.IN.AAAA.AAAA(dns.rdataclass.IN, dns.rdatatype.AAAA, "::"), ttl=3600)
                         response.set_rcode(dns.rcode.NOERROR)
                     else:
                         response.set_rcode(dns.rcode.NXDOMAIN)
