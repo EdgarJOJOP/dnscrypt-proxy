@@ -71,6 +71,7 @@ class ResolverManager:
         self._concurrent_semaphore: Optional[asyncio.Semaphore] = None
         self._bootstrap_ready = asyncio.Event()
         self._dnssec = dnssec_wrapper  # DNSSEC 查询包装器（可选）
+        self._recovery_task: Optional[asyncio.Task] = None  # 自动重连任务
 
     async def initialize(self):
         """初始化所有解析器"""
@@ -194,9 +195,11 @@ class ResolverManager:
         """创建加密上游解析器"""
         timeout = self.config.parallel_timeout
 
+        ech_enabled = self.config.ech_enabled
+
         # DoH
         for url in self.config.doh_servers:
-            resolver = DoHResolver(url, timeout=timeout)
+            resolver = DoHResolver(url, timeout=timeout, ech_enabled=ech_enabled)
             self._upstream_servers.append(UpstreamServer(resolver, "doh"))
 
         # DoT — 先尝试 hostname 直连（系统 DNS），再 fallback bootstrap IP
@@ -205,7 +208,7 @@ class ResolverManager:
             h = parts[0]
             p = int(parts[1]) if len(parts) > 1 else 853
             cached_ips = self._bootstrap_cache.get(h, [])
-            resolver = DoTResolver(h, port=p, timeout=timeout, connect_ips=cached_ips)
+            resolver = DoTResolver(h, port=p, timeout=timeout, connect_ips=cached_ips, ech_enabled=ech_enabled)
             self._upstream_servers.append(UpstreamServer(resolver, "dot"))
 
         # DoQ
@@ -307,6 +310,31 @@ class ResolverManager:
             logger.info("刷新 %s -> %s", hostname, ips)
         return ips
 
+    async def refresh_all_upstream_ips(self) -> int:
+        """刷新所有上游域名的 bootstrap IP 缓存"""
+        all_hostnames = set()
+        for url in self.config.doh_servers:
+            host = url.replace("https://", "").split("/")[0].split(":")[0]
+            all_hostnames.add(host)
+        for host in self.config.dot_servers:
+            h = host.split(":")[0]
+            all_hostnames.add(h)
+        for addr in self.config.doq_servers:
+            host = addr.replace("quic://", "").split(":")[0]
+            all_hostnames.add(host)
+
+        results = await asyncio.gather(
+            *[self.refresh_upstream_ips(h) for h in all_hostnames],
+            return_exceptions=True,
+        )
+        success_count = sum(1 for r in results if isinstance(r, list) and r)
+        logger.info("批量刷新 bootstrap IP: %d/%d 成功", success_count, len(all_hostnames))
+        return success_count
+
+    def get_bootstrap_addresses(self) -> List[str]:
+        """获取所有 bootstrap 解析器地址"""
+        return [bs.name for bs in self._bootstrap_resolvers]
+
     def reenable_all(self):
         """重新启用所有上游服务器"""
         for s in self._upstream_servers:
@@ -316,6 +344,15 @@ class ResolverManager:
 
     async def close_all(self):
         """关闭所有解析器"""
+        # 停止自动重连任务
+        if self._recovery_task:
+            self._recovery_task.cancel()
+            try:
+                await self._recovery_task
+            except asyncio.CancelledError:
+                pass
+            self._recovery_task = None
+
         for server in self._upstream_servers:
             try:
                 await server.resolver.close()
