@@ -131,6 +131,8 @@ class DNSProxyApp:
             msg = context.get("message", "")
             if isinstance(exc, ConnectionError) and "Future exception" in msg:
                 return  # 忽略 aioquic 内部 Future 的 ConnectionError
+            if isinstance(exc, ConnectionResetError) and "_ProactorBasePipeTransport" in msg:
+                return  # 忽略 Windows asyncio proactor 连接重置错误
             if original_exc_handler:
                 original_exc_handler(loop, context)
             else:
