@@ -11,6 +11,7 @@ from typing import Optional
 
 import dns.message
 import dns.rdatatype
+import dns.rdataclass
 import dns.rdtypes.IN.A
 import dns.rdtypes.IN.AAAA
 import dns.rrset
@@ -102,6 +103,40 @@ class PlainDNSServer:
             qtype_str = dns.rdatatype.to_text(question.rdtype)
             cache_key = (question.name, question.rdtype, question.rdclass)
 
+            # 0. 检查自定义 hosts 映射（最高优先级）
+            custom_ips = self.filter_engine.get_custom_hosts_ips(qname)
+            if custom_ips:
+                response = dns.message.make_response(query)
+                rdtype = question.rdtype
+                matched = False
+                for ip, ip_rdtype in custom_ips:
+                    if rdtype == dns.rdatatype.A and ip_rdtype == dns.rdatatype.AAAA:
+                        continue
+                    if rdtype == dns.rdatatype.AAAA and ip_rdtype == dns.rdatatype.A:
+                        continue
+                    if rdtype == dns.rdatatype.A and ip_rdtype == dns.rdatatype.A:
+                        if not response.answer or response.answer[0].rdtype != dns.rdatatype.A:
+                            response.answer.append(
+                                dns.rrset.RRset(question.name, question.rdclass, dns.rdatatype.A)
+                            )
+                        response.answer[-1].add(dns.rdtypes.IN.A.A(dns.rdataclass.IN, dns.rdatatype.A, ip), ttl=3600)
+                        matched = True
+                    elif rdtype == dns.rdatatype.AAAA and ip_rdtype == dns.rdatatype.AAAA:
+                        if not response.answer or response.answer[0].rdtype != dns.rdatatype.AAAA:
+                            response.answer.append(
+                                dns.rrset.RRset(question.name, question.rdclass, dns.rdatatype.AAAA)
+                            )
+                        response.answer[-1].add(dns.rdtypes.IN.AAAA.AAAA(dns.rdataclass.IN, dns.rdatatype.AAAA, ip), ttl=3600)
+                        matched = True
+                if matched:
+                    response.set_rcode(dns.rcode.NOERROR)
+                    if self.config.cache_enabled:
+                        await self.cache.set(cache_key, response)
+                    self._send_raw_response(response.to_wire(), addr, transport)
+                    elapsed = asyncio.get_event_loop().time() - start_time
+                    await self._log_query(client_ip, qname, qtype_str, elapsed, "custom_hosts", "")
+                    return
+
             # 1. 检查域名过滤
             if self.config.filter_enabled:
                 blocked, reason = self.filter_engine.check_domain(qname)
@@ -114,13 +149,13 @@ class PlainDNSServer:
                         response.answer.append(
                             dns.rrset.RRset(question.name, question.rdclass, dns.rdatatype.A)
                         )
-                        response.answer[0].add(dns.rdtypes.IN.A.A(question.name, 3600, "0.0.0.0"))
+                        response.answer[0].add(dns.rdtypes.IN.A.A(dns.rdataclass.IN, dns.rdatatype.A, "0.0.0.0"), ttl=3600)
                         response.set_rcode(dns.rcode.NOERROR)
                     elif question.rdtype == dns.rdatatype.AAAA:
                         response.answer.append(
                             dns.rrset.RRset(question.name, question.rdclass, dns.rdatatype.AAAA)
                         )
-                        response.answer[0].add(dns.rdtypes.IN.AAAA.AAAA(question.name, 3600, "::"))
+                        response.answer[0].add(dns.rdtypes.IN.AAAA.AAAA(dns.rdataclass.IN, dns.rdatatype.AAAA, "::"), ttl=3600)
                         response.set_rcode(dns.rcode.NOERROR)
                     else:
                         response.set_rcode(dns.rcode.NXDOMAIN)
