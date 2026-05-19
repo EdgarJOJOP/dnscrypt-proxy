@@ -27,6 +27,14 @@ import logging
 from pathlib import Path
 from typing import Optional, List
 
+import dns.message
+import dns.rdatatype
+import dns.rdataclass
+import dns.rdtypes.IN.A
+import dns.rdtypes.IN.AAAA
+import dns.rrset
+import dns.rcode
+
 # 确保项目根目录在 sys.path 中
 PROJECT_ROOT = Path(__file__).parent.absolute()
 if str(PROJECT_ROOT) not in sys.path:
@@ -40,6 +48,7 @@ from resolver_manager import ResolverManager
 from doh_server import DoHServer
 from plain_dns_server import PlainDNSServer
 from optimizer import ResourceOptimizer
+from network_monitor import NetworkMonitor
 from dnssec import DNSSECValidator, DNSSECQueryWrapper
 
 # ======================== 日志配置 ========================
@@ -104,6 +113,7 @@ class DNSProxyApp:
         self._filter_reload_task: Optional[asyncio.Task] = None  # 跟踪后台过滤规则重载
         self._filter_reload_gen = 0  # 递增 generation，防止过期重载覆盖
         self._running = False
+        self.network_monitor: Optional[NetworkMonitor] = None  # 网络连通性监控
 
     async def initialize(self):
         """初始化所有组件"""
@@ -152,6 +162,8 @@ class DNSProxyApp:
         # 3. 过滤器
         logger.info("[3/8] 初始化域名过滤引擎...")
         self.filter_engine = FilterEngine()
+        # 加载自定义 hosts 映射
+        self.filter_engine.load_custom_hosts(self.config.hosts_config)
         if self.config.filter_enabled:
             rule_files = self.config.filter_rules_files
             full_paths = [str(PROJECT_ROOT / f) for f in rule_files]
@@ -164,6 +176,9 @@ class DNSProxyApp:
                 self._filter_reload_task = asyncio.create_task(
                     self._filter_reload_safe(full_paths, rule_urls)
                 )
+        else:
+            # 即使过滤规则关闭，也需要标记远程加载已完成（避免阻塞后续逻辑）
+            logger.info("  过滤规则已禁用")
 
         # 4. 日志记录器
         logger.info("[4/8] 初始化异步日志记录器...")
@@ -190,8 +205,13 @@ class DNSProxyApp:
         )
         await self.resource_optimizer.start()
 
-        # 7. 本地 DoH 服务器（带 IPv6 + DNSSEC）
-        logger.info("[7/8] 初始化本地 DoH 服务器...")
+        # 7. 网络连通性监控
+        logger.info("[7/8] 初始化网络连通性监控器...")
+        self.network_monitor = NetworkMonitor(self.config, self.resolver_manager)
+        await self.network_monitor.start()
+
+        # 8. 本地 DoH 服务器（带 IPv6 + DNSSEC）
+        logger.info("[8/8] 初始化本地 DoH 服务器...")
         self.doh_server = DoHServer(
             self.config,
             self.resolver_manager,
@@ -201,8 +221,8 @@ class DNSProxyApp:
             dnssec_wrapper=self._dnssec_wrapper,
         )
 
-        # 8. 普通 DNS 服务器（UDP 53，默认关闭）
-        logger.info("[8/8] 初始化普通 DNS 服务器...")
+        # 9. 普通 DNS 服务器（UDP 53，默认关闭）
+        logger.info("[9/9] 初始化普通 DNS 服务器...")
         self.plain_dns_server = PlainDNSServer(
             self.config,
             self.resolver_manager,
@@ -229,6 +249,7 @@ class DNSProxyApp:
         - 先清空旧规则再加载新规则，不会重复叠加
         - 适用于启动后台加载和热加载
         - 使用 generation 计数器防止过期加载覆盖
+        - 加载完毕后自动扫描 DNS 缓存，覆写已缓存拦截域名的 IP
         """
         gen = self._filter_reload_gen + 1
         self._filter_reload_gen = gen
@@ -246,6 +267,10 @@ class DNSProxyApp:
             logger.info("  拦截索引域名: %d, 白名单域名: %d",
                          self.filter_engine.stats["block_index_domains"],
                          self.filter_engine.stats["allow_index_domains"])
+
+            # ========== 规则加载完毕后：扫描 DNS 缓存，覆写已缓存拦截域名的 IP ==========
+            await self._sweep_cache_after_filter_load()
+
         except asyncio.CancelledError:
             logger.info("过滤规则加载 #%d 被取消", gen)
             self.filter_engine._filter_cache.clear()
@@ -253,12 +278,91 @@ class DNSProxyApp:
         except Exception as e:
             logger.error("过滤规则加载 #%d 失败: %s", gen, e)
 
-    async def _on_config_reload(self, new_config: dict):
-        """配置热加载回调 - 检测远程规则 URL 变更并重新加载"""
-        logger = logging.getLogger("dns-proxy.app")
-        logger.info("配置已热加载，检查远程规则变更...")
+    async def _sweep_cache_after_filter_load(self):
+        """
+        过滤规则加载完毕后，扫描 DNS 缓存中的域名。
+        如果有域名匹配新的拦截规则，将其 IP 覆写为 0.0.0.0（A记录）或 ::（AAAA记录）。
+        这解决了"启动时规则未加载完 → 域名已被解析并缓存 → 规则加载后旧 IP 仍有效"的问题。
+        """
+        if not self.cache or not self.config.cache_enabled or not self.config.filter_enabled:
+            return
 
-        if not self.config.filter_enabled or not self.filter_engine:
+        logger = logging.getLogger("dns-proxy.app")
+        logger.info("开始扫描 DNS 缓存，检查是否有域名应被新规则拦截...")
+
+        # 获取当前缓存的所有 key
+        cache_keys = await self.cache.get_all_keys()
+        swept_count = 0
+        changed_count = 0
+
+        for cache_key in cache_keys:
+            qname, qtype, qclass = cache_key
+            domain = str(qname).rstrip(".")
+            # 检查是否匹配过滤规则
+            blocked, _ = self.filter_engine.check_domain(domain)
+            if blocked:
+                # 获取当前缓存的响应
+                cached_response = await self.cache.peek(cache_key)
+                if cached_response is None:
+                    continue
+                # 检查当前缓存的 IP 是否已经是 0.0.0.0 或 ::
+                already_blocked = False
+                for rrset in cached_response.answer:
+                    for rd in rrset:
+                        if rd.rdtype == dns.rdatatype.A:
+                            if str(rd.address) == "0.0.0.0":
+                                already_blocked = True
+                        elif rd.rdtype == dns.rdatatype.AAAA:
+                            if str(rd.address) == "::":
+                                already_blocked = True
+                if already_blocked:
+                    continue
+                # 覆写为拦截 IP
+                new_response = dns.message.make_response(cached_response)
+                new_response.answer.clear()
+                if qtype == dns.rdatatype.A:
+                    new_response.answer.append(
+                        dns.rrset.RRset(qname, qclass, dns.rdatatype.A)
+                    )
+                    new_response.answer[0].add(
+                        dns.rdtypes.IN.A.A(dns.rdataclass.IN, dns.rdatatype.A, "0.0.0.0"), ttl=3600
+                    )
+                    new_response.set_rcode(dns.rcode.NOERROR)
+                elif qtype == dns.rdatatype.AAAA:
+                    new_response.answer.append(
+                        dns.rrset.RRset(qname, qclass, dns.rdatatype.AAAA)
+                    )
+                    new_response.answer[0].add(
+                        dns.rdtypes.IN.AAAA.AAAA(dns.rdataclass.IN, dns.rdatatype.AAAA, "::"), ttl=3600
+                    )
+                    new_response.set_rcode(dns.rcode.NOERROR)
+                else:
+                    new_response.set_rcode(dns.rcode.NXDOMAIN)
+                await self.cache.set(cache_key, new_response)
+                changed_count += 1
+            swept_count += 1
+
+        logger.info("缓存扫描完成: 检查 %d 条, 覆写 %d 条为拦截 IP", swept_count, changed_count)
+
+    async def _on_config_reload(self, new_config: dict):
+        """配置热加载回调 - 重新加载 hosts、检测远程规则 URL 变更并重新加载"""
+        logger = logging.getLogger("dns-proxy.app")
+        logger.info("配置已热加载，检查变更...")
+
+        if not self.filter_engine:
+            return
+
+        # 0. 始终重新加载自定义 hosts 映射（文件变更后 hosts 可能已修改）
+        if "hosts" in new_config:
+            self.filter_engine.load_custom_hosts(new_config.get("hosts", {}))
+            logger.info("自定义 hosts 映射已重新加载")
+
+        # 清除过滤缓存，强制所有域名重新匹配规则
+        self.filter_engine.clear_filter_cache()
+        logger.debug("过滤缓存已清除")
+
+        if not self.config.filter_enabled:
+            logger.info("过滤规则已禁用，跳过规则重载")
             return
 
         # 获取新配置中的 rules_urls
@@ -271,7 +375,7 @@ class DNSProxyApp:
 
         # 只有 URL 真正变更时才触发重载
         if old_loaded == new_set:
-            logger.debug("远程规则 URL 未变更，跳过重载")
+            logger.debug("远程规则 URL 未变更，跳过规则重载")
             return
 
         logger.info("远程规则 URL 已变更 (%d → %d)，开始重载...",
@@ -348,6 +452,9 @@ class DNSProxyApp:
         logger.info("  - DNSSEC:     %s (mode=%s)",
                      "启用" if self.config.dnssec_enabled else "禁用",
                      self.config.dnssec_mode)
+        logger.info("  - 网络监控:   %s (ping间隔=%ds)",
+                     "启用" if self.config.network_monitor_enabled else "禁用",
+                     self.config.get_raw().get("network_monitor", {}).get("ping_interval", 15))
         logger.info("  - 过滤规则:   %d 条", self.filter_engine.stats["total_rules"] if self.config.filter_enabled else 0)
         logger.info("=" * 60)
 
@@ -384,6 +491,10 @@ class DNSProxyApp:
         # 停止资源优化器
         if self.resource_optimizer:
             await self.resource_optimizer.stop()
+
+        # 停止网络监控
+        if self.network_monitor:
+            await self.network_monitor.stop()
 
         # 刷新日志
         if self.request_logger:
