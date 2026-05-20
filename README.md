@@ -23,7 +23,7 @@ linux上就简单了。。。。。。。
 我目前查询连cloudflare的加密dns都不支持ech，如果要用需要自行搭建加密dns反代nginx或者caddy开启ech就能验证代码是否工作正常。
 使用和写法全部在config.yaml文件里，默认是关闭的。
 
-# 3. 运行
+# 4. 运行
 
 默认关闭本地53端口服务器。
 
@@ -31,7 +31,7 @@ linux上就简单了。。。。。。。
 
 需要打包自行打包exe或者其它平台就行.
 
-# 4. 在win11上使用加密dns本地服务
+# 5. 在win11上使用加密dns本地服务
 
 
 <img width="833" height="457" alt="图片" src="https://github.com/user-attachments/assets/9aa0cbee-0e6c-4913-bb14-b7dac47b18ab" />
