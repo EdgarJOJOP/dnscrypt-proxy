@@ -21,6 +21,7 @@ SecureDNS Proxy - 安全 DNS 加密代理
 
 import os
 import sys
+import gc
 import asyncio
 import signal
 import logging
@@ -42,10 +43,12 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from config import Config
 from cache import DNSCache
-from logger import RequestLogger
+from logger import RequestLogger, TrimFileHandler
 from filter_engine import FilterEngine
 from resolver_manager import ResolverManager
 from doh_server import DoHServer
+from local_dot_server import LocalDoTServer
+from local_doq_server import LocalDoQServer
 from plain_dns_server import PlainDNSServer
 from optimizer import ResourceOptimizer
 from network_monitor import NetworkMonitor
@@ -56,14 +59,15 @@ LOG_FORMAT = "[%(asctime)s] %(levelname)s [%(name)s] %(message)s"
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
-def setup_logging(log_dir: str = "logs"):
-    """配置日志系统"""
+def setup_logging(log_dir: str = "logs", max_log_size_mb: int = 100):
+    """配置日志系统（所有文件日志均带自动裁剪功能）"""
     log_path = Path(PROJECT_ROOT) / log_dir
     log_path.mkdir(parents=True, exist_ok=True)
 
-    # 文件日志
-    file_handler = logging.FileHandler(
-        log_path / "proxy.log", encoding="utf-8", mode="a"
+    # 文件日志（自动裁剪）
+    file_handler = TrimFileHandler(
+        log_path / "proxy.log", max_log_size_mb=max_log_size_mb,
+        encoding="utf-8", mode="a",
     )
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(logging.Formatter(LOG_FORMAT, DATE_FORMAT))
@@ -102,6 +106,8 @@ class DNSProxyApp:
         self.resolver_manager: Optional[ResolverManager] = None
         self.resource_optimizer: Optional[ResourceOptimizer] = None
         self.doh_server: Optional[DoHServer] = None
+        self.local_dot_server: Optional[LocalDoTServer] = None
+        self.local_doq_server: Optional[LocalDoQServer] = None
         self.plain_dns_server: Optional[PlainDNSServer] = None
         # DNSSEC
         self._dnssec_validator: Optional[DNSSECValidator] = None
@@ -141,7 +147,7 @@ class DNSProxyApp:
         loop.set_exception_handler(_exc_handler)
 
         # 1. 缓存
-        logger.info("[1/8] 初始化 DNS 缓存...")
+        logger.info("[1/11] 初始化 DNS 缓存...")
         self.cache = DNSCache(
             max_size=self.config.cache_max_size,
             default_ttl=self.config.cache_default_ttl,
@@ -152,7 +158,7 @@ class DNSProxyApp:
         )
 
         # 2. DNSSEC 验证器
-        logger.info("[2/8] 初始化 DNSSEC 验证器...")
+        logger.info("[2/11] 初始化 DNSSEC 验证器...")
         self._dnssec_validator = DNSSECValidator(enabled=self.config.dnssec_enabled)
         self._dnssec_wrapper = DNSSECQueryWrapper(
             self._dnssec_validator, enabled=self.config.dnssec_enabled
@@ -162,7 +168,7 @@ class DNSProxyApp:
                      self.config.dnssec_mode)
 
         # 3. 过滤器
-        logger.info("[3/8] 初始化域名过滤引擎...")
+        logger.info("[3/11] 初始化域名过滤引擎...")
         self.filter_engine = FilterEngine()
         # 加载自定义 hosts 映射
         self.filter_engine.load_custom_hosts(self.config.hosts_config)
@@ -183,7 +189,7 @@ class DNSProxyApp:
             logger.info("  过滤规则已禁用")
 
         # 4. 日志记录器
-        logger.info("[4/8] 初始化异步日志记录器...")
+        logger.info("[4/11] 初始化异步日志记录器...")
         self.request_logger = RequestLogger(
             log_dir=str(PROJECT_ROOT / self.config.logging_dir),
             log_file=self.config.logging_file,
@@ -196,24 +202,24 @@ class DNSProxyApp:
         await self.request_logger.start()
 
         # 5. 并行解析管理器（带 DNSSEC）
-        logger.info("[5/8] 初始化并行解析管理器...")
+        logger.info("[5/11] 初始化并行解析管理器...")
         self.resolver_manager = ResolverManager(self.config, dnssec_wrapper=self._dnssec_wrapper)
         await self.resolver_manager.initialize()
 
         # 6. 资源优化器
-        logger.info("[6/8] 初始化资源优化器...")
+        logger.info("[6/11] 初始化资源优化器...")
         self.resource_optimizer = ResourceOptimizer(
             self.config, self.cache, self.resolver_manager, self.request_logger
         )
         await self.resource_optimizer.start()
 
         # 7. 网络连通性监控
-        logger.info("[7/8] 初始化网络连通性监控器...")
+        logger.info("[7/11] 初始化网络连通性监控器...")
         self.network_monitor = NetworkMonitor(self.config, self.resolver_manager)
         await self.network_monitor.start()
 
         # 8. 本地 DoH 服务器（带 IPv6 + DNSSEC）
-        logger.info("[8/8] 初始化本地 DoH 服务器...")
+        logger.info("[8/11] 初始化本地 DoH 服务器...")
         self.doh_server = DoHServer(
             self.config,
             self.resolver_manager,
@@ -223,8 +229,40 @@ class DNSProxyApp:
             dnssec_wrapper=self._dnssec_wrapper,
         )
 
-        # 9. 普通 DNS 服务器（UDP 53，默认关闭）
-        logger.info("[9/9] 初始化普通 DNS 服务器...")
+        # 9. 本地 DoT 服务器
+        logger.info("[9/11] 初始化本地 DoT 服务器...")
+        self.local_dot_server = LocalDoTServer(
+            self.config,
+            self.resolver_manager,
+            self.cache,
+            self.filter_engine,
+            self.request_logger,
+            dnssec_wrapper=self._dnssec_wrapper,
+        )
+        if self.config.local_dot_enabled:
+            logger.info("  本地 DoT 服务器已启用（tls://%s:%d）",
+                        self.config.local_dot_host, self.config.local_dot_port)
+        else:
+            logger.info("  本地 DoT 服务器已禁用（可在配置中启用）")
+
+        # 10. 本地 DoQ 服务器
+        logger.info("[10/11] 初始化本地 DoQ 服务器...")
+        self.local_doq_server = LocalDoQServer(
+            self.config,
+            self.resolver_manager,
+            self.cache,
+            self.filter_engine,
+            self.request_logger,
+            dnssec_wrapper=self._dnssec_wrapper,
+        )
+        if self.config.local_doq_enabled:
+            logger.info("  本地 DoQ 服务器已启用（quic://%s:%d）",
+                        self.config.local_doq_host, self.config.local_doq_port)
+        else:
+            logger.info("  本地 DoQ 服务器已禁用（可在配置中启用）")
+
+        # 11. 普通 DNS 服务器（UDP 53，默认关闭）
+        logger.info("[11/11] 初始化普通 DNS 服务器...")
         self.plain_dns_server = PlainDNSServer(
             self.config,
             self.resolver_manager,
@@ -240,6 +278,15 @@ class DNSProxyApp:
 
         # 注册配置热加载回调
         self.config.on_reload(self._on_config_reload)
+
+        # ========== 内存优化：启动后立即 GC ==========
+        # 1. 手动 GC 回收导入模块和初始化过程中产生的临时对象
+        gc.collect()
+        # 2. freeze() 告知 GC 启动后所有存活对象都是永久性的，
+        #    不再扫描它们，显著降低后续 GC 的 CPU 和内存开销
+        gc.freeze()
+        logger.info("  内存优化: gc.freeze() 已执行, 当前内存 %.0f MB",
+                     self._get_memory_mb())
 
         logger.info("=" * 60)
         logger.info("初始化完成！")
@@ -346,48 +393,88 @@ class DNSProxyApp:
 
         logger.info("缓存扫描完成: 检查 %d 条, 覆写 %d 条为拦截 IP", swept_count, changed_count)
 
-    async def _on_config_reload(self, new_config: dict):
-        """配置热加载回调 - 重新加载 hosts、检测远程规则 URL 变更并重新加载"""
+    @staticmethod
+    def _get_memory_mb() -> float:
+        """获取当前进程内存占用（MB）"""
+        try:
+            import psutil
+            proc = psutil.Process()
+            return proc.memory_info().rss / (1024 * 1024)
+        except Exception:
+            return 0.0
+
+    async def _on_config_reload(self, new_config: dict, changed_sections: set = None):
+        """
+        配置热加载回调 — 只当 DNS 缓存配置或域名过滤规则（AdGuard Home 语法）
+        变更时才重新加载拦截规则和替换缓存中匹配的拦截域名。
+        其他配置段（upstream/performance/logging/network_monitor等）变更不会触发任何过滤相关操作。
+
+        Args:
+            new_config: 新的完整配置字典
+            changed_sections: 发生变更的配置段名称集合
+        """
         logger = logging.getLogger("dns-proxy.app")
-        logger.info("配置已热加载，检查变更...")
+        if changed_sections is None:
+            changed_sections = set()
 
         if not self.filter_engine:
             return
 
-        # 0. 始终重新加载自定义 hosts 映射（文件变更后 hosts 可能已修改）
-        if "hosts" in new_config:
+        # ===== 检测是否涉及过滤相关的配置段 =====
+        filter_cache_changed = "cache" in changed_sections or "filter" in changed_sections or "hosts" in changed_sections
+
+        # 0. 始终重新加载自定义 hosts 映射（但只在 hosts 段变化时）
+        if "hosts" in changed_sections and "hosts" in new_config:
             self.filter_engine.load_custom_hosts(new_config.get("hosts", {}))
             logger.info("自定义 hosts 映射已重新加载")
 
-        # 清除过滤缓存，强制所有域名重新匹配规则
+        # 如果完全不涉及 filter/cache/hosts 的变化，直接跳过所有过滤相关操作
+        if not filter_cache_changed:
+            logger.debug("配置变更段 %s 与过滤/缓存无关，跳过过滤规则重载", changed_sections)
+            return
+
+        # 只有 cache/filter/hosts 段变更时才清除过滤结果缓存
         self.filter_engine.clear_filter_cache()
-        logger.debug("过滤缓存已清除")
+        logger.debug("过滤结果缓存已清除（由 %s 变更触发）", ",".join(sorted(changed_sections & {"cache", "filter", "hosts"})))
 
         if not self.config.filter_enabled:
             logger.info("过滤规则已禁用，跳过规则重载")
             return
 
-        # 获取新配置中的 rules_urls
+        # ===== 检测 filter 段是否有实质性的规则变更 =====
+        if "filter" not in changed_sections:
+            logger.debug("域名过滤规则配置未变更，跳过规则重载")
+            return
+
+        # 判断 rules_files 或 rules_urls 是否真正变更
         new_urls = new_config.get("filter", {}).get("rules_urls", [])
         if not isinstance(new_urls, list):
             new_urls = []
 
-        old_loaded = set(self.filter_engine._loaded_urls)
-        new_set = set(new_urls)
+        # 比较新旧 URL 列表（转为规范化集合比较）
+        old_urls = set(self.filter_engine._loaded_urls)
+        new_urls_set = set(new_urls)
 
-        # 只有 URL 真正变更时才触发重载
-        if old_loaded == new_set:
-            logger.debug("远程规则 URL 未变更，跳过规则重载")
+        # 比较 rules_files
+        new_files = new_config.get("filter", {}).get("rules_files", [])
+        if not isinstance(new_files, list):
+            new_files = []
+        old_files = set(self.filter_engine._loaded_files)
+        new_files_full = {str(PROJECT_ROOT / f) for f in new_files}
+
+        # 如果 rules_files 和 rules_urls 都没变，跳过重载
+        if old_files == new_files_full and old_urls == new_urls_set:
+            logger.debug("过滤规则文件/URL 均未变更，跳过规则重载")
             return
 
-        logger.info("远程规则 URL 已变更 (%d → %d)，开始重载...",
-                     len(old_loaded), len(new_set))
+        logger.info("过滤规则配置已变更（文件: %s, URL: %s），开始重载...",
+                     "变更" if old_files != new_files_full else "未变",
+                     "变更" if old_urls != new_urls_set else "未变")
 
-        rule_files = self.config.filter_rules_files
-        full_paths = [str(PROJECT_ROOT / f) for f in rule_files]
+        full_paths = list(new_files_full) if new_files_full else [str(PROJECT_ROOT / f) for f in self.config.filter_rules_files]
         # generation 机制确保先完成的重载不会覆盖后完成的
         self._filter_reload_task = asyncio.create_task(
-            self._filter_reload_safe(full_paths, list(new_set))
+            self._filter_reload_safe(full_paths, list(new_urls_set))
         )
 
     async def _config_reload_loop(self):
@@ -397,7 +484,9 @@ class DNSProxyApp:
                 await asyncio.sleep(5)
                 changed = await self.config.check_reload()
                 if changed:
-                    logging.getLogger("dns-proxy.app").info("配置文件已变更，已热加载")
+                    logging.getLogger("dns-proxy.app").info(
+                        "配置文件已变更（变更段: %s），已热加载", ",".join(sorted(changed))
+                    )
             except asyncio.CancelledError:
                 break
             except Exception:
@@ -423,6 +512,14 @@ class DNSProxyApp:
         # 启动 DoH 服务器（IPv4 + IPv6）
         await self.doh_server.start()
 
+        # 启动本地 DoT 服务器
+        if self.config.local_dot_enabled:
+            await self.local_dot_server.start()
+
+        # 启动本地 DoQ 服务器
+        if self.config.local_doq_enabled:
+            await self.local_doq_server.start()
+
         # 启动普通 DNS 服务器（UDP 53，默认关闭）
         if self.config.plain_dns_enabled:
             await self.plain_dns_server.start()
@@ -433,13 +530,19 @@ class DNSProxyApp:
 
         # 启动过滤规则定时更新（如果配置了远程 URL）
         if self.config.filter_update_interval > 0 and self.config.filter_rules_urls:
+            rule_files = self.config.filter_rules_files
+            full_paths = [str(PROJECT_ROOT / f) for f in rule_files]
             await self.filter_engine.start_auto_update(
                 interval_hours=self.config.filter_update_interval,
                 urls=self.config.filter_rules_urls,
+                files=full_paths,
             )
-            logger.info("  - 规则自动更新: 每 %d 小时", self.config.filter_update_interval)
+            logger.info("  - 规则自动更新: 每 %d 小时（完整替换模式）", self.config.filter_update_interval)
 
         logger.info("所有服务已启动！")
+        # 启动后再次 GC
+        gc.collect()
+        logger.info("  - 启动后内存: %.0f MB", self._get_memory_mb())
         logger.info("  - DoH 服务器: https://%s:%s%s (IPv4)",
                     self.config.doh_host if self.config.doh_host != "0.0.0.0" else "127.0.0.1",
                     self.config.doh_port,
@@ -447,6 +550,16 @@ class DNSProxyApp:
         if self.config.doh_ipv6_enabled:
             logger.info("  - DoH 服务器: https://[%s]:%d%s (IPv6)",
                         self.config.doh_ipv6_host, self.config.doh_ipv6_port, self.config.doh_path)
+        if self.config.local_dot_enabled:
+            logger.info("  - DoT 服务器: tls://%s:%d (域名=%s)",
+                        self.config.local_dot_host if self.config.local_dot_host != "0.0.0.0" else "127.0.0.1",
+                        self.config.local_dot_port,
+                        self.config.local_dot_domain or "未设置")
+        if self.config.local_doq_enabled:
+            logger.info("  - DoQ 服务器: quic://%s:%d (域名=%s)",
+                        self.config.local_doq_host if self.config.local_doq_host != "0.0.0.0" else "127.0.0.1",
+                        self.config.local_doq_port,
+                        self.config.local_doq_domain or "未设置")
         logger.info("  - 上游服务器: DoH x%d + DoT x%d + DoQ x%d",
                     len(self.config.doh_servers),
                     len(self.config.dot_servers),
@@ -483,6 +596,10 @@ class DNSProxyApp:
         # 停止服务器
         if self.doh_server:
             await self.doh_server.stop()
+        if self.local_dot_server:
+            await self.local_dot_server.stop()
+        if self.local_doq_server:
+            await self.local_doq_server.stop()
         if self.plain_dns_server:
             await self.plain_dns_server.stop()
 
@@ -510,10 +627,24 @@ class DNSProxyApp:
 
 async def main_async(config_path: Optional[str] = None):
     """异步主入口"""
-    # 设置日志（在应用初始化前）
-    logger = setup_logging()
+    # 设置日志（在应用初始化前，使用默认值；随后更新为配置值）
+    logger_root = setup_logging(max_log_size_mb=100)
+    logger = logger_root  # 给异常处理器等使用
 
     app = DNSProxyApp(config_path)
+
+    # 用配置文件中的 max_log_size 更新文件日志处理器
+    try:
+        max_size = app.config.logging_max_log_size_mb
+        log_dir = app.config.logging_dir
+        log_path = Path(PROJECT_ROOT) / log_dir
+        for h in logger_root.handlers:
+            if isinstance(h, TrimFileHandler):
+                h._max_bytes = max_size * 1024 * 1024
+                logger_root.info("日志文件最大大小已设置为 %dMB", max_size)
+                break
+    except Exception:
+        pass
 
     try:
         await app.initialize()

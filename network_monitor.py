@@ -225,22 +225,39 @@ class NetworkMonitor:
     async def _recover(self):
         """
         网络恢复后的自动恢复操作：
-        1. 重新启用所有上游服务器（包括 bootstrap）
-        2. 刷新所有上游域名 → IP 的 bootstrap 缓存
-        3. 重置降级状态
+        1. 等待短暂延迟，让网络栈完全初始化（Windows 网卡重新启用后需要时间）
+        2. 重置所有解析器的持久连接（关闭失效的 aiohttp 会话等）
+        3. 重新启用所有上游服务器（包括 bootstrap）
+        4. 刷新所有上游域名 → IP 的 bootstrap 缓存
+        5. 重置降级状态
         """
         logger.info("=" * 50)
         logger.info("网络已恢复，执行自动恢复...")
 
-        # 1. 重新启用所有上游
+        # 0. 短暂延迟，让 Windows 网络栈完全初始化
+        #    网卡启用后，ICMP ping 可能先于 TCP/UDP 恢复，等待 2 秒确保稳定
+        logger.info("  等待网络栈稳定 (2s)...")
+        await asyncio.sleep(2.0)
+
+        # 1. 重置所有持久连接（关闭失效的 aiohttp 会话、QUIC 配置等）
+        #    这是解决"网卡禁用/启用后上游持续失败"的关键步骤
+        logger.info("  正在重置所有解析器的持久连接...")
+        await self.resolver_manager.reset_all_connections()
+        logger.info("  持久连接已重置")
+
+        # 2. 进入恢复模式：网络刚恢复时，上游首次查询可能因连接重建
+        #    而短暂失败，恢复模式下瞬时失败不会禁用上游
+        self.resolver_manager.enter_recovery_mode()
+
+        # 3. 重新启用所有上游
         self.resolver_manager.reenable_all()
         logger.info("  已重新启用所有上游服务器")
 
-        # 2. 刷新所有 bootstrap IP 缓存
+        # 4. 刷新所有 bootstrap IP 缓存
         refreshed = await self.resolver_manager.refresh_all_upstream_ips()
         logger.info("  已刷新 %d 个上游域名的 bootstrap IP 缓存", refreshed)
 
-        # 3. 标记恢复
+        # 5. 标记恢复
         self._degraded = False
         self._consecutive_failures = 0
         self._recovery_successes = 0

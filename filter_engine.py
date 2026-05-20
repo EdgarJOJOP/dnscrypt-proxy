@@ -597,6 +597,8 @@ class FilterEngine:
         self._update_task: Optional[asyncio.Task] = None
         self._running = False
         self._update_interval_hours = 0
+        self._update_files: List[str] = []
+        self._update_urls: List[str] = []
 
         # ========== 自定义 hosts 映射 ==========
         # 格式: {domain: [(ip, rdtype), ...]}
@@ -1034,8 +1036,13 @@ class FilterEngine:
         """注册规则更新回调"""
         self._update_callback = callback
 
-    async def start_auto_update(self, interval_hours: int, urls: List[str]):
-        """启动定时更新任务"""
+    async def start_auto_update(self, interval_hours: int, urls: List[str],
+                                 files: Optional[List[str]] = None):
+        """
+        启动定时更新任务。
+        与 `async_reload` 一致：先清除全部旧规则，再重新从文件和 URL 加载。
+        避免规则累加导致的重复和内存膨胀。
+        """
         if interval_hours <= 0 or not urls:
             logger.info("远程规则自动更新未启用 (interval=%dh, urls=%d)",
                          interval_hours, len(urls))
@@ -1043,8 +1050,10 @@ class FilterEngine:
 
         self._update_interval_hours = interval_hours
         self._running = True
-        self._update_task = asyncio.create_task(self._update_loop(urls))
-        logger.info("远程规则自动更新已启动 (间隔=%d小时, %d个源)",
+        self._update_files = files or []
+        self._update_urls = urls
+        self._update_task = asyncio.create_task(self._update_loop())
+        logger.info("远程规则自动更新已启动 (间隔=%d小时, %d个源, 规则替换模式)",
                      interval_hours, len(urls))
 
     async def stop_auto_update(self):
@@ -1058,24 +1067,23 @@ class FilterEngine:
                 pass
             self._update_task = None
 
-    async def _update_loop(self, urls: List[str]):
-        """定时更新循环"""
+    async def _update_loop(self):
+        """
+        定时更新循环 — 使用 async_reload 完整替换而非追加规则。
+        每次更新先清除全部旧规则，再从文件和 URL 重新加载。
+        """
         while self._running:
             try:
                 await asyncio.sleep(self._update_interval_hours * 3600)
                 if not self._running:
                     break
 
-                logger.info("开始远程规则自动更新...")
+                logger.info("开始远程规则自动更新（完整替换模式）...")
 
-                results = await asyncio.gather(
-                    *[self.load_rules_from_url_async(url) for url in urls],
-                    return_exceptions=True,
-                )
-                success_count = sum(1 for r in results if r is True)
+                # 使用 async_reload 完整替换全部规则（清空旧规则 + 从文件+URL重新加载）
+                await self.async_reload(self._update_files, urls=self._update_urls if self._update_urls else None)
 
-                logger.info("远程规则更新完成: %d/%d 个源成功，当前共 %d 条规则",
-                             success_count, len(urls), self._rule_count)
+                logger.info("远程规则更新完成，当前共 %d 条规则", self._rule_count)
 
                 if self._update_callback:
                     try:

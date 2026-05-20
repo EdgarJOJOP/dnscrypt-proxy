@@ -18,6 +18,32 @@ server:
       host: "::1"
       port: 8443
 
+  # 本地 DoT 服务（DNS over TLS，RFC 7858）
+  dot:
+    enabled: false               # 默认关闭，设为 true 开启
+    host: "127.0.0.1"           # IPv4 监听地址
+    port: 853                   # 标准 DoT 端口
+    domain: ""                  # 服务器域名（SNI），留空则使用证书 CN
+    cert_path: "certs/localhost.crt"
+    key_path: "certs/localhost.key"
+    ipv6:
+      enabled: false
+      host: "::1"
+      port: 853
+
+  # 本地 DoQ 服务（DNS over QUIC，RFC 9250）
+  doq:
+    enabled: false               # 默认关闭，设为 true 开启
+    host: "127.0.0.1"           # IPv4 监听地址
+    port: 784                   # 标准 DoQ 端口
+    domain: ""                  # 服务器域名（SNI），留空则使用证书 CN
+    cert_path: "certs/localhost.crt"
+    key_path: "certs/localhost.key"
+    ipv6:
+      enabled: false
+      host: "::1"
+      port: 784
+
   # 本地纯 DNS 服务器（UDP 53，不加密，默认关闭）
   plain_dns:
     enabled: false               # 默认关闭，设为 true 开启
@@ -35,6 +61,7 @@ upstream:
   # bootstrap DNS：仅用于解析 DoH/DoT/DoQ 服务器的 IP 地址
   # 包含 IPv4 + IPv6 双栈 DNS 服务器
   bootstrap_resolvers:
+    - "9.9.9.9"
     - "223.5.5.5"               # 阿里 DNS (IPv4)
     - "114.114.114.114"         # 114 DNS (IPv4)
     - "119.29.29.29"            # 腾讯 DNS (IPv4)
@@ -137,10 +164,34 @@ logging:
 tls:
   # Encrypted Client Hello（加密客户端问候）
   # 防止 SNI 明文泄露导致的域名嗅探和干扰
-  # 注意：需要 OpenSSL 3.2+ 且编译时启用 ECH 支持
-  ech_enabled: true
+  # 注意：需要 OpenSSL 4.0+ 才能真正启用 ECH
+  ech_enabled: false
   # 密码套件（默认安全配置）
   ciphers: "HIGH:!aNULL:!kRSA:!PSK:!SRP:!MD5:!RC4"
+  # OpenSSL 4.0 DLL 路径（用于上游 ECH 连接）
+  # 下载: https://github.com/TaurusTLS-Developers/OpenSSL-Distribution/releases/tag/v4.0.0
+  # 解压后将 libssl-4-x64.dll 和 libcrypto-4-x64.dll 所在目录填在这里
+  # 支持正斜杠和反斜杠两种格式:
+  #   Windows: "D:/dns/openssl4" 或 'D:\dns\openssl4' 或 "D:\\dns\\openssl4"
+  #   Linux:   "/usr/local/openssl4"
+  openssl4_dll_path: "D:/dns/1/dnscrypt-proxy/openssl-4.0.0-Windows-x64"
+  # 留空则尝试使用 certifi（推荐）: pip install certifi(默认安装了)
+  ca_path: ""
+
+  # ============================================================
+  # ECH 配置（每台上游服务器）
+  # 支持 3 种格式:
+  #   1. Base64 编码的 ECHConfigList（静态配置）
+  #      "dns.alidns.com": "AFj+DQAAAC..."
+  #   2. DNS 查询 URL（自动查询此上游的 HTTPS 记录）
+  #      "dns.cloudflare.com": "https://1.1.1.1/dns-query"
+  #   3. hostname+DNS 查询（查询指定 hostname 的 HTTPS 记录）
+  #      "dns.cloudflare.com": "cloudflare-ech.com+https://1.1.1.1/dns-query"
+  # ============================================================
+  ech:
+    # Cloudflare DNS 的 ECH 配置：查询 cloudflare-ech.com 的 HTTPS 记录
+    "dns.cloudflare.com": "cloudflare-ech.com+https://1.1.1.1/dns-query"
+    "1dot1dot1dot1.cloudflare-dns.com": "cloudflare-ech.com+https://1.1.1.1/dns-query"
 
 # ============================================================
 # 网络连通性监控（自动恢复上游服务器连接）
@@ -171,8 +222,8 @@ network_monitor:
 # ============================================================
 performance:
   parallel_timeout: 2.0     # 并行查询超时（秒）
-  max_concurrent: 100       # 最大并发查询数
-  connection_pool_size: 50  # 连接池大小
+  max_concurrent: 50        # 最大并发查询数
+  connection_pool_size: 100 # 连接池大小（同时打开的上游连接数）
   memory_limit_mb: 512      # 内存软限制（MB）
   cpu_usage_limit: 70       # CPU 使用率软限制（%）
   monitor_interval: 30      # 资源监控间隔（秒）

@@ -1,9 +1,7 @@
 """
-异步请求日志模块
-- 内存缓冲，达到阈值后写入文件并清空内存
-- 定时刷新确保日志不丢失
-- JSON 格式记录
-- 文件大小自动裁剪，避免日志文件无限增长
+日志模块
+- TrimFileHandler: 通用的日志文件自动裁剪处理器（所有系统日志通用）
+- RequestLogger: 异步 DNS 请求日志记录器（内存缓冲 + JSON + 裁剪）
 """
 
 import os
@@ -16,6 +14,74 @@ from pathlib import Path
 from collections import deque
 
 system_logger = logging.getLogger("dns-proxy.logger")
+
+
+class TrimFileHandler(logging.FileHandler):
+    """
+    带自动裁剪功能的日志文件处理器。
+    可设置最大文件大小（MB），超出后自动裁剪，保留后半部分。
+    用法透明：替换 logging.FileHandler 即可。
+    """
+
+    # 裁剪后保留的比例（如 0.6 = 保留文件后半部分的 60%）
+    TRIM_KEEP_RATIO = 0.6
+    # 最小检查间隔（秒），避免频繁 stat
+    MIN_CHECK_INTERVAL = 30
+
+    def __init__(self, filename: str, max_log_size_mb: int = 100,
+                 mode: str = "a", encoding: str = "utf-8", delay: bool = False):
+        super().__init__(filename, mode, encoding, delay)
+        self._max_bytes = max_log_size_mb * 1024 * 1024
+        self._last_check = 0.0
+
+    def emit(self, record):
+        """写入日志记录后检查文件大小"""
+        super().emit(record)
+        self._maybe_trim()
+
+    def _maybe_trim(self):
+        """检查文件大小，超限则裁剪"""
+        now = time.monotonic()
+        if now - self._last_check < self.MIN_CHECK_INTERVAL:
+            return
+        self._last_check = now
+        try:
+            size = os.path.getsize(self.baseFilename)
+            if size < self._max_bytes:
+                return
+        except OSError:
+            return
+        self._trim_file()
+
+    def _trim_file(self):
+        """关闭文件 → 读取全部行 → 保留后半部分 → 重写 → 重新打开"""
+        try:
+            self.flush()
+            self.close()
+        except Exception:
+            pass
+        try:
+            fp = Path(self.baseFilename)
+            lines = fp.read_text(encoding="utf-8").splitlines(True)
+            if not lines:
+                return
+            total = len(lines)
+            keep_start = int(total * (1 - self.TRIM_KEEP_RATIO))
+            kept = lines[keep_start:]
+            removed = total - len(kept)
+            fp.write_text("".join(kept), encoding="utf-8")
+            system_logger.info(
+                "日志裁剪 [%s]: 移除 %d 行，保留 %d 行 (当前 %.1fMB)",
+                fp.name, removed, len(kept), fp.stat().st_size / (1024 * 1024),
+            )
+        except Exception as e:
+            system_logger.error("日志裁剪失败 [%s]: %s", self.baseFilename, e)
+        finally:
+            # 重新打开文件流
+            try:
+                self.stream = self._open()
+            except Exception:
+                pass
 
 
 class RequestLogger:

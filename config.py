@@ -23,6 +23,8 @@ class Config:
         self._last_mtime: float = 0
         self._lock = asyncio.Lock()
         self._reload_callbacks: List[Callable] = []
+        # 记录上一次各配置段的快照，用于检测哪些段发生了变更
+        self._section_snapshots: Dict[str, Any] = {}
         self._load()
 
     def _load(self):
@@ -34,6 +36,31 @@ class Config:
         else:
             self._data = self._defaults()
             self._save()
+        self._update_section_snapshots()
+
+    def _update_section_snapshots(self):
+        """更新各配置段的快照，用于后续检测变更"""
+        self._section_snapshots = {}
+        for key in self._data:
+            if isinstance(self._data[key], dict):
+                self._section_snapshots[key] = dict(self._data[key])
+            else:
+                self._section_snapshots[key] = self._data[key]
+
+    def get_changed_sections(self) -> set:
+        """
+        返回自上次快照以来发生变更的配置段名称集合。
+        返回示例: {'cache', 'filter', 'hosts', 'upstream'}
+        """
+        changed = set()
+        sections_to_check = {"cache", "filter", "hosts", "server", "upstream",
+                              "logging", "dnssec", "performance", "tls", "network_monitor"}
+        for section in sections_to_check:
+            old = self._section_snapshots.get(section, {})
+            new = self._data.get(section, {})
+            if old != new:
+                changed.add(section)
+        return changed
 
     def _defaults(self) -> Dict:
         """默认配置"""
@@ -50,6 +77,34 @@ class Config:
                         "enabled": True,
                         "host": "::",
                         "port": 8443,
+                    },
+                },
+                # 本地 DoT 服务（DNS over TLS）
+                "dot": {
+                    "enabled": False,
+                    "host": "127.0.0.1",
+                    "port": 853,
+                    "domain": "",
+                    "cert_path": "certs/localhost.crt",
+                    "key_path": "certs/localhost.key",
+                    "ipv6": {
+                        "enabled": False,
+                        "host": "::1",
+                        "port": 853,
+                    },
+                },
+                # 本地 DoQ 服务（DNS over QUIC）
+                "doq": {
+                    "enabled": False,
+                    "host": "127.0.0.1",
+                    "port": 784,
+                    "domain": "",
+                    "cert_path": "certs/localhost.crt",
+                    "key_path": "certs/localhost.key",
+                    "ipv6": {
+                        "enabled": False,
+                        "host": "::1",
+                        "port": 784,
                     },
                 },
             },
@@ -96,8 +151,8 @@ class Config:
             },
             "performance": {
                 "parallel_timeout": 3.0,
-                "max_concurrent": 100,
-                "connection_pool_size": 50,
+                "max_concurrent": 50,
+                "connection_pool_size": 100,
                 "memory_limit_mb": 256,
                 "cpu_usage_limit": 70,
                 "monitor_interval": 30,
@@ -117,6 +172,9 @@ class Config:
             "tls": {
                 "ech_enabled": False,
                 "ciphers": "HIGH:!aNULL:!kRSA:!PSK:!SRP:!MD5:!RC4",
+                "openssl4_dll_path": "",
+                "ca_path": "",
+                "ech": {},  # hostname -> config_string: base64 | "https://dns/dns-query" | "hostname+https://dns/dns-query"
             },
         }
 
@@ -126,24 +184,39 @@ class Config:
             yaml.dump(self._data, f, default_flow_style=False, allow_unicode=True)
         self._last_mtime = self._path.stat().st_mtime
 
-    async def check_reload(self) -> bool:
-        """检查配置文件是否变更，是则热加载"""
+    async def check_reload(self) -> set:
+        """
+        检查配置文件是否变更，是则热加载。
+        返回发生变更的配置段名称集合，无变更返回空集。
+        """
         if not self._path.exists():
-            return False
+            return set()
         mtime = self._path.stat().st_mtime
         if mtime > self._last_mtime:
             async with self._lock:
+                # 保存旧快照用于计算变更
+                old_snapshots = dict(self._section_snapshots)
                 self._load()
+                # 计算所有段的变化
+                sections_to_check = {"cache", "filter", "hosts", "server", "upstream",
+                                      "logging", "dnssec", "performance", "tls", "network_monitor"}
+                changed = set()
+                for section in sections_to_check:
+                    old = old_snapshots.get(section, {})
+                    new = self._section_snapshots.get(section, {})
+                    if old != new:
+                        changed.add(section)
+                # 通知回调，传入变更的配置段信息
                 for cb in self._reload_callbacks:
                     try:
                         if asyncio.iscoroutinefunction(cb):
-                            await cb(self._data)
+                            await cb(self._data, changed)
                         else:
-                            cb(self._data)
+                            cb(self._data, changed)
                     except Exception:
                         pass
-            return True
-        return False
+            return changed
+        return set()
 
     def on_reload(self, callback: Callable):
         """注册配置热加载回调"""
@@ -178,19 +251,19 @@ class Config:
 
     @property
     def bootstrap_resolvers(self) -> List[str]:
-        return self._data.get("upstream", {}).get("bootstrap_resolvers", ["223.5.5.5"])
+        return self._data.get("upstream", {}).get("bootstrap_resolvers", ["223.5.5.5"]) or []
 
     @property
     def doh_servers(self) -> List[str]:
-        return self._data.get("upstream", {}).get("doh", [])
+        return self._data.get("upstream", {}).get("doh", []) or []
 
     @property
     def dot_servers(self) -> List[str]:
-        return self._data.get("upstream", {}).get("dot", [])
+        return self._data.get("upstream", {}).get("dot", []) or []
 
     @property
     def doq_servers(self) -> List[str]:
-        return self._data.get("upstream", {}).get("doq", [])
+        return self._data.get("upstream", {}).get("doq", []) or []
 
     @property
     def all_upstream_addresses(self) -> List[str]:
@@ -289,7 +362,7 @@ class Config:
 
     @property
     def connection_pool_size(self) -> int:
-        return self._data.get("performance", {}).get("connection_pool_size", 50)
+        return self._data.get("performance", {}).get("connection_pool_size", 100)
 
     @property
     def memory_limit_mb(self) -> int:
@@ -337,6 +410,92 @@ class Config:
     def doh_ipv6_port(self) -> int:
         return self._data.get("server", {}).get("doh", {}).get("ipv6", {}).get("port", 8443)
 
+    # --- 本地 DoT 服务器 ---
+    @property
+    def local_dot_enabled(self) -> bool:
+        return self._data.get("server", {}).get("dot", {}).get("enabled", False)
+
+    @property
+    def local_dot_host(self) -> str:
+        return self._data.get("server", {}).get("dot", {}).get("host", "127.0.0.1")
+
+    @property
+    def local_dot_port(self) -> int:
+        return self._data.get("server", {}).get("dot", {}).get("port", 853)
+
+    @property
+    def local_dot_domain(self) -> str:
+        return self._data.get("server", {}).get("dot", {}).get("domain", "")
+
+    @property
+    def local_dot_cert_path(self) -> str:
+        return os.path.join(
+            os.path.dirname(self._path),
+            self._data.get("server", {}).get("dot", {}).get("cert_path", "certs/localhost.crt"),
+        )
+
+    @property
+    def local_dot_key_path(self) -> str:
+        return os.path.join(
+            os.path.dirname(self._path),
+            self._data.get("server", {}).get("dot", {}).get("key_path", "certs/localhost.key"),
+        )
+
+    @property
+    def local_dot_ipv6_enabled(self) -> bool:
+        return self._data.get("server", {}).get("dot", {}).get("ipv6", {}).get("enabled", False)
+
+    @property
+    def local_dot_ipv6_host(self) -> str:
+        return self._data.get("server", {}).get("dot", {}).get("ipv6", {}).get("host", "::1")
+
+    @property
+    def local_dot_ipv6_port(self) -> int:
+        return self._data.get("server", {}).get("dot", {}).get("ipv6", {}).get("port", 853)
+
+    # --- 本地 DoQ 服务器 ---
+    @property
+    def local_doq_enabled(self) -> bool:
+        return self._data.get("server", {}).get("doq", {}).get("enabled", False)
+
+    @property
+    def local_doq_host(self) -> str:
+        return self._data.get("server", {}).get("doq", {}).get("host", "127.0.0.1")
+
+    @property
+    def local_doq_port(self) -> int:
+        return self._data.get("server", {}).get("doq", {}).get("port", 784)
+
+    @property
+    def local_doq_domain(self) -> str:
+        return self._data.get("server", {}).get("doq", {}).get("domain", "")
+
+    @property
+    def local_doq_cert_path(self) -> str:
+        return os.path.join(
+            os.path.dirname(self._path),
+            self._data.get("server", {}).get("doq", {}).get("cert_path", "certs/localhost.crt"),
+        )
+
+    @property
+    def local_doq_key_path(self) -> str:
+        return os.path.join(
+            os.path.dirname(self._path),
+            self._data.get("server", {}).get("doq", {}).get("key_path", "certs/localhost.key"),
+        )
+
+    @property
+    def local_doq_ipv6_enabled(self) -> bool:
+        return self._data.get("server", {}).get("doq", {}).get("ipv6", {}).get("enabled", False)
+
+    @property
+    def local_doq_ipv6_host(self) -> str:
+        return self._data.get("server", {}).get("doq", {}).get("ipv6", {}).get("host", "::1")
+
+    @property
+    def local_doq_ipv6_port(self) -> int:
+        return self._data.get("server", {}).get("doq", {}).get("ipv6", {}).get("port", 784)
+
     # --- 纯 DNS 服务器 (UDP 53) ---
     @property
     def plain_dns_enabled(self) -> bool:
@@ -382,6 +541,38 @@ class Config:
     @property
     def tls_ciphers(self) -> str:
         return self._data.get("tls", {}).get("ciphers", "HIGH:!aNULL:!kRSA:!PSK:!SRP:!MD5:!RC4")
+
+    @property
+    def openssl4_dll_path(self) -> str:
+        """OpenSSL 4.0 DLL 所在目录（留空则在 PATH 中搜索）"""
+        raw = self._data.get("tls", {}).get("openssl4_dll_path", "") or ""
+        return self._normalize_path(raw)
+
+    @property
+    def openssl4_ca_path(self) -> str:
+        """CA 证书文件路径（用于 OpenSSL 4.0 证书验证，Windows 需要）"""
+        raw = self._data.get("tls", {}).get("ca_path", "") or ""
+        return self._normalize_path(raw)
+
+    @property
+    def ech_configs(self) -> dict:
+        """
+        每台上游服务器的 ECH 配置。
+        返回 dict: {hostname: config_string}
+          config_string 可以是：
+            - base64 编码的 ECHConfigList（静态）
+            - "https://dns-server/dns-query"（通过 DoH 自动查询此上游的 HTTPS 记录）
+            - "hostname+https://dns-server/dns-query"（查询指定 hostname 的 HTTPS 记录）
+            - "udp://dns-server" 或 "hostname+udp://dns-server"（UDP DNS 查询）
+        """
+        return dict(self._data.get("tls", {}).get("ech", {}) or {})
+
+    @staticmethod
+    def _normalize_path(path: str) -> str:
+        """标准化路径，兼容 Windows 反斜杠和 Linux 正斜杠"""
+        if not path:
+            return ""
+        return os.path.normpath(path)
 
     # --- 网络监控 ---
     @property

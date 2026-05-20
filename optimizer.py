@@ -25,7 +25,6 @@ try:
     HAS_PSUTIL = True
 except ImportError:
     HAS_PSUTIL = False
-    logger.warning("psutil 未安装，资源监控功能受限")
 
 
 class ResourceOptimizer:
