@@ -64,6 +64,14 @@ class BaseResolver(abc.ABC):
 
         return result, elapsed
 
+    async def reset_connections(self):
+        """
+        重置/关闭所有持久连接，强制在下次查询时重新创建。
+        网络恢复后调用（如网卡禁用/重新启用），确保不使用失效连接。
+        默认实现为空（无持久连接的子类无需覆盖）。
+        """
+        pass
+
     @abc.abstractmethod
     async def close(self):
         """关闭释放资源"""
