@@ -93,6 +93,4 @@ DNS over HTTPS 模板：https://dns.alidns.com/dns-query
 
 # 待添加功能
 
-`没有后台运行功能，后面会开发。
-没有自动开机自启功能，后面会开发。
-`
+无
