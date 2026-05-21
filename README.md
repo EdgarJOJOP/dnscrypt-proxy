@@ -31,6 +31,28 @@ linux上就简单了。。。。。。。
 
 需要打包自行打包exe或者其它平台就行.
 
+示例：
+
+`pip install nuitka`
+
+ 目录内运行下面指令（win打包）
+ 
+`python -m nuitka ^
+    --standalone ^
+    --mingw64 ^
+    --lto=yes ^
+    --include-package=crypto ^
+    --include-package=resolvers ^
+    --include-data-dir=openssl-4.0.0-Windows-x64=openssl-4.0.0-Windows-x64 ^
+    --include-data-files=config.yaml=config.yaml ^
+    --windows-console-mode=disable ^
+    --output-dir=dist ^
+    --product-name=dnscrypt-proxy ^
+    --product-version=1.0.0 ^
+    --file-version=1.0.0 ^
+    main.py
+`
+
 # 5. 在win11上使用加密dns本地服务
 
 
