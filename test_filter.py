@@ -180,8 +180,8 @@ def test_filter_engine():
         ("btrace.qq.com", True),
         ("tajs.qq.com", True),
         ("pingtas.qq.com", True),
-        ("utrace.img.qq.com", True),
-        ("qlogo.cn", True),
+        ("utrace.img.qq.com", False),
+        ("qlogo.cn", False),
         ("wu.51.la", True),
         # 应放行的
         ("google.com", False),

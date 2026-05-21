@@ -224,20 +224,75 @@ class FilterRule:
 
         self._parse()
 
-    # DNS 级别已知的 modifier 集合
+    # AdGuard 官方已知的全部 modifier 集合
+    # 参见: https://adguard.com/kb/general/ad-filtering/create-own-filters/
     # 不在列表中的 modifier → 整条规则跳过（官方规范）
     _KNOWN_MODIFIERS = {
-        # DNS-specific
+        # DNS-specific（完全支持）
         'important', 'badfilter', 'client', 'denyallow', 'dnstype',
         'dnsrewrite', 'ctag',
-        # Network-level（浏览器级别，但 DNS 列表中常见，安全忽略）
-        'third-party', 'script', 'image', 'stylesheet', 'object',
+        # Content-type（浏览器级别，DNS 列表中常见，安全忽略）
+        'third-party', 'strict-third-party', 'strict-first-party',
+        'script', 'image', 'stylesheet', 'object',
         'xmlhttprequest', 'subdocument', 'font', 'media', 'popup',
-        'document', 'match-case', 'generichide', 'specifichide',
-        'elemhide', 'extension', 'ping', 'webrtc', 'domain',
-        # 常见但不影响 DNS 过滤的
-        'popunder', 'empty', 'network',
+        'document', 'websocket', 'other', 'all',
+        'ping', 'webrtc', 'popup', 'frame', 'xhr',
+        'inline-font', 'inline-script',
+        # 条件修饰符（需要请求上下文，DNS 无法评估）
+        'domain', 'match-case', 'method', 'to', 'header', 'app',
+        # URL/内容修改
+        'redirect', 'redirect-rule', 'replace', 'removeparam',
+        'queryprune', 'removeheader', 'csp', 'permissions',
+        'referrerpolicy', 'urltransform', 'xmlprune', 'empty',
+        # 例外相关
+        'elemhide', 'generichide', 'specifichide', 'jsinject',
+        'urlblock', 'content', 'extension', 'genericblock',
+        # 杂项
+        'popunder', 'network', 'hls', 'jsonprune', 'cookie',
+        # 其他
+        'noop', 'reason',
     }
+
+    # 例外规则上 DNS 级别无法评估的修饰符集合
+    # 这些修饰符限制了例外规则的适用范围（如仅限特定页面/请求类型），
+    # 但 DNS 代理无法区分请求来源和类型，所以带这些修饰符的例外规则应跳过。
+    _EXCEPTION_RESTRICTIVE_MODIFIERS = frozenset({
+        # 条件修饰符（需要页面域名/请求来源上下文）
+        'domain', 'third-party', 'strict-third-party', 'strict-first-party',
+        'denyallow', 'app', 'method', 'to', 'header', 'client', 'ctag',
+        # Content-type（需要请求类型信息）
+        'script', 'image', 'stylesheet', 'object', 'xmlhttprequest',
+        'subdocument', 'font', 'media', 'popup', 'document',
+        'websocket', 'other', 'all', 'ping', 'webrtc', 'popup',
+        'frame', 'xhr', 'inline-font', 'inline-script',
+        # match-case（DNS 大小写不敏感）
+        'match-case',
+        # URL/内容修改（DNS 级别无法修改请求/响应）
+        'redirect', 'redirect-rule', 'replace', 'removeparam',
+        'queryprune', 'removeheader', 'csp', 'permissions',
+        'referrerpolicy', 'urltransform', 'xmlprune', 'empty',
+        # 伪装/例外相关（DNS 级别无意义）
+        'elemhide', 'generichide', 'specifichide', 'jsinject',
+        'urlblock', 'content', 'extension', 'genericblock',
+        # 杂项限制修饰符
+        'popunder', 'network', 'hls', 'jsonprune', 'cookie',
+    })
+
+    # 拦截规则上 DNS 级别无法评估的范围限制修饰符集合
+    # 这些修饰符将拦截规则的适用范围限制在特定页面/应用/请求上下文中，
+    # 如 $domain=xxx（仅特定页面）、$app=xxx（仅特定应用）。
+    # DNS 代理无法评估这些条件，若不跳过会导致全局拦截 → 误拦合法域名。
+    # 注意：content-type 修饰符（$script、$image 等）不在其中——
+    # 对广告域名进行全类型拦截是可接受的。
+    _BLOCK_RESTRICTIVE_MODIFIERS = frozenset({
+        'domain',    # 限制到特定来源页面
+        'app',       # 限制到特定应用
+        'method',    # 限制到特定 HTTP 方法
+        'to',        # 限制到特定请求目标
+        'header',    # 限制到特定 HTTP 头
+        'client',    # 限制到特定 DHCP 客户端
+        'ctag',      # 限制到特定客户端标签
+    })
 
     @staticmethod
     def _validate_modifiers(modifiers_str: str) -> bool:
@@ -343,8 +398,45 @@ class FilterRule:
             if not self._validate_modifiers(modifiers_str):
                 self._skip = True
                 return
-            if modifiers_str == "important" or modifiers_str.startswith("important"):
-                self.is_important = True
+            # 检测 important 修饰符（可能在 modifier 列表任意位置）
+            for mod in modifiers_str.split(','):
+                if mod.strip() == 'important':
+                    self.is_important = True
+                    break
+
+            # 例外规则带有限制性修饰符（如 $domain=xxx、$third-party、$script 等）
+            # 则跳过该规则。DNS 代理无法评估这些修饰符的条件，
+            # 如果无条件应用，会导致本应有限制的例外被无限放行。
+            if self.is_exception:
+                for mod in modifiers_str.split(','):
+                    mod = mod.strip()
+                    if '=' in mod:
+                        name = mod.split('=', 1)[0].strip()
+                    else:
+                        name = mod
+                    if name.startswith('~'):
+                        name = name[1:]
+                    # 除了 $important 之外的其他修饰符都是限制性的
+                    if name in self._EXCEPTION_RESTRICTIVE_MODIFIERS:
+                        self._skip = True
+                        return
+
+            # 拦截规则带范围限制修饰符（如 $domain=xxx、$app=xxx 等）
+            # 则跳过该规则。这些修饰符将拦截范围限制在特定页面/应用中，
+            # DNS 无法评估这些条件，若不跳过会导致全局拦截 → 误拦合法域名。
+            if not self.is_exception and not self.is_important:
+                for mod in modifiers_str.split(','):
+                    mod = mod.strip()
+                    if '=' in mod:
+                        name = mod.split('=', 1)[0].strip()
+                    else:
+                        name = mod
+                    if name.startswith('~'):
+                        name = name[1:]
+                    # 跳过非重要拦截规则中携带的限制性修饰符
+                    if name in self._BLOCK_RESTRICTIVE_MODIFIERS:
+                        self._skip = True
+                        return
 
         if not text:
             self._skip = True
@@ -360,6 +452,11 @@ class FilterRule:
                 parsed = urlparse(url_text)
                 domain = parsed.hostname
                 if domain:
+                    # 含路径的 URL 规则（如 |https://github.com/path^）需要 HTTP 级别匹配，
+                    # DNS 级别无法评估路径条件，跳过以避免误拦整个域名。
+                    if parsed.path and parsed.path not in ("/", ""):
+                        self._skip = True
+                        return
                     self.pattern = self._pattern_to_regex(domain, match_subdomains=False)
                     if self.pattern:
                         self.is_regex = True
@@ -375,6 +472,10 @@ class FilterRule:
                 parsed = urlparse(text)
                 domain = parsed.hostname
                 if domain:
+                    # 含路径的 URL 规则同上，DNS 级别无法评估路径
+                    if parsed.path and parsed.path not in ("/", ""):
+                        self._skip = True
+                        return
                     self.pattern = self._pattern_to_regex(domain, match_subdomains=False)
                     if self.pattern:
                         self.is_regex = True
@@ -387,8 +488,11 @@ class FilterRule:
         # 6. ||domain.com — 匹配域名及所有子域名
         if text.startswith("||"):
             domain_part = text[2:]
+            # 含路径的 || 规则（如 ||api.bilibili.com/path^）需要 HTTP 路径匹配，
+            # DNS 级别无法评估路径条件，跳过以避免误拦整个域名。
             if "/" in domain_part:
-                domain_part = domain_part.split("/")[0]
+                self._skip = True
+                return
             domain = domain_part.rstrip("^")
             # 去掉前置 *.（||*.example.com → ||example.com）
             if domain.startswith("*."):
@@ -454,6 +558,10 @@ class FilterRule:
         # 10. 普通域名规则 — 官方定义：精确匹配，不匹配子域名
         clean = text.rstrip("^")
         if clean:
+            # 纯通配符 * 会匹配所有域名，DNS 级别不应使用
+            if clean == '*':
+                self._skip = True
+                return
             # 包含 * 通配符的普通域名
             if "*" in clean:
                 self.pattern = self._pattern_to_regex(clean)
@@ -662,8 +770,9 @@ class FilterEngine:
         # ||domain 格式
         if line.startswith("||"):
             domain = line[2:]
+            # 含路径的 ||domain/path 规则在 _parse 中跳过，这里也不应索引
             if "/" in domain:
-                domain = domain.split("/")[0]
+                return None
             domain = domain.rstrip("^")
             if domain.startswith("*."):
                 domain = domain[2:]
@@ -676,6 +785,9 @@ class FilterEngine:
             url_text = line[1:].rstrip("^")
             try:
                 parsed = urlparse(url_text)
+                # 含路径的 URL 规则在 _parse 中跳过，这里也不应索引
+                if parsed.path and parsed.path not in ("/", ""):
+                    return None
                 if parsed.hostname and "." in parsed.hostname:
                     return parsed.hostname.lower()
             except Exception:
@@ -699,6 +811,9 @@ class FilterEngine:
         if line.startswith("http://") or line.startswith("https://"):
             try:
                 parsed = urlparse(line)
+                # 含路径的 URL 规则在 _parse 中跳过，这里也不应索引
+                if parsed.path and parsed.path not in ("/", ""):
+                    return None
                 if parsed.hostname and "." in parsed.hostname:
                     return parsed.hostname.lower()
             except Exception:
@@ -835,26 +950,73 @@ class FilterEngine:
         return True
 
     async def async_reload(self, files: List[str], urls: Optional[List[str]] = None):
-        """异步重新加载所有规则"""
-        self._block_index.clear()
-        self._allow_index.clear()
-        self._important_rules.clear()
-        self._block_rules.clear()
-        self._exception_rules.clear()
-        self._loaded_files.clear()
-        self._loaded_urls.clear()
+        """
+        异步重新加载所有规则（原子加载模式）。
+
+        加载流程：
+        1. 保存旧规则状态
+        2. 创建新规则索引
+        3. 尝试加载本地文件 + 远程 URL
+        4. 如果加载结果为 0 条但旧状态有规则 → 恢复旧规则（URL 不可用场景）
+        5. 加载成功后清除 filter_cache
+        """
+        # 保存旧状态
+        saved_state = {
+            'block_index': self._block_index,
+            'allow_index': self._allow_index,
+            'important_rules': self._important_rules,
+            'block_rules': self._block_rules,
+            'exception_rules': self._exception_rules,
+            'loaded_files': list(self._loaded_files),
+            'loaded_urls': list(self._loaded_urls),
+            'rule_count': self._rule_count,
+        }
+
+        # 创建新空状态
+        self._block_index = DomainIndex()
+        self._allow_index = DomainIndex()
+        self._important_rules = []
+        self._block_rules = []
+        self._exception_rules = []
+        self._loaded_files = []
+        self._loaded_urls = []
         self._rule_count = 0
         self._filter_cache.clear()
         self._custom_hosts_cache.clear()
 
+        # 加载本地文件
         for filepath in files:
             self.load_rules_from_file(filepath)
 
+        # 加载远程 URL
         if urls:
             await asyncio.gather(
                 *[self.load_rules_from_url_async(url) for url in urls],
                 return_exceptions=True,
             )
+
+        # 原子恢复：如果没加载到任何规则但旧状态有规则 → 恢复旧规则
+        if self._rule_count == 0 and saved_state['rule_count'] > 0:
+            logger.error("规则加载失败（所有 %d 个远程 URL 均不可用），"
+                         "恢复上次的 %d 条规则 | 本地上次: %d 个文件",
+                         len(urls or []), saved_state['rule_count'],
+                         len(saved_state['loaded_files']))
+            self._block_index = saved_state['block_index']
+            self._allow_index = saved_state['allow_index']
+            self._important_rules = saved_state['important_rules']
+            self._block_rules = saved_state['block_rules']
+            self._exception_rules = saved_state['exception_rules']
+            self._loaded_files = saved_state['loaded_files']
+            self._loaded_urls = saved_state['loaded_urls']
+            self._rule_count = saved_state['rule_count']
+            # 恢复旧规则时不清除 filter_cache（保留有效的缓存结果）
+            return
+
+        # 核心修复：规则全部加载完毕后再次清除 filter_cache
+        # 防止加载过程中被 DNS 查询写入的过期 (False, ...) 条目污染
+        # 如果不清除，_sweep_cache_after_filter_load 中的 check_domain 会返回
+        # 过期的 False 结果，导致缓存扫描无法将上游真实 IP 覆写为 0.0.0.0/::
+        self._filter_cache.clear()
 
         logger.info("规则重载完成，共 %d 条规则 (本地: %d, 远程: %d)",
                      self._rule_count, len(files), len(urls or []))
@@ -868,14 +1030,28 @@ class FilterEngine:
     def reload(self, files: List[str], urls: Optional[List[str]] = None):
         """
         重新加载所有规则（同步接口，用于测试）
+        使用与 async_reload 相同的原子加载模式。
         """
-        self._block_index.clear()
-        self._allow_index.clear()
-        self._important_rules.clear()
-        self._block_rules.clear()
-        self._exception_rules.clear()
-        self._loaded_files.clear()
-        self._loaded_urls.clear()
+        # 保存旧状态
+        saved_state = {
+            'block_index': self._block_index,
+            'allow_index': self._allow_index,
+            'important_rules': self._important_rules,
+            'block_rules': self._block_rules,
+            'exception_rules': self._exception_rules,
+            'loaded_files': list(self._loaded_files),
+            'loaded_urls': list(self._loaded_urls),
+            'rule_count': self._rule_count,
+        }
+
+        # 创建新空状态
+        self._block_index = DomainIndex()
+        self._allow_index = DomainIndex()
+        self._important_rules = []
+        self._block_rules = []
+        self._exception_rules = []
+        self._loaded_files = []
+        self._loaded_urls = []
         self._rule_count = 0
         self._filter_cache.clear()
         self._custom_hosts_cache.clear()
@@ -897,6 +1073,23 @@ class FilterEngine:
                     self._loaded_urls.append(url)
                 except Exception as e:
                     logger.error("从 %s 加载规则失败: %s", url, e)
+
+        # 原子恢复：如果没加载到任何规则但旧状态有规则 → 恢复旧规则
+        if self._rule_count == 0 and saved_state['rule_count'] > 0:
+            logger.error("同步规则加载失败，恢复上次的 %d 条规则",
+                         saved_state['rule_count'])
+            self._block_index = saved_state['block_index']
+            self._allow_index = saved_state['allow_index']
+            self._important_rules = saved_state['important_rules']
+            self._block_rules = saved_state['block_rules']
+            self._exception_rules = saved_state['exception_rules']
+            self._loaded_files = saved_state['loaded_files']
+            self._loaded_urls = saved_state['loaded_urls']
+            self._rule_count = saved_state['rule_count']
+            return
+
+        # 同步 reload 同样需要在加载规则后清除 filter_cache
+        self._filter_cache.clear()
 
         logger.info("规则重载完成，共 %d 条规则 (本地: %d, 远程: %d)",
                      self._rule_count, len(files), len(urls or []))
@@ -933,21 +1126,30 @@ class FilterEngine:
         if cached is not None:
             result, reason, ts = cached
             if now - ts < self._filter_cache_timeout:
+                if result:
+                    logger.debug("FilterCache HIT(blocked): %s | %s", domain, reason[:60])
+                else:
+                    # 只有 DEBUG 级别才显示缓存的 False（正常情况下不用担心）
+                    logger.log(logging.DEBUG-1, "FilterCache HIT(allow): %s", domain)
                 return result, reason
             # 缓存过期，删除并重新匹配
             del self._filter_cache[domain]
+            logger.debug("FilterCache EXPIRED: %s (age=%.1fs)", domain, now - ts)
 
         # 2. 重要规则优先匹配
         for rule in self._important_rules:
             if rule.matches(domain):
                 result = (True, f"重要规则拦截: {rule.raw}")
                 self._filter_cache[domain] = (True, result[1], now)
+                logger.debug("拦截(重要规则): %s | %s", domain, rule.raw[:60])
                 return result
 
         # 3. 白名单索引 — 类似 Go 的 filteringEngineAllow.MatchRequest()
         match = self._allow_index.match(domain)
         if match is not None:
+            rule, method = match
             self._filter_cache[domain] = (False, "", now)
+            logger.debug("放行(白名单): %s | %s: %s", domain, method, rule.raw[:60])
             return False, ""
 
         # 4. 黑名单索引 — 类似 Go 的 filteringEngine.MatchRequest()
@@ -956,10 +1158,12 @@ class FilterEngine:
             rule, method = match
             reason = f"{method}: {rule.raw}"
             self._filter_cache[domain] = (True, reason, now)
+            logger.debug("拦截: %s | %s (%s)", domain, method, rule.raw[:80])
             return True, reason
 
         # 未匹配：缓存并放行
         self._filter_cache[domain] = (False, "", now)
+        logger.log(logging.DEBUG-1, "放行(无匹配): %s (共 %d 条拦截规则)", domain, self._rule_count)
         return False, ""
 
     # ======================== 自定义 hosts 管理 ========================
