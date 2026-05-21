@@ -1,0 +1,16 @@
+sudo tee /etc/systemd/system/dnscrypt-proxy.service << 'EOF'
+[Unit]
+Description=dnscrypt-proxy DNS proxy
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/path/to/dnscrypt-proxy/dist/main.dist/main
+WorkingDirectory=/path/to/dnscrypt-proxy
+Restart=always
+RestartSec=10
+User=nobody
+
+[Install]
+WantedBy=multi-user.target
+EOF
