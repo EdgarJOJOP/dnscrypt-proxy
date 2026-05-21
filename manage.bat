@@ -12,22 +12,18 @@ echo ========================================
 echo   [1] Install   auto start
 echo   [2] Remove    auto start
 echo   [3] Restart   service
-echo   [4] Start     service
-echo   [5] Stop      service
-echo   [6] Status
+echo   [4] Status
 echo   [Q] Quit
 echo ========================================
 
-choice /c 123456Q /n /m "select: "
+choice /c 1234Q /n /m "select: "
 set n=%errorlevel%
 
 if %n%==1 goto install
 if %n%==2 goto uninstall
 if %n%==3 goto restart
-if %n%==4 goto start
-if %n%==5 goto stop
-if %n%==6 goto status
-if %n%==7 exit
+if %n%==4 goto status
+if %n%==5 exit
 
 :install
 echo.
