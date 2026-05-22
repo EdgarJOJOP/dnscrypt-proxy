@@ -11,7 +11,8 @@ import os
 import ssl
 import asyncio
 import logging
-from typing import Optional, List
+import time
+from typing import Optional, List, Dict, Tuple
 
 import dns.message
 import dns.rdatatype
@@ -65,6 +66,40 @@ class LocalDoTServer:
         self._server_v6: Optional[asyncio.AbstractServer] = None
         self._ssl_context: Optional[ssl.SSLContext] = None
         self._concurrency_semaphore = asyncio.Semaphore(config.max_concurrent)
+
+        # 单 IP 限速
+        self._per_ip_semaphores: Dict[str, Tuple[asyncio.Semaphore, float]] = {}
+        self._per_ip_limit = config.max_concurrent_per_ip
+        self._per_ip_cleanup_interval = 300
+        self._per_ip_idle_timeout = 600
+        self._ip_semaphore_task: Optional[asyncio.Task] = None
+
+    @staticmethod
+    def _is_localhost(ip: str) -> bool:
+        return ip in ("127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost")
+
+    async def _get_per_ip_semaphore(self, client_ip: str) -> asyncio.Semaphore:
+        now = time.time()
+        if client_ip in self._per_ip_semaphores:
+            sem, _ = self._per_ip_semaphores[client_ip]
+            self._per_ip_semaphores[client_ip] = (sem, now)
+            return sem
+        sem = asyncio.Semaphore(self._per_ip_limit)
+        self._per_ip_semaphores[client_ip] = (sem, now)
+        return sem
+
+    async def _cleanup_stale_per_ip_semaphores(self):
+        while True:
+            await asyncio.sleep(self._per_ip_cleanup_interval)
+            now = time.time()
+            stale = [
+                ip for ip, (_, ts) in self._per_ip_semaphores.items()
+                if now - ts > self._per_ip_idle_timeout
+            ]
+            for ip in stale:
+                del self._per_ip_semaphores[ip]
+            if stale:
+                logger.debug("DoT: 清理了 %d 个过期 IP 限速条目", len(stale))
 
     def _create_ssl_context(self) -> Optional[ssl.SSLContext]:
         """创建 TLS 服务器端 SSL 上下文"""
@@ -135,8 +170,19 @@ class LocalDoTServer:
             except OSError as e:
                 logger.warning("DoT [IPv6] 启动失败（跳过）: %s", e)
 
+        # 启动单 IP 限速清理任务
+        self._ip_semaphore_task = asyncio.create_task(self._cleanup_stale_per_ip_semaphores())
+
     async def stop(self):
         """停止 DoT 服务器"""
+        if self._ip_semaphore_task:
+            self._ip_semaphore_task.cancel()
+            try:
+                await self._ip_semaphore_task
+            except asyncio.CancelledError:
+                pass
+            self._ip_semaphore_task = None
+
         for server in (self._server_v4, self._server_v6):
             if server:
                 server.close()
@@ -197,7 +243,12 @@ class LocalDoTServer:
                 pass
 
     async def _process_query(self, wire_data: bytes, client_ip: str) -> Optional[bytes]:
-        """处理 DNS 查询（过滤 → 缓存 → 上游）"""
+        """处理 DNS 查询（并发控制 + 单 IP 限速）"""
+        if not self._is_localhost(client_ip):
+            sem = await self._get_per_ip_semaphore(client_ip)
+            async with sem:
+                async with self._concurrency_semaphore:
+                    return await self._do_process_query(wire_data, client_ip)
         async with self._concurrency_semaphore:
             return await self._do_process_query(wire_data, client_ip)
 
