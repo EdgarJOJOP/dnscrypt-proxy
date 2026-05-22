@@ -11,11 +11,12 @@ import time
 class BaseResolver(abc.ABC):
     """解析器基类"""
 
-    def __init__(self, address: str, timeout: float = 5.0, weight: int = 1):
+    def __init__(self, address: str, timeout: float = 5.0, weight: int = 1,
+                 concurrency: int = 100):
         self.address = address
         self.timeout = timeout
         self.weight = weight
-        self._semaphore = asyncio.Semaphore(10)
+        self._semaphore = asyncio.Semaphore(concurrency)
         self._stats: Dict[str, Any] = {
             "total_queries": 0,
             "successful_queries": 0,

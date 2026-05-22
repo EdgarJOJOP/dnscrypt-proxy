@@ -72,8 +72,8 @@ class DoQResolver(BaseResolver):
     """DoQ 上游解析器（基于 aioquic.asyncio.connect）"""
 
     def __init__(self, address: str, timeout: float = 15.0,
-                 connect_ips: Optional[list] = None):
-        super().__init__(address, timeout)
+                 connect_ips: Optional[list] = None, concurrency: int = 100):
+        super().__init__(address, timeout, concurrency=concurrency)
         # 解析 quic://host:port 格式
         raw = address.replace("quic://", "")
         if ":" in raw:

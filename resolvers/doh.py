@@ -60,8 +60,8 @@ class DoHResolver(BaseResolver):
 
     def __init__(self, url: str, timeout: float = 5.0, ech_enabled: bool = False,
                  connection_pool_size: int = 100, ech_config: bytes = b"",
-                 connect_ips: Optional[List[str]] = None):
-        super().__init__(url, timeout)
+                 connect_ips: Optional[List[str]] = None, concurrency: int = 100):
+        super().__init__(url, timeout, concurrency=concurrency)
         self.url = url
         self._ech_enabled = ech_enabled
         self._connection_pool_size = connection_pool_size

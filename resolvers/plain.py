@@ -18,8 +18,8 @@ from .base import BaseResolver
 class PlainDNSResolver(BaseResolver):
     """普通 DNS 解析器 - 仅用于 bootstrap 解析"""
 
-    def __init__(self, address: str, timeout: float = 5.0):
-        super().__init__(address, timeout)
+    def __init__(self, address: str, timeout: float = 5.0, concurrency: int = 100):
+        super().__init__(address, timeout, concurrency=concurrency)
         self.address = address
         # 检测地址族
         self._is_v6 = ":" in address

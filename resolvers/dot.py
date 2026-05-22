@@ -23,8 +23,8 @@ class DoTResolver(BaseResolver):
     _HAS_ECH = hasattr(ssl, 'ECHClientConfig')
 
     def __init__(self, host: str, port: int = 853, timeout: float = 5.0, connect_ips: Optional[list] = None,
-                 ech_enabled: bool = False, ech_config: bytes = b""):
-        super().__init__(host, timeout)
+                 ech_enabled: bool = False, ech_config: bytes = b"", concurrency: int = 100):
+        super().__init__(host, timeout, concurrency=concurrency)
         self.host = host
         self.port = port
         self._connect_ips = connect_ips or []

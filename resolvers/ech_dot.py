@@ -33,8 +33,8 @@ class ECHDoTResolver(BaseResolver):
                  openssl_wrapper: Optional[OpenSSL4Wrapper] = None,
                  ca_path: Optional[str] = None,
                  ciphers: Optional[str] = None,
-                 connect_ips: Optional[list] = None):
-        super().__init__(host, timeout)
+                 connect_ips: Optional[list] = None, concurrency: int = 100):
+        super().__init__(host, timeout, concurrency=concurrency)
         self.host = host
         self.port = port
         self._ech_fetcher = ech_fetcher
