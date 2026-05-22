@@ -13,7 +13,8 @@ import ssl
 import asyncio
 import struct
 import logging
-from typing import Optional
+import time
+from typing import Optional, Dict, Tuple
 
 import dns.message
 import dns.rdatatype
@@ -233,6 +234,39 @@ class LocalDoQServer:
         self._concurrency_semaphore = asyncio.Semaphore(config.max_concurrent)
         self._cleanup_task: Optional[asyncio.Task] = None
 
+        # 单 IP 限速
+        self._per_ip_semaphores: Dict[str, Tuple[asyncio.Semaphore, float]] = {}
+        self._per_ip_limit = config.max_concurrent_per_ip
+        self._per_ip_cleanup_interval = 300
+        self._per_ip_idle_timeout = 600
+
+    @staticmethod
+    def _is_localhost(ip: str) -> bool:
+        return ip in ("127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost")
+
+    async def _get_per_ip_semaphore(self, client_ip: str) -> asyncio.Semaphore:
+        now = time.time()
+        if client_ip in self._per_ip_semaphores:
+            sem, _ = self._per_ip_semaphores[client_ip]
+            self._per_ip_semaphores[client_ip] = (sem, now)
+            return sem
+        sem = asyncio.Semaphore(self._per_ip_limit)
+        self._per_ip_semaphores[client_ip] = (sem, now)
+        return sem
+
+    async def _cleanup_stale_per_ip_semaphores(self):
+        while True:
+            await asyncio.sleep(self._per_ip_cleanup_interval)
+            now = time.time()
+            stale = [
+                ip for ip, (_, ts) in self._per_ip_semaphores.items()
+                if now - ts > self._per_ip_idle_timeout
+            ]
+            for ip in stale:
+                del self._per_ip_semaphores[ip]
+            if stale:
+                logger.debug("DoQ: 清理了 %d 个过期 IP 限速条目", len(stale))
+
     def _create_quic_config(self) -> Optional[QuicConfiguration]:
         """创建 QUIC 服务器配置（加载证书）"""
         if not (os.path.exists(self.cert_path) and os.path.exists(self.key_path)):
@@ -326,7 +360,7 @@ class LocalDoQServer:
         logger.info("本地 DoQ 服务器已停止")
 
     async def _cleanup_loop(self):
-        """定期清理已关闭的 QUIC 连接"""
+        """定期清理已关闭的 QUIC 连接 + 过期 IP 限速条目"""
         while True:
             try:
                 await asyncio.sleep(30)
@@ -334,13 +368,28 @@ class LocalDoQServer:
                     self._protocol_v4.cleanup_stale_connections()
                 if self._protocol_v6:
                     self._protocol_v6.cleanup_stale_connections()
+                # 清理过期 IP 限速条目
+                now = time.time()
+                stale = [
+                    ip for ip, (_, ts) in self._per_ip_semaphores.items()
+                    if now - ts > self._per_ip_idle_timeout
+                ]
+                for ip in stale:
+                    del self._per_ip_semaphores[ip]
+                if stale:
+                    logger.debug("DoQ: 清理了 %d 个过期 IP 限速条目", len(stale))
             except asyncio.CancelledError:
                 break
             except Exception:
                 pass
 
     async def _process_query(self, wire_data: bytes, client_ip: str) -> Optional[bytes]:
-        """处理 DNS 查询（并发控制）"""
+        """处理 DNS 查询（并发控制 + 单 IP 限速）"""
+        if not self._is_localhost(client_ip):
+            sem = await self._get_per_ip_semaphore(client_ip)
+            async with sem:
+                async with self._concurrency_semaphore:
+                    return await self._do_process_query(wire_data, client_ip)
         async with self._concurrency_semaphore:
             return await self._do_process_query(wire_data, client_ip)
 
