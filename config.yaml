@@ -74,6 +74,7 @@ upstream:
     - "https://doh.pub/dns-query"
     - "https://dns.adguard-dns.com/dns-query"
     - "https://dns.cloudflare.com/dns-query"
+    - "https://dns11.quad9.net/dns-query"
 
   # DNS over TLS
   dot:
@@ -86,7 +87,7 @@ upstream:
   # DNS over QUIC
   doq:
     - "quic://dns9.quad9.net:853"         # Quad9 DoQ（已验证可用）
-    - "quic://unfiltered.adguard-dns.com"  # AdGuard DoQ（无端口则默认 853）
+    - "quic://dns.caliph.dev:853"
     - "quic://dns.alidns.com:853"         # 阿里 DNS（部分环境可能不支持）
 
 # ============================================================

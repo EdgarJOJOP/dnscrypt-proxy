@@ -88,14 +88,14 @@ async def main():
             ("quic://dns9.quad9.net:853", query_bytes),                     # Quad9（已验证可工作）
             ("quic://dns.alidns.com:853", query_bytes),                     # 阿里 DNS 标准查询
             ("quic://dns.alidns.com:853", query_edns_bytes, "带 EDNS"),     # 阿里 DNS + EDNS
-            ("quic://unfiltered.adguard-dns.com", query_bytes),             # AdGuard 默认 853
-            ("quic://unfiltered.adguard-dns.com:784", query_bytes),         # AdGuard 端口 784
+            ("quic://dns.adguard-dns.com", query_edns_bytes),             
+            ("quic://dns.caliph.dev:853", query_edns_bytes),         # AdGuard 端口 784
         ]
         for case in test_cases:
             addr = case[0]
             qb = case[1]
             label = f"DoQ {addr}" + (f" ({case[2]})" if len(case) > 2 else "")
-            resolver = DoQResolver(addr, timeout=10.0)
+            resolver = DoQResolver(addr, timeout=15.0,alpn_versions=["doq", "doq-i11", "dq"])
             await test_resolver(label, resolver, qb)
     else:
         print("  aioquic 未安装，跳过 DoQ 测试")
