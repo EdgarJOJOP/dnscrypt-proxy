@@ -99,6 +99,17 @@ def test_rule_parsing():
         ("example.org", ["example.org"], ["sub.example.org"]),
         # 未知 modifier → 跳过
         ("||example.com^$unknownmod", [], ["example.com"]),
+        # HTTP 级别修饰符规则 → DNS 应跳过（不拦截域名）
+        ("||bing.com^$cookie=ABDEF", [], ["bing.com", "www.bing.com"]),
+        ("||example.com^$redirect=noopjs", [], ["example.com"]),
+        ("||example.com^$removeparam=p", [], ["example.com"]),
+        ("||example.com^$replace=/bad/good/", [], ["example.com"]),
+        ("||example.com^$removeheader=refresh", [], ["example.com"]),
+        ("||example.com^$csp=frame-src 'none'", [], ["example.com"]),
+        ("||example.com^$urltransform=/X/Y/", [], ["example.com"]),
+        ("||example.com^$permissions=autoplay=()", [], ["example.com"]),
+        ("||example.com^$referrerpolicy=unsafe-url", [], ["example.com"]),
+        ("||example.com^$removeparam,important", ["example.com"], []),  # important 覆盖限制
     ]
 
     for rule_text, should_match, should_not_match in test_cases:

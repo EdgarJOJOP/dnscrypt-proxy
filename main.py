@@ -367,7 +367,9 @@ class DNSProxyApp:
                 if already_blocked:
                     continue
                 # 覆写为拦截 IP
-                new_response = dns.message.make_response(cached_response)
+                # 注意：make_response() 需要 query 报文，cache 中存的是 response，需构造 query
+                q_msg = dns.message.make_query(qname, qtype, qclass)
+                new_response = dns.message.make_response(q_msg)
                 new_response.answer.clear()
                 if qtype == dns.rdatatype.A:
                     new_response.answer.append(

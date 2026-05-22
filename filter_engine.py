@@ -284,7 +284,13 @@ class FilterRule:
     # DNS 代理无法评估这些条件，若不跳过会导致全局拦截 → 误拦合法域名。
     # 注意：content-type 修饰符（$script、$image 等）不在其中——
     # 对广告域名进行全类型拦截是可接受的。
+    #
+    # 此外还包括 HTTP 级别操作修饰符（如 $cookie、$redirect 等），
+    # 这些修饰符表示规则的意图是修改 HTTP 请求/响应，而非 DNS 拦截。
+    # DNS 代理无法执行这些操作（如修改 Cookie、重定向到本地资源），
+    # 若在 DNS 级别应用会导致整个域名被误拦截。
     _BLOCK_RESTRICTIVE_MODIFIERS = frozenset({
+        # 范围限制修饰符（需要请求上下文，DNS 无法评估）
         'domain',    # 限制到特定来源页面
         'app',       # 限制到特定应用
         'method',    # 限制到特定 HTTP 方法
@@ -292,6 +298,26 @@ class FilterRule:
         'header',    # 限制到特定 HTTP 头
         'client',    # 限制到特定 DHCP 客户端
         'ctag',      # 限制到特定客户端标签
+        # ========== HTTP 级别操作修饰符 ==========
+        # 以下修饰符表示规则意图是修改 HTTP 请求/响应而非 DNS 拦截。
+        # DNS 代理无法执行这些操作，跳过以避免误拦截整个域名。
+        'cookie',          # 修改/移除 Cookie（HTTP 响应头/请求头）
+        'removeparam',     # 移除 URL 查询参数（HTTP 请求）
+        'queryprune',      # $removeparam 的别名
+        'removeheader',    # 移除 HTTP 请求/响应头
+        'redirect',        # 重定向到本地资源（HTTP 响应）
+        'redirect-rule',   # 条件重定向（HTTP 响应）
+        'replace',         # 替换响应内容（HTTP 响应）
+        'csp',             # 修改 Content-Security-Policy（HTTP 响应头）
+        'permissions',     # 修改 Permissions-Policy（HTTP 响应头）
+        'referrerpolicy',  # 修改 Referrer-Policy（HTTP 响应头）
+        'urltransform',    # 修改请求 URL（HTTP 请求）
+        'xmlprune',        # 修剪 XML 响应内容（HTTP 响应）
+        'empty',           # 返回空响应（HTTP 响应，已弃用）
+        'hls',             # 修改 HLS 流（HTTP 响应）
+        'jsonprune',       # 修剪 JSON 响应内容（HTTP 响应）
+        'network',         # 防火墙规则（IP/端口级别，非 DNS）
+        'mp4',             # 替换为视频占位符（HTTP 响应，已弃用）
     })
 
     @staticmethod
@@ -435,6 +461,8 @@ class FilterRule:
                         name = name[1:]
                     # 跳过非重要拦截规则中携带的限制性修饰符
                     if name in self._BLOCK_RESTRICTIVE_MODIFIERS:
+                        logger.debug("跳过 DNS 不适用的规则: %s (修饰符: $%s)",
+                                      self.raw[:80], name)
                         self._skip = True
                         return
 
