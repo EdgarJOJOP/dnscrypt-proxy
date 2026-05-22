@@ -8,6 +8,7 @@
 """
 
 import gc
+import os
 import asyncio
 import logging
 from typing import Optional
@@ -115,15 +116,20 @@ class ResourceOptimizer:
                 )
                 await self._light_optimize()
 
-            # CPU 检查
+            # CPU 检查（cpu_percent 是多核总和，例如 4 核满 = 400%）
             cpu_percent = self._process.cpu_percent(interval=0.1)
-            if cpu_percent > self.config.cpu_usage_limit:
+            cpu_count = os.cpu_count() or 1
+            core_limit = self.config.cpu_core_limit
+            if core_limit <= 0:
+                core_limit = max(1, cpu_count - 1)  # 自动 = 总核心 - 1
+            # cpu_percent 是总百分比，need 转成"等效核数"来判断
+            # 例: 8核机器, cpu_percent=150 → 约用满 1.5 核
+            cpu_cores_used = cpu_percent / 100.0
+            if cpu_cores_used > core_limit:
                 logger.warning(
-                    "CPU 使用率 %d%%，超过限制 %d%%，降低并发",
-                    cpu_percent,
-                    self.config.cpu_usage_limit,
+                    "CPU 使用 %.1f 核 (%.0f%%)，超过限制 %d 核，降低并发",
+                    cpu_cores_used, cpu_percent, core_limit,
                 )
-                # 动态调低信号量效果：不做特殊处理，asyncio 自身会协调
 
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass

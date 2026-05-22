@@ -7,7 +7,8 @@
 
 import asyncio
 import logging
-from typing import Optional
+import time
+from typing import Optional, Dict, Tuple
 
 import dns.message
 import dns.rdatatype
@@ -57,6 +58,41 @@ class PlainDNSServer:
         self._transport_v4: Optional[asyncio.DatagramTransport] = None
         self._transport_v6: Optional[asyncio.DatagramTransport] = None
         self._running = False
+        self._concurrency_semaphore = asyncio.Semaphore(config.max_concurrent)
+
+        # 单 IP 限速
+        self._per_ip_semaphores: Dict[str, Tuple[asyncio.Semaphore, float]] = {}
+        self._per_ip_limit = config.max_concurrent_per_ip
+        self._per_ip_cleanup_interval = 300
+        self._per_ip_idle_timeout = 600
+        self._ip_semaphore_task: Optional[asyncio.Task] = None
+
+    @staticmethod
+    def _is_localhost(ip: str) -> bool:
+        return ip in ("127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost")
+
+    async def _get_per_ip_semaphore(self, client_ip: str) -> asyncio.Semaphore:
+        now = time.time()
+        if client_ip in self._per_ip_semaphores:
+            sem, _ = self._per_ip_semaphores[client_ip]
+            self._per_ip_semaphores[client_ip] = (sem, now)
+            return sem
+        sem = asyncio.Semaphore(self._per_ip_limit)
+        self._per_ip_semaphores[client_ip] = (sem, now)
+        return sem
+
+    async def _cleanup_stale_per_ip_semaphores(self):
+        while True:
+            await asyncio.sleep(self._per_ip_cleanup_interval)
+            now = time.time()
+            stale = [
+                ip for ip, (_, ts) in self._per_ip_semaphores.items()
+                if now - ts > self._per_ip_idle_timeout
+            ]
+            for ip in stale:
+                del self._per_ip_semaphores[ip]
+            if stale:
+                logger.debug("Plain DNS: 清理了 %d 个过期 IP 限速条目", len(stale))
 
     # ======================== UDP 协议 ========================
 
@@ -83,8 +119,21 @@ class PlainDNSServer:
 
     async def _process_query(self, data: bytes, addr: tuple,
                               transport: Optional[asyncio.DatagramTransport] = None):
-        """异步处理 DNS 查询"""
+        """异步处理 DNS 查询（并发控制 + 单 IP 限速）"""
         client_ip = addr[0]
+        # 单 IP 限速 (非 localhost)
+        if not self._is_localhost(client_ip):
+            sem = await self._get_per_ip_semaphore(client_ip)
+            async with sem:
+                async with self._concurrency_semaphore:
+                    return await self._do_process_query(data, addr, transport, client_ip)
+        async with self._concurrency_semaphore:
+            return await self._do_process_query(data, addr, transport, client_ip)
+
+    async def _do_process_query(self, data: bytes, addr: tuple,
+                                 transport: Optional[asyncio.DatagramTransport],
+                                 client_ip: str):
+        """DNS 查询处理核心逻辑"""
         qname = ""
         qtype_str = ""
         status = "ok"
@@ -285,9 +334,19 @@ class PlainDNSServer:
 
         self._running = True
 
+        # 启动单 IP 限速清理任务
+        self._ip_semaphore_task = asyncio.create_task(self._cleanup_stale_per_ip_semaphores())
+
     async def stop(self):
         """停止 DNS 服务器"""
         self._running = False
+        if self._ip_semaphore_task:
+            self._ip_semaphore_task.cancel()
+            try:
+                await self._ip_semaphore_task
+            except asyncio.CancelledError:
+                pass
+            self._ip_semaphore_task = None
         for transport in [self._transport_v4, self._transport_v6]:
             if transport and not transport.is_closing():
                 try:

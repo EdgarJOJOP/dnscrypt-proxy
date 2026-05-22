@@ -12,7 +12,8 @@ import ssl
 import base64
 import asyncio
 import logging
-from typing import Optional, List
+import time
+from typing import Optional, List, Dict, Tuple
 
 from aiohttp import web
 
@@ -73,6 +74,42 @@ class DoHServer:
 
         # 并发控制
         self._concurrency_semaphore = asyncio.Semaphore(config.max_concurrent)
+
+        # 单 IP 限速
+        self._per_ip_semaphores: Dict[str, Tuple[asyncio.Semaphore, float]] = {}
+        self._per_ip_limit = config.max_concurrent_per_ip
+        self._per_ip_cleanup_interval = 300  # 5 分钟清理一次过期条目
+        self._per_ip_idle_timeout = 600  # 10 分钟无请求则清理
+
+    @staticmethod
+    def _is_localhost(ip: str) -> bool:
+        """判断是否是本地地址（不限速）"""
+        return ip in ("127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost")
+
+    async def _get_per_ip_semaphore(self, client_ip: str) -> asyncio.Semaphore:
+        """获取或创建单 IP 信号量"""
+        now = time.time()
+        if client_ip in self._per_ip_semaphores:
+            sem, _ = self._per_ip_semaphores[client_ip]
+            self._per_ip_semaphores[client_ip] = (sem, now)
+            return sem
+        sem = asyncio.Semaphore(self._per_ip_limit)
+        self._per_ip_semaphores[client_ip] = (sem, now)
+        return sem
+
+    async def _cleanup_stale_per_ip_semaphores(self):
+        """定期清理过期 IP 条目"""
+        while True:
+            await asyncio.sleep(self._per_ip_cleanup_interval)
+            now = time.time()
+            stale = [
+                ip for ip, (_, ts) in self._per_ip_semaphores.items()
+                if now - ts > self._per_ip_idle_timeout
+            ]
+            for ip in stale:
+                del self._per_ip_semaphores[ip]
+            if stale:
+                logger.debug("清理了 %d 个过期 IP 限速条目", len(stale))
 
     def _setup_routes(self):
         """注册路由"""
@@ -168,8 +205,15 @@ class DoHServer:
             query.flags |= dns.flags.CD
         wire_data = query.to_wire()
 
-        async with self._concurrency_semaphore:
-            json_result = await self._process_json_query(wire_data, request)
+        client_ip = request.remote or "unknown"
+        if not self._is_localhost(client_ip):
+            sem = await self._get_per_ip_semaphore(client_ip)
+            async with sem:
+                async with self._concurrency_semaphore:
+                    json_result = await self._process_json_query(wire_data, request)
+        else:
+            async with self._concurrency_semaphore:
+                json_result = await self._process_json_query(wire_data, request)
 
         return web.json_response(json_result)
 
@@ -351,6 +395,12 @@ class DoHServer:
         self, wire_data: bytes, request: web.Request, response_format: str = "wire"
     ) -> web.Response:
         """处理 DNS 查询（Wire Format）- 按 response_format 返回"""
+        client_ip = request.remote or "unknown"
+        if not self._is_localhost(client_ip):
+            sem = await self._get_per_ip_semaphore(client_ip)
+            async with sem:
+                async with self._concurrency_semaphore:
+                    return await self._process_query(wire_data, request, response_format)
         async with self._concurrency_semaphore:
             return await self._process_query(wire_data, request, response_format)
 
@@ -592,6 +642,9 @@ class DoHServer:
 
         self._runner = web.AppRunner(self.app)
         await self._runner.setup()
+
+        # 启动单 IP 限速清理任务
+        asyncio.create_task(self._cleanup_stale_per_ip_semaphores())
 
         # IPv4 监听
         site_v4 = web.TCPSite(

@@ -151,9 +151,11 @@ class Config:
             },
             "performance": {
                 "parallel_timeout": 3.0,
-                "max_concurrent": 50,
-                "connection_pool_size": 100,
+                "max_concurrent": 1000,
+                "connection_pool_size": 1000,
+                "max_concurrent_per_ip": 50,
                 "memory_limit_mb": 256,
+                "cpu_core_limit": 0,  # 0=自动=总核心数-1
                 "cpu_usage_limit": 70,
                 "monitor_interval": 30,
                 "aggressive_gc": True,
@@ -365,8 +367,16 @@ class Config:
         return self._data.get("performance", {}).get("connection_pool_size", 100)
 
     @property
+    def max_concurrent_per_ip(self) -> int:
+        return self._data.get("performance", {}).get("max_concurrent_per_ip", 50)
+
+    @property
     def memory_limit_mb(self) -> int:
         return self._data.get("performance", {}).get("memory_limit_mb", 256)
+
+    @property
+    def cpu_core_limit(self) -> int:
+        return self._data.get("performance", {}).get("cpu_core_limit", 0)
 
     @property
     def cpu_usage_limit(self) -> int:

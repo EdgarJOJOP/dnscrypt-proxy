@@ -96,7 +96,7 @@ class ResolverManager:
         if not self.config.bootstrap_resolvers:
             logger.warning("未配置 bootstrap 解析器！系统 DNS 自引用（127.0.0.1）可能导致死锁")
         for addr in self.config.bootstrap_resolvers:
-            resolver = PlainDNSResolver(addr, timeout=5.0)
+            resolver = PlainDNSResolver(addr, timeout=5.0, concurrency=self.config.connection_pool_size)
             self._bootstrap_resolvers.append(UpstreamServer(resolver, "plain"))
 
         # 检查是否有任何上游服务器
@@ -333,15 +333,18 @@ class ResolverManager:
                     ca_path=ca_path,
                     ciphers=self.config.tls_ciphers,
                     connect_ips=cached_ips,
+                    concurrency=self.config.connection_pool_size,
                 )
                 if not resolver.available:
                     resolver = DoHResolver(url, timeout=timeout,
                                            connection_pool_size=self.config.connection_pool_size,
-                                           connect_ips=cached_ips)
+                                           connect_ips=cached_ips,
+                                           concurrency=self.config.connection_pool_size)
             else:
                 resolver = DoHResolver(url, timeout=timeout,
                                        connection_pool_size=self.config.connection_pool_size,
-                                       connect_ips=cached_ips)
+                                       connect_ips=cached_ips,
+                                       concurrency=self.config.connection_pool_size)
             self._upstream_servers.append(UpstreamServer(resolver, "doh"))
 
         # DoT
@@ -361,18 +364,22 @@ class ResolverManager:
                     ca_path=ca_path,
                     ciphers=self.config.tls_ciphers,
                     connect_ips=cached_ips,
+                    concurrency=self.config.connection_pool_size,
                 )
                 if not resolver.available:
-                    resolver = DoTResolver(h, port=p, timeout=timeout, connect_ips=cached_ips)
+                    resolver = DoTResolver(h, port=p, timeout=timeout, connect_ips=cached_ips,
+                                           concurrency=self.config.connection_pool_size)
             else:
-                resolver = DoTResolver(h, port=p, timeout=timeout, connect_ips=cached_ips)
+                resolver = DoTResolver(h, port=p, timeout=timeout, connect_ips=cached_ips,
+                                       concurrency=self.config.connection_pool_size)
             self._upstream_servers.append(UpstreamServer(resolver, "dot"))
 
         # DoQ
         for addr in self.config.doq_servers:
             hostname = addr.replace("quic://", "").split(":")[0]
             cached_ips = self._bootstrap_cache.get(hostname, [])
-            resolver = DoQResolver(addr, timeout=timeout, connect_ips=cached_ips)
+            resolver = DoQResolver(addr, timeout=timeout, connect_ips=cached_ips,
+                                   concurrency=self.config.connection_pool_size)
             self._upstream_servers.append(UpstreamServer(resolver, "doq"))
 
     async def resolve(self, query_bytes: bytes) -> Optional[bytes]:
@@ -428,7 +435,19 @@ class ResolverManager:
             logger.debug("自动恢复后刷新 bootstrap IP 失败: %s", e)
 
     async def _parallel_resolve(self, query_bytes: bytes) -> Optional[bytes]:
-        """并行查询核心逻辑"""
+        """并行查询核心逻辑（首次全部失败后自动短等待重试一次，应对启动时资源争用）"""
+        for attempt in range(2):
+            result = await self._parallel_resolve_once(query_bytes)
+            if result is not None:
+                return result
+            if attempt == 0:
+                alive = sum(1 for s in self._upstream_servers if s.enabled)
+                logger.warning("并行查询: 所有上游首次均失败 (%d个)，200ms后重试...", alive)
+                await asyncio.sleep(0.2)
+        return None
+
+    async def _parallel_resolve_once(self, query_bytes: bytes) -> Optional[bytes]:
+        """执行一轮并行查询"""
         servers = [s for s in self._upstream_servers if s.enabled]
         if not servers:
             logger.warning("没有可用的上游服务器，触发自动恢复...")
