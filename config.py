@@ -151,9 +151,9 @@ class Config:
             },
             "performance": {
                 "parallel_timeout": 3.0,
-                "max_concurrent": 1000,
-                "connection_pool_size": 1000,
-                "max_concurrent_per_ip": 50,
+                "max_concurrent": 200,
+                "connection_pool_size": 100,
+                "max_concurrent_per_ip": 20,
                 "memory_limit_mb": 256,
                 "cpu_core_limit": 0,  # 0=自动=总核心数-1
                 "cpu_usage_limit": 70,

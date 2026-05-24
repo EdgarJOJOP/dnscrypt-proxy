@@ -51,6 +51,9 @@ class NetworkMonitor:
         self._recovery_check_count = nm.get("recovery_check_count", 2)  # 恢复需要连续成功次数
         self._recovery_successes = 0  # 恢复检测连续成功计数
 
+        # DNS 探测复用解析器缓存（避免每次探测创建新 UDP 套接字）
+        self._dns_probe_resolvers: Dict[str, "PlainDNSResolver"] = {}
+
     @property
     def enabled(self) -> bool:
         """监控器是否启用"""
@@ -191,6 +194,7 @@ class NetworkMonitor:
         """
         DNS 探测：向 bootstrap 公共 DNS 发送 A/AAAA 查询
         验证 DNS 协议栈是否正常工作
+        复用 PlainDNSResolver 实例，避免每次探测创建新 UDP 套接字
         """
         if not self._dns_probe_domains:
             return False
@@ -209,7 +213,14 @@ class NetworkMonitor:
                     is_ipv6 = ":" in addr
                     family = "v6" if is_ipv6 else "v4"
                     from resolvers.plain import PlainDNSResolver
-                    resolver = PlainDNSResolver(addr, timeout=self._ping_timeout)
+
+                    # 复用解析器实例，避免每次创建新 UDP 套接字
+                    if addr not in self._dns_probe_resolvers:
+                        self._dns_probe_resolvers[addr] = PlainDNSResolver(
+                            addr, timeout=self._ping_timeout,
+                        )
+                    resolver = self._dns_probe_resolvers[addr]
+
                     result = await asyncio.wait_for(
                         resolver.resolve(qbytes, prefer_family=family),
                         timeout=self._ping_timeout,

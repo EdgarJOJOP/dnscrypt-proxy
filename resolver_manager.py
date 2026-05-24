@@ -7,7 +7,9 @@
 """
 
 import asyncio
+import collections
 import logging
+import time
 from typing import List, Optional, Dict, Any
 
 import dns.message
@@ -41,20 +43,62 @@ logger = logging.getLogger("dns-proxy.resolver")
 class UpstreamServer:
     """上游服务器封装"""
 
+    # 健康评分权重
+    _SCORE_WEIGHT_FAILURES = 100   # 每次失败扣分
+    _SCORE_WEIGHT_LATENCY = 10     # 每100ms延迟扣分
+    _SCORE_BONUS_DOH = 20          # DoH 偏好（综合性能好）
+    _SCORE_BONUS_DOQ = 15          # DoQ 偏好
+    _SCORE_BONUS_DOT = 0           # DoT 基线
+    _MAX_RESPONSE_TIMES = 10       # 滑动窗口大小
+
     def __init__(self, resolver: BaseResolver, server_type: str):
         self.resolver = resolver
         self.server_type = server_type  # "doh", "dot", "doq", "plain"
         self.failures = 0
         self.consecutive_failures = 0
         self.enabled = True
+        # 响应时间滑动窗口（最近 _MAX_RESPONSE_TIMES 次）
+        self._response_times = collections.deque(maxlen=self._MAX_RESPONSE_TIMES)
 
     @property
     def name(self) -> str:
         return self.resolver.name
 
-    def record_success(self):
+    @property
+    def avg_response_time(self) -> float:
+        """平均响应时间（秒），无数据返回 999"""
+        if not self._response_times:
+            return 999.0
+        return sum(self._response_times) / len(self._response_times)
+
+    @property
+    def health_score(self) -> float:
+        """
+        健康评分（越高越好）。
+        综合：延迟、失败次数、协议类型。
+        """
+        if not self.enabled:
+            return -9999
+        score = 1000.0
+        # 协议偏好
+        proto_bonus = {
+            "doh": self._SCORE_BONUS_DOH,
+            "doq": self._SCORE_BONUS_DOQ,
+            "dot": self._SCORE_BONUS_DOT,
+        }.get(self.server_type, 0)
+        score += proto_bonus
+        # 失败扣分
+        score -= self.failures * self._SCORE_WEIGHT_FAILURES
+        score -= self.consecutive_failures * self._SCORE_WEIGHT_FAILURES * 3
+        # 延迟扣分：每100ms扣分，平滑处理
+        score -= int(self.avg_response_time / 0.1) * self._SCORE_WEIGHT_LATENCY
+        return score
+
+    def record_success(self, response_time: Optional[float] = None):
         self.consecutive_failures = 0
         self.failures = 0
+        if response_time is not None:
+            self._response_times.append(response_time)
 
     def record_failure(self):
         self.consecutive_failures += 1
@@ -130,6 +174,10 @@ class ResolverManager:
 
         # 4. 创建加密上游解析器
         await self._create_upstream_resolvers()
+
+        # 5. 将 connection_pool_size 注入 DoQ 全局并发限制
+        from resolvers.doq import set_doq_global_concurrency
+        set_doq_global_concurrency(self.config.connection_pool_size)
 
         self._bootstrap_ready.set()
         enabled_count = sum(1 for s in self._upstream_servers if s.enabled)
@@ -446,93 +494,123 @@ class ResolverManager:
                 await asyncio.sleep(0.2)
         return None
 
-    async def _parallel_resolve_once(self, query_bytes: bytes) -> Optional[bytes]:
-        """执行一轮并行查询"""
-        servers = [s for s in self._upstream_servers if s.enabled]
-        if not servers:
-            logger.warning("没有可用的上游服务器，触发自动恢复...")
-            # ===== 关键修复：自动触发恢复，不依赖 NetworkMonitor =====
-            # 场景：网卡禁用再启用后，所有上游被禁用。
-            # 如果 NetworkMonitor 未检测到降级（网络恢复太快），
-            # _recover() 永远不会被调用。这里在每次查询时自动恢复。
-            await self._auto_recover()
-            servers = [s for s in self._upstream_servers if s.enabled]
-            if not servers:
-                logger.error("自动恢复后仍无可用上游服务器")
-                return None
+    def _select_encrypted_upstreams(self, count: int = 3) -> List[UpstreamServer]:
+        """
+        按健康评分选择最优的 N 个加密上游（DoH/DoT/DoQ）。
+        不包含 plain（普通 DNS 只做 bootstrap 解析）。
+        """
+        encrypted = [
+            s for s in self._upstream_servers
+            if s.enabled and s.server_type in ("doh", "dot", "doq")
+        ]
+        # 按健康评分从高到低排序
+        encrypted.sort(key=lambda s: s.health_score, reverse=True)
+        return encrypted[:count]
 
-        async def query_with_timeout(
-            server: UpstreamServer,
-        ) -> Optional[tuple]:
+    async def _try_upstream_wave(
+        self, servers: List[UpstreamServer], query_bytes: bytes,
+        remaining_timeout: float,
+    ) -> Optional[tuple]:
+        """
+        向一组上游并行查询，返回最快成功响应 (result, elapsed, server)。
+        若全部失败或超时返回 None。
+        """
+        if not servers:
+            return None
+
+        async def query_one(server: UpstreamServer) -> Optional[tuple]:
             t0 = asyncio.get_event_loop().time()
             try:
-                result, elapsed = await server.resolver.resolve_with_stats(query_bytes)
+                result, elapsed = await server.resolver.resolve_with_stats(
+                    query_bytes
+                )
                 if result is not None:
-                    self.exit_recovery_mode()  # 有任何成功响应即退出恢复模式
-                    server.record_success()
+                    self.exit_recovery_mode()
+                    server.record_success(response_time=elapsed)
                     return (result, elapsed, server)
-                # 失败：恢复模式下不记失败（避免刚恢复就被瞬时失败禁用）
                 if not self._recovery_mode:
                     server.record_failure()
                 else:
-                    logger.debug("上游 %s 返回空结果（恢复模式，不计失败）", server.name)
-                elapsed_ms = (asyncio.get_event_loop().time() - t0) * 1000
-                logger.warning("上游 %s 返回空结果 (%.1fms)", server.name, elapsed_ms)
+                    logger.debug("上游 %s 返回空（恢复模式，不计失败）", server.name)
                 return None
             except asyncio.CancelledError:
-                # 被 parallel_resolve 取消，不记录日志
                 return None
             except Exception as e:
-                # 失败：恢复模式下不记失败
                 if not self._recovery_mode:
                     server.record_failure()
                 else:
-                    logger.debug("上游 %s 异常（恢复模式，不计失败）: %s", server.name, e)
-                elapsed_ms = (asyncio.get_event_loop().time() - t0) * 1000
-                logger.warning("上游 %s 异常: %s (%.1fms)", server.name, e, elapsed_ms)
+                    logger.debug("上游 %s 异常（恢复模式）: %s", server.name, e)
                 return None
 
-        logger.debug("并行查询: %d 个上游可用, timeout=%.1fs", len(servers), self.config.parallel_timeout)
-
-        # 使用 FIRST_COMPLETED 循环策略:
-        # 如果首批完成的任务全部失败（如 DoH 缺依赖瞬时失败），
-        # 继续等待剩余任务（如 DoT），而不是直接放弃
-        tasks = [asyncio.create_task(query_with_timeout(s)) for s in servers]
+        tasks = [asyncio.create_task(query_one(s)) for s in servers]
         remaining = set(tasks)
+        deadline = asyncio.get_event_loop().time() + remaining_timeout
         successful = []
-        deadline = asyncio.get_event_loop().time() + self.config.parallel_timeout
 
         while remaining and not successful:
             now = asyncio.get_event_loop().time()
             if now >= deadline:
                 break
-
             done, remaining = await asyncio.wait(
                 remaining,
                 timeout=deadline - now,
                 return_when=asyncio.FIRST_COMPLETED,
             )
-
             for task in done:
                 try:
-                    result = task.result()
-                    if result is not None:
-                        successful.append(result)
-                except (asyncio.CancelledError, Exception):
+                    r = task.result()
+                    if r is not None:
+                        successful.append(r)
+                except Exception:
                     pass
 
-        # 取消未完成的任务
         for task in remaining:
             task.cancel()
 
-        if not successful:
-            logger.warning("并行查询: 所有 %d 个上游均失败", len(servers))
-            return None
+        if successful:
+            successful.sort(key=lambda x: x[1])
+            return successful[0]
+        return None
 
-        # 按响应时间排序，返回最快的
-        successful.sort(key=lambda x: x[1])
-        fastest = successful[0]
-        return fastest[0]
+    async def _parallel_resolve_once(self, query_bytes: bytes) -> Optional[bytes]:
+        """执行一轮并行查询（分波次：最优上游 → 剩余上游）"""
+        enabled = [s for s in self._upstream_servers if s.enabled]
+        if not enabled:
+            logger.warning("没有可用的上游服务器，触发自动恢复...")
+            await self._auto_recover()
+            enabled = [s for s in self._upstream_servers if s.enabled]
+            if not enabled:
+                logger.error("自动恢复后仍无可用上游服务器")
+                return None
+
+        timeout = self.config.parallel_timeout
+
+        # 第一波：按健康评分选最优的 3 个加密上游（DoH/DoT/DoQ）
+        first_wave = self._select_encrypted_upstreams(count=3)
+        if first_wave:
+            logger.debug("首波查询: %d 个最优上游", len(first_wave))
+            result = await self._try_upstream_wave(
+                first_wave, query_bytes, timeout,
+            )
+            if result is not None:
+                return result[0]
+
+        # 第二波：剩余加密上游
+        remaining = [
+            s for s in enabled
+            if s not in first_wave
+            and s.server_type in ("doh", "dot", "doq")
+        ]
+        if remaining:
+            logger.debug("备用查询: 尝试剩余 %d 个加密上游", len(remaining))
+            result = await self._try_upstream_wave(
+                remaining, query_bytes, timeout * 0.5,
+            )
+            if result is not None:
+                return result[0]
+
+        logger.warning("并行查询: 全部 %d 个上游均失败", len(enabled))
+        return None
 
     async def refresh_upstream_ips(self, hostname: str):
         """刷新特定上游服务器的 IP 地址"""
