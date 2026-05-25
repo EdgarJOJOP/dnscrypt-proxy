@@ -27,6 +27,7 @@ from resolver_manager import ResolverManager
 from filter_engine import FilterEngine
 from logger import RequestLogger
 from dnssec import DNSSECQueryWrapper
+from qps_limiter import QPSCounter
 
 logger = logging.getLogger("dns-proxy.local-dot")
 
@@ -73,6 +74,13 @@ class LocalDoTServer:
         self._per_ip_cleanup_interval = 300
         self._per_ip_idle_timeout = 600
         self._ip_semaphore_task: Optional[asyncio.Task] = None
+
+        # QPS 限速（所有客户端包括 localhost）
+        self._qps_limiter = QPSCounter(config.dot_qps_limit, "DoT")
+
+        # 最大并发 TCP 连接数限制
+        self._max_tcp_connections = config.dot_max_connections
+        self._active_connections = 0
 
     @staticmethod
     def _is_localhost(ip: str) -> bool:
@@ -199,6 +207,18 @@ class LocalDoTServer:
     ):
         """处理单个 DoT 客户端连接（RFC 7858：2 字节长度前缀）"""
         client_ip = writer.get_extra_info("peername", ("unknown", 0))[0]
+
+        # 最大 TCP 连接数限制
+        if self._active_connections >= self._max_tcp_connections:
+            logger.warning("DoT 超出最大连接数 %d，拒绝 %s", self._max_tcp_connections, client_ip)
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+            return
+
+        self._active_connections += 1
         try:
             while True:
                 # 读取 2 字节长度前缀
@@ -236,6 +256,7 @@ class LocalDoTServer:
         except Exception as e:
             logger.debug("DoT 客户端 %s 处理异常: %s", client_ip, e)
         finally:
+            self._active_connections -= 1
             try:
                 writer.close()
                 await writer.wait_closed()
@@ -243,7 +264,8 @@ class LocalDoTServer:
                 pass
 
     async def _process_query(self, wire_data: bytes, client_ip: str) -> Optional[bytes]:
-        """处理 DNS 查询（并发控制 + 单 IP 限速）"""
+        """处理 DNS 查询（并发控制 + 单 IP 限速 + QPS 限速）"""
+        await self._qps_limiter.acquire()  # QPS 限速（所有客户端）
         if not self._is_localhost(client_ip):
             sem = await self._get_per_ip_semaphore(client_ip)
             async with sem:

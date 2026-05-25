@@ -160,6 +160,11 @@ class Config:
                 "monitor_interval": 30,
                 "aggressive_gc": True,
                 "gc_interval": 60,
+                "doh_qps_limit": 1000,
+                "dot_qps_limit": 500,
+                "doq_qps_limit": 500,
+                "dot_max_connections": 200,
+                "doq_max_connections": 100,
             },
             "network_monitor": {
                 "enabled": True,
@@ -393,6 +398,26 @@ class Config:
     @property
     def gc_interval(self) -> int:
         return self._data.get("performance", {}).get("gc_interval", 60)
+
+    @property
+    def doh_qps_limit(self) -> int:
+        return int(self._data.get("performance", {}).get("doh_qps_limit", 1000))
+
+    @property
+    def dot_qps_limit(self) -> int:
+        return int(self._data.get("performance", {}).get("dot_qps_limit", 500))
+
+    @property
+    def doq_qps_limit(self) -> int:
+        return int(self._data.get("performance", {}).get("doq_qps_limit", 500))
+
+    @property
+    def dot_max_connections(self) -> int:
+        return int(self._data.get("performance", {}).get("dot_max_connections", 200))
+
+    @property
+    def doq_max_connections(self) -> int:
+        return int(self._data.get("performance", {}).get("doq_max_connections", 100))
 
     # --- DNSSEC ---
     @property

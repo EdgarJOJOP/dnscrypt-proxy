@@ -29,6 +29,7 @@ from resolver_manager import ResolverManager
 from filter_engine import FilterEngine
 from logger import RequestLogger
 from dnssec import DNSSECQueryWrapper
+from qps_limiter import QPSCounter
 
 logger = logging.getLogger("dns-proxy.local-doq")
 
@@ -83,14 +84,14 @@ class _DoQConnection:
             elif isinstance(event, ConnectionTerminated):
                 logger.debug("DoQ 客户端 %s 断开连接", self._addr[0])
 
-        # 发送 QUIC 数据包
+        # 发送 QUIC 流控数据包
         for data, addr in self._quic.send_flow_control_offered(now=now):
-            pass  # 用 send_datagram 替代
+            try:
+                self._transport.sendto(data, addr)
+            except Exception:
+                pass
 
-        # 发送缓冲的数据
-        quic_data = self._quic.send_flow_control_offered(now=now)
-
-        # 获取待发送的数据报
+        # 发送 QUIC 数据报
         while True:
             data = self._quic.send_datagram(now=now)
             if data is None:
@@ -157,9 +158,10 @@ class _DoQConnection:
 class _DoQUdpProtocol(asyncio.DatagramProtocol):
     """UDP 协议处理器，将数据报路由到对应的 QUIC 连接"""
 
-    def __init__(self, server: "LocalDoQServer", quic_config: QuicConfiguration):
+    def __init__(self, server: "LocalDoQServer", quic_config: QuicConfiguration, max_connections: int = 100):
         self._server = server
         self._quic_config = quic_config
+        self._max_connections = max_connections
         self.transport: Optional[asyncio.DatagramTransport] = None
         self._connections: dict = {}  # addr -> _DoQConnection
         self._closed = False
@@ -173,6 +175,10 @@ class _DoQUdpProtocol(asyncio.DatagramProtocol):
             return
         conn = self._connections.get(addr)
         if conn is None:
+            # 最大 QUIC 连接数限制
+            if len(self._connections) >= self._max_connections:
+                logger.warning("DoQ 超出最大连接数 %d，丢弃 %s 的数据报", self._max_connections, addr[0])
+                return
             conn = _DoQConnection(self._server, self._quic_config, self.transport, addr)
             self._connections[addr] = conn
         conn.receive_datagram(data)
@@ -240,6 +246,12 @@ class LocalDoQServer:
         self._per_ip_cleanup_interval = 300
         self._per_ip_idle_timeout = 600
 
+        # 最大 QUIC 连接数限制
+        self._max_doq_connections = config.doq_max_connections
+
+        # QPS 限速（所有客户端包括 localhost）
+        self._qps_limiter = QPSCounter(config.doq_qps_limit, "DoQ")
+
     @staticmethod
     def _is_localhost(ip: str) -> bool:
         return ip in ("127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost")
@@ -302,7 +314,7 @@ class LocalDoQServer:
 
         # IPv4 UDP 监听
         try:
-            self._protocol_v4 = _DoQUdpProtocol(self, self._quic_config)
+            self._protocol_v4 = _DoQUdpProtocol(self, self._quic_config, self._max_doq_connections)
             self._transport_v4, _ = await loop.create_datagram_endpoint(
                 lambda: self._protocol_v4,
                 local_addr=(self.host, self.port),
@@ -320,7 +332,7 @@ class LocalDoQServer:
         # IPv6 UDP 监听（可选）
         if self.ipv6_enabled:
             try:
-                self._protocol_v6 = _DoQUdpProtocol(self, self._quic_config)
+                self._protocol_v6 = _DoQUdpProtocol(self, self._quic_config, self._max_doq_connections)
                 self._transport_v6, _ = await loop.create_datagram_endpoint(
                     lambda: self._protocol_v6,
                     local_addr=(self.ipv6_host, self.ipv6_port),
@@ -384,7 +396,8 @@ class LocalDoQServer:
                 pass
 
     async def _process_query(self, wire_data: bytes, client_ip: str) -> Optional[bytes]:
-        """处理 DNS 查询（并发控制 + 单 IP 限速）"""
+        """处理 DNS 查询（并发控制 + 单 IP 限速 + QPS 限速）"""
+        await self._qps_limiter.acquire()  # QPS 限速（所有客户端）
         if not self._is_localhost(client_ip):
             sem = await self._get_per_ip_semaphore(client_ip)
             async with sem:

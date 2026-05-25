@@ -30,6 +30,7 @@ from resolver_manager import ResolverManager
 from filter_engine import FilterEngine
 from logger import RequestLogger
 from dnssec import DNSSECQueryWrapper, DNSSECValidator
+from qps_limiter import QPSCounter
 
 logger = logging.getLogger("dns-proxy.doh-server")
 
@@ -80,6 +81,9 @@ class DoHServer:
         self._per_ip_limit = config.max_concurrent_per_ip
         self._per_ip_cleanup_interval = 300  # 5 分钟清理一次过期条目
         self._per_ip_idle_timeout = 600  # 10 分钟无请求则清理
+
+        # QPS 限速（所有客户端包括 localhost）
+        self._qps_limiter = QPSCounter(config.doh_qps_limit, "DoH")
 
     @staticmethod
     def _is_localhost(ip: str) -> bool:
@@ -206,6 +210,7 @@ class DoHServer:
         wire_data = query.to_wire()
 
         client_ip = request.remote or "unknown"
+        await self._qps_limiter.acquire()  # QPS 限速（所有客户端）
         if not self._is_localhost(client_ip):
             sem = await self._get_per_ip_semaphore(client_ip)
             async with sem:
@@ -396,6 +401,7 @@ class DoHServer:
     ) -> web.Response:
         """处理 DNS 查询（Wire Format）- 按 response_format 返回"""
         client_ip = request.remote or "unknown"
+        await self._qps_limiter.acquire()  # QPS 限速（所有客户端）
         if not self._is_localhost(client_ip):
             sem = await self._get_per_ip_semaphore(client_ip)
             async with sem:
