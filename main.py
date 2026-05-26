@@ -215,7 +215,8 @@ class DNSProxyApp:
 
         # 7. 网络连通性监控
         logger.info("[7/11] 初始化网络连通性监控器...")
-        self.network_monitor = NetworkMonitor(self.config, self.resolver_manager)
+        self.network_monitor = NetworkMonitor(self.config, self.resolver_manager,
+                                                 filter_engine=self.filter_engine)
         await self.network_monitor.start()
 
         # 8. 本地 DoH 服务器（带 IPv6 + DNSSEC）
