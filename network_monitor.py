@@ -26,9 +26,10 @@ class NetworkMonitor:
     2. 刷新 bootstrap DNS 缓存（重新解析上游域名 → IP）
     """
 
-    def __init__(self, config, resolver_manager):
+    def __init__(self, config, resolver_manager, filter_engine=None):
         self.config = config
         self.resolver_manager = resolver_manager
+        self.filter_engine = filter_engine  # 网络恢复时用于清除过滤结果缓存
 
         # 运行状态
         self._running = False
@@ -113,7 +114,12 @@ class NetworkMonitor:
                         logger.warning("网络连通性异常（连续 %d 次检测失败），进入降级模式",
                                         self._consecutive_failures)
 
-                await asyncio.sleep(self._interval)
+                # 降级模式下每秒检测一次，尽快发现网络恢复
+                # 正常模式下使用配置的间隔
+                if self._degraded:
+                    await asyncio.sleep(1)
+                else:
+                    await asyncio.sleep(self._interval)
 
             except asyncio.CancelledError:
                 break
@@ -268,7 +274,15 @@ class NetworkMonitor:
         refreshed = await self.resolver_manager.refresh_all_upstream_ips()
         logger.info("  已刷新 %d 个上游域名的 bootstrap IP 缓存", refreshed)
 
-        # 5. 标记恢复
+        # 5. 清除过滤引擎的过滤结果缓存
+        #    断网期间过滤结果可能被误缓存为"放行"状态（FilterCache TTL=5s），
+        #    不清除的话恢复后拦截规则中的域名会被错误放行（返回真实 IP 而非 0.0.0.0）
+        #    注意：不需要清除 DNS 缓存，因为过滤检查在缓存检查之前执行
+        if self.filter_engine:
+            self.filter_engine.clear_filter_cache()
+            logger.info("  已清除过滤引擎缓存")
+
+        # 6. 标记恢复
         self._degraded = False
         self._consecutive_failures = 0
         self._recovery_successes = 0
