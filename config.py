@@ -175,6 +175,10 @@ class Config:
                 "dns_probe_domains": ["www.baidu.com", "www.qq.com"],
                 "failure_threshold": 3,
                 "recovery_check_count": 2,
+                "arp_protection": {
+                    "enabled": True,
+                    "gateway": "",  # "网关IP,网关MAC" 英文逗号隔开，留空自动探测
+                },
             },
             "tls": {
                 "ech_enabled": False,
@@ -617,6 +621,14 @@ class Config:
     @property
     def network_monitor_config(self) -> dict:
         return self._data.get("network_monitor", {})
+
+    @property
+    def arp_protection_config(self) -> dict:
+        """ARP 防护配置（透传原始 gateway 字段，由 ARPProtection 自行解析）"""
+        raw = dict(self._data.get("network_monitor", {}).get("arp_protection", {}))
+        raw.setdefault("gateway_ip", "")
+        raw.setdefault("gateway_mac", "")
+        return raw
 
     def get_raw(self) -> Dict[str, Any]:
         """获取原始配置数据"""

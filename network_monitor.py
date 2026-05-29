@@ -3,6 +3,7 @@
 - 定期 ping/探测网络连通性（IPv4 + IPv6 双栈）
 - 检测网络中断/恢复，自动重新启用上游服务器
 - 支持 ICMP ping 和 DNS 探测两种检测方式
+- 集成 ARP 防护：网络检测失败时自动刷新网关 ARP 缓存
 """
 
 import sys
@@ -13,6 +14,8 @@ from typing import List, Optional
 import dns.message
 import dns.rdatatype
 import dns.asyncquery
+
+from arp_protection import ARPProtection
 
 logger = logging.getLogger("dns-proxy.network")
 
@@ -55,6 +58,9 @@ class NetworkMonitor:
         # DNS 探测复用解析器缓存（避免每次探测创建新 UDP 套接字）
         self._dns_probe_resolvers: Dict[str, "PlainDNSResolver"] = {}
 
+        # ARP 防护
+        self._arp_protection = ARPProtection(config.arp_protection_config)
+
     @property
     def enabled(self) -> bool:
         """监控器是否启用"""
@@ -75,6 +81,10 @@ class NetworkMonitor:
         logger.info("网络连通性监控已启动 (间隔=%ds, ping目标=%s)",
                      self._interval, self._ping_targets_v4 + self._ping_targets_v6)
 
+        # ARP 防护：自动探测网关（手动配置了 IP+MAC 则跳过）
+        if self._arp_protection.enabled and not self._arp_protection.is_manual:
+            await self._arp_protection.detect_gateway()
+
     async def stop(self):
         """停止监控循环"""
         self._running = False
@@ -93,6 +103,24 @@ class NetworkMonitor:
         while self._running:
             try:
                 healthy = await self._check_connectivity()
+
+                # ARP 防护：检测到故障时检查本地网卡状态
+                # 如果网卡有 IP/子网掩码/网关（配置正常），说明问题可能在路由器 ARP 表
+                # 此时发送流量到网关以触发路由器更新 ARP 表
+                if not healthy and self._arp_protection.enabled and self._arp_protection.gateway_ip \
+                        and not self._arp_protection.is_manual:
+                    iface_ok, iface_details = await self._arp_protection.check_interface_healthy()
+                    if iface_ok:
+                        logger.debug("网络检测失败，本地网卡正常 (%s)，尝试刷新路由器 ARP ...",
+                                     iface_details)
+                        if await self._arp_protection.refresh_router_arp():
+                            # 刷新后重新检测连通性
+                            healthy = await self._check_connectivity()
+                            if healthy:
+                                logger.info("ARP 防护: 路由器 ARP 刷新后网络已恢复")
+                    else:
+                        logger.debug("网络检测失败，本地网卡异常 (%s)，不尝试 ARP 刷新",
+                                     iface_details)
 
                 if healthy:
                     self._consecutive_failures = 0

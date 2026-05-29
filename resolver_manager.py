@@ -133,11 +133,18 @@ class ResolverManager:
         self._last_all_failed_time = 0.0
         # 冷却期：距上次全部失败不足此时长时，新查询等待剩余时间再发起
         self._all_failed_cooldown = 1.0
+        # 启动缓冲：程序启动后前 3 秒内上游失败时等待再试，不触发重试风暴
+        self._start_time = 0.0
+        self._startup_buffer = 3.0
+        # 重试互斥锁：只有一个并发请求执行重试，其余直接返回 SERVFAIL
+        self._retry_lock = asyncio.Lock()
+        self._retry_version = 0  # 每次重试递增，避免锁排队请求重复重试
         self._ech_fetchers: Dict[str, ECHConfigFetcher] = {}  # hostname -> ECHConfigFetcher
         self._openssl4_wrapper = None  # OpenSSL 4.0 wrapper（ECH；如不可用则为 None）
 
     async def initialize(self):
         """初始化所有解析器"""
+        self._start_time = asyncio.get_event_loop().time()
         self._concurrent_semaphore = asyncio.Semaphore(self.config.max_concurrent)
 
         # 1. 创建 bootstrap 解析器（普通 DNS）
@@ -488,15 +495,42 @@ class ResolverManager:
 
     async def _parallel_resolve(self, query_bytes: bytes) -> Optional[bytes]:
         """
-        并行查询核心逻辑（带集群故障冷却 + 渐进退避重试）。
+        并行查询核心逻辑（带启动缓冲 + 集群故障冷却 + 互斥渐进退避重试）。
 
-        当所有上游都失败时：
-        1. 记录时间戳，后续 resolve 调用在冷却期内等待，避免客户端重试风暴
-        2. 单次 resolve 内部以 0.2s/0.5s/1.0s 的间隔重试最多 3 次
+        启动缓冲期（前 3 秒）：上游全部失败时不执行重试，等待缓冲期结束再试一次。
+          解决刚启动时所有上游尚未建立连接导致的"全部失败"日志洪流。
+
+        集群故障冷却：上次全部失败距今不足 1 秒时，新查询等待剩余时间再发起。
+          避免客户端重试风暴。
+
+        互斥重试锁：同时只有一个并发请求执行重试循环（0.2s/0.5s/1.0s 三次退避），
+          其余并发请求直接返回 SERVFAIL。消除同一时刻多个请求各自重试的重复日志。
         """
         now = asyncio.get_event_loop().time()
 
-        # 集群故障冷却：上次全部失败距今不足冷却期 → 等待剩余时间
+        # === 启动缓冲期 ===
+        # 程序刚启动时，上游 DNS 连接尚未建立，给它们 3 秒时间
+        startup_elapsed = now - self._start_time
+        if startup_elapsed < self._startup_buffer:
+            result = await self._parallel_resolve_once(query_bytes)
+            if result is not None:
+                if self._last_all_failed_time > 0:
+                    logger.info("并行查询: 上游服务器已恢复域名解析")
+                    self._last_all_failed_time = 0.0
+                return result
+            # 全部失败：等待到缓冲期结束再试
+            wait = self._startup_buffer - (asyncio.get_event_loop().time() - self._start_time)
+            if wait > 0:
+                logger.debug("并行查询: 启动缓冲期 %.1fs，等待上游连接...", wait)
+                await asyncio.sleep(wait)
+            result = await self._parallel_resolve_once(query_bytes)
+            if result is not None:
+                if self._last_all_failed_time > 0:
+                    logger.info("并行查询: 上游服务器已恢复域名解析 (启动缓冲后)")
+                    self._last_all_failed_time = 0.0
+                return result
+
+        # === 集群故障冷却 ===
         if self._last_all_failed_time > 0:
             elapsed = now - self._last_all_failed_time
             if elapsed < self._all_failed_cooldown:
@@ -511,26 +545,39 @@ class ResolverManager:
                 self._last_all_failed_time = 0.0
             return result
 
-        # 首次全部失败 → 渐进退避，最多重试 3 次
+        # === 全部失败 → 仅一个请求执行重试 ===
         self._last_all_failed_time = asyncio.get_event_loop().time()
-        _failure_start = self._last_all_failed_time  # 局部快照，避免并发协程重置导致耗时计算错误
+
+        if self._retry_lock.locked():
+            # 已有其他请求在重试，这个请求直接返回（避免重复日志）
+            return None
+
+        _failure_start = self._last_all_failed_time
         alive = sum(1 for s in self._upstream_servers if s.enabled)
+        _version = self._retry_version
 
-        for retry, delay in enumerate([0.2, 0.5, 1.0], start=1):
-            logger.warning("并行查询: 全部 %d 个上游均失败，%.1fs 后第 %d 次重试...",
-                           alive, delay, retry)
-            await asyncio.sleep(delay)
-            result = await self._parallel_resolve_once(query_bytes)
-            if result is not None:
-                logger.info("并行查询: 上游服务器已恢复域名解析 (第 %d 次重试成功, 耗时 %.1fs)",
-                            retry,
-                            asyncio.get_event_loop().time() - _failure_start)
-                self._last_all_failed_time = 0.0
-                return result
-            self._last_all_failed_time = asyncio.get_event_loop().time()
+        async with self._retry_lock:
+            # 检查版本号：如果已在之前的重试中被递增，说明已有其他请求执行过重试
+            if _version != self._retry_version:
+                return None
 
-        logger.warning("并行查询: 全部 %d 个上游均失败 (%d 次重试后放弃)", alive, 3)
-        return None
+            for retry, delay in enumerate([0.2, 0.5, 1.0], start=1):
+                logger.warning("并行查询: 全部 %d 个上游均失败，%.1fs 后第 %d 次重试...",
+                               alive, delay, retry)
+                await asyncio.sleep(delay)
+                result = await self._parallel_resolve_once(query_bytes)
+                if result is not None:
+                    logger.info("并行查询: 上游服务器已恢复域名解析 (第 %d 次重试成功, 耗时 %.1fs)",
+                                retry,
+                                asyncio.get_event_loop().time() - _failure_start)
+                    self._last_all_failed_time = 0.0
+                    self._retry_version += 1
+                    return result
+                self._last_all_failed_time = asyncio.get_event_loop().time()
+
+            self._retry_version += 1
+            logger.warning("并行查询: 全部 %d 个上游均失败 (%d 次重试后放弃)", alive, 3)
+            return None
 
     def _select_encrypted_upstreams(self, count: int = 3) -> List[UpstreamServer]:
         """
