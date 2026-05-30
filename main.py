@@ -139,6 +139,8 @@ class DNSProxyApp:
                 return  # 忽略 aioquic 内部 Future 的 ConnectionError
             if isinstance(exc, ConnectionResetError) and "_ProactorBasePipeTransport" in msg:
                 return  # 忽略 Windows asyncio proactor 连接重置错误
+            if isinstance(exc, OSError) and ("Accept failed" in msg or "accept" in str(context.get("socket", "")).lower()):
+                return  # 忽略 Windows accept 客户端提前断开错误
             if original_exc_handler:
                 original_exc_handler(loop, context)
             else:
