@@ -368,7 +368,7 @@ class ResolverManager:
             and self._openssl4_wrapper.available
             and self._openssl4_wrapper.ech_supported
         )
-        # CA 证书路径：配置 > certifi > None
+        # CA 证书路径：配置 > certifi > None（用于所有 DoH/DoT/DoQ 解析器的证书验证）
         ca_path = self.config.openssl4_ca_path or None
         if ca_path is None:
             try:
@@ -398,12 +398,14 @@ class ResolverManager:
                     resolver = DoHResolver(url, timeout=timeout,
                                            connection_pool_size=self.config.connection_pool_size,
                                            connect_ips=cached_ips,
-                                           concurrency=self.config.connection_pool_size)
+                                           concurrency=self.config.connection_pool_size,
+                                           ca_path=ca_path or "")
             else:
                 resolver = DoHResolver(url, timeout=timeout,
                                        connection_pool_size=self.config.connection_pool_size,
                                        connect_ips=cached_ips,
-                                       concurrency=self.config.connection_pool_size)
+                                       concurrency=self.config.connection_pool_size,
+                                       ca_path=ca_path or "")
             self._upstream_servers.append(UpstreamServer(resolver, "doh"))
 
         # DoT
@@ -427,10 +429,12 @@ class ResolverManager:
                 )
                 if not resolver.available:
                     resolver = DoTResolver(h, port=p, timeout=timeout, connect_ips=cached_ips,
-                                           concurrency=self.config.connection_pool_size)
+                                           concurrency=self.config.connection_pool_size,
+                                           ca_path=ca_path or "")
             else:
                 resolver = DoTResolver(h, port=p, timeout=timeout, connect_ips=cached_ips,
-                                       concurrency=self.config.connection_pool_size)
+                                       concurrency=self.config.connection_pool_size,
+                                       ca_path=ca_path or "")
             self._upstream_servers.append(UpstreamServer(resolver, "dot"))
 
         # DoQ
@@ -438,7 +442,8 @@ class ResolverManager:
             hostname = addr.replace("quic://", "").split(":")[0]
             cached_ips = self._bootstrap_cache.get(hostname, [])
             resolver = DoQResolver(addr, timeout=timeout, connect_ips=cached_ips,
-                                   concurrency=self.config.connection_pool_size)
+                                   concurrency=self.config.connection_pool_size,
+                                   ca_path=ca_path or "")
             self._upstream_servers.append(UpstreamServer(resolver, "doq"))
 
     async def resolve(self, query_bytes: bytes) -> Optional[bytes]:
