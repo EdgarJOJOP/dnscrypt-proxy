@@ -170,6 +170,9 @@ class ARPProtection:
             else:
                 logger.info("ARP 防护: 网关 %s -> IP=%s, MAC=%s",
                              src, self.gateway_ip, self.gateway_mac or "未知")
+            # 网关 MAC 已知时设静态 ARP 防止本机缓存被投毒
+            if self.gateway_mac:
+                await self._protect_gateway_arp()
         else:
             logger.warning("ARP 防护: 无法自动探测网关地址（防火墙可能阻止了探测）")
         return ok
@@ -212,7 +215,7 @@ class ARPProtection:
             if mac:
                 self._auto_gateway_mac = mac
                 return True
-            logger.debug("ARP 防护: 无法获取网关 %s 的 MAC 地址", target_ip)
+            logger.warning("ARP 防护: 无法获取网关 %s 的 MAC 地址", target_ip)
             return True
         return False
 
@@ -252,7 +255,7 @@ class ARPProtection:
             if mac:
                 self._auto_gateway_mac = mac
             else:
-                logger.debug("ARP 防护: 无法获取网关 %s 的 MAC 地址", target_ip)
+                logger.warning("ARP 防护: 无法获取网关 %s 的 MAC 地址", target_ip)
             return True
         return False
 
@@ -291,7 +294,7 @@ class ARPProtection:
                             met = 9999
                         routes.append((gw, if_ip, met))
         except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
-            logger.debug("ARP 防护: route print 失败: %s", e)
+            logger.warning("ARP 防护: route print 失败: %s", e)
 
         if not routes:
             return None
@@ -302,7 +305,7 @@ class ARPProtection:
         all_gateways = [{"ip": gw, "iface_ip": ip, "metric": m} for gw, ip, m in routes]
 
         if len(routes) > 1:
-            logger.debug("ARP 防护: 检测到 %d 条默认路由，选用 metric=%d (网关=%s)",
+            logger.info("ARP 防护: 检测到 %d 条默认路由，选用 metric=%d (网关=%s)",
                          len(routes), metric, gateway_ip)
 
         # 2. ipconfig 按适配器分段解析，找到匹配接口 IP 的网卡
@@ -319,7 +322,7 @@ class ARPProtection:
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
             text = stdout.decode("utf-8", errors="replace")
         except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
-            logger.debug("ARP 防护: ipconfig 失败: %s", e)
+            logger.warning("ARP 防护: ipconfig 失败: %s", e)
             text = ""
 
         if text:
@@ -417,7 +420,7 @@ class ARPProtection:
                     met = int(m.group(3)) if m.group(3) else 9999
                     routes.append((gw, dev, met))
         except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
-            logger.debug("ARP 防护: ip route 失败: %s", e)
+            logger.warning("ARP 防护: ip route 失败: %s", e)
 
         if not routes:
             return None
@@ -427,7 +430,7 @@ class ARPProtection:
         all_gateways = [{"ip": gw, "iface": dev, "metric": m} for gw, dev, m in routes]
 
         if len(routes) > 1:
-            logger.debug("ARP 防护: 检测到 %d 条默认路由，选用 metric=%d (网关=%s, 网卡=%s)",
+            logger.info("ARP 防护: 检测到 %d 条默认路由，选用 metric=%d (网关=%s, 网卡=%s)",
                          len(routes), metric, gateway_ip, iface_name)
 
         # 2. ip -4 addr show dev <iface> → 获取 IP 和前缀
@@ -452,7 +455,7 @@ class ARPProtection:
                     )
                     break
         except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
-            logger.debug("ARP 防护: ip addr show %s 失败: %s", iface_name, e)
+            logger.warning("ARP 防护: ip addr show %s 失败: %s", iface_name, e)
 
         if not local_ipv4:
             return None
@@ -491,7 +494,7 @@ class ARPProtection:
                             return gateway
             return None
         except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
-            logger.debug("ARP 防护: route print 失败: %s", e)
+            logger.warning("ARP 防护: route print 失败: %s", e)
             return None
 
     @staticmethod
@@ -512,7 +515,7 @@ class ARPProtection:
                     return m.group(1)
             return None
         except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
-            logger.debug("ARP 防护: ip route 失败: %s", e)
+            logger.warning("ARP 防护: ip route 失败: %s", e)
             return None
 
     # ======================== MAC 探测 ========================
@@ -539,7 +542,7 @@ class ARPProtection:
                             return part.upper()
             return None
         except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
-            logger.debug("ARP 防护: arp -a %s 失败: %s", ip, e)
+            logger.warning("ARP 防护: arp -a %s 失败: %s", ip, e)
             return None
 
     @staticmethod
@@ -559,7 +562,7 @@ class ARPProtection:
                 return m.group(1).upper()
             return None
         except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
-            logger.debug("ARP 防护: ip neigh show %s 失败: %s", ip, e)
+            logger.warning("ARP 防护: ip neigh show %s 失败: %s", ip, e)
             return None
 
     # ======================== 本地网卡状态检查 ========================
@@ -1013,12 +1016,12 @@ class ARPProtection:
                                gw_ip_poisoned, expected, actual)
             logger.warning("ARP 防护: 正在执行抗投毒修复...")
         else:
-            logger.debug("ARP 防护: 本机 ARP 表正常，未检测到投毒")
+            logger.info("ARP 防护: 本机 ARP 表正常，未检测到投毒")
 
         # 1. 爆发 ping 网关（10 次，10ms 间隔）
         #    路由器收到本机 IP 包 → 看到源 MAC → 更新 ARP 表中本机 IP↔MAC
         #    增加次数（3→10）抵抗攻击者的快速重投毒
-        logger.debug("ARP 防护: 爆发 ping 网关 %s x10", gw_ip)
+        logger.info("ARP 防护: 爆发 ping 网关 %s x10", gw_ip)
         for _ in range(10):
             await self._ping_gateway(gw_ip)
             await asyncio.sleep(0.01)
@@ -1045,6 +1048,11 @@ class ARPProtection:
         ping_ok = await self._ping_gateway(gw_ip)
         if ping_ok:
             logger.info("ARP 防护: 网关 %s 可达", gw_ip)
+            # 设静态 ARP 保护本机缓存
+            if self.gateway_mac:
+                await self._protect_gateway_arp()
+            # 持续 GARP 对抗：对抗攻击者重投毒
+            await self._garp_sustain(gw_ip, duration=5, interval=0.3)
             if self._arp_attack_logged and not self._conflict_resolved:
                 logger.warning("ARP 防护: 网络已恢复但检测到 ARP 异常，建议检查局域网设备")
             return True
@@ -1072,10 +1080,38 @@ class ARPProtection:
         if not broadcast_ip:
             return
 
-        logger.debug("ARP 防护: GARP 爆发广播 ping %s x%d", broadcast_ip, count)
+        logger.info("ARP 防护: GARP 爆发广播 ping %s x%d", broadcast_ip, count)
         for _ in range(count):
             await self._ping_broadcast(broadcast_ip)
             await asyncio.sleep(0.01)
+
+    async def _garp_sustain(self, gw_ip: str, duration: int = 5, interval: float = 0.3):
+        """
+        持续 GARP 对抗：在恢复后继续发送 GARP 广播，防止攻击者立即重投毒。
+        每次循环：GARP 小爆发 + ping 验证。
+
+        Args:
+            gw_ip: 网关 IP（用于 ping 验证）
+            duration: 持续秒数
+            interval: 每轮间隔（秒）
+        """
+        end_time = asyncio.get_event_loop().time() + duration
+        rounds = 0
+        while asyncio.get_event_loop().time() < end_time:
+            rounds += 1
+            await self._garp_broadcast_burst(count=3)
+            # 快速验证网关是否仍可达
+            if not await self._ping_gateway(gw_ip):
+                remain = end_time - asyncio.get_event_loop().time()
+                logger.warning("ARP 防护: 持续 GARP 对抗中检测到网关再次不可达"
+                               "(第 %d 轮, 剩余 %.1fs), 立即爆发覆盖...",
+                               rounds, remain)
+                # 立即再爆发一次覆盖
+                await self._garp_broadcast_burst(count=10)
+                await self._ping_gateway(gw_ip)
+                # 继续撑到结束
+            await asyncio.sleep(interval)
+        logger.info("ARP 防护: 持续 GARP 对抗结束（共 %d 轮）", rounds)
 
     async def _switch_ip(self, new_ip: str) -> bool:
         """
@@ -1110,11 +1146,11 @@ class ARPProtection:
                 _, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
                 if proc.returncode != 0:
                     err = stderr.decode("utf-8", errors="replace")[:200]
-                    logger.debug("ARP 防护: netsh 切换 IP 失败: %s", err)
+                    logger.warning("ARP 防护: netsh 切换 IP 失败: %s", err)
                     return False
                 return True
             except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
-                logger.debug("ARP 防护: netsh 切换 IP 异常: %s", e)
+                logger.warning("ARP 防护: netsh 切换 IP 异常: %s", e)
                 return False
         else:
             prefix = self._subnet_mask_to_prefix(self._subnet_mask)
@@ -1139,7 +1175,7 @@ class ARPProtection:
                 _, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
                 if proc.returncode != 0:
                     err = stderr.decode("utf-8", errors="replace")[:200]
-                    logger.debug("ARP 防护: ip addr 切换 IP 失败: %s", err)
+                    logger.warning("ARP 防护: ip addr 切换 IP 失败: %s", err)
                     return False
                 # 网关路由
                 if gw_ip:
@@ -1151,7 +1187,7 @@ class ARPProtection:
                     )
                 return True
             except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
-                logger.debug("ARP 防护: ip addr 切换 IP 异常: %s", e)
+                logger.warning("ARP 防护: ip addr 切换 IP 异常: %s", e)
                 return False
 
     async def _garp_ip_switch_defense(self) -> bool:
@@ -1179,13 +1215,13 @@ class ARPProtection:
         """
         original_ip = self._local_ipv4
         if not original_ip or not self._subnet_mask:
-            logger.debug("ARP 防护: 缺少 IP 或子网掩码，无法执行两阶段 GARP")
+            logger.warning("ARP 防护: 缺少 IP 或子网掩码，无法执行两阶段 GARP")
             return False
 
         # 计算临时 IP（在当前主机位范围内偏移 50，避免冲突）
         decoy_ip = self._increment_ip(original_ip, self._subnet_mask, offset=50)
         if not decoy_ip or decoy_ip == original_ip:
-            logger.debug("ARP 防护: 无法生成临时 IP，跳过两阶段 GARP")
+            logger.warning("ARP 防护: 无法生成临时 IP，跳过两阶段 GARP")
             return False
 
         gw_ip = self.gateway_ip
@@ -1193,7 +1229,7 @@ class ARPProtection:
                         original_ip, decoy_ip, original_ip)
 
         # --- 阶段 1：切换到临时 IP，宣告解绑 ---
-        logger.debug("ARP 防护: 阶段 1 — 切换到临时 IP %s", decoy_ip)
+        logger.info("ARP 防护: 阶段 1 — 切换到临时 IP %s", decoy_ip)
         if not await self._switch_ip(decoy_ip):
             logger.warning("ARP 防护: 切换到临时 IP %s 失败", decoy_ip)
             return False
@@ -1204,7 +1240,7 @@ class ARPProtection:
         await asyncio.sleep(0.3)
 
         # --- 阶段 2：切回原始 IP，宣告正确绑定 ---
-        logger.debug("ARP 防护: 阶段 2 — 切回原始 IP %s", original_ip)
+        logger.info("ARP 防护: 阶段 2 — 切回原始 IP %s", original_ip)
         if not await self._switch_ip(original_ip):
             logger.warning("ARP 防护: 切回原始 IP %s 失败", original_ip)
             self._local_ipv4 = original_ip
@@ -1216,7 +1252,116 @@ class ARPProtection:
 
         # 确认网关可达
         reachable = await self._ping_gateway(gw_ip)
+        if reachable and self.gateway_mac:
+            await self._protect_gateway_arp()
         return reachable
+
+    async def _is_router_changed(self) -> Optional[str]:
+        """
+        检测是否换了路由器（网关 MAC 变了但能 ping 通）。
+        换路由器时：ARP 表中 MAC 不同，但网关 IP 可达。
+        ARP 投毒时：ARP 表中 MAC 不同，网关 IP 不可达。
+
+        Returns:
+            新的 MAC 地址（换了路由器时），None（未换或不确定）
+        """
+        gw_ip = self.gateway_ip
+        expected_mac = self.gateway_mac
+        if not gw_ip or not expected_mac:
+            return None
+
+        if sys.platform == "win32":
+            current_mac = await self._arp_get_mac_windows(gw_ip)
+        else:
+            current_mac = await self._arp_get_mac_linux(gw_ip)
+
+        if not current_mac:
+            return None
+
+        if current_mac.upper() == expected_mac.upper():
+            return None  # MAC 一致，没换路由器
+
+        # MAC 变了，看是否还能 ping 通
+        ping_ok = await self._ping_gateway(gw_ip)
+        if ping_ok:
+            return current_mac.upper()  # 能 ping 通 → 换了路由器
+        return None  # ping 不通 → 可能是投毒，不是换路由器
+
+    async def _protect_gateway_arp(self) -> bool:
+        """
+        为网关添加静态 ARP 条目，防止本机 ARP 缓存被投毒。
+
+        原理：
+          Windows: netsh interface ipv4 set neighbors
+          Linux: ip neigh replace ... nud permanent
+
+        设静态 ARP 前先检测是否换了路由器：
+          - MAC 变了但 ping 通 → 更新 MAC → 设新静态条目
+          - MAC 变了但 ping 不通 → 先抗毒，再设静态条目
+        """
+        gw_ip = self.gateway_ip
+        gw_mac = self.gateway_mac
+        iface = self._interface_name
+        if not gw_ip or not gw_mac or not iface:
+            logger.debug("ARP 防护: 缺少网关信息，跳过静态 ARP 保护")
+            return False
+
+        # === 换路由器检测 ===
+        new_mac = await self._is_router_changed()
+        if new_mac:
+            logger.warning("ARP 防护: 检测到路由器 MAC 变更 %s → %s，更新静态 ARP",
+                            self.gateway_mac, new_mac)
+            # 更新手动/自动 MAC
+            if self._manual_gateways and self._manual_gateways[0][0] == gw_ip:
+                self._manual_gateways[0] = (gw_ip, new_mac)
+            self._manual_gateway_mac = new_mac
+            self._auto_gateway_mac = new_mac
+            gw_mac = new_mac
+
+        # 标准化 MAC 格式
+        if sys.platform == "win32":
+            mac_fmt = gw_mac.replace(":", "-")
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "netsh", "interface", "ipv4", "set", "neighbors",
+                    iface, gw_ip, mac_fmt,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+                if proc.returncode == 0:
+                    logger.info("ARP 防护: ✓ 静态 ARP 已绑定 %s (%s → %s)",
+                                 gw_ip, iface, gw_mac)
+                    return True
+                out_text = stdout.decode("utf-8", errors="replace").strip()
+                err_text = stderr.decode("utf-8", errors="replace").strip()
+                detail = err_text or out_text or "(空 — 可能需要管理员权限)"
+                logger.warning("ARP 防护: netsh set neighbors 失败: %s", detail)
+                return False
+            except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
+                logger.warning("ARP 防护: netsh set neighbors 异常: %s", e)
+                return False
+        else:
+            mac_fmt = gw_mac.replace("-", ":")
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "ip", "neigh", "replace", gw_ip,
+                    "dev", iface, "lladdr", mac_fmt, "nud", "permanent",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+                if proc.returncode == 0:
+                    logger.info("ARP 防护: ✓ 静态 ARP 已绑定 %s (%s → %s)",
+                                 gw_ip, iface, gw_mac)
+                    return True
+                err_text = stderr.decode("utf-8", errors="replace").strip()
+                logger.warning("ARP 防护: ip neigh replace 失败: %s",
+                                err_text or "(空)")
+                return False
+            except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
+                logger.warning("ARP 防护: ip neigh replace 异常: %s", e)
+                return False
 
     @staticmethod
     async def _ping_gateway(gw_ip: str) -> bool:
