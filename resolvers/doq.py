@@ -458,7 +458,8 @@ if HAS_AIOQUIC:
         def __init__(self, address: str, timeout: float = 15.0,
                      connect_ips: Optional[list] = None, concurrency: int = 100,
                      verify_cert: bool = True,
-                     alpn_versions: Optional[List[str]] = None):
+                     alpn_versions: Optional[List[str]] = None,
+                     ca_path: str = ""):
             super().__init__(address, timeout, concurrency=concurrency)
             raw = address.replace("quic://", "")
             if ":" in raw:
@@ -469,6 +470,7 @@ if HAS_AIOQUIC:
                 self.port = 853
             self._verify_cert = verify_cert
             self._connect_ips = connect_ips or []
+            self._ca_path = ca_path
             self._alpn_versions = alpn_versions or DEFAULT_ALPN_VERSIONS
             self._session_ticket: Optional["SessionTicket"] = None
 
@@ -484,7 +486,7 @@ if HAS_AIOQUIC:
             if not HAS_AIOQUIC:
                 return None
 
-            cache_key = (self.host, alpn, self._verify_cert)
+            cache_key = (self.host, alpn, self._verify_cert, self._ca_path)
             if cache_key in self._config_cache:
                 return self._config_cache[cache_key]
 
@@ -495,6 +497,18 @@ if HAS_AIOQUIC:
                 verify_mode=verify,
                 server_name=self.host,
             )
+            # 自定义 CA 证书包（只信任自定义 CA，不加载系统默认 CA）
+            if self._verify_cert and self._ca_path:
+                try:
+                    config.load_verify_locations(cafile=self._ca_path)
+                    logger.info("DoQ %s: 使用自定义 CA 证书（系统默认 CA 已禁用）: %s",
+                                self.host, self._ca_path)
+                except Exception as e:
+                    logger.critical(
+                        "DoQ %s: 加载自定义 CA 证书失败: %s，系统 CA 不可信，程序退出",
+                        self.host, e,
+                    )
+                    raise SystemExit(1)
             config.max_data = 10_000_000
             config.max_stream_data = 1_000_000
             # 空闲超时设为 60 秒（避免因 _ATTEMPT_TIMEOUT 过短导致连接频繁断开）
@@ -563,7 +577,8 @@ else:
         def __init__(self, address: str, timeout: float = 15.0,
                      connect_ips: Optional[list] = None, concurrency: int = 100,
                      verify_cert: bool = True,
-                     alpn_versions: Optional[List[str]] = None):
+                     alpn_versions: Optional[List[str]] = None,
+                     ca_path: str = ""):
             super().__init__(address, timeout, concurrency=concurrency)
             self.host = address
             self.port = 853

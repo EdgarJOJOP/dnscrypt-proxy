@@ -23,13 +23,15 @@ class DoTResolver(BaseResolver):
     _HAS_ECH = hasattr(ssl, 'ECHClientConfig')
 
     def __init__(self, host: str, port: int = 853, timeout: float = 5.0, connect_ips: Optional[list] = None,
-                 ech_enabled: bool = False, ech_config: bytes = b"", concurrency: int = 100):
+                 ech_enabled: bool = False, ech_config: bytes = b"", concurrency: int = 100,
+                 ca_path: str = ""):
         super().__init__(host, timeout, concurrency=concurrency)
         self.host = host
         self.port = port
         self._connect_ips = connect_ips or []
         self._ech_enabled = ech_enabled
         self._ech_config = ech_config
+        self._ca_path = ca_path
         self._ssl_context = self._create_ssl_context()
         if self._connect_ips:
             logger.info("DoT %s 使用 bootstrap IP: %s", host, ", ".join(self._connect_ips[:4]))
@@ -42,11 +44,36 @@ class DoTResolver(BaseResolver):
             logger.warning("DoT %s ECH 已请求但当前 Python/OpenSSL 不支持", host)
 
     def _create_ssl_context(self) -> ssl.SSLContext:
-        """创建 SSL 上下文并应用 ECH 配置"""
-        ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-        ctx.check_hostname = True
-        ctx.verify_mode = ssl.CERT_REQUIRED
-        ctx.set_ciphers("HIGH:!aNULL:!kRSA:!PSK:!SRP:!MD5:!RC4")
+        """创建 SSL 上下文（CA 证书验证 + 自定义 CA + ECH 配置）
+
+        安全策略：
+        - 如果配置了 ca_path: 创建空 SSL 上下文，**只信任自定义 CA**，完全排除系统默认 CA
+          防御系统 CA 已被入侵的 MITM 场景
+        - 如果未配置 ca_path: 使用系统默认 CA
+        """
+        ciphers = "HIGH:!aNULL:!kRSA:!PSK:!SRP:!MD5:!RC4"
+
+        if self._ca_path:
+            # 自定义 CA 模式：创建空上下文，只加载自定义 CA
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = True
+            ctx.verify_mode = ssl.CERT_REQUIRED
+            ctx.set_ciphers(ciphers)
+            try:
+                ctx.load_verify_locations(self._ca_path)
+                logger.info("DoT %s: 使用自定义 CA 证书（系统默认 CA 已禁用）: %s",
+                            self.host, self._ca_path)
+            except Exception as e:
+                logger.critical(
+                    "DoT %s: 加载自定义 CA 证书失败: %s，系统 CA 不可信，程序退出",
+                    self.host, e,
+                )
+                raise SystemExit(1)
+        else:
+            ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+            ctx.check_hostname = True
+            ctx.verify_mode = ssl.CERT_REQUIRED
+            ctx.set_ciphers(ciphers)
 
         # 真正的 ECH：通过 HTTPS 记录获取的 ECHConfigList 配置到 SSL 上下文
         if self._ech_enabled and self._HAS_ECH and self._ech_config:

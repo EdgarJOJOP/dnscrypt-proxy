@@ -60,13 +60,15 @@ class DoHResolver(BaseResolver):
 
     def __init__(self, url: str, timeout: float = 5.0, ech_enabled: bool = False,
                  connection_pool_size: int = 100, ech_config: bytes = b"",
-                 connect_ips: Optional[List[str]] = None, concurrency: int = 100):
+                 connect_ips: Optional[List[str]] = None, concurrency: int = 100,
+                 ca_path: str = ""):
         super().__init__(url, timeout, concurrency=concurrency)
         self.url = url
         self._ech_enabled = ech_enabled
         self._connection_pool_size = connection_pool_size
         self._ech_config = ech_config
         self._connect_ips = connect_ips or []
+        self._ca_path = ca_path
         self._session: Optional[aiohttp.ClientSession] = None
 
         if self._connect_ips:
@@ -80,14 +82,35 @@ class DoHResolver(BaseResolver):
         elif ech_enabled and not self._HAS_ECH:
             logger.warning("DoH %s ECH 已请求但当前 Python/OpenSSL 不支持", url)
 
-    def _create_ssl_context(self) -> Optional[ssl.SSLContext]:
-        """为 DoH 连接创建 SSL 上下文（应用 ECH 配置）"""
-        if not (self._ech_enabled and self._ech_config):
-            return None  # 使用 aiohttp 默认 SSL 上下文
-        ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-        ctx.check_hostname = True
-        ctx.verify_mode = ssl.CERT_REQUIRED
-        if self._HAS_ECH:
+    def _create_ssl_context(self) -> ssl.SSLContext:
+        """为 DoH 连接创建 SSL 上下文（CA 证书验证 + ECH 配置）
+
+        安全策略：
+        - 如果配置了 ca_path: 创建空 SSL 上下文，**只信任自定义 CA**，完全排除系统默认 CA
+          防御系统 CA 已被入侵的 MITM 场景
+        - 如果未配置 ca_path: 使用系统默认 CA
+        """
+        if self._ca_path:
+            # 自定义 CA 模式：创建空上下文，只加载自定义 CA
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = True
+            ctx.verify_mode = ssl.CERT_REQUIRED
+            try:
+                ctx.load_verify_locations(self._ca_path)
+                logger.info("DoH %s: 使用自定义 CA 证书（系统默认 CA 已禁用）: %s",
+                            self.url, self._ca_path)
+            except Exception as e:
+                logger.critical(
+                    "DoH %s: 加载自定义 CA 证书失败: %s，系统 CA 不可信，程序退出",
+                    self.url, e,
+                )
+                raise SystemExit(1)
+        else:
+            ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+            ctx.check_hostname = True
+            ctx.verify_mode = ssl.CERT_REQUIRED
+
+        if self._ech_enabled and self._ech_config and self._HAS_ECH:
             try:
                 ech_obj = ssl.ECHClientConfig(self._ech_config)
                 ctx.set_ech_config(ech_obj)
@@ -102,7 +125,7 @@ class DoHResolver(BaseResolver):
         return self.url.replace("https://", "").split("/")[0].split(":")[0]
 
     def _get_session(self) -> aiohttp.ClientSession:
-        """获取或创建 HTTP 会话（支持 bootstrap IP 直连）"""
+        """获取或创建 HTTP 会话（支持 bootstrap IP 直连 + 自定义 CA）"""
         if self._session is None or self._session.closed:
             ssl_ctx = self._create_ssl_context()
             pool_size = max(1, self._connection_pool_size)
