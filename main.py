@@ -689,8 +689,54 @@ async def main_async(config_path: Optional[str] = None):
         await app.stop()
 
 
+def _is_admin() -> bool:
+    """检查当前进程是否具有管理员/root 权限"""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            return True  # 无法判断时默认放行
+    else:
+        return os.geteuid() == 0
+
+
+def _elevate():
+    """
+    自动提权：非管理员时重新以管理员/root 身份启动。
+    - Windows: UAC 弹窗
+    - Linux/macOS: sudo 提权
+    """
+    if _is_admin():
+        return
+
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.ShellExecuteW(
+                None, "runas", sys.executable, " ".join(sys.argv), None, 1
+            )
+        except Exception as e:
+            print(f"UAC 提权失败: {e}，继续以当前权限运行")
+            return
+    else:
+        import shlex
+        import subprocess
+        cmd = ["sudo", sys.executable] + sys.argv
+        try:
+            subprocess.run(cmd, check=True)
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            print(f"sudo 提权失败: {e}，继续以当前权限运行")
+            return
+
+    sys.exit()
+
+
 def main():
     """主入口"""
+    # 自动提权：ARP 防护模块需要管理员/root 权限执行 netsh/iptables 等命令
+    _elevate()
+
     config_path = os.environ.get("DNS_PROXY_CONFIG")
     if not config_path:
         config_path = str(PROJECT_ROOT / "config.yaml")
