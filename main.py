@@ -570,9 +570,11 @@ class DNSProxyApp:
         logger.info("  - DNSSEC:     %s (mode=%s)",
                      "启用" if self.config.dnssec_enabled else "禁用",
                      self.config.dnssec_mode)
-        logger.info("  - 网络监控:   %s (ping间隔=%ds)",
+        nm_cfg = self.config.get_raw().get("network_monitor", {})
+        logger.info("  - 网络监控:   %s (网关检测=%gs, 外网检测=%ds)",
                      "启用" if self.config.network_monitor_enabled else "禁用",
-                     self.config.get_raw().get("network_monitor", {}).get("ping_interval", 15))
+                     nm_cfg.get("ping_interval", 0.01),
+                     nm_cfg.get("external_interval", 15))
         logger.info("  - 过滤规则:   %d 条", self.filter_engine.stats["total_rules"] if self.config.filter_enabled else 0)
         logger.info("=" * 60)
 

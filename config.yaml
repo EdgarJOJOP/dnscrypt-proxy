@@ -200,7 +200,8 @@ tls:
 # ============================================================
 network_monitor:
   enabled: true
-  ping_interval: 15        # 检测间隔（秒）
+  ping_interval: 0.01       # 网关检测间隔（秒，0.01 = 10ms）
+  external_interval: 15     # 外网 ping/DNS 探测间隔（秒）
   ping_timeout: 1          # ping 超时（秒）
   # ICMP ping 检测目标（IPv4 + IPv6 双栈）
   ping_targets_v4:

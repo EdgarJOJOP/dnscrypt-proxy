@@ -43,10 +43,15 @@ class NetworkMonitor:
         self._consecutive_failures = 0  # 连续检测失败次数
         self._last_recovery_time = 0.0  # 上次恢复时间戳
 
+        # ARP 防护锁（防止 10ms 间隔下并发执行 refresh_router_arp）
+        self._arp_busy = False
+
         # 从配置读取
         nm = config.get_raw().get("network_monitor", {})
         self._enabled = nm.get("enabled", True)
-        self._interval = nm.get("ping_interval", 15)  # 检测间隔（秒）
+        self._interval = nm.get("ping_interval", 0.01)  # 网关检测间隔（秒，默认 10ms）
+        self._external_interval = nm.get("external_interval", 15)  # 外网检测间隔（秒）
+        self._next_external_check = 0.0  # 下次外网检测时间戳
         self._ping_timeout = nm.get("ping_timeout", 5)  # ping 超时（秒）
         self._ping_targets_v4 = nm.get("ping_targets_v4", ["223.5.5.5", "114.114.114.114"])
         self._ping_targets_v6 = nm.get("ping_targets_v6", ["2400:3200::1", "2400:da00::6666"])
@@ -78,8 +83,8 @@ class NetworkMonitor:
             return
         self._running = True
         self._task = asyncio.create_task(self._monitor_loop())
-        logger.info("网络连通性监控已启动 (间隔=%ds, ping目标=%s)",
-                     self._interval, self._ping_targets_v4 + self._ping_targets_v6)
+        logger.info("网络连通性监控已启动 (网关检测=%gs, 外网检测=%ds, ping目标=%s)",
+                     self._interval, self._external_interval, self._ping_targets_v4 + self._ping_targets_v6)
 
         # ARP 防护：自动探测网关（手动配置了 IP+MAC 则跳过）
         if self._arp_protection.enabled and not self._arp_protection.is_manual:
@@ -99,61 +104,74 @@ class NetworkMonitor:
     # ======================== 主循环 ========================
 
     async def _monitor_loop(self):
-        """监控主循环"""
+        """
+        监控主循环（双速检测）：
+        - 网关 ping：10ms 间隔，快速发现 ARP 投毒
+        - 外网 ping + DNS 探测：15s 间隔，判断整体连通性
+        """
         while self._running:
             try:
-                healthy = await self._check_connectivity()
+                now = asyncio.get_event_loop().time()
 
-                # ARP 防护：检测到故障时检查本地网卡状态
-                # 如果网卡有 IP/子网掩码/网关（配置正常），说明问题可能在路由器 ARP 表
-                # 此时发送流量到网关以触发路由器更新 ARP 表
-                if not healthy and self._arp_protection.enabled and self._arp_protection.gateway_ip \
-                        and not self._arp_protection.is_manual:
+                # ========== 1. 快速网关检测（10ms） ==========
+                gw_ok = True
+                gw_ip = self._arp_protection.gateway_ip
+                if gw_ip:
+                    gw_ok = await self._arp_protection._ping_gateway(gw_ip)
+
+                # ARP 防护：网关不通时尝试刷新
+                if not gw_ok and self._arp_protection.enabled \
+                        and not self._arp_protection.is_manual and not self._arp_busy:
                     iface_ok, iface_details = await self._arp_protection.check_interface_healthy()
                     if iface_ok:
-                        logger.debug("网络检测失败，本地网卡正常 (%s)，尝试刷新路由器 ARP ...",
-                                     iface_details)
-                        if await self._arp_protection.refresh_router_arp():
-                            # 刷新后重新检测连通性
-                            healthy = await self._check_connectivity()
-                            if healthy:
-                                logger.info("ARP 防护: 路由器 ARP 刷新后网络已恢复")
+                        logger.warning("ARP 防护: 网关 ping 失败，本地网卡正常 (%s)，"
+                                     "尝试刷新路由器 ARP ...", iface_details)
+                        self._arp_busy = True
+                        try:
+                            if await self._arp_protection.refresh_router_arp():
+                                # ARP 恢复后重新检查
+                                if await self._arp_protection._ping_gateway(gw_ip):
+                                    logger.info("ARP 防护: 路由器 ARP 刷新后网关已恢复")
+                                    gw_ok = True
+                        finally:
+                            self._arp_busy = False
                     else:
-                        logger.debug("网络检测失败，本地网卡异常 (%s)，不尝试 ARP 刷新",
-                                     iface_details)
+                        logger.warning("ARP 防护: 网关 ping 失败，本地网卡异常 (%s)"
+                                     "，不尝试 ARP 刷新", iface_details)
 
-                if healthy:
-                    self._consecutive_failures = 0
-                    if self._degraded:
-                        # 降级模式：需要连续成功 recovery_check_count 次才算恢复
-                        self._recovery_successes += 1
-                        if self._recovery_successes >= self._recovery_check_count:
-                            logger.info("网络已恢复（连续 %d 次检测成功），开始恢复上游...",
-                                         self._recovery_successes)
-                            await self._recover()
+                # ========== 2. 外网连通性检测（15s） ==========
+                if now >= self._next_external_check:
+                    self._next_external_check = now + self._external_interval
+                    ext_ok = await self._check_connectivity()
+
+                    if ext_ok:
+                        self._consecutive_failures = 0
+                        if self._degraded:
+                            self._recovery_successes += 1
+                            if self._recovery_successes >= self._recovery_check_count:
+                                logger.info("网络已恢复（连续 %d 次外网检测成功），开始恢复上游...",
+                                             self._recovery_successes)
+                                await self._recover()
+                                self._recovery_successes = 0
+                        else:
                             self._recovery_successes = 0
                     else:
+                        self._consecutive_failures += 1
                         self._recovery_successes = 0
-                else:
-                    self._consecutive_failures += 1
-                    self._recovery_successes = 0
-                    if not self._degraded and self._consecutive_failures >= self._failure_threshold:
-                        self._degraded = True
-                        logger.warning("网络连通性异常（连续 %d 次检测失败），进入降级模式",
-                                        self._consecutive_failures)
+                        if not self._degraded \
+                                and self._consecutive_failures >= self._failure_threshold:
+                            self._degraded = True
+                            logger.warning("外网连通性异常（连续 %d 次检测失败），进入降级模式",
+                                            self._consecutive_failures)
 
-                # 降级模式下每秒检测一次，尽快发现网络恢复
-                # 正常模式下使用配置的间隔
-                if self._degraded:
-                    await asyncio.sleep(1)
-                else:
-                    await asyncio.sleep(self._interval)
+                # 快速间隔
+                await asyncio.sleep(self._interval)
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error("网络监控异常: %s", e)
-                await asyncio.sleep(10)
+                await asyncio.sleep(0.1)
 
     # ======================== 连通性检测 ========================
 
@@ -177,7 +195,7 @@ class NetworkMonitor:
                          successes, results[0], results[1], results[2])
             return True
         else:
-            logger.debug("网络连通性检测: 全部失败")
+            logger.info("网络连通性检测: 全部失败")
             return False
 
     async def _ping_check_v4(self) -> bool:
