@@ -61,8 +61,7 @@ class DoTResolver(BaseResolver):
             ctx.set_ciphers(ciphers)
             try:
                 ctx.load_verify_locations(self._ca_path)
-                logger.info("DoT %s: 使用自定义 CA 证书（系统默认 CA 已禁用）: %s",
-                            self.host, self._ca_path)
+                logger.info("DoT %s: 使用自定义 CA 证书（系统默认 CA 已禁用）", self.host)
             except Exception as e:
                 logger.critical(
                     "DoT %s: 加载自定义 CA 证书失败: %s，系统 CA 不可信，程序退出",

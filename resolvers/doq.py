@@ -501,8 +501,7 @@ if HAS_AIOQUIC:
             if self._verify_cert and self._ca_path:
                 try:
                     config.load_verify_locations(cafile=self._ca_path)
-                    logger.info("DoQ %s: 使用自定义 CA 证书（系统默认 CA 已禁用）: %s",
-                                self.host, self._ca_path)
+                    logger.info("DoQ %s: 使用自定义 CA 证书（系统默认 CA 已禁用）", self.host)
                 except Exception as e:
                     logger.critical(
                         "DoQ %s: 加载自定义 CA 证书失败: %s，系统 CA 不可信，程序退出",

@@ -97,8 +97,7 @@ class DoHResolver(BaseResolver):
             ctx.verify_mode = ssl.CERT_REQUIRED
             try:
                 ctx.load_verify_locations(self._ca_path)
-                logger.info("DoH %s: 使用自定义 CA 证书（系统默认 CA 已禁用）: %s",
-                            self.url, self._ca_path)
+                logger.info("DoH %s: 使用自定义 CA 证书（系统默认 CA 已禁用）", self.url)
             except Exception as e:
                 logger.critical(
                     "DoH %s: 加载自定义 CA 证书失败: %s，系统 CA 不可信，程序退出",
