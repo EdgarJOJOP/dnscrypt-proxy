@@ -168,7 +168,7 @@ class Config:
             },
             "network_monitor": {
                 "enabled": True,
-                "ping_interval": 0.01,
+                "ping_interval": 0.80,
                 "external_interval": 15,
                 "ping_timeout": 5,
                 "ping_targets_v4": ["223.5.5.5", "114.114.114.114"],
