@@ -3,16 +3,35 @@
 
 # 新功能：
 
-支持ipv4的arp防护避免流量劫持的高危风险(ipv6不用担心)：
+## 1.支持ipv4的arp防护避免流量劫持的高危风险(ipv6不用担心)：
 
-  0. ARP 投毒检测 → 对比本机 ARP 表中网关 MAC 与预期值
-  1. 爆发 ping 网关（10 次）→ 强制路由器更新本机 IP-MAC
-  2. 爆发 GARP 广播（20 次 ping 广播地址）→ 全子网饱和宣告本机 IP-MAC
-  3. 丢包模式分析 + IP 冲突检测
-    - 丢包 ~50% → IP 冲突（攻击者使用相同静态 IP）→ 自动 IP +1
-    - 丢包 ~100% → ARP 投毒（流量被劫持）→ 两阶段 IP 切换
-  4. 验证 ping → 成功则设静态 ARP + 持续 GARP 对抗
-  5. 以上都失败 → 两阶段 IP 切换抗 ARP 中毒
+    0. ARP 投毒检测 → 对比本机 ARP 表中网关 MAC 与预期值
+    1. 爆发 ping 网关（10 次）→ 强制路由器更新本机 IP-MAC
+    2. 爆发 GARP 广播（20 次 ping 广播地址）→ 全子网饱和宣告本机 IP-MAC
+    3. 丢包模式分析 + IP 冲突检测
+      - 丢包 ~50% → IP 冲突（攻击者使用相同静态 IP）→ 自动 IP +1
+      - 丢包 ~100% → ARP 投毒（流量被劫持）→ 两阶段 IP 切换
+    4. 验证 ping → 成功则设静态 ARP + 持续 GARP 对抗
+    5. 以上都失败 → 两阶段 IP 切换抗 ARP 中毒
+
+## 2.支持config.yaml自定义根目录证书集验证上游加密dns是否可靠：
+
+      根目录证书集下载链接: https://curl.se/ca/cacert.pem
+
+      这是 Mozilla 维护的 CA 证书包，由 curl 项目打包提供，不依赖 Windows和linux系统存储。
+      
+      config.yaml：
+      
+      `tls:
+            ca_path: "D:/dns/certs/cacert.pem"  # 只信任此 CA，系统 CA 被完全禁用
+      `
+      自己只设置自己搭建的上游服务器就只导入你公共 CA签发的(阿里云/腾讯云/华为云)的证书(不要密钥).
+
+      证书扎订(Certificate Pinning)也是一样，程序将只信任这张证书，连 CA 都不需要信任:
+      
+      示例：
+      
+      `openssl s_client -connect dns.alidns.com:443 -servername dns.alidns.com </dev/null | openssl x509 -outform PEM > alidns-cert.pem`
  
 # 1. 安装库
 
