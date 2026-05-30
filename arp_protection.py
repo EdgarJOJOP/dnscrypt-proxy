@@ -347,7 +347,12 @@ class ARPProtection:
                         break
 
                 if not current_name:
+                    # 诊断未知名称格式的段
+                    if lines and "适配器" in lines[0] or "adapter" in lines[0].lower():
+                        logger.info("ARP 防护: ipconfig 未知适配器格式: %s", lines[0].strip()[:80])
                     continue
+                else:
+                    logger.info("ARP 防护: ipconfig 解析到适配器: '%s'", current_name)
 
                 # 扫描本段中的所有 IPv4 地址
                 section_ipv4 = None
@@ -369,6 +374,11 @@ class ARPProtection:
                                 section_mask = mask
                                 break
 
+                # 诊断：记录每个段解析到的 IPv4
+                if section_ipv4:
+                    logger.info("ARP 防护: ipconfig 段 '%s' -> IPv4=%s, mask=%s (目标 iface_ip=%s)",
+                                 current_name, section_ipv4, section_mask, iface_ip)
+
                 # 检查 IPv4 是否匹配路由表中的接口 IP
                 if section_ipv4 and section_ipv4 == iface_ip:
                     interface_name = current_name
@@ -379,6 +389,17 @@ class ARPProtection:
         # 3. 如果 ipconfig 没找到匹配（罕见情况），用 route 的信息兜底
         if not local_ipv4:
             local_ipv4 = iface_ip
+            logger.warning("ARP 防护: ipconfig 未找到匹配的网卡段 "
+                           "(iface_ip=%s, 共解析 %d 个适配器段)",
+                           iface_ip, len(raw_sections) if text else 0)
+
+        # 如果通过 ipconfig 没解析到网卡名，通过 netsh 补充
+        if not interface_name:
+            logger.info("ARP 防护: 通过 netsh show interfaces 补充网卡名...")
+            netsh_info = await self._resolve_interface_netsh()
+            if netsh_info:
+                interface_name = netsh_info[0]
+                logger.info("ARP 防护: netsh 补充网卡名: '%s'", interface_name)
 
         result = {
             "gateway_ip": gateway_ip,
@@ -388,6 +409,9 @@ class ARPProtection:
             "metric": metric,
             "all_gateways": all_gateways,
         }
+        if not interface_name:
+            logger.warning("ARP 防护: 未能获取网卡名，使用 IP %s 作为接口标识",
+                           result["interface_name"])
         return result
 
     async def _resolve_interface_linux(self) -> Optional[dict]:
@@ -1148,12 +1172,17 @@ class ARPProtection:
         持续 GARP 对抗：在恢复后继续发送 GARP 广播，防止攻击者立即重投毒。
         每次循环：GARP 小爆发 + ping 验证。
 
+        检测到攻击者重投毒时自动延长对抗时间（每次 +5s），
+        攻击不停就不停，最长不超过 max_duration 秒。
+
         Args:
             gw_ip: 网关 IP（用于 ping 验证）
-            duration: 持续秒数
+            duration: 初始持续秒数
             interval: 每轮间隔（秒）
         """
-        end_time = asyncio.get_event_loop().time() + duration
+        start_time = asyncio.get_event_loop().time()
+        end_time = start_time + duration
+        max_end = start_time + 60  # 绝对上限 60 秒
         rounds = 0
         while asyncio.get_event_loop().time() < end_time:
             rounds += 1
@@ -1161,15 +1190,22 @@ class ARPProtection:
             # 快速验证网关是否仍可达
             if not await self._ping_gateway(gw_ip):
                 remain = end_time - asyncio.get_event_loop().time()
+                now = asyncio.get_event_loop().time()
                 logger.warning("ARP 防护: 持续 GARP 对抗中检测到网关再次不可达"
-                               "(第 %d 轮, 剩余 %.1fs), 立即爆发覆盖...",
+                               "(第 %d 轮, 剩余 %.1fs), 延长对抗时间...",
                                rounds, remain)
-                # 立即再爆发一次覆盖
+                # 立即爆发覆盖
                 await self._garp_broadcast_burst(count=10)
                 await self._ping_gateway(gw_ip)
-                # 继续撑到结束
+                # 延长 5 秒（但不超过绝对上限）
+                new_end = end_time + 5
+                if new_end <= max_end:
+                    end_time = new_end
+                    logger.warning("ARP 防护: 对抗已延长至 %.0fs（攻击者持续重投毒）",
+                                   end_time - start_time)
             await asyncio.sleep(interval)
-        logger.info("ARP 防护: 持续 GARP 对抗结束（共 %d 轮）", rounds)
+        total = asyncio.get_event_loop().time() - start_time
+        logger.info("ARP 防护: 持续 GARP 对抗结束（共 %d 轮, 耗时 %.0fs）", rounds, total)
 
     async def _switch_ip(self, new_ip: str) -> bool:
         """
@@ -1345,6 +1381,62 @@ class ARPProtection:
             return current_mac.upper()  # 能 ping 通 → 换了路由器
         return None  # ping 不通 → 可能是投毒，不是换路由器
 
+    async def _resolve_interface_netsh(self) -> Optional[Tuple[str, int]]:
+        """
+        通过 netsh interface ipv4 show interfaces 获取网卡 (名称, 索引)。
+        返回 (interface_name, interface_idx) 或 None。
+        跳过 Loopback 接口，取第一个 connected 的非回环接口。
+
+        输出格式：
+          Idx  Met   MTU   状态         名称
+           1   75  1500   connected    以太网
+          14   25  1500   connected    Loopback Pseudo-Interface 1  ← 名称含空格
+           列序: Idx, Met, MTU, State, Name...
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "netsh", "interface", "ipv4", "show", "interfaces",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+            text = stdout.decode("utf-8", errors="replace")
+            logger.info("ARP 防护: netsh show interfaces 原始输出:\n%s", text)
+
+            interfaces = []
+            for line in text.splitlines():
+                line = line.strip()
+                if not line or line.startswith("-"):
+                    continue
+                parts = line.split()
+                if len(parts) < 5:  # 最少需要 Idx, Met, MTU, State, Name
+                    continue
+                try:
+                    idx = int(parts[0])
+                except ValueError:
+                    continue
+                # 名称 = 第5列到行尾（可能包含空格）
+                iface_name = " ".join(parts[4:])
+                status = parts[3]
+                interfaces.append((iface_name, idx, status))
+
+            if interfaces:
+                logger.info("ARP 防护: netsh 解析到 %d 个接口: %s",
+                             len(interfaces),
+                             [(n, i, s) for n, i, s in interfaces])
+                # 选择第一个 connected 且非 Loopback 的接口
+                for name, idx, status in interfaces:
+                    if status.lower() == "connected" and "loopback" not in name.lower():
+                        logger.info("ARP 防护: 选择网卡 '%s' (idx=%d)", name, idx)
+                        return (name, idx)
+                # 没有符合条件的，回退到第一个
+                logger.warning("ARP 防护: 无 connected 非回环接口，回退到第一个")
+                return (interfaces[0][0], interfaces[0][1])
+            return None
+        except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
+            logger.warning("ARP 防护: netsh show interfaces 异常: %s", e)
+            return None
+
     async def _protect_gateway_arp(self) -> bool:
         """
         为网关添加静态 ARP 条目，防止本机 ARP 缓存被投毒。
@@ -1379,10 +1471,18 @@ class ARPProtection:
         # 标准化 MAC 格式
         if sys.platform == "win32":
             mac_fmt = gw_mac.replace(":", "-")
+            logger.info("ARP 防护: 准备 netsh — iface='%s', gw_ip=%s, mac=%s",
+                         iface, gw_ip, gw_mac)
+
+            # === 主方案：使用 name= address= neighbor= 参数格式 ===
+            # 实测 Windows 11 中文版需要命名参数格式才能成功
+            named_args = [
+                "netsh", "interface", "ipv4", "set", "neighbors",
+                f"name={iface}", f"address={gw_ip}", f"neighbor={mac_fmt}",
+            ]
             try:
                 proc = await asyncio.create_subprocess_exec(
-                    "netsh", "interface", "ipv4", "set", "neighbors",
-                    iface, gw_ip, mac_fmt,
+                    *named_args,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
@@ -1391,13 +1491,59 @@ class ARPProtection:
                     logger.info("ARP 防护: ✓ 静态 ARP 已绑定 %s (%s → %s)",
                                  gw_ip, iface, gw_mac)
                     return True
-                out_text = stdout.decode("utf-8", errors="replace").strip()
                 err_text = stderr.decode("utf-8", errors="replace").strip()
+                out_text = stdout.decode("utf-8", errors="replace").strip()
                 detail = err_text or out_text or "(空 — 可能需要管理员权限)"
-                logger.warning("ARP 防护: netsh set neighbors 失败: %s", detail)
+                logger.warning("ARP 防护: netsh 命名参数格式失败: %s", detail)
+
+                # === 尝试用接口索引 ===
+                logger.info("ARP 防护: 尝试通过 netsh show interfaces 获取接口索引...")
+                netsh_info = await self._resolve_interface_netsh()
+                if netsh_info:
+                    netsh_name, netsh_idx = netsh_info
+                    logger.warning("ARP 防护: netsh 返回: name='%s', idx=%d",
+                                    netsh_name, netsh_idx)
+                    # 用索引 + 命名参数
+                    proc2 = await asyncio.create_subprocess_exec(
+                        "netsh", "interface", "ipv4", "set", "neighbors",
+                        f"name={netsh_idx}", f"address={gw_ip}", f"neighbor={mac_fmt}",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    sout2, serr2 = await asyncio.wait_for(proc2.communicate(), timeout=10)
+                    if proc2.returncode == 0:
+                        logger.info("ARP 防护: ✓ 静态 ARP 已绑定(索引) %s (idx=%d → %s)",
+                                     gw_ip, netsh_idx, gw_mac)
+                        if netsh_name and netsh_name.upper() != iface.upper():
+                            self._interface_name = netsh_name
+                        return True
+                    err2 = serr2.decode("utf-8", errors="replace").strip() or sout2.decode("utf-8", errors="replace").strip() or "(空)"
+                    logger.warning("ARP 防护: netsh 索引也失败: %s", err2)
+
+                    # 用 netsh 的名称重试
+                    if netsh_name and netsh_name.upper() != iface.upper():
+                        logger.warning("ARP 防护: 尝试用 netsh 名称 '%s' 重试...", netsh_name)
+                        self._interface_name = netsh_name
+                        return await self._protect_gateway_arp()
+
+                # === 后备方案：传统位置参数 ===
+                logger.info("ARP 防护: 尝试传统位置参数格式...")
+                proc3 = await asyncio.create_subprocess_exec(
+                    "netsh", "interface", "ipv4", "set", "neighbors",
+                    self._interface_name, gw_ip, mac_fmt,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                sout3, serr3 = await asyncio.wait_for(proc3.communicate(), timeout=10)
+                if proc3.returncode == 0:
+                    logger.info("ARP 防护: ✓ 静态 ARP 已绑定(位置参数) %s (%s → %s)",
+                                 gw_ip, self._interface_name, gw_mac)
+                    return True
+                err3 = serr3.decode("utf-8", errors="replace").strip() or sout3.decode("utf-8", errors="replace").strip() or "(空)"
+                logger.warning("ARP 防护: netsh 位置参数也失败: %s", err3)
                 return False
             except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
-                logger.warning("ARP 防护: netsh set neighbors 异常: %s", e)
+                logger.warning("ARP 防护: netsh 异常: %s", e)
                 return False
         else:
             mac_fmt = gw_mac.replace("-", ":")
