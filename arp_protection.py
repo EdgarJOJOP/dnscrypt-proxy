@@ -783,6 +783,40 @@ class ARPProtection:
             pass
         return None
 
+    async def _detect_packet_loss_pattern(self, gw_ip: str, count: int = 10) -> dict:
+        """
+        连续 ping 网关多次，通过丢包率判断网络异常类型。
+
+        IP 冲突特征：两个设备抢同一个 IP，路由器在两个 MAC 间摇摆，
+                    约 40%-70% 的包能到达本机（另一半去了攻击者）。
+
+        ARP 投毒特征：流量完全被劫持到攻击者 MAC，几乎 100% 丢包。
+
+        网络拥塞特征：低丢包率（<10%），但延迟高。
+
+        Returns:
+            {"loss_rate": float, "success": int, "total": int, "diagnosis": str}
+            diagnosis: "ip_conflict" | "arp_poisoning" | "network_down" | "normal"
+        """
+        success = 0
+        for _ in range(count):
+            if await self._ping_gateway(gw_ip):
+                success += 1
+            await asyncio.sleep(0.05)
+
+        loss_rate = (count - success) / count
+        if loss_rate >= 0.90:
+            if success == 0:
+                diagnosis = "network_down"
+            else:
+                diagnosis = "arp_poisoning"
+        elif loss_rate >= 0.25:
+            diagnosis = "ip_conflict"
+        else:
+            diagnosis = "normal"
+
+        return {"loss_rate": loss_rate, "success": success, "total": count, "diagnosis": diagnosis}
+
     @staticmethod
     def _increment_ip(ip: str, subnet_mask: Optional[str] = None,
                       offset: int = 1) -> Optional[str]:
@@ -993,11 +1027,15 @@ class ARPProtection:
         """
         针对路由器 ARP 表被篡改或 IP 冲突的高级修复策略：
 
-        1. ARP 投毒检测 → 对比本机 ARP 表中网关 MAC 与预期值
-        2. 爆发 ping 网关（10 次，10ms 间隔）→ 强制路由器更新本机 IP-MAC
-        3. 爆发 GARP 广播（20 次 ping 广播地址）→ 全子网饱和宣告本机 IP-MAC
-        4. 检测 IP 冲突 → 如发现冲突，自动 IP +1（子网掩码和网关不变）
-        5. 如果以上都失败 → 两阶段 IP 切换抗 ARP 中毒
+        步骤:
+          0. ARP 投毒检测 → 对比本机 ARP 表中网关 MAC 与预期值
+          1. 爆发 ping 网关（10 次，10ms 间隔）→ 强制路由器更新本机 IP-MAC
+          2. 爆发 GARP 广播（20 次 ping 广播地址）→ 全子网饱和宣告本机 IP-MAC
+          3. 丢包模式分析 + IP 冲突检测
+             - 丢包 ~50% → IP 冲突（攻击者使用相同静态 IP）→ 自动 IP +1
+             - 丢包 ~100% → ARP 投毒（流量被劫持）→ 两阶段 IP 切换
+          4. 验证 ping → 成功则设静态 ARP + 持续 GARP 对抗
+          5. 以上都失败 → 两阶段 IP 切换抗 ARP 中毒
         """
         gw_ip = self.gateway_ip
         if not gw_ip:
@@ -1026,25 +1064,45 @@ class ARPProtection:
             await self._ping_gateway(gw_ip)
             await asyncio.sleep(0.01)
 
-        # 2. 爆发 GARP 广播（20 次 ping 广播地址）
+        # 2. 丢包模式分析：通过连续 ping 判断是 IP 冲突还是 ARP 投毒
+        loss_info = await self._detect_packet_loss_pattern(gw_ip, count=10)
+        if loss_info["diagnosis"] == "ip_conflict":
+            loss_pct = round(loss_info["loss_rate"] * 100)
+            logger.warning("ARP 防护: 网关丢包 %d%% (%d/%d), "
+                           "诊断=IP冲突(攻击者使用相同静态IP)",
+                           loss_pct, loss_info["success"], loss_info["total"])
+        elif loss_info["diagnosis"] == "arp_poisoning":
+            loss_pct = round(loss_info["loss_rate"] * 100)
+            logger.warning("ARP 防护: 网关丢包 %d%% (%d/%d), "
+                           "诊断=ARP投毒(流量被劫持到攻击者)",
+                           loss_pct, loss_info["success"], loss_info["total"])
+        elif loss_info["diagnosis"] == "network_down":
+            logger.warning("ARP 防护: 网关完全不可达，诊断=网络断开")
+
+        # 3. 爆发 GARP 广播（20 次 ping 广播地址）
         #    饱和式宣告本机 IP-MAC，覆盖攻击者的伪造 ARP 条目
         await self._garp_broadcast_burst(count=20)
 
-        # 3. 检测 IP 冲突
+        # 4. IP 冲突检测 + 自动修复
+        #    丢包 ~50% 说明有设备用相同静态 IP，即使 ARP 表没显示也要处理
         conflict = await self._detect_ip_conflict()
-        if conflict:
-            logger.warning("ARP 防护: %s", conflict)
-            self._arp_attack_logged = True
-            if sys.platform == "win32":
-                if await self._resolve_ip_conflict_windows():
-                    await asyncio.sleep(1.0)
-                    return True
+        if loss_info["diagnosis"] == "ip_conflict" or conflict:
+            if not conflict:
+                logger.warning("ARP 防护: 丢包模式指向 IP 冲突（ARP 表未捕获），"
+                               "尝试自动 IP +1")
             else:
-                if await self._resolve_ip_conflict_linux():
-                    await asyncio.sleep(1.0)
-                    return True
+                logger.warning("ARP 防护: %s", conflict)
+            self._arp_attack_logged = True
+            ip_ok = False
+            if sys.platform == "win32":
+                ip_ok = await self._resolve_ip_conflict_windows()
+            else:
+                ip_ok = await self._resolve_ip_conflict_linux()
+            if ip_ok:
+                await asyncio.sleep(1.0)
+                return True
 
-        # 4. 验证 ping
+        # 5. 验证 ping
         ping_ok = await self._ping_gateway(gw_ip)
         if ping_ok:
             logger.info("ARP 防护: 网关 %s 可达", gw_ip)
@@ -1057,7 +1115,7 @@ class ARPProtection:
                 logger.warning("ARP 防护: 网络已恢复但检测到 ARP 异常，建议检查局域网设备")
             return True
 
-        # 5. 网关仍不可达 → 可能持续 ARP 中毒 → 尝试两阶段 IP 切换抗毒
+        # 6. 网关仍不可达 → 持续 ARP 中毒 → 两阶段 IP 切换抗毒
         logger.warning("ARP 防护: 网关 %s 仍不可达，尝试两阶段 IP 切换抗 ARP 中毒...", gw_ip)
         if await self._garp_ip_switch_defense():
             logger.info("ARP 防护: 两阶段 GARP 切换后网关 %s 可达", gw_ip)
