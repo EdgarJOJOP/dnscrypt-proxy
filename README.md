@@ -47,7 +47,7 @@
 
 # 2. 生成本地DOH服务所需证书(可选)
 
-证书创建命令.txt中的命令在openssl中进行生成(https://slproweb.com/products/Win32OpenSSL.html)，然后：
+证书创建命令.txt中的命令在openssl中进行生成(https://slproweb.com/products/Win32OpenSSL.html )，然后：
 1. 按下 Windows 键 + R，输入 `mmc` 打开 Microsoft 管理控制台。
 2. 在菜单中选择“文件” > “添加/删除管理单元”。
 3. 选择“证书”并点击“添加”。
