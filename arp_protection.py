@@ -324,6 +324,9 @@ class ARPProtection:
         interface_name = None
         local_ipv4 = None
         subnet_mask = None
+        fallback_name = None
+        fallback_ipv4 = None
+        fallback_mask = None
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -400,8 +403,26 @@ class ARPProtection:
                     local_ipv4 = section_ipv4
                     subnet_mask = section_mask or subnet_mask
                     break
+                # 精确匹配失败时，记录第一个有效的非 APIPA 地址作兜底
+                if (
+                    section_ipv4
+                    and ARPProtection._is_valid_ip(section_ipv4)
+                    and not interface_name
+                ):
+                    fallback_name = current_name
+                    fallback_ipv4 = section_ipv4
+                    fallback_mask = section_mask
 
-        # 3. 如果 ipconfig 没找到匹配（罕见情况），用 route 的信息兜底
+        # 3. 精确匹配失败 → 使用兜底（取第一个有效非 APIPA 地址）
+        if not local_ipv4 and fallback_ipv4:
+            interface_name = fallback_name
+            local_ipv4 = fallback_ipv4
+            subnet_mask = fallback_mask or subnet_mask
+            logger.info("ARP 防护: ipconfig 精确匹配失败 (iface_ip=%s)，"
+                         "使用兜底 IPv4=%s, 网卡=%s",
+                         iface_ip, local_ipv4, interface_name)
+
+        # 4. 如果 ipconfig 没找到匹配（罕见情况），用 route 的信息兜底
         if not local_ipv4:
             local_ipv4 = iface_ip
             logger.warning("ARP 防护: ipconfig 未找到匹配的网卡段 "
@@ -1439,6 +1460,7 @@ class ARPProtection:
                                        "无错误输出，可能需要管理员权限运行",
                                        proc.returncode)
                     return False
+                self._local_ipv4 = new_ip  # 切换成功后更新本机 IP
                 return True
             except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
                 logger.warning("ARP 防护: netsh 切换 IP 异常: %s", e)
@@ -1476,6 +1498,7 @@ class ARPProtection:
                         stdout=asyncio.subprocess.DEVNULL,
                         stderr=asyncio.subprocess.DEVNULL,
                     )
+                self._local_ipv4 = new_ip  # 切换成功后更新本机 IP
                 return True
             except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
                 logger.warning("ARP 防护: ip addr 切换 IP 异常: %s", e)
@@ -2020,24 +2043,49 @@ class ARPProtection:
 
     @staticmethod
     async def _ping_icmp(ip: str, timeout_ms: int) -> bool:
-        """底层 ICMP Echo 实现（绕过了进程，没有子进程开销）"""
+        """
+        底层 ICMP Echo 实现。
+        ICMP 失败时自动尝试 TCP 连接兜底（端口 80/443），
+        防止因防火墙阻止 ping.exe 导致的误判。
+        """
         if sys.platform == "win32":
-            return await ARPProtection._ping_icmp_windows(ip, timeout_ms)
+            ok = await ARPProtection._ping_icmp_windows(ip, timeout_ms)
         else:
-            return await ARPProtection._ping_icmp_linux(ip, timeout_ms)
+            ok = await ARPProtection._ping_icmp_linux(ip, timeout_ms)
+        if ok:
+            return True
+        # ICMP 失败 → TCP 兜底：尝试连接常见端口
+        return await ARPProtection._ping_tcp(ip, timeout_ms=3000)
+
+    @staticmethod
+    async def _ping_tcp(ip: str, timeout_ms: int = 3000) -> bool:
+        """TCP 连接检测：尝试连接目标 IP 的 80 和 443 端口"""
+        for port in (443, 80):
+            try:
+                _, writer = await asyncio.wait_for(
+                    asyncio.open_connection(ip, port),
+                    timeout=min(timeout_ms / 1000, 3.0),
+                )
+                writer.close()
+                await writer.wait_closed()
+                return True
+            except (asyncio.TimeoutError, OSError, ConnectionError):
+                continue
+        return False
 
     @staticmethod
     async def _ping_icmp_windows(ip: str, timeout_ms: int) -> bool:
-        """Windows ICMP Echo：直接跑 ping.exe，-w 参数控制内部超时，进程本身按时退出"""
+        """Windows ICMP Echo：跑 ping.exe，带超时安全包装"""
         try:
             proc = await asyncio.create_subprocess_exec(
                 "ping", "-n", "1", "-w", str(timeout_ms), ip,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            await proc.wait()
+            # 总超时 = ping 内部超时 + 5s 余量，防止 ping.exe 异常挂起
+            await asyncio.wait_for(proc.wait(), timeout=(timeout_ms / 1000) + 5)
             return proc.returncode == 0
-        except FileNotFoundError:
+        except (asyncio.TimeoutError, FileNotFoundError):
             return False
 
     @staticmethod

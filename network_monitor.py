@@ -136,8 +136,26 @@ class NetworkMonitor:
                         finally:
                             self._arp_busy = False
                     else:
-                        logger.warning("ARP 防护: 网关 ping 失败，本地网卡异常 (%s)"
-                                     "，不尝试 ARP 刷新", iface_details)
+                        # 接口检查返回异常，可能因 ipconfig/route 解析失败导致误判
+                        # 用 TCP 连接网关兜底验证
+                        tcp_ok = False
+                        if gw_ip:
+                            tcp_ok = await self._arp_protection._ping_tcp(gw_ip)
+                        if tcp_ok:
+                            logger.warning("ARP 防护: 网关 ping 失败，接口检查异常 (%s)"
+                                         "，但 TCP 连接网关可达，继续尝试 ARP 刷新",
+                                         iface_details)
+                            self._arp_busy = True
+                            try:
+                                if await self._arp_protection.refresh_router_arp():
+                                    if await self._arp_protection._ping_gateway(gw_ip):
+                                        logger.info("ARP 防护: 路由器 ARP 刷新后网关已恢复")
+                                        gw_ok = True
+                            finally:
+                                self._arp_busy = False
+                        else:
+                            logger.warning("ARP 防护: 网关 ping 失败，本地网卡异常 (%s)"
+                                         "，不尝试 ARP 刷新", iface_details)
 
                 # ========== 2. 外网连通性检测（15s） ==========
                 if now >= self._next_external_check:
