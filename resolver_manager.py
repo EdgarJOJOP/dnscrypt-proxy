@@ -9,7 +9,10 @@
 import asyncio
 import collections
 import logging
+import os
 import time
+import tempfile
+import atexit
 from typing import List, Optional, Dict, Any
 
 import dns.message
@@ -370,12 +373,20 @@ class ResolverManager:
         )
         # CA 证书路径：配置 > certifi > None（用于所有 DoH/DoT/DoQ 解析器的证书验证）
         ca_path = self.config.openssl4_ca_path or None
+        custom_ca = bool(self.config.openssl4_ca_path)  # 用户显式配置了 ca_path
         if ca_path is None:
             try:
                 import certifi
                 ca_path = certifi.where()
             except ImportError:
                 pass
+
+        # 自定义 CA 模式时，自动将本地服务器证书加入信任链
+        # 这样自签名的本地 DoH/DoT/DoQ 证书也能被代理信任
+        if custom_ca:
+            merged = self._merge_local_server_certs(ca_path)
+            if merged:
+                ca_path = merged
 
         # DoH
         for url in self.config.doh_servers:
@@ -445,6 +456,65 @@ class ResolverManager:
                                    concurrency=self.config.connection_pool_size,
                                    ca_path=ca_path or "")
             self._upstream_servers.append(UpstreamServer(resolver, "doq"))
+
+    def _merge_local_server_certs(self, base_ca_path: str) -> Optional[str]:
+        """
+        将本地 DoH/DoT/DoQ 服务器的自签名证书合并到 CA 信任链。
+
+        当用户配置了 tls.ca_path（自定义 CA 模式）时调用。
+        读取本地服务器 cert_path 文件中的 PEM 证书，
+        与 base_ca_path 合并写入临时文件，返回临时文件路径。
+
+        Returns:
+            合并后的临时 PEM 文件路径，失败返回 None
+        """
+        extra_certs = []
+
+        # DoH 默认启用，只要证书文件存在就加入
+        doh = self.config.doh_cert_path
+        if doh and os.path.isfile(doh):
+            extra_certs.append(doh)
+
+        # DoT 启用且证书存在
+        if self.config.local_dot_enabled:
+            dot = self.config.local_dot_cert_path
+            if dot and os.path.isfile(dot):
+                extra_certs.append(dot)
+
+        # DoQ 启用且证书存在
+        if self.config.local_doq_enabled:
+            doq = self.config.local_doq_cert_path
+            if doq and os.path.isfile(doq):
+                extra_certs.append(doq)
+
+        if not extra_certs:
+            return None
+
+        try:
+            with open(base_ca_path, 'r') as f:
+                base_content = f.read()
+        except (OSError, IOError) as e:
+            logger.warning("合并 CA: 读取基础 CA 文件失败: %s", e)
+            return None
+
+        fd, tmp_path = tempfile.mkstemp(suffix='.pem', prefix='dnscrypt_ca_')
+        try:
+            with os.fdopen(fd, 'w') as f:
+                f.write(base_content.rstrip('\n') + '\n\n')
+                for cp in extra_certs:
+                    with open(cp, 'r') as cf:
+                        f.write(cf.read().rstrip('\n') + '\n\n')
+        except Exception as e:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            logger.warning("合并 CA: 写入合并文件失败: %s", e)
+            return None
+
+        atexit.register(lambda p=tmp_path: os.unlink(p) if os.path.exists(p) else None)
+        logger.info("已合并 %d 个本地服务器证书到 CA 信任链", len(extra_certs))
+        return tmp_path
 
     async def resolve(self, query_bytes: bytes) -> Optional[bytes]:
         """
