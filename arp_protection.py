@@ -296,6 +296,10 @@ class ARPProtection:
                     gw = parts[2].strip()
                     if gw and gw != "0.0.0.0" and ":" not in gw:
                         if_ip = parts[3].strip() if len(parts) >= 4 else None
+                        # 校验接口 IP 合法性，防止 netsh 切换 IP 后路由表临时输出垃圾值
+                        if if_ip and not ARPProtection._is_valid_ip(if_ip):
+                            logger.debug("ARP 防护: route print 跳过非法接口 IP '%s'", if_ip)
+                            continue
                         try:
                             met = int(parts[4].strip())
                         except (ValueError, IndexError):
@@ -1758,7 +1762,9 @@ class ARPProtection:
             if len(lines) < 2:
                 continue
 
-            section_has_target = target_ip in section if target_ip else False
+            # target_ip 不是有效 IP 时不按 IP 匹配，只按接口名匹配
+            target_is_valid = target_ip and ARPProtection._is_valid_ip(target_ip)
+            section_has_target = target_ip in section if target_is_valid else False
             name_match = False
             if iface_name and not section_has_target:
                 for line in lines:
