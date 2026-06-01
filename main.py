@@ -529,6 +529,20 @@ class DNSProxyApp:
         if self.config.plain_dns_enabled:
             await self.plain_dns_server.start()
 
+        # 注册 ARP IP 切换后的 TCP 监听器重启钩子
+        # netsh 切换 IP 后 Windows IOCP 会取消所有排队的 AcceptEx 操作，
+        # 导致 TCP 监听 socket 失效（WinError 64），需要显式重启服务器。
+        if self.network_monitor and hasattr(self.network_monitor, '_arp_protection'):
+            ap = self.network_monitor._arp_protection
+            if ap.enabled:
+                ap.register_restart_hook(self.doh_server.restart)
+                if self.config.local_dot_enabled:
+                    ap.register_restart_hook(self.local_dot_server.restart)
+                if self.config.local_doq_enabled:
+                    ap.register_restart_hook(self.local_doq_server.restart)
+                logger.info("  - ARP 防护: 已注册 %d 个 TCP 监听器重启钩子",
+                             len(ap._restart_hooks))
+
         # 启动后台任务
         self._config_reload_task = asyncio.create_task(self._config_reload_loop())
         self._cache_cleanup_task = asyncio.create_task(self._cache_cleanup_loop())

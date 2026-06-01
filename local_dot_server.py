@@ -202,6 +202,11 @@ class LocalDoTServer:
         self._server_v6 = None
         logger.info("本地 DoT 服务器已停止")
 
+    async def restart(self):
+        """重启 DoT 服务器（IP 切换后恢复监听）"""
+        await self.stop()
+        await self.start()
+
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ):

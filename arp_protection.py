@@ -69,6 +69,25 @@ class ARPProtection:
         self._arp_attack_logged = False    # 是否已记录攻击警告（避免重复刷屏）
         self._conflict_resolved = False    # 本周期是否已自动修复 IP 冲突
 
+        # IP 切换后的 TCP 监听器重启钩子（避免 netsh 后 socket 失效）
+        self._restart_hooks: list = []
+
+    def register_restart_hook(self, hook):
+        """注册 IP 切换后的 TCP 监听器重启回调"""
+        if hook not in self._restart_hooks:
+            self._restart_hooks.append(hook)
+
+    async def _fire_restart_hooks(self):
+        """触发所有已注册的 TCP 监听器重启回调"""
+        for hook in self._restart_hooks:
+            try:
+                if asyncio.iscoroutinefunction(hook):
+                    await hook()
+                else:
+                    hook()
+            except Exception as e:
+                logger.warning("ARP 防护: 重启钩子执行异常: %s", e)
+
     @staticmethod
     def _parse_gateway_field(gw_field: str) -> list:
         """
@@ -1613,6 +1632,8 @@ class ARPProtection:
                         break
                     if attempt < 4:
                         await asyncio.sleep(1.0)
+                # IP 切换后 TCP 监听器 socket 可能失效，触发重启
+                await self._fire_restart_hooks()
                 if reachable and self.gateway_mac:
                     await self._protect_gateway_arp()
                 return reachable
@@ -1636,6 +1657,8 @@ class ARPProtection:
                 await asyncio.sleep(1.0)
         if reachable and self.gateway_mac:
             await self._protect_gateway_arp()
+        # IP 切换后 TCP 监听器 socket 可能失效，触发重启
+        await self._fire_restart_hooks()
         return reachable
 
     async def _is_router_changed(self) -> Optional[str]:

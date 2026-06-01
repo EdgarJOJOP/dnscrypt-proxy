@@ -72,6 +72,7 @@ class DoHServer:
         self._setup_routes()
         self._runner: Optional[web.AppRunner] = None
         self._sites: List[web.TCPSite] = []
+        self._cleanup_task: Optional[asyncio.Task] = None
 
         # 并发控制
         self._concurrency_semaphore = asyncio.Semaphore(config.max_concurrent)
@@ -650,7 +651,7 @@ class DoHServer:
         await self._runner.setup()
 
         # 启动单 IP 限速清理任务
-        asyncio.create_task(self._cleanup_stale_per_ip_semaphores())
+        self._cleanup_task = asyncio.create_task(self._cleanup_stale_per_ip_semaphores())
 
         # IPv4 监听
         site_v4 = web.TCPSite(
@@ -683,6 +684,14 @@ class DoHServer:
 
     async def stop(self):
         """停止 DoH 服务器（IPv4 + IPv6）"""
+        # 取消清理任务
+        if self._cleanup_task:
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
+            self._cleanup_task = None
         for site in self._sites:
             try:
                 await site.stop()
@@ -692,3 +701,8 @@ class DoHServer:
         if self._runner:
             await self._runner.cleanup()
             logger.info("DoH 服务器已停止")
+
+    async def restart(self):
+        """重启 DoH 服务器（IP 切换后恢复监听）"""
+        await self.stop()
+        await self.start()
