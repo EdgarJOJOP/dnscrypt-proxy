@@ -120,42 +120,28 @@ class NetworkMonitor:
                     gw_ok = await self._arp_protection._ping_gateway(gw_ip)
 
                 # ARP 防护：网关不通时尝试刷新
+                # 接口检查（check_interface_healthy）只用于日志提示，不阻断恢复流程。
+                # 即使接口检查返回异常（可能是 netsh 切换 IP 后 ipconfig/route 解析误判），
+                # 仍应尝试 ARP 恢复，因为 ARP 刷新本身就是修复手段。
                 if not gw_ok and self._arp_protection.enabled \
                         and not self._arp_protection.is_manual and not self._arp_busy:
                     iface_ok, iface_details = await self._arp_protection.check_interface_healthy()
                     if iface_ok:
                         logger.warning("ARP 防护: 网关 ping 失败，本地网卡正常 (%s)，"
                                      "尝试刷新路由器 ARP ...", iface_details)
-                        self._arp_busy = True
-                        try:
-                            if await self._arp_protection.refresh_router_arp():
-                                # ARP 恢复后重新检查
-                                if await self._arp_protection._ping_gateway(gw_ip):
-                                    logger.info("ARP 防护: 路由器 ARP 刷新后网关已恢复")
-                                    gw_ok = True
-                        finally:
-                            self._arp_busy = False
                     else:
-                        # 接口检查返回异常，可能因 ipconfig/route 解析失败导致误判
-                        # 用 TCP 连接网关兜底验证
-                        tcp_ok = False
-                        if gw_ip:
-                            tcp_ok = await self._arp_protection._ping_tcp(gw_ip)
-                        if tcp_ok:
-                            logger.warning("ARP 防护: 网关 ping 失败，接口检查异常 (%s)"
-                                         "，但 TCP 连接网关可达，继续尝试 ARP 刷新",
-                                         iface_details)
-                            self._arp_busy = True
-                            try:
-                                if await self._arp_protection.refresh_router_arp():
-                                    if await self._arp_protection._ping_gateway(gw_ip):
-                                        logger.info("ARP 防护: 路由器 ARP 刷新后网关已恢复")
-                                        gw_ok = True
-                            finally:
-                                self._arp_busy = False
-                        else:
-                            logger.warning("ARP 防护: 网关 ping 失败，本地网卡异常 (%s)"
-                                         "，不尝试 ARP 刷新", iface_details)
+                        logger.warning("ARP 防护: 网关 ping 失败，接口检查异常 (%s)"
+                                     "（可能为 ipconfig/route 解析误判），仍尝试 ARP 刷新",
+                                     iface_details)
+                    self._arp_busy = True
+                    try:
+                        if await self._arp_protection.refresh_router_arp():
+                            # ARP 恢复后重新检查
+                            if await self._arp_protection._ping_gateway(gw_ip):
+                                logger.info("ARP 防护: 路由器 ARP 刷新后网关已恢复")
+                                gw_ok = True
+                    finally:
+                        self._arp_busy = False
 
                 # ========== 2. 外网连通性检测（15s） ==========
                 if now >= self._next_external_check:

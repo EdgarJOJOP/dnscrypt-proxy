@@ -1606,7 +1606,13 @@ class ARPProtection:
                 self._local_ipv4 = fallback_ip
                 await self._garp_broadcast_burst(count=10)
                 await asyncio.sleep(0.3)
-                reachable = await self._ping_gateway(gw_ip)
+                reachable = False
+                for attempt in range(5):
+                    reachable = await self._ping_gateway(gw_ip)
+                    if reachable:
+                        break
+                    if attempt < 4:
+                        await asyncio.sleep(1.0)
                 if reachable and self.gateway_mac:
                     await self._protect_gateway_arp()
                 return reachable
@@ -1619,8 +1625,15 @@ class ARPProtection:
         await self._garp_broadcast_burst(count=10)
         await asyncio.sleep(0.3)
 
-        # 确认网关可达
-        reachable = await self._ping_gateway(gw_ip)
+        # 确认网关可达：多轮重试，给接口/路由/ARP 足够时间稳定
+        # netsh 切换 IP 后 Windows 需时间更新路由表和 ARP 缓存
+        reachable = False
+        for attempt in range(5):
+            reachable = await self._ping_gateway(gw_ip)
+            if reachable:
+                break
+            if attempt < 4:
+                await asyncio.sleep(1.0)
         if reachable and self.gateway_mac:
             await self._protect_gateway_arp()
         return reachable
@@ -2038,15 +2051,21 @@ class ARPProtection:
 
     @staticmethod
     async def _ping_gateway_fast(gw_ip: str) -> bool:
-        """ping 网关（快速版：200ms 超时，用于 GARP 爆发场景的快速验证）"""
-        return await ARPProtection._ping_icmp(gw_ip, timeout_ms=200)
+        """ping 网关（快速版：200ms 超时，用于 GARP 爆发场景的快速验证，不启用 TCP 兜底）"""
+        return await ARPProtection._ping_icmp(gw_ip, timeout_ms=200, use_tcp_fallback=False)
 
     @staticmethod
-    async def _ping_icmp(ip: str, timeout_ms: int) -> bool:
+    async def _ping_icmp(ip: str, timeout_ms: int,
+                         use_tcp_fallback: bool = True) -> bool:
         """
         底层 ICMP Echo 实现。
         ICMP 失败时自动尝试 TCP 连接兜底（端口 80/443），
         防止因防火墙阻止 ping.exe 导致的误判。
+
+        Args:
+            ip: 目标 IP
+            timeout_ms: ping 内部超时（毫秒）
+            use_tcp_fallback: 是否在 ICMP 失败时尝试 TCP 兜底
         """
         if sys.platform == "win32":
             ok = await ARPProtection._ping_icmp_windows(ip, timeout_ms)
@@ -2054,6 +2073,8 @@ class ARPProtection:
             ok = await ARPProtection._ping_icmp_linux(ip, timeout_ms)
         if ok:
             return True
+        if not use_tcp_fallback:
+            return False
         # ICMP 失败 → TCP 兜底：尝试连接常见端口
         return await ARPProtection._ping_tcp(ip, timeout_ms=3000)
 
@@ -2065,6 +2086,39 @@ class ARPProtection:
                 _, writer = await asyncio.wait_for(
                     asyncio.open_connection(ip, port),
                     timeout=min(timeout_ms / 1000, 3.0),
+                )
+                writer.close()
+                await writer.wait_closed()
+                return True
+            except (asyncio.TimeoutError, OSError, ConnectionError):
+                continue
+        return False
+
+    @staticmethod
+    async def _check_external_connectivity() -> bool:
+        """
+        检查外部连通性（DNS 解析 + TCP 外网）。
+        当网关 ping 和接口检查均失败时作为最后兜底。
+        """
+        # 1. DNS 解析检测
+        test_domains = ["dns.alidns.com", "dns.google", "one.one.one.one"]
+        for domain in test_domains:
+            try:
+                await asyncio.wait_for(
+                    asyncio.get_event_loop().getaddrinfo(domain, 443),
+                    timeout=3.0,
+                )
+                return True
+            except (asyncio.TimeoutError, OSError):
+                continue
+        # 2. TCP 外网检测：直接连接知名公共 DNS
+        ext_targets = [("223.5.5.5", 53), ("223.6.6.6", 53),
+                       ("8.8.8.8", 53), ("114.114.114.114", 53)]
+        for ext_ip, ext_port in ext_targets:
+            try:
+                _, writer = await asyncio.wait_for(
+                    asyncio.open_connection(ext_ip, ext_port),
+                    timeout=3.0,
                 )
                 writer.close()
                 await writer.wait_closed()
