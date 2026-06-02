@@ -69,6 +69,9 @@ class ARPProtection:
         self._arp_attack_logged = False    # 是否已记录攻击警告（避免重复刷屏）
         self._conflict_resolved = False    # 本周期是否已自动修复 IP 冲突
 
+        # 记录上次有效的非 APIPA IP（用于 APIPA 后恢复正确子网）
+        self._last_known_ip: Optional[str] = None
+
         # IP 切换后的 TCP 监听器重启钩子（避免 netsh 后 socket 失效）
         self._restart_hooks: list = []
 
@@ -226,6 +229,8 @@ class ARPProtection:
             # 同步更新本机网卡信息（供后续 check_interface / IP 冲突使用）
             if not self._local_ipv4:
                 self._local_ipv4 = iface_info["local_ipv4"]
+                if self._local_ipv4 and not self._local_ipv4.startswith("169.254."):
+                    self._last_known_ip = self._local_ipv4
             if not self._local_mac:
                 self._local_mac = iface_info.get("local_mac")
             if not self._subnet_mask:
@@ -269,6 +274,8 @@ class ARPProtection:
             self._auto_gateway_ip = iface_info["gateway_ip"]
             if not self._local_ipv4:
                 self._local_ipv4 = iface_info["local_ipv4"]
+                if self._local_ipv4 and not self._local_ipv4.startswith("169.254."):
+                    self._last_known_ip = self._local_ipv4
             if not self._local_mac:
                 self._local_mac = iface_info.get("local_mac")
             if not self._subnet_mask:
@@ -680,6 +687,8 @@ class ARPProtection:
         if iface_info:
             # 更新本机网卡信息
             self._local_ipv4 = iface_info["local_ipv4"]
+            if self._local_ipv4 and not self._local_ipv4.startswith("169.254."):
+                self._last_known_ip = self._local_ipv4
             if iface_info.get("local_mac"):
                 self._local_mac = iface_info["local_mac"]
             if iface_info["subnet_mask"]:
@@ -792,6 +801,8 @@ class ARPProtection:
         iface_info = await self._resolve_interface_linux()
         if iface_info:
             self._local_ipv4 = iface_info["local_ipv4"]
+            if self._local_ipv4 and not self._local_ipv4.startswith("169.254."):
+                self._last_known_ip = self._local_ipv4
             if iface_info.get("local_mac"):
                 self._local_mac = iface_info["local_mac"]
             if iface_info["subnet_mask"]:
@@ -1011,7 +1022,18 @@ class ARPProtection:
             logger.warning("ARP 防护: 清理子网掩码: '%s' → '%s'", self._subnet_mask, cleaned_mask)
             self._subnet_mask = cleaned_mask
 
-        new_ip = self._increment_ip(self._local_ipv4, self._subnet_mask)
+        # 检测 APIPA：本机 IP 为 169.254.x.x 时，不递增 APIPA
+        # 而是基于上次有效的非 APIPA IP 恢复（避免在链路本地子网内空转）
+        is_apipa = self._local_ipv4.startswith("169.254.") if self._local_ipv4 else False
+        if is_apipa and self._last_known_ip:
+            logger.warning("ARP 防护: 本机 IP %s 为 APIPA 地址，"
+                           "基于上次有效 IP %s 生成新 IP",
+                           self._local_ipv4, self._last_known_ip)
+            base_ip = self._last_known_ip
+        else:
+            base_ip = self._local_ipv4
+
+        new_ip = self._increment_ip(base_ip, self._subnet_mask)
         if not new_ip:
             logger.warning("ARP 防护: 无法自动修复 IP 冲突（IP=%s, 掩码=%s, 网卡=%s）",
                            self._local_ipv4, self._subnet_mask, self._interface_name)
@@ -1043,8 +1065,13 @@ class ARPProtection:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
             if proc.returncode == 0:
                 self._local_ipv4 = new_ip
+                if new_ip and not new_ip.startswith("169.254."):
+                    self._last_known_ip = new_ip
                 self._conflict_resolved = True
                 logger.warning("ARP 防护: IP 已成功变更为 %s", new_ip)
+                # IP 变更后重启 TCP 监听器 + 刷新网络栈
+                await self._fire_restart_hooks()
+                await self._flush_network_stack()
                 return True
             else:
                 err_text = stderr.decode("utf-8", errors="replace")[:200]
@@ -1097,7 +1124,18 @@ class ARPProtection:
             logger.warning("ARP 防护: 清理子网掩码: '%s' → '%s'", self._subnet_mask, cleaned_mask)
             self._subnet_mask = cleaned_mask
 
-        new_ip = self._increment_ip(self._local_ipv4, self._subnet_mask)
+        # 检测 APIPA：本机 IP 为 169.254.x.x 时，不递增 APIPA
+        # 而是基于上次有效的非 APIPA IP 恢复（避免在链路本地子网内空转）
+        is_apipa = self._local_ipv4.startswith("169.254.") if self._local_ipv4 else False
+        if is_apipa and self._last_known_ip:
+            logger.warning("ARP 防护: 本机 IP %s 为 APIPA 地址，"
+                           "基于上次有效 IP %s 生成新 IP",
+                           self._local_ipv4, self._last_known_ip)
+            base_ip = self._last_known_ip
+        else:
+            base_ip = self._local_ipv4
+
+        new_ip = self._increment_ip(base_ip, self._subnet_mask)
         if not new_ip:
             logger.warning("ARP 防护: 无法自动修复 IP 冲突（IP=%s, 掩码=%s, 网卡=%s）",
                            self._local_ipv4, self._subnet_mask, self._interface_name)
@@ -1152,8 +1190,13 @@ class ARPProtection:
                 )
 
             self._local_ipv4 = new_ip
+            if new_ip and not new_ip.startswith("169.254."):
+                self._last_known_ip = new_ip
             self._conflict_resolved = True
             logger.warning("ARP 防护: IP 已成功变更为 %s", new_ip)
+            # IP 变更后重启 TCP 监听器 + 刷新网络栈
+            await self._fire_restart_hooks()
+            await self._flush_network_stack()
             return True
         except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
             logger.warning("ARP 防护: ip addr 执行异常: %s", e)
@@ -1222,8 +1265,19 @@ class ARPProtection:
             await self._ping_gateway_fast(gw_ip)
             await asyncio.sleep(0.01)
 
-        # 2. 丢包模式分析：通过连续 ping 判断是 IP 冲突还是 ARP 投毒
-        loss_info = await self._detect_packet_loss_pattern(gw_ip, count=10)
+        # 检查本机是否为 APIPA 地址（169.254.x.x）
+        # APIPA 时网关在不同子网，所有 ping 必然失败，无需跑 35s 丢包检测
+        current_ip = self._local_ipv4 or ""
+        is_apipa = current_ip.startswith("169.254.")
+        if is_apipa:
+            logger.warning("ARP 防护: 本机 IP %s 为 APIPA 地址，"
+                           "跳过丢包检测，直接执行 IP 冲突修复", current_ip)
+            # 构建一个全丢包的 loss_info，直接导向 ip_conflict 分支
+            loss_info = {"loss_rate": 1.0, "success": 0, "total": 10,
+                         "diagnosis": "ip_conflict"}
+        else:
+            # 2. 丢包模式分析：通过连续 ping 判断是 IP 冲突还是 ARP 投毒
+            loss_info = await self._detect_packet_loss_pattern(gw_ip, count=10)
         if loss_info["diagnosis"] == "ip_conflict":
             loss_pct = round(loss_info["loss_rate"] * 100)
             logger.warning("ARP 防护: 网关丢包 %d%% (%d/%d), "
@@ -1480,6 +1534,9 @@ class ARPProtection:
                                        proc.returncode)
                     return False
                 self._local_ipv4 = new_ip  # 切换成功后更新本机 IP
+                if new_ip and not new_ip.startswith("169.254."):
+                    self._last_known_ip = new_ip
+                await self._flush_network_stack()
                 return True
             except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
                 logger.warning("ARP 防护: netsh 切换 IP 异常: %s", e)
@@ -1518,6 +1575,9 @@ class ARPProtection:
                         stderr=asyncio.subprocess.DEVNULL,
                     )
                 self._local_ipv4 = new_ip  # 切换成功后更新本机 IP
+                if new_ip and not new_ip.startswith("169.254."):
+                    self._last_known_ip = new_ip
+                await self._flush_network_stack()
                 return True
             except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
                 logger.warning("ARP 防护: ip addr 切换 IP 异常: %s", e)
@@ -1562,6 +1622,62 @@ class ARPProtection:
             except (asyncio.TimeoutError, FileNotFoundError, OSError):
                 pass
 
+    async def _flush_network_stack(self):
+        """
+        IP 变更后刷新本地网络栈（ARP 缓存 + DNS 缓存），防止旧条目导致路由异常。
+        需要在 IP 变更成功且确认可用后调用。
+        """
+        if sys.platform == "win32":
+            try:
+                # 刷新 DNS 解析器缓存
+                proc = await asyncio.create_subprocess_exec(
+                    "ipconfig", "/flushdns",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(proc.wait(), timeout=10)
+            except (asyncio.TimeoutError, FileNotFoundError, OSError):
+                pass
+            try:
+                # 清空 ARP 缓存（使所有邻居条目重新通过 ARP 请求学习）
+                proc = await asyncio.create_subprocess_exec(
+                    "arp", "-d", "*",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(proc.wait(), timeout=10)
+            except (asyncio.TimeoutError, FileNotFoundError, OSError):
+                pass
+        else:
+            try:
+                # 清空邻居表（Linux ARP 缓存）
+                proc = await asyncio.create_subprocess_exec(
+                    "ip", "neigh", "flush", "all",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(proc.wait(), timeout=10)
+            except (asyncio.TimeoutError, FileNotFoundError, OSError):
+                pass
+            try:
+                # 刷新 DNS 缓存
+                proc = await asyncio.create_subprocess_exec(
+                    "resolvectl", "flush-caches",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except (asyncio.TimeoutError, FileNotFoundError, OSError):
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        "systemd-resolve", "--flush-caches",
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except (asyncio.TimeoutError, FileNotFoundError, OSError):
+                    pass
+
     async def _garp_ip_switch_defense(self) -> bool:
         """
         两阶段 GARP 抗 ARP 中毒（MITM）：
@@ -1589,6 +1705,9 @@ class ARPProtection:
         if not original_ip or not self._subnet_mask:
             logger.warning("ARP 防护: 缺少 IP 或子网掩码，无法执行两阶段 GARP")
             return False
+        # 保存当前有效 IP 供后续 APIPA 恢复使用
+        if original_ip and not original_ip.startswith("169.254."):
+            self._last_known_ip = original_ip
 
         # 计算临时 IP（在当前主机位范围内偏移 50，避免冲突）
         decoy_ip = self._increment_ip(original_ip, self._subnet_mask, offset=50)
@@ -1640,6 +1759,8 @@ class ARPProtection:
             # 所有尝试都失败 → 接口可能处于无 IP 状态，尝试 DHCP 恢复
             logger.critical("ARP 防护: 无法设置任何静态 IP，尝试 DHCP 恢复")
             await self._recover_interface_dhcp()
+            # DHCP 后无论拿到什么 IP（可能 APIPA），都重启 TCP 监听器
+            await self._fire_restart_hooks()
             return False
 
         self._local_ipv4 = original_ip
