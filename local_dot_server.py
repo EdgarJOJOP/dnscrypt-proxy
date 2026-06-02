@@ -203,7 +203,11 @@ class LocalDoTServer:
         logger.info("本地 DoT 服务器已停止")
 
     async def restart(self):
-        """重启 DoT 服务器（IP 切换后恢复监听）"""
+        """重启 DoT 服务器（IP 切换后恢复监听）
+
+        即使 stop() 部分失败也强制尝试 start()，
+        防止重启钩子执行期间服务器永久挂掉。
+        """
         await self.stop()
         await self.start()
 

@@ -1069,8 +1069,9 @@ class ARPProtection:
                     self._last_known_ip = new_ip
                 self._conflict_resolved = True
                 logger.warning("ARP 防护: IP 已成功变更为 %s", new_ip)
-                # IP 变更后重启 TCP 监听器 + 刷新网络栈
+                # IP 变更后重启 TCP 监听器（避免 WinError 64）
                 await self._fire_restart_hooks()
+                # 刷新 DNS 缓存（VPN 切换 / IP 变更后旧 DNS 缓存可能指向错误 IP）
                 await self._flush_network_stack()
                 return True
             else:
@@ -1194,8 +1195,9 @@ class ARPProtection:
                 self._last_known_ip = new_ip
             self._conflict_resolved = True
             logger.warning("ARP 防护: IP 已成功变更为 %s", new_ip)
-            # IP 变更后重启 TCP 监听器 + 刷新网络栈
+            # IP 变更后重启 TCP 监听器（避免 WinError 64）
             await self._fire_restart_hooks()
+            # 刷新 DNS 缓存（VPN 切换 / IP 变更后旧 DNS 缓存可能指向错误 IP）
             await self._flush_network_stack()
             return True
         except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
@@ -1311,6 +1313,13 @@ class ARPProtection:
                 ip_ok = await self._resolve_ip_conflict_linux()
             if ip_ok:
                 await asyncio.sleep(1.0)
+                # IP 冲突修复后验证网关可达性，并设置静态 ARP
+                # 防止攻击者立即重新投毒网关条目导致新一轮切换
+                if await self._ping_gateway(gw_ip) and self.gateway_mac:
+                    if await self._protect_gateway_arp():
+                        logger.info("ARP 防护: IP 冲突修复后静态 ARP 已绑定")
+                    else:
+                        await self._garp_sustain(gw_ip, duration=3, interval=0.5)
                 return True
 
         # 5. 验证 ping
@@ -1536,7 +1545,8 @@ class ARPProtection:
                 self._local_ipv4 = new_ip  # 切换成功后更新本机 IP
                 if new_ip and not new_ip.startswith("169.254."):
                     self._last_known_ip = new_ip
-                await self._flush_network_stack()
+                # 注意：此处不刷新 ARP 缓存（arp -d *），
+                # 因为 ARP 攻击进行中时清空网关 ARP 条目会让攻击者立刻重新投毒。
                 return True
             except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
                 logger.warning("ARP 防护: netsh 切换 IP 异常: %s", e)
@@ -1577,7 +1587,7 @@ class ARPProtection:
                 self._local_ipv4 = new_ip  # 切换成功后更新本机 IP
                 if new_ip and not new_ip.startswith("169.254."):
                     self._last_known_ip = new_ip
-                await self._flush_network_stack()
+                # 不在此处刷新 ARP 缓存 — 同上（攻击中清空 ARP 有害）
                 return True
             except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
                 logger.warning("ARP 防护: ip addr 切换 IP 异常: %s", e)
@@ -1624,12 +1634,12 @@ class ARPProtection:
 
     async def _flush_network_stack(self):
         """
-        IP 变更后刷新本地网络栈（ARP 缓存 + DNS 缓存），防止旧条目导致路由异常。
-        需要在 IP 变更成功且确认可用后调用。
+        IP 变更后刷新 DNS 缓存，防止旧 DNS 条目指向过时的上游 IP。
+        注意：不在此处刷新 ARP 缓存（arp -d *），
+        因为 ARP 攻击进行中时清空网关 ARP 条目会让攻击者立刻重新投毒。
         """
         if sys.platform == "win32":
             try:
-                # 刷新 DNS 解析器缓存
                 proc = await asyncio.create_subprocess_exec(
                     "ipconfig", "/flushdns",
                     stdout=asyncio.subprocess.DEVNULL,
@@ -1638,29 +1648,8 @@ class ARPProtection:
                 await asyncio.wait_for(proc.wait(), timeout=10)
             except (asyncio.TimeoutError, FileNotFoundError, OSError):
                 pass
-            try:
-                # 清空 ARP 缓存（使所有邻居条目重新通过 ARP 请求学习）
-                proc = await asyncio.create_subprocess_exec(
-                    "arp", "-d", "*",
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-                await asyncio.wait_for(proc.wait(), timeout=10)
-            except (asyncio.TimeoutError, FileNotFoundError, OSError):
-                pass
         else:
             try:
-                # 清空邻居表（Linux ARP 缓存）
-                proc = await asyncio.create_subprocess_exec(
-                    "ip", "neigh", "flush", "all",
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-                await asyncio.wait_for(proc.wait(), timeout=10)
-            except (asyncio.TimeoutError, FileNotFoundError, OSError):
-                pass
-            try:
-                # 刷新 DNS 缓存
                 proc = await asyncio.create_subprocess_exec(
                     "resolvectl", "flush-caches",
                     stdout=asyncio.subprocess.DEVNULL,
@@ -1753,6 +1742,8 @@ class ARPProtection:
                         await asyncio.sleep(1.0)
                 # IP 切换后 TCP 监听器 socket 可能失效，触发重启
                 await self._fire_restart_hooks()
+                # 刷新 DNS 缓存（IP 变更后旧 DNS 缓存可能指向错误 IP）
+                await self._flush_network_stack()
                 if reachable and self.gateway_mac:
                     await self._protect_gateway_arp()
                 return reachable
@@ -1761,6 +1752,7 @@ class ARPProtection:
             await self._recover_interface_dhcp()
             # DHCP 后无论拿到什么 IP（可能 APIPA），都重启 TCP 监听器
             await self._fire_restart_hooks()
+            await self._flush_network_stack()
             return False
 
         self._local_ipv4 = original_ip
@@ -1780,6 +1772,8 @@ class ARPProtection:
             await self._protect_gateway_arp()
         # IP 切换后 TCP 监听器 socket 可能失效，触发重启
         await self._fire_restart_hooks()
+        # 刷新 DNS 缓存（IP 变更后旧 DNS 缓存可能指向错误 IP）
+        await self._flush_network_stack()
         return reachable
 
     async def _is_router_changed(self) -> Optional[str]:

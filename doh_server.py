@@ -699,10 +699,20 @@ class DoHServer:
                 pass
         self._sites.clear()
         if self._runner:
-            await self._runner.cleanup()
+            try:
+                await self._runner.cleanup()
+            except Exception as e:
+                logger.warning("DoH 服务器 cleanup 异常: %s", e)
+            self._runner = None
             logger.info("DoH 服务器已停止")
 
     async def restart(self):
-        """重启 DoH 服务器（IP 切换后恢复监听）"""
+        """重启 DoH 服务器（IP 切换后恢复监听）
+
+        即使 stop() 部分失败也强制尝试 start()，
+        防止服务器在重启过程中永久挂掉。
+        """
         await self.stop()
+        # 确保 _runner 被重置，避免 start() 使用已清理的旧 runner
+        self._runner = None
         await self.start()
