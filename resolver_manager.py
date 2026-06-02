@@ -142,6 +142,9 @@ class ResolverManager:
         # 重试互斥锁：只有一个并发请求执行重试，其余直接返回 SERVFAIL
         self._retry_lock = asyncio.Lock()
         self._retry_version = 0  # 每次重试递增，避免锁排队请求重复重试
+        # 网络断开标志：网络不可达时不查询上游、不打日志，直接返回 SERVFAIL
+        self._network_down = False
+        self._network_down_reported = False  # 避免重复日志
         self._ech_fetchers: Dict[str, ECHConfigFetcher] = {}  # hostname -> ECHConfigFetcher
         self._openssl4_wrapper = None  # OpenSSL 4.0 wrapper（ECH；如不可用则为 None）
 
@@ -568,6 +571,18 @@ class ResolverManager:
         except Exception as e:
             logger.debug("自动恢复后刷新 bootstrap IP 失败: %s", e)
 
+    def set_network_down(self, down: bool = True):
+        """设置网络断开标志。网络断开时上游查询直接跳过，不打印任何警告。"""
+        if down and not self._network_down_reported:
+            self._network_down = True
+            self._network_down_reported = True
+            logger.warning("网络已断开，暂停上游加密 DNS 查询")
+        elif not down:
+            if self._network_down:
+                logger.info("网络已恢复，恢复上游加密 DNS 查询")
+            self._network_down = False
+            self._network_down_reported = False
+
     async def _parallel_resolve(self, query_bytes: bytes) -> Optional[bytes]:
         """
         并行查询核心逻辑（带启动缓冲 + 集群故障冷却 + 互斥渐进退避重试）。
@@ -582,6 +597,11 @@ class ResolverManager:
           其余并发请求直接返回 SERVFAIL。消除同一时刻多个请求各自重试的重复日志。
         """
         now = asyncio.get_event_loop().time()
+
+        # === 网络断开检查 ===
+        # 网络不可达时不查询上游、不打任何警告日志，直接返回 SERVFAIL
+        if self._network_down:
+            return None
 
         # === 启动缓冲期 ===
         # 程序刚启动时，上游 DNS 连接尚未建立，给它们 3 秒时间

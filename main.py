@@ -558,6 +558,13 @@ class DNSProxyApp:
             )
             logger.info("  - 规则自动更新: 每 %d 小时（完整替换模式）", self.config.filter_update_interval)
 
+        # 等待后台过滤规则加载完成，确保摘要中的规则数准确
+        if self._filter_reload_task is not None:
+            try:
+                await self._filter_reload_task
+            except Exception:
+                pass
+
         logger.info("所有服务已启动！")
         # 启动后再次 GC
         gc.collect()
