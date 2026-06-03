@@ -241,8 +241,8 @@ class ECHDoHResolver(BaseResolver):
                     elif writer:
                         try:
                             writer.close()
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.debug("ECH DoH writer 关闭异常: %s", e)
                     # 重置变量防止在下一轮循环中被错误使用
                     ssl_ptr = None
                     ctx_ptr = None

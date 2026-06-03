@@ -40,7 +40,8 @@ class _StaticHostResolver:
                         "proto": socket.IPPROTO_TCP,
                         "flags": socket.AI_NUMERICHOST,
                     })
-                except Exception:
+                except Exception as e:
+                    logger.debug("DoH 解析器获取结果异常: %s", e)
                     continue
             return results
         # 非目标主机：返回空列表让 aiohttp 触发连接错误
@@ -176,8 +177,8 @@ class DoHResolver(BaseResolver):
         if self._session and not self._session.closed:
             try:
                 await self._session.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("DoH 解析器关闭会话异常: %s", e)
             self._session = None
 
     async def reset_connections(self):

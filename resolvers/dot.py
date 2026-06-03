@@ -125,6 +125,9 @@ class DoTResolver(BaseResolver):
                         reader.readexactly(2), timeout=self.timeout
                     )
                     resp_len = int.from_bytes(raw_len, "big")
+                    if resp_len < 12 or resp_len > 65535:
+                        logger.debug("DoT %s: 响应长度 %d 超出范围", self.host, resp_len)
+                        raise ConnectionError(f"无效的响应长度: {resp_len}")
 
                     # 读取响应内容
                     response_data = await asyncio.wait_for(

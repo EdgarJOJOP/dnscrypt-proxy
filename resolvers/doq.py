@@ -171,16 +171,16 @@ if HAS_AIOQUIC:
                         # 否则 create_datagram_endpoint 创建的 UDP 套接字泄漏
                         self._close_transport()
 
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("DoQ 解析器连接异常: %s", e)
 
         def _close_transport(self):
             """安全关闭 UDP transport（释放端口，避免泄漏）"""
             if self._transport and not self._transport.is_closing():
                 try:
                     self._transport.close()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("DoQ 解析器关闭传输异常: %s", e)
 
         def _flush_send(self, now: float):
             """发送 QUIC 缓冲的数据报"""
@@ -188,8 +188,8 @@ if HAS_AIOQUIC:
                 for data, addr in self._quic.send_flow_control_offered(now=now):
                     try:
                         self._transport.sendto(data, addr)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("DoQ 解析器发送异常: %s", e)
 
         async def send_query(self, query_bytes: bytes,
                              enforce_id_zero: bool = True) -> Optional[bytes]:
@@ -223,8 +223,8 @@ if HAS_AIOQUIC:
             try:
                 self._quic.close()
                 self._flush_send(time.time())
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("DoQ 解析器关闭异常: %s", e)
             self._close_transport()
 
         @property
