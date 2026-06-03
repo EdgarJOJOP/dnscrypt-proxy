@@ -9,6 +9,10 @@ from typing import Any, Dict, List, Optional, Callable
 from pathlib import Path
 
 import yaml
+import logging
+
+logger = logging.getLogger("dns-proxy.config")
+
 
 
 DEFAULT_CONFIG_PATH = Path(__file__).parent / "config.yaml"
@@ -68,7 +72,7 @@ class Config:
             "server": {
                 "doh": {
                     "enabled": True,
-                    "host": "0.0.0.0",
+                    "host": "0.0.0.0",  # nosec B104 - configurable default binding
                     "port": 8443,
                     "path": "/dns-query",
                     "cert_path": "certs/localhost.crt",
@@ -134,7 +138,7 @@ class Config:
                 "rules_urls": [],
                 "update_interval": 24,
                 "block_nxdomain": True,
-                "block_ip": "0.0.0.0",
+                "block_ip": "0.0.0.0",  # nosec B104 - default blocked IP for filtering
             },
             "hosts": {
                 "enabled": True,
@@ -225,8 +229,8 @@ class Config:
                             await cb(self._data, changed)
                         else:
                             cb(self._data, changed)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning("配置回调异常: %s", e)
             return changed
         return set()
 
@@ -237,7 +241,7 @@ class Config:
     # --- 便捷访问属性 ---
     @property
     def doh_host(self) -> str:
-        return self._data.get("server", {}).get("doh", {}).get("host", "0.0.0.0")
+        return self._data.get("server", {}).get("doh", {}).get("host", "0.0.0.0")  # nosec B104 - fallback default, not a binding
 
     @property
     def doh_port(self) -> int:
@@ -331,7 +335,7 @@ class Config:
 
     @property
     def filter_block_ip(self) -> str:
-        return self._data.get("filter", {}).get("block_ip", "0.0.0.0")
+        return self._data.get("filter", {}).get("block_ip", "0.0.0.0")  # nosec B104 - fallback default blocked IP
 
     @property
     def logging_enabled(self) -> bool:
@@ -543,7 +547,7 @@ class Config:
 
     @property
     def plain_dns_host(self) -> str:
-        return self._data.get("server", {}).get("plain_dns", {}).get("host", "0.0.0.0")
+        return self._data.get("server", {}).get("plain_dns", {}).get("host", "0.0.0.0")  # nosec B104 - fallback default, not a binding
 
     @property
     def plain_dns_port(self) -> int:

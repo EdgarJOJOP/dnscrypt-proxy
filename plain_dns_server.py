@@ -198,7 +198,7 @@ class PlainDNSServer:
                         response.answer.append(
                             dns.rrset.RRset(question.name, question.rdclass, dns.rdatatype.A)
                         )
-                        response.answer[0].add(dns.rdtypes.IN.A.A(dns.rdataclass.IN, dns.rdatatype.A, "0.0.0.0"), ttl=3600)
+                        response.answer[0].add(dns.rdtypes.IN.A.A(dns.rdataclass.IN, dns.rdatatype.A, "0.0.0.0"), ttl=3600)  # nosec B104 - blocked A record, not binding
                         response.set_rcode(dns.rcode.NOERROR)
                     elif question.rdtype == dns.rdatatype.AAAA:
                         response.answer.append(
@@ -263,8 +263,8 @@ class PlainDNSServer:
                             dns.rcode.REFUSED,
                         )
                         await self.cache.set(cache_key, response_msg, is_negative)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("Plain DNS 缓存写入异常: %s", e)
 
             elapsed = asyncio.get_event_loop().time() - start_time
             await self._log_query(client_ip, qname, qtype_str, elapsed, status, block_reason)
@@ -297,8 +297,8 @@ class PlainDNSServer:
                 upstream="",
                 block_reason=block_reason,
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Plain DNS 查询日志记录异常: %s", e)
 
     # ======================== 启动 / 停止 ========================
 
@@ -351,8 +351,8 @@ class PlainDNSServer:
             if transport and not transport.is_closing():
                 try:
                     transport.close()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Plain DNS 传输关闭异常: %s", e)
         self._transport_v4 = None
         self._transport_v6 = None
         logger.info("普通 DNS 服务器已停止")

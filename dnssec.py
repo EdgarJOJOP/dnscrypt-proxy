@@ -83,7 +83,8 @@ def has_dnssec_do_bit(query_bytes: bytes) -> bool:
         for rr in msg.additional:
             if rr.rdtype == dns.rdatatype.OPT:
                 return bool(rr.flags & 0x8000)
-    except Exception:
+    except Exception as e:
+        logger.debug("DNSSEC 查询 OPT 记录异常: %s", e)
         pass
     return False
 

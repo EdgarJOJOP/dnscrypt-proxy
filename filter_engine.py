@@ -489,7 +489,8 @@ class FilterRule:
                     if self.pattern:
                         self.is_regex = True
                         return
-            except Exception:
+            except Exception as e:
+                logger.debug("过滤器规则解析异常（域名）: %s", e)
                 pass
             self._skip = True
             return
@@ -508,7 +509,8 @@ class FilterRule:
                     if self.pattern:
                         self.is_regex = True
                         return
-            except Exception:
+            except Exception as e:
+                logger.debug("过滤器规则解析异常（URL）: %s", e)
                 pass
             self._skip = True
             return
@@ -721,6 +723,7 @@ class FilterEngine:
         # 过滤结果缓存 {domain: (blocked, reason, timestamp)} — 避免重复匹配，大幅提升效率
         self._filter_cache: Dict[str, Tuple[bool, str, float]] = {}
         self._filter_cache_timeout: float = 5.0
+        self._filter_cache_maxsize: int = 100000  # 过滤缓存最大条目数，防止无界增长
         self._update_callback: Optional[Callable] = None
         # 校验和缓存（类似 Go 的 checksum）
         self._file_checksums: dict = {}
@@ -818,7 +821,8 @@ class FilterEngine:
                     return None
                 if parsed.hostname and "." in parsed.hostname:
                     return parsed.hostname.lower()
-            except Exception:
+            except Exception as e:
+                logger.debug("过滤器域名提取异常（URL）: %s", e)
                 pass
             return None
 
@@ -844,7 +848,8 @@ class FilterEngine:
                     return None
                 if parsed.hostname and "." in parsed.hostname:
                     return parsed.hostname.lower()
-            except Exception:
+            except Exception as e:
+                logger.debug("过滤器域名提取异常（HTTP）: %s", e)
                 pass
             return None
 
@@ -1052,8 +1057,8 @@ class FilterEngine:
         if self._update_callback:
             try:
                 self._update_callback(self._rule_count)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("过滤器异步重载回调异常: %s", e)
 
     def reload(self, files: List[str], urls: Optional[List[str]] = None):
         """
@@ -1094,8 +1099,12 @@ class FilterEngine:
                     if loop.is_running():
                         logger.warning("规则 URL %s 无法同步加载（事件循环已运行）", url)
                         continue
+                    from urllib.parse import urlparse as _urlparse
+                    parsed = _urlparse(url)
+                    if parsed.scheme not in ("http", "https"):
+                        raise ValueError(f"不允许的 URL 协议: {parsed.scheme}")
                     import urllib.request
-                    resp = urllib.request.urlopen(url, timeout=120)
+                    resp = urllib.request.urlopen(url, timeout=120)  # nosec B310 - scheme validated above
                     content = resp.read().decode("utf-8", errors="replace")
                     self.load_rules_from_text(content, source=url)
                     self._loaded_urls.append(url)
@@ -1125,8 +1134,8 @@ class FilterEngine:
         if self._update_callback:
             try:
                 self._update_callback(self._rule_count)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("过滤器同步重载回调异常: %s", e)
 
     def check_domain(self, domain: str) -> Tuple[bool, str]:
         """
@@ -1169,6 +1178,7 @@ class FilterEngine:
             if rule.matches(domain):
                 result = (True, f"重要规则拦截: {rule.raw}")
                 self._filter_cache[domain] = (True, result[1], now)
+                self._trim_filter_cache()
                 logger.debug("拦截(重要规则): %s | %s", domain, rule.raw[:60])
                 return result
 
@@ -1177,6 +1187,7 @@ class FilterEngine:
         if match is not None:
             rule, method = match
             self._filter_cache[domain] = (False, "", now)
+            self._trim_filter_cache()
             logger.debug("放行(白名单): %s | %s: %s", domain, method, rule.raw[:60])
             return False, ""
 
@@ -1186,11 +1197,13 @@ class FilterEngine:
             rule, method = match
             reason = f"{method}: {rule.raw}"
             self._filter_cache[domain] = (True, reason, now)
+            self._trim_filter_cache()
             logger.debug("拦截: %s | %s (%s)", domain, method, rule.raw[:80])
             return True, reason
 
         # 未匹配：缓存并放行
         self._filter_cache[domain] = (False, "", now)
+        self._trim_filter_cache()
         logger.log(logging.DEBUG-1, "放行(无匹配): %s (共 %d 条拦截规则)", domain, self._rule_count)
         return False, ""
 
@@ -1262,6 +1275,21 @@ class FilterEngine:
         self._custom_hosts_cache.clear()
         logger.debug("过滤缓存已清除 (%d 条)", len(self._filter_cache))
 
+    def _trim_filter_cache(self):
+        """限制过滤缓存大小，防止无界增长导致内存消耗过快"""
+        if len(self._filter_cache) <= self._filter_cache_maxsize:
+            return
+        # 超出上限时移除最旧的 25% 条目（dict 在 Python 3.7+ 保持插入顺序）
+        remove_count = len(self._filter_cache) - self._filter_cache_maxsize
+        remove_count = max(remove_count, len(self._filter_cache) // 4)
+        for _ in range(remove_count):
+            try:
+                self._filter_cache.popitem(last=False)
+            except KeyError:
+                break
+        logger.debug("过滤缓存已达上限 %d，已裁剪 %d 条",
+                     self._filter_cache_maxsize, remove_count)
+
     # ======================== 定时更新 ========================
 
     def on_update(self, callback: Callable):
@@ -1320,8 +1348,8 @@ class FilterEngine:
                 if self._update_callback:
                     try:
                         self._update_callback(self._rule_count)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("过滤器更新循环回调异常: %s", e)
 
             except asyncio.CancelledError:
                 break

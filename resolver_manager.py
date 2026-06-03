@@ -292,7 +292,8 @@ class ResolverManager:
                                 for rd in rrset:
                                     if rd.rdtype == qtype:
                                         ips.append(str(rd.address))
-                        except Exception:
+                        except Exception as e:
+                            logger.debug("解析管理器 DNS 响应解析异常: %s", e)
                             continue
 
             if ips:
@@ -546,13 +547,13 @@ class ResolverManager:
         for server in self._upstream_servers:
             try:
                 await server.resolver.reset_connections()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("解析管理器重置上游连接异常: %s", e)
         for server in self._bootstrap_resolvers:
             try:
                 await server.resolver.reset_connections()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("解析管理器重置 bootstrap 连接异常: %s", e)
         # 清除 bootstrap 缓存
         self._bootstrap_cache.clear()
         # 重新启用 + 恢复模式
@@ -741,8 +742,8 @@ class ResolverManager:
                     r = task.result()
                     if r is not None:
                         successful.append(r)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("解析管理器并行查询任务异常: %s", e)
 
         for task in remaining:
             task.cancel()
@@ -882,20 +883,20 @@ class ResolverManager:
         for server in self._upstream_servers:
             try:
                 await server.resolver.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("解析管理器关闭上游解析器异常: %s", e)
         for server in self._bootstrap_resolvers:
             try:
                 await server.resolver.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("解析管理器关闭 bootstrap 解析器异常: %s", e)
 
         # 关闭 ECH fetchers（取消后台刷新任务）
         for hostname, fetcher in self._ech_fetchers.items():
             try:
                 fetcher.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("解析管理器关闭 ECH fetcher 异常: %s", e)
 
     @property
     def stats(self) -> Dict[str, Any]:

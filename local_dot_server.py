@@ -152,7 +152,7 @@ class LocalDoTServer:
             )
             logger.info(
                 "本地 DoT [IPv4] tls://%s:%d (域名: %s)",
-                self.host if self.host != "0.0.0.0" else "127.0.0.1",
+                self.host if self.host != "0.0.0.0" else "127.0.0.1",  # nosec B104 - display formatting, not binding
                 self.port,
                 self.domain or "未设置",
             )
@@ -196,8 +196,8 @@ class LocalDoTServer:
                 server.close()
                 try:
                     await server.wait_closed()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("DoT 服务器等待关闭异常: %s", e)
         self._server_v4 = None
         self._server_v6 = None
         logger.info("本地 DoT 服务器已停止")
@@ -223,8 +223,8 @@ class LocalDoTServer:
             try:
                 writer.close()
                 await writer.wait_closed()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("DoT 拒绝连接时关闭异常: %s", e)
             return
 
         self._active_connections += 1
@@ -269,8 +269,8 @@ class LocalDoTServer:
             try:
                 writer.close()
                 await writer.wait_closed()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("DoT 客户端关闭异常: %s", e)
 
     async def _process_query(self, wire_data: bytes, client_ip: str) -> Optional[bytes]:
         """处理 DNS 查询（并发控制 + 单 IP 限速 + QPS 限速）"""
@@ -346,7 +346,7 @@ class LocalDoTServer:
                         response.answer.append(
                             dns.rrset.RRset(question.name, question.rdclass, dns.rdatatype.A)
                         )
-                        response.answer[0].add(dns.rdtypes.IN.A.A(dns.rdataclass.IN, dns.rdatatype.A, "0.0.0.0"), ttl=3600)
+                        response.answer[0].add(dns.rdtypes.IN.A.A(dns.rdataclass.IN, dns.rdatatype.A, "0.0.0.0"), ttl=3600)  # nosec B104 - blocked A record, not binding
                         response.set_rcode(dns.rcode.NOERROR)
                     elif rdtype == dns.rdatatype.AAAA:
                         response.answer.append(
@@ -400,8 +400,8 @@ class LocalDoTServer:
                         response_msg = dns.message.from_wire(result_wire)
                         is_negative = response_msg.rcode() in (dns.rcode.NXDOMAIN, dns.rcode.REFUSED)
                         await self.cache.set(cache_key, response_msg, is_negative)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("DoT 缓存写入异常: %s", e)
 
             await self._log_query(client_ip, qname, qtype_name, status, block_reason)
             return response_wire
@@ -424,5 +424,5 @@ class LocalDoTServer:
                 upstream="",
                 block_reason=block_reason,
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("DoT 查询日志记录异常: %s", e)

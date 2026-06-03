@@ -42,23 +42,23 @@ def test_parser():
 
     # 1.4 规则计数
     result = parser.parse("! comment\n# another comment\n||doubleclick.net^\n||example.com^")
-    assert result.rules_count == 2, f"期望 2 条规则, 得到 {result.rules_count}"
+    assert result.rules_count == 2, f"期望 2 条规则, 得到 {result.rules_count}"  # nosec B101
     print(f"  OK 规则计数: {result.rules_count} 条")
 
     # 1.5 Hosts 格式
     result = parser.parse("0.0.0.0 ad.doubleclick.net\n127.0.0.1 ads.example.com\n1.2.3.4 tracker.com")
-    assert result.rules_count == 3, f"期望 3 条 hosts 规则, 得到 {result.rules_count}"
+    assert result.rules_count == 3, f"期望 3 条 hosts 规则, 得到 {result.rules_count}"  # nosec B101
     print(f"  OK Hosts 格式: 正确解析 {result.rules_count} 条")
 
     # 1.6 Cosmetic 跳过
     result = parser.parse("||doubleclick.net^\nexample.com##.ad-banner\n||ads.com^")
-    assert result.rules_count == 2, f"期望 2 条规则 (cosmetic 忽略), 得到 {result.rules_count}"
+    assert result.rules_count == 2, f"期望 2 条规则 (cosmetic 忽略), 得到 {result.rules_count}"  # nosec B101
     print(f"  OK Cosmetic 跳过: {result.rules_count} 条（cosmetic 已忽略）")
 
     # 1.7 Checksum 一致性
     r1 = parser.parse("||doubleclick.net^\n||example.com^")
     r2 = parser.parse("||doubleclick.net^\n||example.com^")
-    assert r1.checksum == r2.checksum, "相同内容的 checksum 应一致"
+    assert r1.checksum == r2.checksum, "相同内容的 checksum 应一致"  # nosec B101
     print(f"  OK Checksum 一致性: {r1.checksum:#x}")
 
 
@@ -242,12 +242,12 @@ def test_parser_in_engine():
 shandian.biz##.ad-banner
 """
     engine.load_rules_from_text(text, source="test")
-    assert engine.stats["total_rules"] >= 4, f"规则不足: {engine.stats['total_rules']}"
+    assert engine.stats["total_rules"] >= 4, f"规则不足: {engine.stats['total_rules']}"  # nosec B101
     print(f"  OK 从文本加载: {engine.stats['total_rules']} 条规则")
 
     # 测试拦截
     blocked, reason = engine.check_domain("doubleclick.net")
-    assert blocked, "doubleclick.net 应被拦截"
+    assert blocked, "doubleclick.net 应被拦截"  # nosec B101
     print(f"  OK 拦截 doubleclick.net: {reason[:50]}")
 
     blocked, reason = engine.check_domain("example.com")
@@ -257,7 +257,7 @@ shandian.biz##.ad-banner
         print(f"  OK 例外规则生效: example.com 放行")
 
     blocked, reason = engine.check_domain("tracker.ads.net")
-    assert blocked, "hosts 格式 tracker.ads.net 应被拦截"
+    assert blocked, "hosts 格式 tracker.ads.net 应被拦截"  # nosec B101
     print(f"  OK Hosts 格式拦截: tracker.ads.net")
 
     print(f"  OK Title: {engine.title}")

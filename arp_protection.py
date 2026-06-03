@@ -309,7 +309,7 @@ class ARPProtection:
         routes = []  # [(gateway_ip, iface_ip, metric), ...]
         try:
             proc = await asyncio.create_subprocess_exec(
-                "route", "print", "0.0.0.0",
+                "route", "print", "0.0.0.0",  # nosec B104 - route command argument, not binding
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
@@ -318,9 +318,9 @@ class ARPProtection:
             for line in text.splitlines():
                 parts = line.strip().split()
                 # 0.0.0.0  0.0.0.0  192.168.1.1  192.168.1.100  25
-                if len(parts) >= 5 and parts[0] == "0.0.0.0" and parts[1] == "0.0.0.0":
+                if len(parts) >= 5 and parts[0] == "0.0.0.0" and parts[1] == "0.0.0.0":  # nosec B104 - parsing route table output
                     gw = parts[2].strip()
-                    if gw and gw != "0.0.0.0" and ":" not in gw:
+                    if gw and gw != "0.0.0.0" and ":" not in gw:  # nosec B104 - filtering gateway IP in route output
                         if_ip = parts[3].strip() if len(parts) >= 4 else None
                         # 校验接口 IP 合法性，防止 netsh 切换 IP 后路由表临时输出垃圾值
                         if if_ip and not ARPProtection._is_valid_ip(if_ip):
@@ -414,7 +414,7 @@ class ARPProtection:
                             # 移除可能的 CIDR 后缀如 "/24"
                             if "/" in mask:
                                 mask = mask.split("/")[0]
-                            if mask and "." in mask and mask != "0.0.0.0":
+                            if mask and "." in mask and mask != "0.0.0.0":  # nosec B104 - comparing subnet mask string
                                 section_mask = ARPProtection._clean_ip(mask) or mask
                                 break
 
@@ -578,7 +578,7 @@ class ARPProtection:
         """Windows: 通过 route print 获取默认网关"""
         try:
             proc = await asyncio.create_subprocess_exec(
-                "route", "print", "0.0.0.0",
+                "route", "print", "0.0.0.0",  # nosec B104 - route command argument, not binding
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
@@ -588,11 +588,11 @@ class ARPProtection:
             # 解析 route print 输出中的默认网关
             # 匹配: 0.0.0.0          0.0.0.0         192.168.1.1      192.168.1.100    25
             for line in text.splitlines():
-                if "0.0.0.0" in line and "0.0.0.0" in line:
+                if "0.0.0.0" in line and "0.0.0.0" in line:  # nosec B104 - parsing route table output
                     parts = line.strip().split()
-                    if len(parts) >= 3 and parts[0] == "0.0.0.0" and parts[1] == "0.0.0.0":
+                    if len(parts) >= 3 and parts[0] == "0.0.0.0" and parts[1] == "0.0.0.0":  # nosec B104 - parsing route table output
                         gateway = parts[2].strip()
-                        if gateway and gateway != "0.0.0.0" and ":" not in gateway:
+                        if gateway and gateway != "0.0.0.0" and ":" not in gateway:  # nosec B104 - filtering gateway IP in route output
                             return gateway
             return None
         except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
@@ -775,7 +775,7 @@ class ARPProtection:
                     mask = parts[1].strip()
                     if "/" in mask:
                         mask = mask.split("/")[0]
-                    if mask and mask != "0.0.0.0" and "." in mask:
+                    if mask and mask != "0.0.0.0" and "." in mask:  # nosec B104 - comparing subnet mask string
                         if not self._subnet_mask:
                             self._subnet_mask = mask
 
@@ -790,7 +790,7 @@ class ARPProtection:
                 parts = stripped.split(":", 1)
                 if len(parts) == 2:
                     gw = parts[1].strip()
-                    if gw and gw != "0.0.0.0" and gw != ":":
+                    if gw and gw != "0.0.0.0" and gw != ":":  # nosec B104 - filtering gateway IP in ipconfig output
                         has_gateway = True
 
         details = f"IPv4={'正常' if has_ipv4 else '无'}, IPv6={'正常' if has_ipv6 else '无'}, 网关={'存在' if has_gateway else '无'}"
@@ -2333,7 +2333,8 @@ class ARPProtection:
         except (asyncio.TimeoutError, FileNotFoundError, OSError):
             try:
                 proc.kill()
-            except Exception:
+            except Exception as e:
+                logger.debug("ARP 防护: 终止 ping 进程异常: %s", e)
                 pass
             return False
 

@@ -58,8 +58,8 @@ class TrimFileHandler(logging.FileHandler):
         try:
             self.flush()
             self.close()
-        except Exception:
-            pass
+        except Exception as e:
+            system_logger.debug("日志裁剪关闭文件异常: %s", e)
         try:
             fp = Path(self.baseFilename)
             lines = fp.read_text(encoding="utf-8").splitlines(True)
@@ -80,8 +80,8 @@ class TrimFileHandler(logging.FileHandler):
             # 重新打开文件流
             try:
                 self.stream = self._open()
-            except Exception:
-                pass
+            except Exception as e:
+                system_logger.debug("日志裁剪重新打开文件异常: %s", e)
 
 
 class RequestLogger:

@@ -145,6 +145,8 @@ class DoHServer:
                 wire_data = base64.urlsafe_b64decode(dns_param)
             except Exception:
                 return web.Response(status=400, text="无效的 base64url 编码")
+            if not wire_data or len(wire_data) < 12:
+                return web.Response(status=400, text="DNS 消息长度不足")
             return await self._handle_dns_query(wire_data, request, "wire")
 
         # 格式2: JSON API — ?name=example.com&type=A
@@ -185,7 +187,6 @@ class DoHServer:
         wire_data = await request.read()
         if not wire_data or len(wire_data) < 12:
             return web.Response(status=400, text="空请求体或无效长度")
-
         return await self._handle_dns_query(wire_data, request, "wire")
 
     # ======================== JSON API 查询 ========================
@@ -205,10 +206,15 @@ class DoHServer:
             )
 
         # 构建 DNS 查询
-        query = dns.message.make_query(name, qtype, want_dnssec=self.config.dnssec_enabled)
-        if cd_flag:
-            query.flags |= dns.flags.CD
-        wire_data = query.to_wire()
+        try:
+            query = dns.message.make_query(name, qtype, want_dnssec=self.config.dnssec_enabled)
+            if cd_flag:
+                query.flags |= dns.flags.CD
+            wire_data = query.to_wire()
+        except Exception:
+            return web.json_response(
+                {"Status": 2, "Comment": f"无效的域名: {name}"}
+            )
 
         client_ip = request.remote or "unknown"
         await self._qps_limiter.acquire()  # QPS 限速（所有客户端）
@@ -498,7 +504,7 @@ class DoHServer:
                         response.answer.append(
                             dns.rrset.RRset(question.name, question.rdclass, dns.rdatatype.A)
                         )
-                        response.answer[0].add(dns.rdtypes.IN.A.A(dns.rdataclass.IN, dns.rdatatype.A, "0.0.0.0"), ttl=3600)
+                        response.answer[0].add(dns.rdtypes.IN.A.A(dns.rdataclass.IN, dns.rdatatype.A, "0.0.0.0"), ttl=3600)  # nosec B104 - blocked A record, not binding
                         response.set_rcode(dns.rcode.NOERROR)
                     elif rdtype == dns.rdatatype.AAAA:
                         response.answer.append(
@@ -568,8 +574,8 @@ class DoHServer:
                                     dns.rcode.REFUSED,
                                 )
                                 await self.cache.set(cache_key, response_msg, is_negative)
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                logger.debug("DoH 缓存写入异常: %s", e)
                 else:
                     response_wire = result_wire
                     status = "resolved"
@@ -582,8 +588,8 @@ class DoHServer:
                                 dns.rcode.REFUSED,
                             )
                             await self.cache.set(cache_key, response_msg, is_negative)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.debug("DoH 缓存写入异常: %s", e)
 
             elapsed = asyncio.get_event_loop().time() - start_time
             await self._log_query(
@@ -620,8 +626,8 @@ class DoHServer:
                 upstream=upstream,
                 block_reason=block_reason,
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("DoH 查询日志记录异常: %s", e)
 
     async def start(self):
         """启动 DoH 服务器（IPv4 + 可选 IPv6）"""
@@ -661,7 +667,7 @@ class DoHServer:
         self._sites.append(site_v4)
         logger.info(
             "DoH [IPv4] https://%s:%s%s",
-            self.host if self.host != "0.0.0.0" else "127.0.0.1",
+            self.host if self.host != "0.0.0.0" else "127.0.0.1",  # nosec B104 - display formatting, not binding
             self.port,
             self.doh_path,
         )
@@ -695,8 +701,8 @@ class DoHServer:
         for site in self._sites:
             try:
                 await site.stop()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("DoH 站点停止异常: %s", e)
         self._sites.clear()
         if self._runner:
             try:

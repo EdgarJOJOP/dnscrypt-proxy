@@ -88,8 +88,8 @@ class _DoQConnection:
         for data, addr in self._quic.send_flow_control_offered(now=now):
             try:
                 self._transport.sendto(data, addr)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("DoQ 流控发送异常: %s", e)
 
         # 发送 QUIC 数据报
         while True:
@@ -98,8 +98,8 @@ class _DoQConnection:
                 break
             try:
                 self._transport.sendto(data, self._addr)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("DoQ 数据报发送异常: %s", e)
 
     def _handle_stream_data(self, event: StreamDataReceived):
         """处理 QUIC 流上的 DNS 查询"""
@@ -132,8 +132,8 @@ class _DoQConnection:
         for data, addr in self._quic.send_flow_control_offered(now=now):
             try:
                 self._transport.sendto(data, addr)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("DoQ 刷新发送异常: %s", e)
 
     def get_timer(self) -> Optional[float]:
         """获取下一个定时器到期时间"""
@@ -151,8 +151,8 @@ class _DoQConnection:
         try:
             self._quic.close()
             self._flush()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("DoQ 连接关闭异常: %s", e)
 
 
 class _DoQUdpProtocol(asyncio.DatagramProtocol):
@@ -322,7 +322,7 @@ class LocalDoQServer:
             )
             logger.info(
                 "本地 DoQ [IPv4] quic://%s:%d (域名: %s)",
-                self.host if self.host != "0.0.0.0" else "127.0.0.1",
+                self.host if self.host != "0.0.0.0" else "127.0.0.1",  # nosec B104 - display formatting, not binding
                 self.port,
                 self.domain or "未设置",
             )
@@ -362,8 +362,8 @@ class LocalDoQServer:
             if transport:
                 try:
                     transport.close()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("DoQ 传输关闭异常: %s", e)
         self._transport_v4 = None
         self._transport_v6 = None
         self._protocol_v4 = None
@@ -392,8 +392,8 @@ class LocalDoQServer:
                     logger.debug("DoQ: 清理了 %d 个过期 IP 限速条目", len(stale))
             except asyncio.CancelledError:
                 break
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("DoQ 清理循环异常: %s", e)
 
     async def _process_query(self, wire_data: bytes, client_ip: str) -> Optional[bytes]:
         """处理 DNS 查询（并发控制 + 单 IP 限速 + QPS 限速）"""
@@ -468,7 +468,7 @@ class LocalDoQServer:
                         response.answer.append(
                             dns.rrset.RRset(question.name, question.rdclass, dns.rdatatype.A)
                         )
-                        response.answer[0].add(dns.rdtypes.IN.A.A(dns.rdataclass.IN, dns.rdatatype.A, "0.0.0.0"), ttl=3600)
+                        response.answer[0].add(dns.rdtypes.IN.A.A(dns.rdataclass.IN, dns.rdatatype.A, "0.0.0.0"), ttl=3600)  # nosec B104 - blocked A record, not binding
                         response.set_rcode(dns.rcode.NOERROR)
                     elif rdtype == dns.rdatatype.AAAA:
                         response.answer.append(
@@ -520,8 +520,8 @@ class LocalDoQServer:
                         response_msg = dns.message.from_wire(result_wire)
                         is_negative = response_msg.rcode() in (dns.rcode.NXDOMAIN, dns.rcode.REFUSED)
                         await self.cache.set(cache_key, response_msg, is_negative)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("DoQ 缓存写入异常: %s", e)
 
             await self._log_query(client_ip, qname, qtype_name, status, block_reason)
             return response_wire
@@ -544,5 +544,5 @@ class LocalDoQServer:
                 upstream="",
                 block_reason=block_reason,
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("DoQ 查询日志记录异常: %s", e)

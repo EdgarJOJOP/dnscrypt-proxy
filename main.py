@@ -362,7 +362,7 @@ class DNSProxyApp:
                 for rrset in cached_response.answer:
                     for rd in rrset:
                         if rd.rdtype == dns.rdatatype.A:
-                            if str(rd.address) == "0.0.0.0":
+                            if str(rd.address) == "0.0.0.0":  # nosec B104 - checking blocked IP in cache
                                 already_blocked = True
                         elif rd.rdtype == dns.rdatatype.AAAA:
                             if str(rd.address) == "::":
@@ -379,7 +379,7 @@ class DNSProxyApp:
                         dns.rrset.RRset(qname, qclass, dns.rdatatype.A)
                     )
                     new_response.answer[0].add(
-                        dns.rdtypes.IN.A.A(dns.rdataclass.IN, dns.rdatatype.A, "0.0.0.0"), ttl=3600
+                        dns.rdtypes.IN.A.A(dns.rdataclass.IN, dns.rdatatype.A, "0.0.0.0"), ttl=3600  # nosec B104 - blocked A record
                     )
                     new_response.set_rcode(dns.rcode.NOERROR)
                 elif qtype == dns.rdatatype.AAAA:
@@ -494,8 +494,8 @@ class DNSProxyApp:
                     )
             except asyncio.CancelledError:
                 break
-            except Exception:
-                pass
+            except Exception as e:
+                logging.getLogger("dns-proxy.app").debug("配置监控循环异常: %s", e)
 
     async def _cache_cleanup_loop(self):
         """定期清理过期缓存"""
@@ -506,8 +506,8 @@ class DNSProxyApp:
                     await self.cache.cleanup_expired()
             except asyncio.CancelledError:
                 break
-            except Exception:
-                pass
+            except Exception as e:
+                logging.getLogger("dns-proxy.app").debug("缓存清理循环异常: %s", e)
 
     async def start(self):
         """启动所有服务"""
@@ -562,15 +562,15 @@ class DNSProxyApp:
         if self._filter_reload_task is not None:
             try:
                 await self._filter_reload_task
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("过滤规则加载任务异常: %s", e)
 
         logger.info("所有服务已启动！")
         # 启动后再次 GC
         gc.collect()
         logger.info("  - 启动后内存: %.0f MB", self._get_memory_mb())
         logger.info("  - DoH 服务器: https://%s:%s%s (IPv4)",
-                    self.config.doh_host if self.config.doh_host != "0.0.0.0" else "127.0.0.1",
+                    self.config.doh_host if self.config.doh_host != "0.0.0.0" else "127.0.0.1",  # nosec B104 - display formatting
                     self.config.doh_port,
                     self.config.doh_path)
         if self.config.doh_ipv6_enabled:
@@ -578,12 +578,12 @@ class DNSProxyApp:
                         self.config.doh_ipv6_host, self.config.doh_ipv6_port, self.config.doh_path)
         if self.config.local_dot_enabled:
             logger.info("  - DoT 服务器: tls://%s:%d (域名=%s)",
-                        self.config.local_dot_host if self.config.local_dot_host != "0.0.0.0" else "127.0.0.1",
+                        self.config.local_dot_host if self.config.local_dot_host != "0.0.0.0" else "127.0.0.1",  # nosec B104 - display formatting
                         self.config.local_dot_port,
                         self.config.local_dot_domain or "未设置")
         if self.config.local_doq_enabled:
             logger.info("  - DoQ 服务器: quic://%s:%d (域名=%s)",
-                        self.config.local_doq_host if self.config.local_doq_host != "0.0.0.0" else "127.0.0.1",
+                        self.config.local_doq_host if self.config.local_doq_host != "0.0.0.0" else "127.0.0.1",  # nosec B104 - display formatting
                         self.config.local_doq_port,
                         self.config.local_doq_domain or "未设置")
         logger.info("  - 上游服务器: DoH x%d + DoT x%d + DoQ x%d",
@@ -671,8 +671,8 @@ async def main_async(config_path: Optional[str] = None):
                 h._max_bytes = max_size * 1024 * 1024
                 logger_root.info("日志文件最大大小已设置为 %dMB", max_size)
                 break
-    except Exception:
-        pass
+    except Exception as e:
+        logging.getLogger("dns-proxy.app").debug("设置日志文件大小异常: %s", e)
 
     try:
         await app.initialize()
@@ -742,10 +742,10 @@ def _elevate():
             return
     else:
         import shlex
-        import subprocess
+        import subprocess  # nosec B404 - not used with untrusted input
         cmd = ["sudo", sys.executable] + sys.argv
         try:
-            subprocess.run(cmd, check=True)
+            subprocess.run(cmd, check=True)  # nosec B603 - constructed list, no shell=True
         except (subprocess.CalledProcessError, FileNotFoundError) as e:
             print(f"sudo 提权失败: {e}，继续以当前权限运行")
             return

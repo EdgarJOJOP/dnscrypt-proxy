@@ -313,7 +313,8 @@ class NetworkMonitor:
                     )
                     if result is not None:
                         return True
-                except Exception:
+                except Exception as e:
+                    logger.debug("网络监控 ping 异常: %s", e)
                     continue
         return False
 

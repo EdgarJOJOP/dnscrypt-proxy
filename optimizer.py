@@ -52,8 +52,8 @@ class ResourceOptimizer:
         if HAS_PSUTIL:
             try:
                 self._process = psutil.Process()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("优化器初始化 psutil 异常: %s", e)
 
     async def start(self):
         """启动资源监控和优化任务"""
@@ -171,8 +171,8 @@ class ResourceOptimizer:
                         gc.collect(generation=2)
             except asyncio.CancelledError:
                 break
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("优化器 GC 循环异常: %s", e)
 
     async def get_memory_usage(self) -> dict:
         """获取内存使用信息"""
@@ -186,6 +186,6 @@ class ResourceOptimizer:
                 result["rss_mb"] = round(mem.rss / (1024 * 1024), 1)
                 result["vms_mb"] = round(mem.vms / (1024 * 1024), 1)
                 result["cpu_percent"] = self._process.cpu_percent(interval=0)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("优化器获取内存异常: %s", e)
         return result
