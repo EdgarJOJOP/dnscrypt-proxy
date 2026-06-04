@@ -21,12 +21,14 @@ logger = logging.getLogger("dns-proxy.arp")
 class ARPProtection:
     """ARP 防护：网关侦测 + 路由器 ARP 表刷新"""
 
-    def __init__(self, config_arp: dict):
+    def __init__(self, config_arp: dict, ping_timeout: float = 1.0):
         """
         Args:
             config_arp: 从配置读取的 arp_protection 字典
+            ping_timeout: ping 超时（秒），默认 1.0，与 network_monitor.ping_timeout 同步
         """
         self._enabled = config_arp.get("enabled", True)
+        self._ping_timeout = ping_timeout
 
         # 解析 gateway 逗号格式（支持多组 "IP1,MAC1,IP2,MAC2" 交替逗号格式）
         self._manual_gateways: list = []  # [(ip, mac), ...] — 手动配置的全部网关
@@ -313,7 +315,7 @@ class ARPProtection:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
             text = stdout.decode("utf-8", errors="replace")
             for line in text.splitlines():
                 parts = line.strip().split()
@@ -360,7 +362,7 @@ class ARPProtection:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
             text = stdout.decode("utf-8", errors="replace")
         except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
             logger.warning("ARP 防护: ipconfig 失败: %s", e)
@@ -504,7 +506,7 @@ class ARPProtection:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
             text = stdout.decode("utf-8", errors="replace")
             for line in text.splitlines():
                 # default via 192.168.1.1 dev eth0  metric 100
@@ -540,7 +542,7 @@ class ARPProtection:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
             text = stdout.decode("utf-8", errors="replace")
             for line in text.splitlines():
                 m = re.search(r'inet\s+(\d+\.\d+\.\d+\.\d+)/(\d+)', line)
@@ -582,7 +584,7 @@ class ARPProtection:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
             text = stdout.decode("utf-8", errors="replace")
 
             # 解析 route print 输出中的默认网关
@@ -608,7 +610,7 @@ class ARPProtection:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
             text = stdout.decode("utf-8", errors="replace")
             # 匹配: default via 192.168.1.1 dev eth0
             for line in text.splitlines():
@@ -631,7 +633,7 @@ class ARPProtection:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
             text = stdout.decode("utf-8", errors="replace")
 
             # 匹配: 192.168.1.1         00-11-22-33-44-55     dynamic
@@ -656,7 +658,7 @@ class ARPProtection:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
             text = stdout.decode("utf-8", errors="replace")
             # 匹配: 192.168.1.1 dev eth0 lladdr 00:11:22:33:44:55 REACHABLE
             m = re.search(r'lladdr\s+(([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2})', text)
@@ -714,7 +716,7 @@ class ARPProtection:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
             text = stdout.decode("utf-8", errors="replace")
             for line in text.splitlines():
                 s = line.strip()
@@ -736,7 +738,7 @@ class ARPProtection:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
             text = stdout.decode("utf-8", errors="replace")
         except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
             return False, f"ipconfig 执行失败: {e}"
@@ -827,7 +829,7 @@ class ARPProtection:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
             text = stdout.decode("utf-8", errors="replace")
             for line in text.splitlines():
                 m = re.search(r'inet6\s+([0-9a-f:]+)', line.lower())
@@ -876,7 +878,7 @@ class ARPProtection:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.DEVNULL,
                 )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
             text = stdout.decode("utf-8", errors="replace")
 
             # Windows: arp -a 输出中找本机 IP
@@ -912,7 +914,7 @@ class ARPProtection:
         """
         success = 0
         for _ in range(count):
-            if await self._ping_gateway(gw_ip):
+            if await self._ping_gateway_fast(gw_ip):
                 success += 1
             await asyncio.sleep(0.05)
 
@@ -1062,7 +1064,7 @@ class ARPProtection:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=8)
             if proc.returncode == 0:
                 self._local_ipv4 = new_ip
                 if new_ip and not new_ip.startswith("169.254."):
@@ -1163,7 +1165,7 @@ class ARPProtection:
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
             )
-            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
             if proc.returncode != 0:
                 err = stderr.decode("utf-8", errors="replace")[:200]
                 logger.warning("ARP 防护: ip addr del 失败: %s", err)
@@ -1175,7 +1177,7 @@ class ARPProtection:
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
             )
-            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
             if proc.returncode != 0:
                 err = stderr.decode("utf-8", errors="replace")[:200]
                 logger.warning("ARP 防护: ip addr add 失败: %s", err)
@@ -1227,7 +1229,7 @@ class ARPProtection:
 
     # ======================== 刷新路由器 ARP 表 ========================
 
-    async def refresh_router_arp(self) -> bool:
+    async def refresh_router_arp(self, abort_check=None) -> bool:
         """
         针对路由器 ARP 表被篡改或 IP 冲突的高级修复策略：
 
@@ -1240,6 +1242,9 @@ class ARPProtection:
              - 丢包 ~100% → ARP 投毒（流量被劫持）→ 两阶段 IP 切换
           4. 验证 ping → 成功则设静态 ARP + 持续 GARP 对抗
           5. 以上都失败 → 两阶段 IP 切换抗 ARP 中毒
+
+        Args:
+            abort_check: 可选回调，每次主要步骤后检查，若返回 True 则提前中止（网络已恢复）
         """
         gw_ip = self.gateway_ip
         if not gw_ip:
@@ -1248,6 +1253,17 @@ class ARPProtection:
 
         self._arp_attack_logged = False
         logger.info("ARP 防护: 正在修复路由器 ARP 表 (网关=%s)...", gw_ip)
+
+        # 定义 abort 检查辅助
+        async def _check_abort():
+            if abort_check:
+                try:
+                    if abort_check():
+                        logger.info("ARP 防护: 网络已恢复，提前中止修复")
+                        return True
+                except Exception:
+                    pass
+            return False
 
         # 0. ARP 投毒检测：检查本机 ARP 表中各网关 MAC 是否被篡改
         poisoned = await self._check_arp_poisoning()
@@ -1266,6 +1282,9 @@ class ARPProtection:
         for _ in range(10):
             await self._ping_gateway_fast(gw_ip)
             await asyncio.sleep(0.01)
+
+        if await _check_abort():
+            return True
 
         # 检查本机是否为 APIPA 地址（169.254.x.x）
         # APIPA 时网关在不同子网，所有 ping 必然失败，无需跑 35s 丢包检测
@@ -1293,8 +1312,21 @@ class ARPProtection:
         elif loss_info["diagnosis"] == "network_down":
             logger.warning("ARP 防护: 网关完全不可达，诊断=网络断开")
 
-        # 3. 爆发真实 GARP x20（发送真实二层 ARP 包，全网强制更新 ARP 表）
-        await self._garp_broadcast_burst(count=20)
+        # 3. 爆发真实 GARP x10（发送真实二层 ARP 包，全网强制更新 ARP 表）
+        await self._garp_broadcast_burst(count=10)
+
+        # GARP 爆发后立即验证网关是否已恢复，如果可达则提前返回
+        if await self._ping_gateway_fast(gw_ip):
+            logger.info("ARP 防护: GARP 爆发后网关 %s 已恢复可达", gw_ip)
+            if self.gateway_mac:
+                if await self._protect_gateway_arp():
+                    logger.info("ARP 防护: 静态 ARP 已绑定")
+                else:
+                    await self._garp_sustain(gw_ip, duration=3, interval=0.5)
+            return True
+
+        if await _check_abort():
+            return True
 
         # 4. IP 冲突检测 + 自动修复
         #    丢包 ~50% 说明有设备用相同静态 IP，即使 ARP 表没显示也要处理
@@ -1339,6 +1371,8 @@ class ARPProtection:
             return True
 
         # 6. 网关仍不可达 → 持续 ARP 中毒 → 两阶段 IP 切换抗毒
+        if await _check_abort():
+            return True
         logger.warning("ARP 防护: 网关 %s 仍不可达，尝试两阶段 IP 切换抗 ARP 中毒...", gw_ip)
         if await self._garp_ip_switch_defense():
             logger.info("ARP 防护: 两阶段 GARP 切换后网关 %s 可达", gw_ip)
@@ -1439,9 +1473,11 @@ class ARPProtection:
         for i in range(count):
             # 发送真实 GARP 宣告
             await self._send_single_garp()
-            # 每 3 次加一次网关快速 ping（双重确认）
+            # 每 3 次加一次网关快速 ping（双重确认），成功则提前结束
             if i % 3 == 0:
-                await self._ping_gateway_fast(gw_ip)
+                if await self._ping_gateway_fast(gw_ip):
+                    logger.info("ARP 防护: GARP 爆发中网关已恢复 (第 %d 轮)", i + 1)
+                    return
             await asyncio.sleep(0.01)
 
         # 最后再 ping 一次广播地址（作为辅助，部分交换机可能需要）
@@ -1531,7 +1567,7 @@ class ARPProtection:
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.PIPE,
                 )
-                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=8)
                 if proc.returncode != 0:
                     err = stderr.decode("utf-8", errors="replace")[:200]
                     if err:
@@ -1563,7 +1599,7 @@ class ARPProtection:
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.DEVNULL,
                 )
-                await asyncio.wait_for(proc.wait(), timeout=10)
+                await asyncio.wait_for(proc.wait(), timeout=5)
                 # 添加新 IP
                 proc = await asyncio.create_subprocess_exec(
                     "ip", "addr", "add", f"{new_ip}/{prefix}",
@@ -1571,7 +1607,7 @@ class ARPProtection:
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.PIPE,
                 )
-                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
                 if proc.returncode != 0:
                     err = stderr.decode("utf-8", errors="replace")[:200]
                     logger.warning("ARP 防护: ip addr 切换 IP 失败: %s", err)
@@ -1610,7 +1646,7 @@ class ARPProtection:
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.PIPE,
                 )
-                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=8)
                 if proc.returncode == 0:
                     logger.critical("ARP 防护: DHCP 模式已启用，等待 DHCP 服务器分配 IP...")
                     # 等待 DHCP 获取地址
@@ -1628,7 +1664,7 @@ class ARPProtection:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
-                await asyncio.wait_for(proc.wait(), timeout=15)
+                await asyncio.wait_for(proc.wait(), timeout=8)
             except (asyncio.TimeoutError, FileNotFoundError, OSError):
                 pass
 
@@ -1645,7 +1681,7 @@ class ARPProtection:
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.DEVNULL,
                 )
-                await asyncio.wait_for(proc.wait(), timeout=10)
+                await asyncio.wait_for(proc.wait(), timeout=5)
             except (asyncio.TimeoutError, FileNotFoundError, OSError):
                 pass
         else:
@@ -1734,12 +1770,12 @@ class ARPProtection:
                 await self._garp_broadcast_burst(count=10)
                 await asyncio.sleep(0.3)
                 reachable = False
-                for attempt in range(5):
+                for attempt in range(3):
                     reachable = await self._ping_gateway(gw_ip)
                     if reachable:
                         break
-                    if attempt < 4:
-                        await asyncio.sleep(1.0)
+                    if attempt < 2:
+                        await asyncio.sleep(0.5)
                 # IP 切换后 TCP 监听器 socket 可能失效，触发重启
                 await self._fire_restart_hooks()
                 # 刷新 DNS 缓存（IP 变更后旧 DNS 缓存可能指向错误 IP）
@@ -1762,12 +1798,12 @@ class ARPProtection:
         # 确认网关可达：多轮重试，给接口/路由/ARP 足够时间稳定
         # netsh 切换 IP 后 Windows 需时间更新路由表和 ARP 缓存
         reachable = False
-        for attempt in range(5):
+        for attempt in range(3):
             reachable = await self._ping_gateway(gw_ip)
             if reachable:
                 break
-            if attempt < 4:
-                await asyncio.sleep(1.0)
+            if attempt < 2:
+                await asyncio.sleep(0.5)
         if reachable and self.gateway_mac:
             await self._protect_gateway_arp()
         # IP 切换后 TCP 监听器 socket 可能失效，触发重启
@@ -1825,7 +1861,7 @@ class ARPProtection:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
             text = stdout.decode("utf-8", errors="replace")
             logger.info("ARP 防护: netsh show interfaces 原始输出:\n%s", text)
 
@@ -1898,7 +1934,7 @@ class ARPProtection:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
             text = stdout.decode("utf-8", errors="replace")
         except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
             logger.debug("ARP 防护: netsh show config 失败: %s", e)
@@ -1924,7 +1960,7 @@ class ARPProtection:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
             text = stdout.decode("utf-8", errors="replace")
         except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
             logger.debug("ARP 防护: netsh show address 失败: %s", e)
@@ -2017,7 +2053,7 @@ class ARPProtection:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
                 if proc.returncode == 0:
                     logger.info("ARP 防护: ✓ 静态 ARP 已绑定 %s (%s → %s)",
                                  gw_ip, iface, gw_mac)
@@ -2085,7 +2121,7 @@ class ARPProtection:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
                 if proc.returncode == 0:
                     logger.info("ARP 防护: ✓ 静态 ARP 已绑定 %s (%s → %s)",
                                  gw_ip, iface, gw_mac)
@@ -2117,7 +2153,7 @@ class ARPProtection:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.DEVNULL,
                 )
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
                 text = stdout.decode("utf-8", errors="replace")
                 for line in text.splitlines():
                     line = line.strip()
@@ -2182,15 +2218,15 @@ class ARPProtection:
         except (ValueError, IndexError):
             return False
 
-    @staticmethod
-    async def _ping_gateway(gw_ip: str) -> bool:
-        """ping 网关（标准版：3 秒超时）"""
-        return await ARPProtection._ping_icmp(gw_ip, timeout_ms=3000)
+    async def _ping_gateway(self, gw_ip: str) -> bool:
+        """ping 网关（使用配置的 ping_timeout，公式 max(ping_timeout*100, 80)ms，默认 80ms）"""
+        timeout_ms = max(int(self._ping_timeout * 100), 80)
+        return await ARPProtection._ping_icmp(gw_ip, timeout_ms=timeout_ms)
 
     @staticmethod
     async def _ping_gateway_fast(gw_ip: str) -> bool:
-        """ping 网关（快速版：200ms 超时，用于 GARP 爆发场景的快速验证，不启用 TCP 兜底）"""
-        return await ARPProtection._ping_icmp(gw_ip, timeout_ms=200, use_tcp_fallback=False)
+        """ping 网关（快速版：80ms 超时，用于 GARP 爆发场景的快速验证，不启用 TCP 兜底）"""
+        return await ARPProtection._ping_icmp(gw_ip, timeout_ms=80, use_tcp_fallback=False)
 
     @staticmethod
     async def _ping_icmp(ip: str, timeout_ms: int,

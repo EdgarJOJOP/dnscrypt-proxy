@@ -9,7 +9,8 @@
 import sys
 import asyncio
 import logging
-from typing import List, Optional
+import collections
+from typing import List, Optional, Callable
 
 import dns.message
 import dns.rdatatype
@@ -43,20 +44,21 @@ class NetworkMonitor:
         self._consecutive_failures = 0  # 连续检测失败次数
         self._last_recovery_time = 0.0  # 上次恢复时间戳
 
-        # ARP 防护锁（防止 10ms 间隔下并发执行 refresh_router_arp）
-        self._arp_busy = False
-        # 网络断开标记：ARP 防护完整执行失败且外网也不可达时设置，
-        # 后续跳过 ARP 防护直到外网检测恢复（避免路由器关机时无限循环）
+        # 滑动窗口：记录最近 N 次 ping 结果
+        self._gw_results: collections.deque = collections.deque(maxlen=5)   # 网关 ping 结果窗口 (~4s)
+        self._ext_results: collections.deque = collections.deque(maxlen=3)  # 外网 ping 结果窗口 (~2.4s)
+
+        # 网络断开标记：滑动窗口全丢包+外网不通时设置，
+        # 跳过 ARP 防护直接抑制 DNS，恢复后重新启用
         self._arp_network_down = False
-        # 连通性检测运行中标志（防止断网时 1s 间隔重叠检测）
-        self._connectivity_check_busy = False
+
+        # ARP 防护后台任务（主循环不 block，继续以 ping_interval 采样）
+        self._arp_task: Optional[asyncio.Task] = None
 
         # 从配置读取
         nm = config.get_raw().get("network_monitor", {})
         self._enabled = nm.get("enabled", True)
         self._interval = nm.get("ping_interval", 0.01)  # 网关检测间隔（秒，默认 10ms）
-        self._external_interval = nm.get("external_interval", 15)  # 外网检测间隔（秒）
-        self._next_external_check = 0.0  # 下次外网检测时间戳
         self._ping_timeout = nm.get("ping_timeout", 5)  # ping 超时（秒）
         self._ping_targets_v4 = nm.get("ping_targets_v4", ["223.5.5.5", "114.114.114.114"])
         self._ping_targets_v6 = nm.get("ping_targets_v6", ["2400:3200::1", "2400:da00::6666"])
@@ -69,7 +71,11 @@ class NetworkMonitor:
         self._dns_probe_resolvers: Dict[str, "PlainDNSResolver"] = {}
 
         # ARP 防护
-        self._arp_protection = ARPProtection(config.arp_protection_config)
+        self._arp_protection = ARPProtection(config.arp_protection_config,
+                                              ping_timeout=self._ping_timeout)
+
+        # 外网 ping 轮询索引（轮流 ping 多个 v4 目标，每轮一个）
+        self._ext_ping_index = 0
 
     @property
     def enabled(self) -> bool:
@@ -88,8 +94,8 @@ class NetworkMonitor:
             return
         self._running = True
         self._task = asyncio.create_task(self._monitor_loop())
-        logger.info("网络连通性监控已启动 (网关检测=%gs, 外网检测=%ds, ping目标=%s)",
-                     self._interval, self._external_interval, self._ping_targets_v4 + self._ping_targets_v6)
+        logger.info("网络连通性监控已启动 (网关检测=%gs, ping目标=%s)",
+                     self._interval, self._ping_targets_v4 + self._ping_targets_v6)
 
         # ARP 防护：自动探测网关（手动配置了 IP+MAC 则跳过）
         if self._arp_protection.enabled and not self._arp_protection.is_manual:
@@ -110,95 +116,87 @@ class NetworkMonitor:
 
     async def _monitor_loop(self):
         """
-        监控主循环（双速检测）：
-        - 网关 ping：10ms 间隔，快速发现 ARP 投毒
-        - 外网 ping + DNS 探测：15s 间隔，判断整体连通性
+        监控主循环（滑动窗口丢包检测）：
+        - 每 ping_interval(0.80s) 采样一次：ping 网关 + ping 一个外网目标
+        - 滑动窗口（网关5次/外网3次）计算丢包率
+        - 丢包分级驱动 ARP 防护后台任务，主循环继续采样
         """
         while self._running:
             try:
-                now = asyncio.get_event_loop().time()
-
-                # ========== 1. 快速网关检测（10ms） ==========
-                gw_ok = True
                 gw_ip = self._arp_protection.gateway_ip
+
+                # ========== 1. ping 网关 + ping 外网（每轮一次） ==========
+                gw_ok = True
                 if gw_ip:
                     gw_ok = await self._arp_protection._ping_gateway(gw_ip)
+                self._gw_results.append(gw_ok)
 
-                # 网关可达时清除断网标记（网络已恢复）
-                if gw_ok:
-                    self._arp_network_down = False
-                    self.resolver_manager.set_network_down(False)
+                # 每轮顺便 ping 一个外网 IPv4 目标（轮流）
+                ext_ok = True
+                if self._ping_targets_v4:
+                    idx = self._ext_ping_index % len(self._ping_targets_v4)
+                    self._ext_ping_index += 1
+                    ext_ok = await self._ping(self._ping_targets_v4[idx])
+                self._ext_results.append(ext_ok)
 
-                # ARP 防护：网关不通时尝试恢复
-                if not gw_ok and self._arp_protection.enabled \
-                        and not self._arp_protection.is_manual and not self._arp_busy:
-                    if self._arp_network_down:
-                        # 已确认是网络断开而非 ARP 攻击（之前跑完一轮 ARP 防护 + 外网不可达），
-                        # 跳过 ARP 防护，等外网连通性检测恢复后再重新启用
-                        pass
-                    else:
-                        iface_ok, iface_details = await self._arp_protection.check_interface_healthy()
-                        if iface_ok:
-                            logger.warning("ARP 防护: 网关 ping 失败，本地网卡正常 (%s)，"
-                                         "尝试刷新路由器 ARP ...", iface_details)
-                        else:
-                            logger.warning("ARP 防护: 网关 ping 失败，接口检查异常 (%s)"
-                                         "（可能为 ipconfig/route 解析误判），仍尝试 ARP 刷新",
-                                         iface_details)
-                        self._arp_busy = True
-                        try:
-                            if await self._arp_protection.refresh_router_arp():
-                                if await self._arp_protection._ping_gateway(gw_ip):
-                                    logger.info("ARP 防护: 路由器 ARP 刷新后网关已恢复")
-                                    gw_ok = True
-                            if not gw_ok:
-                                # ARP 防护完整执行后网关仍不通 → 快速检查外网
-                                # 如果外网也不可达说明是网络断开而非攻击，标记后跳过后续循环
-                                ext_ok = await self._check_connectivity()
-                                if not ext_ok:
-                                    self._arp_network_down = True
-                                    self.resolver_manager.set_network_down(True)
-                                    logger.warning("ARP 防护: 所有恢复手段失败且外网不可达，"
-                                                  "确认网络断开，暂停 ARP 防护等待网络恢复")
-                        finally:
-                            self._arp_busy = False
+                # ========== 2. 从滑动窗口计算丢包分级 ==========
+                loss_pct, diagnosis = self._classify_loss()
 
-                # ========== 2. 外网连通性检测（15s / 断网时 1s） ==========
-                if now >= self._next_external_check:
-                    # 断网时 1 秒检测一次快速恢复；正常时用配置间隔
-                    check_interval = 1.0 if self._arp_network_down else self._external_interval
-                    self._next_external_check = now + check_interval
-                    ext_ok = False
-                    if not self._connectivity_check_busy:
-                        self._connectivity_check_busy = True
-                        try:
-                            ext_ok = await self._check_connectivity()
-                        finally:
-                            self._connectivity_check_busy = False
-
-                    if ext_ok:
-                        self._arp_network_down = False  # 外网恢复，清除断网标记
+                # ========== 3. 决策 ==========
+                if diagnosis == "recovered":
+                    # 窗口内大部分成功 → 网络已正常
+                    if self._arp_network_down or self.resolver_manager._network_down:
+                        logger.info("网络已恢复 (网关丢包=%d%%, 外网正常)", loss_pct)
+                        self._arp_network_down = False
                         self.resolver_manager.set_network_down(False)
-                        self._consecutive_failures = 0
-                        if self._degraded:
-                            self._recovery_successes += 1
-                            if self._recovery_successes >= self._recovery_check_count:
-                                logger.info("网络已恢复（连续 %d 次外网检测成功），开始恢复上游...",
-                                             self._recovery_successes)
-                                await self._recover()
-                                self._recovery_successes = 0
-                        else:
-                            self._recovery_successes = 0
-                    else:
-                        self._consecutive_failures += 1
-                        self._recovery_successes = 0
-                        if not self._degraded \
-                                and self._consecutive_failures >= self._failure_threshold:
-                            self._degraded = True
-                            logger.warning("外网连通性异常（连续 %d 次检测失败），进入降级模式",
-                                            self._consecutive_failures)
+                    # 取消还在运行的 ARP 防护任务
+                    if self._arp_task and not self._arp_task.done():
+                        self._arp_task.cancel()
+                        self._arp_task = None
 
-                # 快速间隔
+                elif diagnosis == "network_down":
+                    # 全丢包 + 外网不通 → 确认断网，抑制 DNS
+                    if not self._arp_network_down:
+                        logger.warning("网络断开确认 (网关丢包=%d%%, 外网不可达)", loss_pct)
+                        self._arp_network_down = True
+                        self.resolver_manager.set_network_down(True)
+                    # 取消可能还在跑的 ARP 防护任务（断网没必要跑）
+                    if self._arp_task and not self._arp_task.done():
+                        self._arp_task.cancel()
+                        self._arp_task = None
+
+                elif diagnosis == "arp_issue":
+                    # 部分丢包 → 需要 ARP 防护（启动后台任务）
+                    if not self._arp_network_down and self._arp_protection.enabled \
+                            and not self._arp_protection.is_manual:
+                        self.resolver_manager.set_network_down(True)
+                        if not self._arp_task or self._arp_task.done():
+                            logger.warning("ARP 防护: 网关丢包 %d%%，启动后台 ARP 修复", loss_pct)
+                            self._arp_task = asyncio.create_task(
+                                self._run_arp_defense(gw_ip, lambda: self._is_recovered())
+                            )
+                        else:
+                            # 已有 ARP 防护任务在运行，主循环继续采样
+                            pass
+
+                # ========== 4. 外网降级跟踪（全量 check 每 15s 做一次，非每轮） ==========
+                # 这里简化：降级状态仅用于触发全量 recover
+                if not ext_ok and not self._arp_network_down:
+                    self._consecutive_failures += 1
+                    self._recovery_successes = 0
+                    if not self._degraded \
+                            and self._consecutive_failures >= self._failure_threshold:
+                        self._degraded = True
+                elif ext_ok and self._degraded:
+                    self._recovery_successes += 1
+                    if self._recovery_successes >= self._recovery_check_count:
+                        await self._recover()
+                        self._recovery_successes = 0
+                elif ext_ok:
+                    self._consecutive_failures = 0
+                    self._recovery_successes = 0
+
+                # ========== 5. 等待下一个采样周期 ==========
                 await asyncio.sleep(self._interval)
 
             except asyncio.CancelledError:
@@ -206,6 +204,95 @@ class NetworkMonitor:
             except Exception as e:
                 logger.error("网络监控异常: %s", e)
                 await asyncio.sleep(0.1)
+
+    # ======================== 滑动窗口丢包分级 ========================
+
+    def _classify_loss(self) -> tuple:
+        """
+        根据滑动窗口计算丢包率并分级。
+
+        Returns:
+            (loss_pct, diagnosis)
+            diagnosis: "recovered" (丢包 <20%, 外网通)
+                       "arp_issue" (丢包 20~89%)
+                       "network_down" (丢包 ≥90% 且外网不通)
+        """
+        gw_len = len(self._gw_results)
+        if gw_len < 2:
+            # 窗口未填满，不做决策
+            return (0, "normal")
+
+        gw_fails = gw_len - sum(self._gw_results)
+        gw_loss = int(gw_fails / gw_len * 100)
+
+        ext_len = len(self._ext_results)
+        ext_fails = ext_len - sum(self._ext_results) if ext_len > 0 else 0
+        ext_loss = int(ext_fails / max(ext_len, 1) * 100) if ext_len > 0 else 100
+
+        if gw_loss < 20 and ext_loss < 100:
+            return (gw_loss, "recovered")
+        elif gw_loss >= 90 and ext_loss >= 67:
+            return (gw_loss, "network_down")
+        elif gw_loss >= 20:
+            return (gw_loss, "arp_issue")
+        return (gw_loss, "normal")
+
+    def _is_recovered(self) -> bool:
+        """
+        ARP 防护后台任务用：检查主循环的滑动窗口是否显示已恢复。
+        被作为 abort_check 回调传给 refresh_router_arp。
+        """
+        loss_pct, diagnosis = self._classify_loss()
+        # 网关恢复率 > 50% 就算恢复（窗口内至少 3/5 成功）
+        gw_len = len(self._gw_results)
+        if gw_len >= 3:
+            gw_ok_count = sum(self._gw_results)
+            if gw_ok_count >= max(3, gw_len // 2 + 1):
+                return True
+        return diagnosis == "recovered"
+
+    async def _run_arp_defense(self, gw_ip: str, abort_check: Callable[[], bool]):
+        """
+        ARP 防护后台任务：在后台运行 refresh_router_arp，
+        主循环继续以 ping_interval 采样。
+        每步后检查 abort_check，若网络已恢复则提前退出。
+        """
+        if not gw_ip or not self._arp_protection.enabled:
+            return
+        try:
+            # 先检查本地网卡状态
+            iface_ok, iface_details = await self._arp_protection.check_interface_healthy()
+            if iface_ok:
+                logger.warning("ARP 防护: 网关丢包 %d%%，本地网卡正常 (%s)，"
+                               "启动后台 ARP 修复", self._classify_loss()[0], iface_details)
+            else:
+                logger.warning("ARP 防护: 网关丢包，接口检查异常 (%s)"
+                               "（可能为 ipconfig/route 解析误判），仍尝试 ARP 刷新",
+                               iface_details)
+
+            # 调用 refresh_router_arp，传入 abort_check
+            result = await self._arp_protection.refresh_router_arp(abort_check=abort_check)
+
+            if result:
+                # ARP 防护成功
+                if abort_check() or await self._arp_protection._ping_gateway_fast(gw_ip):
+                    logger.info("ARP 防护: 后台修复完成，网关已恢复")
+                    self._arp_network_down = False
+                    self.resolver_manager.set_network_down(False)
+            else:
+                # ARP 防护后网关仍不通 → 检查外网
+                ext_ok = abort_check() or (len(self._ext_results) > 0 and
+                                            sum(self._ext_results) > 0)
+                if not ext_ok:
+                    self._arp_network_down = True
+                    self.resolver_manager.set_network_down(True)
+                    logger.warning("ARP 防护: 后台修复无效且外网不可达，确认网络断开")
+                else:
+                    logger.warning("ARP 防护: 后台修复无效但外网可达，网关可能自身故障")
+        except asyncio.CancelledError:
+            logger.info("ARP 防护: 后台任务被取消（网络已恢复）")
+        except Exception as e:
+            logger.error("ARP 防护: 后台任务异常: %s", e)
 
     # ======================== 连通性检测 ========================
 
