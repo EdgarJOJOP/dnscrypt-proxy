@@ -1287,7 +1287,7 @@ class ARPProtection:
             return True
 
         # 检查本机是否为 APIPA 地址（169.254.x.x）
-        # APIPA 时网关在不同子网，所有 ping 必然失败，无需跑 35s 丢包检测
+        # APIPA 时网关在不同子网，所有 ping 必然失败，无需跑丢包检测
         current_ip = self._local_ipv4 or ""
         is_apipa = current_ip.startswith("169.254.")
         if is_apipa:
@@ -1297,33 +1297,65 @@ class ARPProtection:
             loss_info = {"loss_rate": 1.0, "success": 0, "total": 10,
                          "diagnosis": "ip_conflict"}
         else:
-            # 2. 丢包模式分析：通过连续 ping 判断是 IP 冲突还是 ARP 投毒
-            loss_info = await self._detect_packet_loss_pattern(gw_ip, count=10)
-        if loss_info["diagnosis"] == "ip_conflict":
-            loss_pct = round(loss_info["loss_rate"] * 100)
-            logger.warning("ARP 防护: 网关丢包 %d%% (%d/%d), "
-                           "诊断=IP冲突(攻击者使用相同静态IP)",
-                           loss_pct, loss_info["success"], loss_info["total"])
-        elif loss_info["diagnosis"] == "arp_poisoning":
-            loss_pct = round(loss_info["loss_rate"] * 100)
-            logger.warning("ARP 防护: 网关丢包 %d%% (%d/%d), "
-                           "诊断=ARP投毒(流量被劫持到攻击者)",
-                           loss_pct, loss_info["success"], loss_info["total"])
-        elif loss_info["diagnosis"] == "network_down":
-            logger.warning("ARP 防护: 网关完全不可达，诊断=网络断开")
+            # 2-3. 并发执行：丢包模式分析 + GARP 爆发
+            #     GARP 内置每 3 轮 ping 检查，网络恢复可提前退出
+            #     丢包分析提供诊断信息
+            loss_task = asyncio.create_task(
+                self._detect_packet_loss_pattern(gw_ip, count=10))
+            garp_task = asyncio.create_task(
+                self._garp_broadcast_burst(count=10))
 
-        # 3. 爆发真实 GARP x10（发送真实二层 ARP 包，全网强制更新 ARP 表）
-        await self._garp_broadcast_burst(count=10)
+            done, pending = await asyncio.wait(
+                [loss_task, garp_task],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
 
-        # GARP 爆发后立即验证网关是否已恢复，如果可达则提前返回
-        if await self._ping_gateway_fast(gw_ip):
-            logger.info("ARP 防护: GARP 爆发后网关 %s 已恢复可达", gw_ip)
-            if self.gateway_mac:
-                if await self._protect_gateway_arp():
-                    logger.info("ARP 防护: 静态 ARP 已绑定")
-                else:
-                    await self._garp_sustain(gw_ip, duration=3, interval=0.5)
-            return True
+            # 取消仍在运行的任务
+            for task in pending:
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+            # 获取丢包分析结果（可能已被取消，此时用 None 兜底）
+            loss_info = None
+            if loss_task in done and not loss_task.exception():
+                try:
+                    loss_info = loss_task.result()
+                except Exception:
+                    pass
+
+            # GARP 完成后立即验证网关
+            if await self._ping_gateway_fast(gw_ip):
+                logger.info("ARP 防护: GARP 爆发后网关 %s 已恢复可达", gw_ip)
+                if self.gateway_mac:
+                    if await self._protect_gateway_arp():
+                        logger.info("ARP 防护: 静态 ARP 已绑定")
+                    else:
+                        await self._garp_sustain(gw_ip, duration=3, interval=0.5)
+                return True
+
+        # 有丢包分析结果时才打印诊断日志
+        if loss_info:
+            if loss_info["diagnosis"] == "ip_conflict":
+                loss_pct = round(loss_info["loss_rate"] * 100)
+                logger.warning("ARP 防护: 网关丢包 %d%% (%d/%d), "
+                               "诊断=IP冲突(攻击者使用相同静态IP)",
+                               loss_pct, loss_info["success"], loss_info["total"])
+            elif loss_info["diagnosis"] == "arp_poisoning":
+                loss_pct = round(loss_info["loss_rate"] * 100)
+                logger.warning("ARP 防护: 网关丢包 %d%% (%d/%d), "
+                               "诊断=ARP投毒(流量被劫持到攻击者)",
+                               loss_pct, loss_info["success"], loss_info["total"])
+            elif loss_info["diagnosis"] == "network_down":
+                logger.warning("ARP 防护: 网关完全不可达，诊断=网络断开")
+        else:
+            # 没有丢包分析结果（GARP 跑完但网关不通，loss 被取消），手动检查
+            if not await self._ping_gateway_fast(gw_ip):
+                logger.warning("ARP 防护: 网关完全不可达，诊断=网络断开")
+            loss_info = loss_info or {"loss_rate": 1.0, "success": 0, "total": 10,
+                                       "diagnosis": "network_down"}
 
         if await _check_abort():
             return True

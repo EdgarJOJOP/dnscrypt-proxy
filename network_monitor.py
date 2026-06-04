@@ -54,6 +54,7 @@ class NetworkMonitor:
 
         # ARP 防护后台任务（主循环不 block，继续以 ping_interval 采样）
         self._arp_task: Optional[asyncio.Task] = None
+        self._arp_last_end_time: float = 0.0  # 上次 ARP 防护结束时间，用于防抖
 
         # 从配置读取
         nm = config.get_raw().get("network_monitor", {})
@@ -149,6 +150,8 @@ class NetworkMonitor:
                         logger.info("网络已恢复 (网关丢包=%d%%, 外网正常)", loss_pct)
                         self._arp_network_down = False
                         self.resolver_manager.set_network_down(False)
+                        # 从断网恢复时重建上游连接，避免 DNS 继续失败 19s
+                        await self._recover()
                     # 取消还在运行的 ARP 防护任务
                     if self._arp_task and not self._arp_task.done():
                         self._arp_task.cancel()
@@ -259,19 +262,36 @@ class NetworkMonitor:
         """
         if not gw_ip or not self._arp_protection.enabled:
             return
-        try:
-            # 先检查本地网卡状态
-            iface_ok, iface_details = await self._arp_protection.check_interface_healthy()
-            if iface_ok:
-                logger.warning("ARP 防护: 网关丢包 %d%%，本地网卡正常 (%s)，"
-                               "启动后台 ARP 修复", self._classify_loss()[0], iface_details)
-            else:
-                logger.warning("ARP 防护: 网关丢包，接口检查异常 (%s)"
-                               "（可能为 ipconfig/route 解析误判），仍尝试 ARP 刷新",
-                               iface_details)
 
-            # 调用 refresh_router_arp，传入 abort_check
+        # 防抖：距上次 ARP 结束不足 3s，跳过（波动期避免重复任务）
+        now = asyncio.get_event_loop().time()
+        if now - self._arp_last_end_time < 3.0:
+            return
+
+        try:
+            # 并发执行接口检查（仅用于日志，不阻塞 ARP 修复）
+            async def _log_iface_check():
+                iface_ok, iface_details = await self._arp_protection.check_interface_healthy()
+                loss_pct, _ = self._classify_loss()
+                if iface_ok:
+                    logger.warning("ARP 防护: 网关丢包 %d%%，本地网卡正常 (%s), 启动后台 ARP 修复",
+                                   loss_pct, iface_details)
+                else:
+                    logger.warning("ARP 防护: 网关丢包 %d%%，接口检查异常 (%s)"
+                                   "（可能为 ipconfig/route 解析误判），仍尝试 ARP 刷新",
+                                   loss_pct, iface_details)
+
+            iface_task = asyncio.create_task(_log_iface_check())
+
+            # 立即启动 ARP 修复（不等待接口检查完成）
             result = await self._arp_protection.refresh_router_arp(abort_check=abort_check)
+
+            # 等待接口检查日志完成（不关键，最多等 3s）
+            if not iface_task.done():
+                try:
+                    await asyncio.wait_for(iface_task, timeout=3.0)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    iface_task.cancel()
 
             if result:
                 # ARP 防护成功
@@ -279,6 +299,9 @@ class NetworkMonitor:
                     logger.info("ARP 防护: 后台修复完成，网关已恢复")
                     self._arp_network_down = False
                     self.resolver_manager.set_network_down(False)
+                    # 如果是从 network_down 恢复，重建上游连接
+                    if self.resolver_manager._network_down:
+                        await self._recover()
             else:
                 # ARP 防护后网关仍不通 → 检查外网
                 ext_ok = abort_check() or (len(self._ext_results) > 0 and
@@ -293,6 +316,8 @@ class NetworkMonitor:
             logger.info("ARP 防护: 后台任务被取消（网络已恢复）")
         except Exception as e:
             logger.error("ARP 防护: 后台任务异常: %s", e)
+        finally:
+            self._arp_last_end_time = asyncio.get_event_loop().time()
 
     # ======================== 连通性检测 ========================
 
