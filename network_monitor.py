@@ -79,6 +79,15 @@ class NetworkMonitor:
         # 外网 ping 轮询索引（轮流 ping 多个 v4 目标，每轮一个）
         self._ext_ping_index = 0
 
+        # 净化 dns_probe_domains：启动时移除非法域名
+        self._dns_probe_domains = [
+            d for d in self._dns_probe_domains
+            if self._is_valid_domain(d)
+        ]
+        if len(self._dns_probe_domains) < len(nm.get("dns_probe_domains", [])):
+            removed = set(nm.get("dns_probe_domains", [])) - set(self._dns_probe_domains)
+            logger.warning("已移除 %d 个非法 DNS 探测域名: %s", len(removed), removed)
+
         # 常驻恢复 worker（事件触发，用完冻结）
         self._run_recover = asyncio.Event()
         self._recover_task: Optional[asyncio.Task] = None
@@ -251,7 +260,7 @@ class NetworkMonitor:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error("网络监控异常: %s", e)
+                logger.error("网络监控异常: %s", e, exc_info=True)
                 await asyncio.sleep(0.1)
 
     # ======================== 滑动窗口丢包分级 ========================
@@ -285,6 +294,23 @@ class NetworkMonitor:
         elif gw_loss >= 20:
             return (gw_loss, "arp_issue")
         return (gw_loss, "normal")
+
+    @staticmethod
+    def _is_valid_domain(domain: str) -> bool:
+        """
+        校验域名是否合法（防止 IDNA 编码异常）。
+        尝试 DNS 名称编码，失败说明含非法字符。
+        """
+        if not domain or not isinstance(domain, str):
+            return False
+        domain = domain.strip().rstrip(".")
+        if not domain or len(domain) > 253:
+            return False
+        try:
+            domain.encode("idna")
+            return True
+        except (UnicodeError, ValueError):
+            return False
 
     def _is_recovered(self) -> bool:
         """
@@ -452,6 +478,10 @@ class NetworkMonitor:
                 return False
 
         for domain in self._dns_probe_domains:
+            # 校验域名合法性：跳过含非法 Unicode/IDNA 字符的域名
+            if not self._is_valid_domain(domain):
+                logger.warning("DNS 探测: 跳过非法域名 '%s'", domain)
+                continue
             for addr in bootstrap_addrs:
                 try:
                     q = dns.message.make_query(domain, dns.rdatatype.A)
@@ -491,48 +521,54 @@ class NetworkMonitor:
         """
         logger.info("=" * 50)
         logger.info("网络已恢复，执行自动恢复...")
+        try:
+            # 0. 短暂延迟，让 Windows 网络栈完全初始化
+            #    主循环已经确认了多轮成功 ping，网络已通，0.5s 足够
+            logger.info("  等待网络栈稳定 (0.5s)...")
+            await asyncio.sleep(0.5)
 
-        # 0. 短暂延迟，让 Windows 网络栈完全初始化
-        #    主循环已经确认了多轮成功 ping，网络已通，0.5s 足够
-        logger.info("  等待网络栈稳定 (0.5s)...")
-        await asyncio.sleep(0.5)
+            # 1. 重置所有持久连接（关闭失效的 aiohttp 会话、QUIC 配置等）
+            #    这是解决"网卡禁用/启用后上游持续失败"的关键步骤
+            logger.info("  正在重置所有解析器的持久连接...")
+            await self.resolver_manager.reset_all_connections()
+            logger.info("  持久连接已重置")
 
-        # 1. 重置所有持久连接（关闭失效的 aiohttp 会话、QUIC 配置等）
-        #    这是解决"网卡禁用/启用后上游持续失败"的关键步骤
-        logger.info("  正在重置所有解析器的持久连接...")
-        await self.resolver_manager.reset_all_connections()
-        logger.info("  持久连接已重置")
+            # 2. 进入恢复模式：网络刚恢复时，上游首次查询可能因连接重建
+            #    而短暂失败，恢复模式下瞬时失败不会禁用上游
+            self.resolver_manager.enter_recovery_mode()
 
-        # 2. 进入恢复模式：网络刚恢复时，上游首次查询可能因连接重建
-        #    而短暂失败，恢复模式下瞬时失败不会禁用上游
-        self.resolver_manager.enter_recovery_mode()
+            # 3. 重新启用所有上游
+            self.resolver_manager.reenable_all()
+            logger.info("  已重新启用所有上游服务器")
 
-        # 3. 重新启用所有上游
-        self.resolver_manager.reenable_all()
-        logger.info("  已重新启用所有上游服务器")
+            # 4. 刷新所有 bootstrap IP 缓存
+            refreshed = await self.resolver_manager.refresh_all_upstream_ips()
+            logger.info("  已刷新 %d 个上游域名的 bootstrap IP 缓存", refreshed)
 
-        # 4. 刷新所有 bootstrap IP 缓存
-        refreshed = await self.resolver_manager.refresh_all_upstream_ips()
-        logger.info("  已刷新 %d 个上游域名的 bootstrap IP 缓存", refreshed)
+            # 5. 清除过滤引擎的过滤结果缓存
+            #    断网期间过滤结果可能被误缓存为"放行"状态（FilterCache TTL=5s），
+            #    不清除的话恢复后拦截规则中的域名会被错误放行（返回真实 IP 而非 0.0.0.0）
+            #    注意：不需要清除 DNS 缓存，因为过滤检查在缓存检查之前执行
+            if self.filter_engine:
+                self.filter_engine.clear_filter_cache()
+                logger.info("  已清除过滤引擎缓存")
 
-        # 5. 清除过滤引擎的过滤结果缓存
-        #    断网期间过滤结果可能被误缓存为"放行"状态（FilterCache TTL=5s），
-        #    不清除的话恢复后拦截规则中的域名会被错误放行（返回真实 IP 而非 0.0.0.0）
-        #    注意：不需要清除 DNS 缓存，因为过滤检查在缓存检查之前执行
-        if self.filter_engine:
-            self.filter_engine.clear_filter_cache()
-            logger.info("  已清除过滤引擎缓存")
+            # 6. 标记恢复
+            self._degraded = False
+            self._consecutive_failures = 0
+            self._recovery_successes = 0
+            self._last_recovery_time = asyncio.get_event_loop().time()
 
-        # 6. 标记恢复
-        self._degraded = False
-        self._consecutive_failures = 0
-        self._recovery_successes = 0
-        self._last_recovery_time = asyncio.get_event_loop().time()
-
-        # 重新统计可用上游
-        enabled = sum(1 for s in self.resolver_manager._upstream_servers if s.enabled)
-        total = len(self.resolver_manager._upstream_servers)
-        logger.info("自动恢复完成: %d/%d 个上游可用", enabled, total)
+            # 重新统计可用上游
+            enabled = sum(1 for s in self.resolver_manager._upstream_servers if s.enabled)
+            total = len(self.resolver_manager._upstream_servers)
+            logger.info("自动恢复完成: %d/%d 个上游可用", enabled, total)
+        except Exception as e:
+            logger.error("自动恢复异常: %s", e, exc_info=True)
+            # 不要因恢复失败而让 _degraded 保持在"恢复中"状态
+            self._degraded = False
+            self._consecutive_failures = 0
+            self._recovery_successes = 0
         logger.info("=" * 50)
 
     async def _recover_worker_loop(self):
@@ -581,4 +617,4 @@ class NetworkMonitor:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.error("后台恢复异常: %s", e)
+                logger.error("后台恢复异常: %s", e, exc_info=True)

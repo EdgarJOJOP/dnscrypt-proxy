@@ -23,6 +23,7 @@ from cache import DNSCache
 from filter_engine import FilterEngine
 from logger import RequestLogger
 from dnssec import DNSSECQueryWrapper
+from rate_limiter import get_per_ip_limiter
 
 logger = logging.getLogger("dns-proxy.plain-dns")
 
@@ -60,11 +61,11 @@ class PlainDNSServer:
         self._running = False
         self._concurrency_semaphore = asyncio.Semaphore(config.max_concurrent)
 
-        # 单 IP 限速
-        self._per_ip_semaphores: Dict[str, Tuple[asyncio.Semaphore, float]] = {}
+        # 单 IP 限速（共享 PerIPRateLimiter 单例）
+        self._per_ip_limiter = get_per_ip_limiter(
+            per_ip_limit=config.max_concurrent_per_ip,
+        )
         self._per_ip_limit = config.max_concurrent_per_ip
-        self._per_ip_cleanup_interval = 300
-        self._per_ip_idle_timeout = 600
         self._ip_semaphore_task: Optional[asyncio.Task] = None
 
     @staticmethod
@@ -72,27 +73,11 @@ class PlainDNSServer:
         return ip in ("127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost")
 
     async def _get_per_ip_semaphore(self, client_ip: str) -> asyncio.Semaphore:
-        now = time.time()
-        if client_ip in self._per_ip_semaphores:
-            sem, _ = self._per_ip_semaphores[client_ip]
-            self._per_ip_semaphores[client_ip] = (sem, now)
-            return sem
-        sem = asyncio.Semaphore(self._per_ip_limit)
-        self._per_ip_semaphores[client_ip] = (sem, now)
-        return sem
+        return await self._per_ip_limiter.acquire(client_ip)
 
     async def _cleanup_stale_per_ip_semaphores(self):
-        while True:
-            await asyncio.sleep(self._per_ip_cleanup_interval)
-            now = time.time()
-            stale = [
-                ip for ip, (_, ts) in self._per_ip_semaphores.items()
-                if now - ts > self._per_ip_idle_timeout
-            ]
-            for ip in stale:
-                del self._per_ip_semaphores[ip]
-            if stale:
-                logger.debug("Plain DNS: 清理了 %d 个过期 IP 限速条目", len(stale))
+        # 由共享 PerIPRateLimiter 后台管理
+        await asyncio.Event().wait()
 
     # ======================== UDP 协议 ========================
 

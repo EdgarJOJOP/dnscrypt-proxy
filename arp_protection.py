@@ -31,6 +31,9 @@ except ImportError:
 class ARPProtection:
     """ARP 防护：网关侦测 + 路由器 ARP 表刷新"""
 
+    # Linux ICMP 持久 raw socket（避免每 ping 创建/销毁）
+    _icmp_sock: Optional[socket.socket] = None
+
     def __init__(self, config_arp: dict, ping_interval: float = 0.80,
                  ping_targets_v4: list = None):
         """
@@ -170,6 +173,16 @@ class ARPProtection:
             except (asyncio.CancelledError, Exception):
                 pass
         self._arp_workers = []
+
+    @classmethod
+    def close_icmp_socket(cls):
+        """关闭 Linux 持久 ICMP raw socket（程序退出时调用）"""
+        if cls._icmp_sock is not None:
+            try:
+                cls._icmp_sock.close()
+            except Exception:
+                pass
+            cls._icmp_sock = None
 
     async def _recovery_worker_loop(self):
         """Worker 1: 永久等待 recovery_trigger → ping gw+ext → 通则 recovery_detected.set()"""
@@ -2810,11 +2823,15 @@ class ARPProtection:
     @staticmethod
     async def _ping_icmp_linux(ip: str, timeout_ms: int) -> bool:
         """Linux：使用 raw ICMP 套接字发送 Echo 请求"""
+        # 使用类级别的持久 socket（避免每 ping 创建/销毁）
+        cls = ARPProtection
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_RAW,
-                                 socket.IPPROTO_ICMP)
+            if cls._icmp_sock is None:
+                cls._icmp_sock = socket.socket(socket.AF_INET, socket.SOCK_RAW,
+                                               socket.IPPROTO_ICMP)
+                cls._icmp_sock.setblocking(False)
+            sock = cls._icmp_sock
             sock.settimeout(timeout_ms / 1000.0)
-            sock.setblocking(True)
 
             pid = os.getpid() & 0xFFFF
             data = struct.pack('!d', asyncio.get_event_loop().time()) + b'\x00' * 24
@@ -2827,9 +2844,10 @@ class ARPProtection:
             pkt = header + data
 
             sock.sendto(pkt, (ip, 0))
-            # 等回复
+            # 等回复（非阻塞模式，用 select 或 settimeout 处理）
+            sock.settimeout(timeout_ms / 1000.0)
+            sock.setblocking(True)
             sock.recvfrom(4096)
-            sock.close()
             return True
         except socket.timeout:
             return False
@@ -2838,6 +2856,13 @@ class ARPProtection:
             pass
         except Exception:
             return False
+        finally:
+            # 恢复非阻塞供下次复用
+            if cls._icmp_sock is not None:
+                try:
+                    cls._icmp_sock.setblocking(False)
+                except Exception:
+                    pass
         # 回退：使用 timeout 包装的子进程 ping
         try:
             proc = await asyncio.create_subprocess_exec(

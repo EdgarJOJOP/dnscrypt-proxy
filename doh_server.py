@@ -31,6 +31,7 @@ from filter_engine import FilterEngine
 from logger import RequestLogger
 from dnssec import DNSSECQueryWrapper, DNSSECValidator
 from qps_limiter import QPSCounter
+from rate_limiter import get_per_ip_limiter
 
 logger = logging.getLogger("dns-proxy.doh-server")
 
@@ -77,11 +78,11 @@ class DoHServer:
         # 并发控制
         self._concurrency_semaphore = asyncio.Semaphore(config.max_concurrent)
 
-        # 单 IP 限速
-        self._per_ip_semaphores: Dict[str, Tuple[asyncio.Semaphore, float]] = {}
+        # 单 IP 限速（共享 PerIPRateLimiter 单例，消除各服务器独立 dict 的内存浪费）
+        self._per_ip_limiter = get_per_ip_limiter(
+            per_ip_limit=config.max_concurrent_per_ip,
+        )
         self._per_ip_limit = config.max_concurrent_per_ip
-        self._per_ip_cleanup_interval = 300  # 5 分钟清理一次过期条目
-        self._per_ip_idle_timeout = 600  # 10 分钟无请求则清理
 
         # QPS 限速（所有客户端包括 localhost）
         self._qps_limiter = QPSCounter(config.doh_qps_limit, "DoH")
@@ -92,29 +93,14 @@ class DoHServer:
         return ip in ("127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost")
 
     async def _get_per_ip_semaphore(self, client_ip: str) -> asyncio.Semaphore:
-        """获取或创建单 IP 信号量"""
-        now = time.time()
-        if client_ip in self._per_ip_semaphores:
-            sem, _ = self._per_ip_semaphores[client_ip]
-            self._per_ip_semaphores[client_ip] = (sem, now)
-            return sem
-        sem = asyncio.Semaphore(self._per_ip_limit)
-        self._per_ip_semaphores[client_ip] = (sem, now)
-        return sem
+        """获取或创建单 IP 信号量（使用共享 PerIPRateLimiter）"""
+        return await self._per_ip_limiter.acquire(client_ip)
 
     async def _cleanup_stale_per_ip_semaphores(self):
-        """定期清理过期 IP 条目"""
-        while True:
-            await asyncio.sleep(self._per_ip_cleanup_interval)
-            now = time.time()
-            stale = [
-                ip for ip, (_, ts) in self._per_ip_semaphores.items()
-                if now - ts > self._per_ip_idle_timeout
-            ]
-            for ip in stale:
-                del self._per_ip_semaphores[ip]
-            if stale:
-                logger.debug("清理了 %d 个过期 IP 限速条目", len(stale))
+        """定期清理过期 IP 条目（由共享 PerIPRateLimiter 管理）"""
+        # PerIPRateLimiter 有自身后台清理任务，此方法保持空占位
+        # 兼容 start() 中创建的循环
+        await asyncio.Event().wait()
 
     def _setup_routes(self):
         """注册路由"""
@@ -656,7 +642,9 @@ class DoHServer:
         self._runner = web.AppRunner(self.app)
         await self._runner.setup()
 
-        # 启动单 IP 限速清理任务
+        # 启动共享 PerIPRateLimiter（全局单例，清理过期 IP 条目）
+        self._per_ip_limiter.start()
+        # 保持兼容性：占位清理任务
         self._cleanup_task = asyncio.create_task(self._cleanup_stale_per_ip_semaphores())
 
         # IPv4 监听

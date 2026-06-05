@@ -155,8 +155,8 @@ def test_filter_engine():
     t1 = time.time()
     print(f"  首次加载: {t1-t0:.1f}s")
     print(f"  总规则数: {engine.stats['total_rules']}")
-    print(f"  拦截规则: {len(engine._block_rules)}")
-    print(f"  例外规则: {len(engine._exception_rules)}")
+    print(f"  拦截规则: {engine._block_index.count}")
+    print(f"  例外规则: {engine._allow_index.count}")
     print(f"  域名索引: {engine.stats['block_index_domains']}")
 
     # 第二次加载（同一引擎实例，checksum 缓存应生效）

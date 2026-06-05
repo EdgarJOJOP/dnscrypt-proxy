@@ -282,6 +282,11 @@ class DNSProxyApp:
         # 注册配置热加载回调
         self.config.on_reload(self._on_config_reload)
 
+        # 启动共享 PerIPRateLimiter（单例，所有服务器共用）
+        from rate_limiter import get_per_ip_limiter
+        limiter = get_per_ip_limiter()
+        limiter.start()
+
         # ========== 内存优化：启动后立即 GC ==========
         # 1. 手动 GC 回收导入模块和初始化过程中产生的临时对象
         gc.collect()

@@ -30,6 +30,7 @@ from filter_engine import FilterEngine
 from logger import RequestLogger
 from dnssec import DNSSECQueryWrapper
 from qps_limiter import QPSCounter
+from rate_limiter import get_per_ip_limiter
 
 logger = logging.getLogger("dns-proxy.local-doq")
 
@@ -240,11 +241,11 @@ class LocalDoQServer:
         self._concurrency_semaphore = asyncio.Semaphore(config.max_concurrent)
         self._cleanup_task: Optional[asyncio.Task] = None
 
-        # 单 IP 限速
-        self._per_ip_semaphores: Dict[str, Tuple[asyncio.Semaphore, float]] = {}
+        # 单 IP 限速（共享 PerIPRateLimiter 单例）
+        self._per_ip_limiter = get_per_ip_limiter(
+            per_ip_limit=config.max_concurrent_per_ip,
+        )
         self._per_ip_limit = config.max_concurrent_per_ip
-        self._per_ip_cleanup_interval = 300
-        self._per_ip_idle_timeout = 600
 
         # 最大 QUIC 连接数限制
         self._max_doq_connections = config.doq_max_connections
@@ -257,27 +258,11 @@ class LocalDoQServer:
         return ip in ("127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost")
 
     async def _get_per_ip_semaphore(self, client_ip: str) -> asyncio.Semaphore:
-        now = time.time()
-        if client_ip in self._per_ip_semaphores:
-            sem, _ = self._per_ip_semaphores[client_ip]
-            self._per_ip_semaphores[client_ip] = (sem, now)
-            return sem
-        sem = asyncio.Semaphore(self._per_ip_limit)
-        self._per_ip_semaphores[client_ip] = (sem, now)
-        return sem
+        return await self._per_ip_limiter.acquire(client_ip)
 
     async def _cleanup_stale_per_ip_semaphores(self):
-        while True:
-            await asyncio.sleep(self._per_ip_cleanup_interval)
-            now = time.time()
-            stale = [
-                ip for ip, (_, ts) in self._per_ip_semaphores.items()
-                if now - ts > self._per_ip_idle_timeout
-            ]
-            for ip in stale:
-                del self._per_ip_semaphores[ip]
-            if stale:
-                logger.debug("DoQ: 清理了 %d 个过期 IP 限速条目", len(stale))
+        # 由共享 PerIPRateLimiter 后台管理
+        await asyncio.Event().wait()
 
     def _create_quic_config(self) -> Optional[QuicConfiguration]:
         """创建 QUIC 服务器配置（加载证书）"""
@@ -372,7 +357,7 @@ class LocalDoQServer:
         logger.info("本地 DoQ 服务器已停止")
 
     async def _cleanup_loop(self):
-        """定期清理已关闭的 QUIC 连接 + 过期 IP 限速条目"""
+        """定期清理已关闭的 QUIC 连接（IP 限速条目由 PerIPRateLimiter 管理）"""
         while True:
             try:
                 await asyncio.sleep(30)
@@ -380,16 +365,6 @@ class LocalDoQServer:
                     self._protocol_v4.cleanup_stale_connections()
                 if self._protocol_v6:
                     self._protocol_v6.cleanup_stale_connections()
-                # 清理过期 IP 限速条目
-                now = time.time()
-                stale = [
-                    ip for ip, (_, ts) in self._per_ip_semaphores.items()
-                    if now - ts > self._per_ip_idle_timeout
-                ]
-                for ip in stale:
-                    del self._per_ip_semaphores[ip]
-                if stale:
-                    logger.debug("DoQ: 清理了 %d 个过期 IP 限速条目", len(stale))
             except asyncio.CancelledError:
                 break
             except Exception as e:

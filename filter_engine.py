@@ -709,19 +709,19 @@ class FilterEngine:
         self._block_index = DomainIndex()
         # 白名单索引（Go: filteringEngineAllow）
         self._allow_index = DomainIndex()
-        # 重要规则（Go: 通过 rules.NetworkRule.Important 标志）
-        self._important_rules: List[FilterRule] = []
+        # 重要规则不再单独保存列表，直接查索引即可
 
-        # 原始规则列表（用于统计和调试）
-        self._block_rules: List[FilterRule] = []
-        self._exception_rules: List[FilterRule] = []
+        # 冗余规则列表已移除：_block_rules / _exception_rules / _important_rules
+        # 改为实时从索引计算 stats（见 stats 属性）
 
         self._loaded_files: List[str] = []
         self._loaded_urls: List[str] = []
         self._rule_count = 0
         self._title = ""
-        # 过滤结果缓存 {domain: (blocked, reason, timestamp)} — 避免重复匹配，大幅提升效率
-        self._filter_cache: Dict[str, Tuple[bool, str, float]] = {}
+        # 统一过滤结果缓存（合并原 _filter_cache + _custom_hosts_cache）
+        # 格式: {domain: (blocked, reason, timestamp, priority)}
+        # priority=True 的条目（自定义 hosts）永不淘汰
+        self._filter_cache: Dict[str, Tuple[bool, str, float, bool]] = {}
         self._filter_cache_timeout: float = 5.0
         self._filter_cache_maxsize: int = 100000  # 过滤缓存最大条目数，防止无界增长
         self._update_callback: Optional[Callable] = None
@@ -743,7 +743,6 @@ class FilterEngine:
         # 格式: {domain: [(ip, rdtype), ...]}
         # 例如: {"my.dns": [("127.0.0.1", dns.rdatatype.A), ("192.168.1.1", dns.rdatatype.A)]}
         self._custom_hosts: Dict[str, List[Tuple[str, int]]] = {}
-        self._custom_hosts_cache: Dict[str, Tuple[bool, str, float]] = {}
         self._custom_hosts_enabled = True
 
     @property
@@ -860,19 +859,15 @@ class FilterEngine:
         return None
 
     def _index_rule(self, rule: FilterRule, rule_text: str):
-        """将单条规则加入对应的索引"""
+        """将单条规则加入对应的索引（不再维护冗余列表）"""
         if rule.is_exception:
-            self._exception_rules.append(rule)
             index_domain = self._extract_index_domain(rule_text)
             self._allow_index.add_rule(rule, index_domain)
         elif rule.is_important:
-            self._important_rules.append(rule)
             # 重要规则也加入黑名单索引
             index_domain = self._extract_index_domain(rule_text)
             self._block_index.add_rule(rule, index_domain)
-            self._block_rules.append(rule)
         else:
-            self._block_rules.append(rule)
             index_domain = self._extract_index_domain(rule_text)
             self._block_index.add_rule(rule, index_domain)
 
@@ -935,7 +930,7 @@ class FilterEngine:
 
     async def _fetch_url_async(self, url: str, max_size: int = DEFAULT_MAX_SIZE,
                                timeout: int = 30) -> Optional[str]:
-        """异步获取远程 URL 内容"""
+        """获取远程 URL 内容（全量模式，向下兼容）"""
         try:
             async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=timeout),
@@ -965,22 +960,98 @@ class FilterEngine:
 
     async def load_rules_from_url_async(self, url: str) -> bool:
         """
-        异步从远程 URL 加载规则（带总超时防止阻塞）
+        异步从远程 URL 加载规则（带流式处理，避免全量文本驻留内存）。
+        逐行读取并解析，不将整个文件同时加载到内存。
         """
         try:
-            content = await asyncio.wait_for(
-                self._fetch_url_async(url), timeout=35
-            )
-            if content is None:
-                return False
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=35),
+                headers={"User-Agent": "SecureDNS-Proxy/1.0"},
+            ) as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=35)) as resp:
+                    if resp.status != 200:
+                        logger.error("获取 URL %s 失败: HTTP %d", url, resp.status)
+                        return False
+
+                    content_length = resp.headers.get("Content-Length")
+                    if content_length and int(content_length) > DEFAULT_MAX_SIZE:
+                        logger.error("URL %s 文件过大: %s bytes (限制 %d)",
+                                     url, content_length, DEFAULT_MAX_SIZE)
+                        return False
+
+                    # 流式逐块读取，逐行处理
+                    total = 0
+                    line_buffer = ""
+                    rule_count = 0
+                    lines_processed = 0
+                    first_chunk = True
+                    raw_preview = bytearray()
+
+                    async for chunk, _ in resp.content.iter_chunks():
+                        total += len(chunk)
+                        if total > DEFAULT_MAX_SIZE:
+                            logger.error("URL %s 实际大小超过限制 %d", url, DEFAULT_MAX_SIZE)
+                            return False
+
+                        # 收集前 64KB 用于 HTML/二进制检测
+                        if first_chunk and len(raw_preview) < 65536:
+                            raw_preview.extend(chunk)
+                            if len(raw_preview) >= 65536 or len(chunk) == 0:
+                                preview_text = raw_preview.decode("utf-8", errors="replace")
+                                # HTML 检测
+                                if self._parser._looks_like_html(preview_text):
+                                    logger.error("URL %s 内容包含 HTML，跳过", url)
+                                    return False
+                                # 二进制检测
+                                has_binary, line_no, desc = self._parser._has_binary_chars(preview_text)
+                                if has_binary:
+                                    logger.error("URL %s 包含二进制字符: %s", url, desc)
+                                    return False
+                                first_chunk = False
+
+                        # 解码块并逐行处理
+                        decoded = chunk.decode("utf-8", errors="replace")
+                        line_buffer += decoded
+
+                        while "\n" in line_buffer:
+                            line, line_buffer = line_buffer.split("\n", 1)
+                            stripped = line.rstrip("\r").strip()
+                            if not stripped:
+                                continue
+
+                            cleaned = AdGuardRuleParser._clean_rule_line(stripped)
+                            if cleaned is None:
+                                continue
+
+                            # 直接编译规则（跳过 parse_to_text 的全量拆分）
+                            rule = FilterRule(cleaned)
+                            if rule._skip:
+                                continue
+                            self._index_rule(rule, cleaned)
+                            rule_count += 1
+                            lines_processed += 1
+
+                    # 处理最后一行（无换行符）
+                    if line_buffer.strip():
+                        cleaned = AdGuardRuleParser._clean_rule_line(line_buffer.strip())
+                        if cleaned:
+                            rule = FilterRule(cleaned)
+                            if not rule._skip:
+                                self._index_rule(rule, cleaned)
+                                rule_count += 1
+                                lines_processed += 1
+
+                    self._rule_count += rule_count
+                    self._loaded_urls.append(url)
+                    logger.info("从 %s 流式加载了 %d 条规则 (总: %d)", url, rule_count, self._rule_count)
+                    return rule_count > 0
+
         except asyncio.TimeoutError:
             logger.error("从 URL %s 加载规则超时 (35s)", url)
             return False
-
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, self.load_rules_from_text, content, url)
-        self._loaded_urls.append(url)
-        return True
+        except Exception as e:
+            logger.error("从 URL %s 加载规则失败: %s", url, e)
+            return False
 
     async def async_reload(self, files: List[str], urls: Optional[List[str]] = None):
         """
@@ -997,9 +1068,6 @@ class FilterEngine:
         saved_state = {
             'block_index': self._block_index,
             'allow_index': self._allow_index,
-            'important_rules': self._important_rules,
-            'block_rules': self._block_rules,
-            'exception_rules': self._exception_rules,
             'loaded_files': list(self._loaded_files),
             'loaded_urls': list(self._loaded_urls),
             'rule_count': self._rule_count,
@@ -1008,14 +1076,10 @@ class FilterEngine:
         # 创建新空状态
         self._block_index = DomainIndex()
         self._allow_index = DomainIndex()
-        self._important_rules = []
-        self._block_rules = []
-        self._exception_rules = []
         self._loaded_files = []
         self._loaded_urls = []
         self._rule_count = 0
         self._filter_cache.clear()
-        self._custom_hosts_cache.clear()
 
         # 加载本地文件
         for filepath in files:
@@ -1036,9 +1100,6 @@ class FilterEngine:
                          len(saved_state['loaded_files']))
             self._block_index = saved_state['block_index']
             self._allow_index = saved_state['allow_index']
-            self._important_rules = saved_state['important_rules']
-            self._block_rules = saved_state['block_rules']
-            self._exception_rules = saved_state['exception_rules']
             self._loaded_files = saved_state['loaded_files']
             self._loaded_urls = saved_state['loaded_urls']
             self._rule_count = saved_state['rule_count']
@@ -1069,9 +1130,6 @@ class FilterEngine:
         saved_state = {
             'block_index': self._block_index,
             'allow_index': self._allow_index,
-            'important_rules': self._important_rules,
-            'block_rules': self._block_rules,
-            'exception_rules': self._exception_rules,
             'loaded_files': list(self._loaded_files),
             'loaded_urls': list(self._loaded_urls),
             'rule_count': self._rule_count,
@@ -1080,14 +1138,10 @@ class FilterEngine:
         # 创建新空状态
         self._block_index = DomainIndex()
         self._allow_index = DomainIndex()
-        self._important_rules = []
-        self._block_rules = []
-        self._exception_rules = []
         self._loaded_files = []
         self._loaded_urls = []
         self._rule_count = 0
         self._filter_cache.clear()
-        self._custom_hosts_cache.clear()
 
         for filepath in files:
             self.load_rules_from_file(filepath)
@@ -1117,9 +1171,6 @@ class FilterEngine:
                          saved_state['rule_count'])
             self._block_index = saved_state['block_index']
             self._allow_index = saved_state['allow_index']
-            self._important_rules = saved_state['important_rules']
-            self._block_rules = saved_state['block_rules']
-            self._exception_rules = saved_state['exception_rules']
             self._loaded_files = saved_state['loaded_files']
             self._loaded_urls = saved_state['loaded_urls']
             self._rule_count = saved_state['rule_count']
@@ -1153,56 +1204,62 @@ class FilterEngine:
         domain = domain.lower().rstrip(".")
         now = time.monotonic()
 
-        # 0. 检查自定义 hosts 映射（最高优先级）
+        # 0. 检查自定义 hosts 映射（最高优先级，存入统一缓存且标记 priority）
         if self._custom_hosts_enabled and domain in self._custom_hosts:
-            self._custom_hosts_cache[domain] = (True, "custom_hosts", now)
+            self._filter_cache[domain] = (True, "custom_hosts", now, True)
             return True, "custom_hosts"
 
-        # 1. 检查过滤结果缓存
+        # 1. 检查统一过滤结果缓存
         cached = self._filter_cache.get(domain)
         if cached is not None:
-            result, reason, ts = cached
-            if now - ts < self._filter_cache_timeout:
+            result, reason, ts, priority = cached
+            if priority or now - ts < self._filter_cache_timeout:
                 if result:
                     logger.debug("FilterCache HIT(blocked): %s | %s", domain, reason[:60])
                 else:
-                    # 只有 DEBUG 级别才显示缓存的 False（正常情况下不用担心）
                     logger.log(logging.DEBUG-1, "FilterCache HIT(allow): %s", domain)
                 return result, reason
-            # 缓存过期，删除并重新匹配
+            # 非 priority 缓存过期，删除并重新匹配
             del self._filter_cache[domain]
             logger.debug("FilterCache EXPIRED: %s (age=%.1fs)", domain, now - ts)
 
-        # 2. 重要规则优先匹配
-        for rule in self._important_rules:
-            if rule.matches(domain):
-                result = (True, f"重要规则拦截: {rule.raw}")
-                self._filter_cache[domain] = (True, result[1], now)
+        # 2. 重要规则优先匹配（通过 block_index 中的 is_important 规则）
+        #    重要规则与普通规则都在 block_index 中，但通过 FilterRule.is_important 区分
+        #    先查 block_index，如果命中重要规则直接拦截；
+        #    如果命中普通规则则保存结果，等白名单检查完后决定
+        block_match = self._block_index.match(domain)
+        block_rule_result = None
+        if block_match is not None:
+            rule, method = block_match
+            if rule.is_important:
+                reason = f"重要规则拦截: {rule.raw}"
+                self._filter_cache[domain] = (True, reason, now, False)
                 self._trim_filter_cache()
                 logger.debug("拦截(重要规则): %s | %s", domain, rule.raw[:60])
-                return result
+                return True, reason
+            # 保存普通规则匹配结果，避免后续重新查询
+            block_rule_result = (rule, method)
 
         # 3. 白名单索引 — 类似 Go 的 filteringEngineAllow.MatchRequest()
         match = self._allow_index.match(domain)
         if match is not None:
             rule, method = match
-            self._filter_cache[domain] = (False, "", now)
+            self._filter_cache[domain] = (False, "", now, False)
             self._trim_filter_cache()
             logger.debug("放行(白名单): %s | %s: %s", domain, method, rule.raw[:60])
             return False, ""
 
-        # 4. 黑名单索引 — 类似 Go 的 filteringEngine.MatchRequest()
-        match = self._block_index.match(domain)
-        if match is not None:
-            rule, method = match
+        # 4. 使用步骤 2 保存的 block 匹配结果（如有）
+        if block_rule_result is not None:
+            rule, method = block_rule_result
             reason = f"{method}: {rule.raw}"
-            self._filter_cache[domain] = (True, reason, now)
+            self._filter_cache[domain] = (True, reason, now, False)
             self._trim_filter_cache()
             logger.debug("拦截: %s | %s (%s)", domain, method, rule.raw[:80])
             return True, reason
 
         # 未匹配：缓存并放行
-        self._filter_cache[domain] = (False, "", now)
+        self._filter_cache[domain] = (False, "", now, False)
         self._trim_filter_cache()
         logger.log(logging.DEBUG-1, "放行(无匹配): %s (共 %d 条拦截规则)", domain, self._rule_count)
         return False, ""
@@ -1221,7 +1278,7 @@ class FilterEngine:
               - "ipv6test.local ::1,fe80::1"
         """
         self._custom_hosts.clear()
-        self._custom_hosts_cache.clear()
+        # 统一缓存中 priority 标记的自定义 hosts 条目在下次 check_domain 时会自动覆盖
 
         if not hosts_config:
             return
@@ -1270,25 +1327,40 @@ class FilterEngine:
         return self._custom_hosts.get(domain)
 
     def clear_filter_cache(self):
-        """清除过滤结果缓存 - 让所有域名重新匹配规则"""
+        """清除过滤结果缓存（保留 priority 条目如自定义 hosts）"""
+        priority_keys = [k for k, v in self._filter_cache.items()
+                         if len(v) >= 4 and v[3]]  # v = (blocked, reason, ts, priority)
         self._filter_cache.clear()
-        self._custom_hosts_cache.clear()
-        logger.debug("过滤缓存已清除 (%d 条)", len(self._filter_cache))
+        for k in priority_keys:
+            if k in self._custom_hosts:
+                self._filter_cache[k] = (True, "custom_hosts", time.monotonic(), True)
+        logger.debug("过滤缓存已清除（保留 %d 条 priority 条目）", len(priority_keys))
 
     def _trim_filter_cache(self):
-        """限制过滤缓存大小，防止无界增长导致内存消耗过快"""
+        """限制过滤缓存大小，跳过 priority 条目（自定义 hosts）"""
         if len(self._filter_cache) <= self._filter_cache_maxsize:
             return
-        # 超出上限时移除最旧的 25% 条目（dict 在 Python 3.7+ 保持插入顺序）
+        # 超出上限时移除最旧的非 priority 条目
         remove_count = len(self._filter_cache) - self._filter_cache_maxsize
         remove_count = max(remove_count, len(self._filter_cache) // 4)
-        for _ in range(remove_count):
-            try:
-                self._filter_cache.popitem(last=False)
-            except KeyError:
+        removed = 0
+        for _ in range(remove_count * 2):  # 加倍扫描，因为可能跳过 priority
+            if len(self._filter_cache) <= self._filter_cache_maxsize:
                 break
-        logger.debug("过滤缓存已达上限 %d，已裁剪 %d 条",
-                     self._filter_cache_maxsize, remove_count)
+            try:
+                k, v = next(iter(self._filter_cache.items()))
+                # priority 条目永不淘汰
+                if len(v) >= 4 and v[3]:
+                    # 移到末尾再试下一个
+                    self._filter_cache.move_to_end(k)
+                    continue
+                del self._filter_cache[k]
+                removed += 1
+            except (KeyError, StopIteration):
+                break
+        if removed:
+            logger.debug("过滤缓存已达上限 %d，已裁剪 %d 条",
+                         self._filter_cache_maxsize, removed)
 
     # ======================== 定时更新 ========================
 
@@ -1359,11 +1431,14 @@ class FilterEngine:
 
     @property
     def stats(self) -> dict:
+        # 从索引实时计算，不再维护冗余列表
+        block_count = self._block_index.count
+        allow_count = self._allow_index.count
         return {
-            "total_rules": self._rule_count,
-            "block_rules": len(self._block_rules),
-            "exception_rules": len(self._exception_rules),
-            "important_rules": len(self._important_rules),
+            "total_rules": block_count + allow_count,
+            "block_rules": block_count,
+            "exception_rules": allow_count,
+            "important_rules": 0,  # 不再单独追踪，包含在 block_rules 中
             "block_index_domains": self._block_index.domain_count,
             "allow_index_domains": self._allow_index.domain_count,
             "filter_cache_size": len(self._filter_cache),

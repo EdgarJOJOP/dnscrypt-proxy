@@ -184,6 +184,13 @@ class Config:
                     "enabled": True,
                     "gateway": "",  # "网关IP,网关MAC" 英文逗号隔开，留空自动探测
                 },
+                "ndp_protection": {
+                    "enabled": True,  # IPv6 NDP 防护，未检测到 IPv6 时自动关闭
+                    "gateway_ipv6": "",  # "网关IPv6,网关MAC" 英文逗号隔开，留空自动探测
+                    "check_interval": 30,
+                    "ra_sniff_timeout": 5.0,
+                    "max_ra_routers": 1,
+                },
             },
             "tls": {
                 "ech_enabled": False,
@@ -633,6 +640,16 @@ class Config:
         raw = dict(self._data.get("network_monitor", {}).get("arp_protection", {}))
         raw.setdefault("gateway_ip", "")
         raw.setdefault("gateway_mac", "")
+        return raw
+
+    @property
+    def ndp_protection_config(self) -> dict:
+        """NDP 防护配置（透传原始 gateway_ipv6 字段，由 NDPProtection 自行解析）"""
+        raw = dict(self._data.get("network_monitor", {}).get("ndp_protection", {}))
+        raw.setdefault("gateway_ipv6", "")
+        raw.setdefault("check_interval", 30)
+        raw.setdefault("ra_sniff_timeout", 5.0)
+        raw.setdefault("max_ra_routers", 1)
         return raw
 
     def get_raw(self) -> Dict[str, Any]:

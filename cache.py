@@ -4,17 +4,144 @@ DNS 缓存模块
 - 可配置 TTL
 - 过期条目自动清理
 - 线程安全（asyncio.Lock）
+- 缓存反序列化后的 DNS 消息，减少 from_wire() 开销
+- 预构建常见查询模板，避免重复 make_query()
 """
 
 import time
 import asyncio
+import copy
 import logging
 from typing import Optional, Tuple, Dict, Any
 from collections import OrderedDict
+from functools import lru_cache
 
 import dns.message
+import dns.name
+import dns.rdatatype
+import dns.rrset
+import dns.name
+import dns.rdatatype
 
 logger = logging.getLogger("dns-proxy.cache")
+
+
+# ======================== 查询模板缓存 ========================
+# 预构建常见 DNS 查询的 wire_bytes，避免每次 make_query() 重建对象
+
+_query_template_cache: Dict[Tuple[str, int, bool], bytes] = {}
+
+
+def get_query_wire(qname: str, rdtype: int, rdclass: int = 1,
+                   want_dnssec: bool = False) -> bytes:
+    """
+    获取预构建的 DNS 查询 wire bytes。
+    缓存常见查询（A/AAAA/TXT/HTTPS 等类型），避免反复 make_query() + to_wire()。
+    抛出 UnicodeError 时返回空 bytes，由调用者处理。
+    """
+    key = (qname.lower(), rdtype, want_dnssec)
+    cached = _query_template_cache.get(key)
+    if cached is not None:
+        return cached
+
+    try:
+        name = dns.name.from_text(qname)
+        msg = dns.message.make_query(name, rdtype, rdclass, want_dnssec=want_dnssec)
+        wire = msg.to_wire()
+    except (UnicodeError, ValueError) as e:
+        logger.warning("get_query_wire: 跳过非法域名 '%s' (%s)", qname, e)
+        return b""
+    # 仅缓存有限数量（常见域名查询可复用，极端域名不计）
+    if len(_query_template_cache) < 512:
+        _query_template_cache[key] = wire
+    return wire
+
+
+def clear_query_cache():
+    """清空查询模板缓存（配置变更时调用）"""
+    _query_template_cache.clear()
+
+
+class CacheEntry:
+    """缓存条目 — 同时缓存 wire 和反序列化后的 Message 对象"""
+
+    __slots__ = ("response_wire", "response_msg", "ttl",
+                 "created_at", "is_negative")
+
+    def __init__(self, response: dns.message.Message, ttl: int):
+        # 缓存序列化后的字节数据（用于持久化和校验）
+        self.response_wire: bytes = response.to_wire()
+        # 缓存反序列化后的 Message 对象，避免每次 get 都 from_wire()
+        # 注意：传出时通过 copy 避免修改缓存内容
+        self.response_msg: dns.message.Message = response
+        self.ttl: int = ttl
+        self.created_at: float = time.time()
+
+    def is_expired(self, now: Optional[float] = None) -> bool:
+        """判断是否过期"""
+        if now is None:
+            now = time.time()
+        return (now - self.created_at) >= self.ttl
+
+    def get_adjusted_response(self) -> dns.message.Message:
+        """
+        获取已调整 TTL 的响应（浅拷贝 + TTL 覆写，避免 from_wire 全量反序列化）。
+        """
+        elapsed = time.time() - self.created_at
+        remaining = max(1, int(self.ttl - elapsed))
+
+        # 从缓存的 Message 浅拷贝，避免 from_wire() 全量解析
+        response = copy.copy(self.response_msg)
+        # 浅拷贝 answer 列表，但复用底层的 rrset 和 rdata 对象
+        # 然后逐个覆写 TTL（不影响缓存中的原始值）
+        response.answer = list(self.response_msg.answer)
+        # 为每个 RRset 创建新实例以安全修改 TTL
+        new_answer = []
+        for rrset in response.answer:
+            new_rrset = dns.rrset.RRset(
+                rrset.name, rrset.rdclass, rrset.rdtype,
+                rrset.covers,
+            )
+            for rd in rrset:
+                new_rd = copy.copy(rd)
+                if hasattr(new_rd, "ttl"):
+                    new_rd.ttl = remaining
+                new_rrset.add(new_rd)
+            new_answer.append(new_rrset)
+        response.answer = new_answer
+
+        # 同样处理 authority 和 additional 段
+        response.authority = list(self.response_msg.authority)
+        new_auth = []
+        for rrset in response.authority:
+            new_rrset = dns.rrset.RRset(
+                rrset.name, rrset.rdclass, rrset.rdtype,
+                rrset.covers,
+            )
+            for rd in rrset:
+                new_rd = copy.copy(rd)
+                if hasattr(new_rd, "ttl"):
+                    new_rd.ttl = remaining
+                new_rrset.add(new_rd)
+            new_auth.append(new_rrset)
+        response.authority = new_auth
+
+        response.additional = list(self.response_msg.additional)
+        new_add = []
+        for rrset in response.additional:
+            new_rrset = dns.rrset.RRset(
+                rrset.name, rrset.rdclass, rrset.rdtype,
+                rrset.covers,
+            )
+            for rd in rrset:
+                new_rd = copy.copy(rd)
+                if hasattr(new_rd, "ttl"):
+                    new_rd.ttl = remaining
+                new_rrset.add(new_rd)
+            new_add.append(new_rrset)
+        response.additional = new_add
+
+        return response
 
 
 class DNSCache:
@@ -155,33 +282,3 @@ class DNSCache:
                 del self._cache[key]
                 return None
             return entry.get_adjusted_response()
-
-
-class CacheEntry:
-    """缓存条目"""
-
-    __slots__ = ("response_wire", "ttl", "created_at", "is_negative")
-
-    def __init__(self, response: dns.message.Message, ttl: int):
-        # 缓存序列化后的字节数据以减少内存
-        self.response_wire: bytes = response.to_wire()
-        self.ttl: int = ttl
-        self.created_at: float = time.time()
-
-    def is_expired(self, now: Optional[float] = None) -> bool:
-        """判断是否过期"""
-        if now is None:
-            now = time.time()
-        return (now - self.created_at) >= self.ttl
-
-    def get_adjusted_response(self) -> dns.message.Message:
-        """获取已调整 TTL 的响应"""
-        response = dns.message.from_wire(self.response_wire)
-        elapsed = time.time() - self.created_at
-        remaining = max(1, int(self.ttl - elapsed))
-
-        for rrset in response.answer:
-            for rd in rrset:
-                if hasattr(rd, "ttl"):
-                    rd.ttl = remaining
-        return response

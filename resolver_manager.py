@@ -20,12 +20,15 @@ import dns.name
 import dns.rdatatype
 import dns.asyncquery
 
+import aiohttp
+
 from config import Config
 from crypto.ech_fetcher import ECHConfigFetcher
 from dnssec import DNSSECQueryWrapper, DNSSECValidator
 from resolvers.base import BaseResolver
-from resolvers.doh import DoHResolver
+from resolvers.doh import DoHResolver, _MultiHostResolver
 from resolvers.dot import DoTResolver
+from cache import get_query_wire, clear_query_cache
 from resolvers.doq import DoQResolver
 from resolvers.plain import PlainDNSResolver
 
@@ -147,6 +150,9 @@ class ResolverManager:
         self._network_down_reported = False  # 避免重复日志
         self._ech_fetchers: Dict[str, ECHConfigFetcher] = {}  # hostname -> ECHConfigFetcher
         self._openssl4_wrapper = None  # OpenSSL 4.0 wrapper（ECH；如不可用则为 None）
+        # 全局共享的 aiohttp.ClientSession（所有 DoH 上游共用，消除多个连接池）
+        self._shared_doh_session: Optional[aiohttp.ClientSession] = None
+        self._shared_doh_resolver: Optional[_MultiHostResolver] = None
 
     async def initialize(self):
         """初始化所有解析器"""
@@ -188,6 +194,10 @@ class ResolverManager:
                     logger.warning("OpenSSL 4.0 DLL 不可用，ECH 将降级为传统 TLS")
             else:
                 logger.info("无 ECH 配置或 OpenSSL 4.0 不可用，跳过")
+
+        # 3b. 创建全局共享的 aiohttp.ClientSession（所有 DoH 上游共用）
+        #     显著减少独立连接池的内存开销
+        await self._init_shared_doh_session()
 
         # 4. 创建加密上游解析器
         await self._create_upstream_resolvers()
@@ -255,8 +265,9 @@ class ResolverManager:
         """
         queries = {}
         for qtype in (dns.rdatatype.A, dns.rdatatype.AAAA):
-            q = dns.message.make_query(hostname, qtype)
-            queries[qtype] = q.to_wire()
+            wire = get_query_wire(hostname, qtype)
+            if wire:
+                queries[qtype] = wire
 
         async def try_resolver(qbytes: bytes, bs: UpstreamServer, addr_family: str) -> Optional[bytes]:
             try:
@@ -268,7 +279,9 @@ class ResolverManager:
             ips = []
             # A 和 AAAA 独立查询，一个失败不影响另一个
             for qtype in (dns.rdatatype.A, dns.rdatatype.AAAA):
-                qbytes = queries[qtype]
+                qbytes = queries.get(qtype)
+                if qbytes is None:
+                    continue  # 跳过非法域名的查询类型
                 addr_family = "v4" if qtype == dns.rdatatype.A else "v6"
                 # 只选择与查询类型匹配的 bootstrap 解析器地址族
                 suitable_bs = []
@@ -292,6 +305,9 @@ class ResolverManager:
                                 for rd in rrset:
                                     if rd.rdtype == qtype:
                                         ips.append(str(rd.address))
+                        except (UnicodeError, ValueError) as e:
+                            logger.debug("解析管理器 DNS 响应包含非法字符: %s", e)
+                            continue
                         except Exception as e:
                             logger.debug("解析管理器 DNS 响应解析异常: %s", e)
                             continue
@@ -363,6 +379,41 @@ class ResolverManager:
         enabled_count = sum(1 for f in self._ech_fetchers.values() if f.enabled)
         logger.info("ECH 获取器初始化完成: %d/%d 个上游", enabled_count, len(self._ech_fetchers))
 
+    async def _init_shared_doh_session(self):
+        """
+        创建全局共享的 aiohttp.ClientSession + _MultiHostResolver。
+        所有 DoH 上游共用一个连接池，显著减少内存占用。
+        """
+        if not self.config.doh_servers:
+            return
+
+        # 收集所有 DoH 主机名 → bootstrap IP 映射
+        self._shared_doh_resolver = _MultiHostResolver()
+        for url in self.config.doh_servers:
+            hostname = url.replace("https://", "").split("/")[0].split(":")[0]
+            cached_ips = self._bootstrap_cache.get(hostname, [])
+            if cached_ips:
+                self._shared_doh_resolver.add_host(hostname, cached_ips)
+
+        pool_size = max(1, self.config.connection_pool_size)
+        n_doh = max(1, len(self.config.doh_servers))
+        connector = aiohttp.TCPConnector(
+            limit=pool_size,
+            limit_per_host=max(1, pool_size // n_doh),
+            ttl_dns_cache=300,
+            force_close=False,
+            resolver=self._shared_doh_resolver if any(self._bootstrap_cache.values()) else None,
+            # 不在这里设 ssl，per-request 传入
+        )
+        self._shared_doh_session = aiohttp.ClientSession(
+            connector=connector,
+            timeout=aiohttp.ClientTimeout(total=self.config.parallel_timeout),
+        )
+        logger.info(
+            "全局共享 DoH session 已创建 (pool_size=%d, upstreams=%d)",
+            pool_size, n_doh,
+        )
+
     async def _create_upstream_resolvers(self):
         """创建加密上游解析器"""
         timeout = self.config.parallel_timeout
@@ -414,13 +465,17 @@ class ResolverManager:
                                            connection_pool_size=self.config.connection_pool_size,
                                            connect_ips=cached_ips,
                                            concurrency=self.config.connection_pool_size,
-                                           ca_path=ca_path or "")
+                                           ca_path=ca_path or "",
+                                           shared_session=self._shared_doh_session,
+                                           shared_resolver=self._shared_doh_resolver)
             else:
                 resolver = DoHResolver(url, timeout=timeout,
                                        connection_pool_size=self.config.connection_pool_size,
                                        connect_ips=cached_ips,
                                        concurrency=self.config.connection_pool_size,
-                                       ca_path=ca_path or "")
+                                       ca_path=ca_path or "",
+                                       shared_session=self._shared_doh_session,
+                                       shared_resolver=self._shared_doh_resolver)
             self._upstream_servers.append(UpstreamServer(resolver, "doh"))
 
         # DoT
@@ -445,11 +500,13 @@ class ResolverManager:
                 if not resolver.available:
                     resolver = DoTResolver(h, port=p, timeout=timeout, connect_ips=cached_ips,
                                            concurrency=self.config.connection_pool_size,
-                                           ca_path=ca_path or "")
+                                           ca_path=ca_path or "",
+                                           connection_pool_size=self.config.connection_pool_size)
             else:
                 resolver = DoTResolver(h, port=p, timeout=timeout, connect_ips=cached_ips,
                                        concurrency=self.config.connection_pool_size,
-                                       ca_path=ca_path or "")
+                                       ca_path=ca_path or "",
+                                       connection_pool_size=self.config.connection_pool_size)
             self._upstream_servers.append(UpstreamServer(resolver, "dot"))
 
         # DoQ
@@ -897,6 +954,14 @@ class ResolverManager:
                 fetcher.close()
             except Exception as e:
                 logger.debug("解析管理器关闭 ECH fetcher 异常: %s", e)
+
+        # 关闭全局共享 DoH session
+        if self._shared_doh_session and not self._shared_doh_session.closed:
+            try:
+                await self._shared_doh_session.close()
+            except Exception as e:
+                logger.debug("解析管理器关闭共享 DoH session 异常: %s", e)
+            self._shared_doh_session = None
 
     @property
     def stats(self) -> Dict[str, Any]:
