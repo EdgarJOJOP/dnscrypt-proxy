@@ -9,14 +9,22 @@
 
 ## 1.支持ipv4的arp防护避免流量劫持的高危风险(ipv6不用担心)：
 
-    0. ARP 投毒检测 → 对比本机 ARP 表中网关 MAC 与预期值
-    1. 爆发 ping 网关（10 次）→ 强制路由器更新本机 IP-MAC
-    2. 爆发 GARP 广播（20 次 ping 广播地址）→ 全子网饱和宣告本机 IP-MAC
-    3. 丢包模式分析 + IP 冲突检测
-      - 丢包 ~50% → IP 冲突（攻击者使用相同静态 IP）→ 自动 IP +1
-      - 丢包 ~100% → ARP 投毒（流量被劫持）→ 两阶段 IP 切换
-    4. 验证 ping → 成功则设静态 ARP + 持续 GARP 对抗
-    5. 以上都失败 → 两阶段 IP 切换抗 ARP 中毒
+win安装npcap （https://npcap.com/#download ），linux不管有root就行。
+
+win记得安装360杀毒(https://sd.360.cn/)比360安全管家管用。
+
+支持的arp防御：
+
+    攻击类型	攻击包特征
+    1	网关冒充	Sender IP=网关IP, Sender MAC=攻击者MAC
+    2	IP 冲突	Sender IP=本机IP, Sender MAC=攻击者MAC
+    3	GARP 宣告（最危险）	Opcode=2, Sender IP=Target IP=网关, MAC=攻击者
+    4	双向 MITM	同时发包 Sender=网关(攻MAC) 和 Sender=本机(攻MAC)
+    5	ARP 应答投毒	Opcode=2, Sender IP=网关, MAC=攻击者 → Target=本机
+    6	目标端伪装	Target=网关IP, Target MAC≠正确MAC 回应者攻击
+    7	基线污染（启动时）	程序刚启动时第一个收到的 ARP 包被设为基线
+    8	Opcode=2 回复劫持	正常请求 谁有网关IP? 后被攻击者抢先用错误 MAC 回复
+    9	ARP Flood/风暴	短时间内大量不同 MAC 声称是网关/本机
 
 ## 2.支持config.yaml自定义根目录证书集验证上游加密dns是否可靠：
 
