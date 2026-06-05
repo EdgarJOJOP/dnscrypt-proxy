@@ -11,7 +11,7 @@
 
 win安装npcap （https://npcap.com/#download ），linux不管有root就行。
 
-win记得安装360杀毒(https://sd.360.cn/)比360安全管家管用。
+win记得安装360杀毒(https://sd.360.cn/ )比360安全管家管用。
 
 支持的arp防御：
 
