@@ -45,12 +45,24 @@ class ECHDoHResolver(BaseResolver):
         self._ciphers = ciphers
         self._connect_ips = connect_ips or []
 
-        # 解析 URL
+        # 解析 URL（正确支持 IPv6 地址，含方括号表示法）
         rest = url.replace("https://", "")
-        self._hostname = rest.split("/")[0].split(":")[0]
-        self._port = 443
-        if ":" in rest.split("/")[0]:
-            self._port = int(rest.split("/")[0].split(":")[1])
+        host_part = rest.split("/")[0]
+        # [IPv6]:port 格式
+        if host_part.startswith("["):
+            raw_host, sep, port_part = host_part.partition("]")
+            self._hostname = raw_host[1:]  # 去掉前导 [
+            self._port = int(port_part.lstrip(":")) if port_part.lstrip(":") else 443
+        elif host_part.count(":") > 1:
+            # 裸 IPv6 地址，无端口
+            self._hostname = host_part
+            self._port = 443
+        elif ":" in host_part:
+            self._hostname = host_part.split(":")[0]
+            self._port = int(host_part.split(":")[1])
+        else:
+            self._hostname = host_part
+            self._port = 443
         self._path = "/" + "/".join(rest.split("/")[1:]) if "/" in rest else "/dns-query"
 
         if self._connect_ips:

@@ -462,7 +462,17 @@ if HAS_AIOQUIC:
                      ca_path: str = ""):
             super().__init__(address, timeout, concurrency=concurrency)
             raw = address.replace("quic://", "")
-            if ":" in raw:
+            # 支持 IPv6 地址: [::1]:853 或 [::1] 或裸 IPv6 地址
+            if raw.startswith("["):
+                # [ipv6]:port 格式
+                raw_host, sep, port_part = raw.partition("]")
+                self.host = raw_host[1:]  # 去掉前导 [
+                self.port = int(port_part.lstrip(":")) if ":" in port_part else 853
+            elif raw.count(":") > 1:
+                # 裸 IPv6 地址（无端口）
+                self.host = raw
+                self.port = 853
+            elif ":" in raw:
                 self.host, port_str = raw.split(":")
                 self.port = int(port_str)
             else:

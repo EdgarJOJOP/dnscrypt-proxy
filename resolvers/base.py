@@ -27,9 +27,14 @@ class BaseResolver(abc.ABC):
         self._name = self._extract_name(address)
 
     def _extract_name(self, address: str) -> str:
-        """从地址中提取可读名称"""
+        """从地址中提取可读名称（正确支持 IPv6）"""
         addr = address.replace("https://", "").replace("quic://", "")
-        return addr.split("/")[0].split(":")[0]
+        host = addr.split("/")[0]
+        # IPv6 地址含多个冒号，直接返回（不按冒号截断）
+        if host.count(":") > 1:
+            return host
+        # 主机名:端口 → 去掉端口部分
+        return host.split(":")[0]
 
     @property
     def name(self) -> str:
