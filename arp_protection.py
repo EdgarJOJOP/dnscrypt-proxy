@@ -13,22 +13,35 @@ import struct
 import asyncio
 import socket
 import logging
+import random
 from typing import Optional, Tuple
 
 logger = logging.getLogger("dns-proxy.arp")
+
+# ARP 嗅探：scapy 跨平台抓包（可选，需 libpcap/Npcap 驱动支持）
+_SCAPY_AVAILABLE = False
+try:
+    import scapy.all as scapy
+
+    _SCAPY_AVAILABLE = True
+except ImportError:
+    pass
 
 
 class ARPProtection:
     """ARP 防护：网关侦测 + 路由器 ARP 表刷新"""
 
-    def __init__(self, config_arp: dict, ping_timeout: float = 1.0):
+    def __init__(self, config_arp: dict, ping_interval: float = 0.80,
+                 ping_targets_v4: list = None):
         """
         Args:
             config_arp: 从配置读取的 arp_protection 字典
-            ping_timeout: ping 超时（秒），默认 1.0，与 network_monitor.ping_timeout 同步
+            ping_interval: 网关检测间隔（秒），直接转为 ping 超时（ping_interval × 1000 ms）
+            ping_targets_v4: 外网 ping 目标列表，后台监控从中随机选一个
         """
         self._enabled = config_arp.get("enabled", True)
-        self._ping_timeout = ping_timeout
+        self._ping_interval = ping_interval
+        self._ping_targets_v4 = ping_targets_v4 or ["223.5.5.5"]
 
         # 解析 gateway 逗号格式（支持多组 "IP1,MAC1,IP2,MAC2" 交替逗号格式）
         self._manual_gateways: list = []  # [(ip, mac), ...] — 手动配置的全部网关
@@ -77,6 +90,34 @@ class ARPProtection:
         # IP 切换后的 TCP 监听器重启钩子（避免 netsh 后 socket 失效）
         self._restart_hooks: list = []
 
+        # ========== 常驻 worker 框架 ==========
+        self._arp_running = False                 # 运行标志
+        self._arp_workers: list = []              # worker task 列表
+
+        # 恢复监控 worker：通过 event 触发/通知
+        self._recovery_trigger = asyncio.Event()  # 信号：开始监控恢复
+        self._recovery_detected = asyncio.Event() # 信号：恢复已确认
+
+        # 诊断 worker：通过 event 触发
+        self._run_loss = asyncio.Event()          # 信号：丢包检测
+        self._run_garp = asyncio.Event()          # 信号：GARP 爆发
+        self._run_conflict = asyncio.Event()      # 信号：IP 冲突检测
+        self._loss_result = None                  # 丢包检测结果
+        self._garp_done = False                   # GARP 完成标记
+        self._conflict_result = None              # IP 冲突检测结果
+        self._garp_done_event = asyncio.Event()   # GARP 完成通知（替代轮询）
+        self._loss_done_event = asyncio.Event()   # 丢包检测完成通知
+
+        # ARP 投毒检测（嗅探 worker 检测到变化时设此 event）
+        self._baseline_mac = self.gateway_mac or ""  # 首次正确的网关 MAC
+        self._poison_detected = asyncio.Event()    # 信号：检测到 ARP 投毒/IP冲突
+        self._local_ips: set = set()               # 本机所有 IPv4 地址（嗅探用）
+        self._last_alert_mac: str = ""             # 上次告警的攻击者 MAC（同 MAC <3s 不重复触发）
+        self._last_alert_time: float = 0.0         # 上次告警时间戳
+        self._baseline_learned: bool = False       # 基线 MAC 是否已通过多次确认学习
+        self._baseline_proposed_mac: str = ""      # 首次候选基线 MAC（待二次确认）
+        self._baseline_proposed_time: float = 0.0  # 首次候选时间
+
     def register_restart_hook(self, hook):
         """注册 IP 切换后的 TCP 监听器重启回调"""
         if hook not in self._restart_hooks:
@@ -92,6 +133,335 @@ class ARPProtection:
                     hook()
             except Exception as e:
                 logger.warning("ARP 防护: 重启钩子执行异常: %s", e)
+
+    # ======================== 常驻 worker 框架 ========================
+
+    async def _start_workers(self):
+        """启动所有常驻 worker task，程序启动时调用一次，workers 循环等待事件触发"""
+        if self._arp_workers:
+            return  # 已启动
+        self._arp_running = True
+
+        self._arp_workers = [
+            asyncio.create_task(self._recovery_worker_loop()),
+            asyncio.create_task(self._loss_worker_loop()),
+            asyncio.create_task(self._garp_worker_loop()),
+            asyncio.create_task(self._conflict_worker_loop()),
+            asyncio.create_task(self._arp_sniffer_worker_loop()),
+        ]
+        logger.debug("ARP 防护: 5 个常驻 worker(含嗅探)已启动")
+
+    async def _stop_workers(self):
+        """停止所有常驻 worker"""
+        self._arp_running = False
+        # 触发所有 event 让 worker 从等待中醒来
+        self._recovery_trigger.set()
+        self._run_loss.set()
+        self._run_garp.set()
+        self._run_conflict.set()
+        self._garp_done_event.set()
+        self._loss_done_event.set()
+        self._poison_detected.set()
+        # 嗅探 worker 不依赖 event，靠 _arp_running=False 和 socket.close 退出
+        for w in self._arp_workers:
+            w.cancel()
+            try:
+                await w
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._arp_workers = []
+
+    async def _recovery_worker_loop(self):
+        """Worker 1: 永久等待 recovery_trigger → ping gw+ext → 通则 recovery_detected.set()"""
+        ext_ip = random.choice(self._ping_targets_v4) if self._ping_targets_v4 else "223.5.5.5"
+        ping_ms = int(self._ping_interval * 1000)
+        while self._arp_running:
+            await self._recovery_trigger.wait()
+            if not self._arp_running:
+                return
+            self._recovery_trigger.clear()
+            self._recovery_detected.clear()
+            gw_ip = self.gateway_ip
+            if not gw_ip:
+                continue
+            while self._arp_running and not self._recovery_detected.is_set():
+                gw_ok = await self._ping_gateway(gw_ip)
+                if gw_ok:
+                    ext_ok = await ARPProtection._ping_icmp(
+                        ext_ip, timeout_ms=ping_ms, use_tcp_fallback=False)
+                    if ext_ok:
+                        logger.info("ARP 防护: 后台 worker 检测到网关+外网已恢复")
+                        self._recovery_detected.set()
+                        break
+                await asyncio.sleep(self._ping_interval)
+
+    async def _loss_worker_loop(self):
+        """Worker 2: 永久等待 run_loss → 丢包检测 → 存结果到 _loss_result → 通知"""
+        while self._arp_running:
+            await self._run_loss.wait()
+            if not self._arp_running:
+                return
+            self._run_loss.clear()
+            self._loss_done_event.clear()
+            gw_ip = self.gateway_ip
+            if gw_ip:
+                try:
+                    self._loss_result = await self._detect_packet_loss_pattern(gw_ip, count=10)
+                except Exception as e:
+                    logger.debug("ARP 防护: 丢包检测 worker 异常: %s", e)
+            self._loss_done_event.set()
+
+    async def _garp_worker_loop(self):
+        """Worker 3: 永久等待 run_garp → GARP 爆发 → 标记完成 → 通知"""
+        while self._arp_running:
+            await self._run_garp.wait()
+            if not self._arp_running:
+                return
+            self._run_garp.clear()
+            self._garp_done_event.clear()
+            gw_ip = self.gateway_ip
+            if gw_ip:
+                try:
+                    await self._garp_broadcast_burst(count=10)
+                    self._garp_done = True
+                except Exception as e:
+                    logger.debug("ARP 防护: GARP worker 异常: %s", e)
+            self._garp_done_event.set()
+
+    async def _conflict_worker_loop(self):
+        """Worker 4: 永久等待 run_conflict → IP 冲突检测 → 存结果"""
+        while self._arp_running:
+            await self._run_conflict.wait()
+            if not self._arp_running:
+                return
+            self._run_conflict.clear()
+            gw_ip = self.gateway_ip
+            if gw_ip:
+                try:
+                    self._conflict_result = await self._detect_ip_conflict()
+                except Exception as e:
+                    logger.debug("ARP 防护: 冲突检测 worker 异常: %s", e)
+
+    async def _check_arp_packet(self, sender_ip: str, sender_mac: str,
+                                  target_ip: str, target_mac: str,
+                                  opcode: int) -> str:
+        """
+        统一 ARP 包检测 — 覆盖所有已知 ARP 攻击向量。
+
+        Args:
+            sender_ip:    发送者 IP（arp.psrc / frame[14:18]）
+            sender_mac:   发送者 MAC（arp.hwsrc，冒号大写）
+            target_ip:    目标 IP（arp.pdst / frame[24:28]）
+            target_mac:   目标 MAC（arp.hwdst / frame[18:24]，冒号大写）
+            opcode:       1=request, 2=reply
+
+        Returns:
+            "" (正常) 或 描述字符串 (检测到攻击)
+        """
+        gw_ip = self.gateway_ip
+        gw_ips = set(ip for ip, _ in self.gateway_pairs)
+        local_mac = (self._local_mac or "").replace("-", ":").upper()
+        is_garp = (sender_ip == target_ip)
+
+        # === 防抖 ===
+        if self._poison_detected.is_set():
+            return ""
+        now = asyncio.get_event_loop().time()
+        if sender_mac == self._last_alert_mac and now - self._last_alert_time < 3.0:
+            return ""
+
+        # === 安全基线学习（启动时防投毒）===
+        if not self._baseline_learned and not self._baseline_mac:
+            if sender_ip == gw_ip and sender_mac:
+                if not self._baseline_proposed_mac:
+                    # 首次收到网关包，记录候选
+                    self._baseline_proposed_mac = sender_mac
+                    self._baseline_proposed_time = now
+                    return ""
+                elif sender_mac == self._baseline_proposed_mac and now - self._baseline_proposed_time >= 2.0:
+                    # 2 秒内同一 MAC 确认 → 学习为基线
+                    self._baseline_mac = sender_mac
+                    self._baseline_learned = True
+                    logger.info("ARP 防护: 基线 MAC 已学习: %s => %s", gw_ip, sender_mac)
+                    return ""
+                elif sender_mac != self._baseline_proposed_mac:
+                    # 两次 MAC 不一致，可能启动时被攻击，清空候选等下一次
+                    self._baseline_proposed_mac = ""
+                    return ""
+            return ""
+
+        # === 攻击向量检测 ===
+        poisoned = False
+        reason = ""
+
+        # ① Sender = 网关 IP × MAC 不匹配（ARP 投毒/网关冒充）
+        if sender_ip in gw_ips and self._baseline_mac and sender_mac != self._baseline_mac:
+            poisoned = True
+            reason = f"ARP 投毒！网关 {sender_ip} → 期望 {self._baseline_mac} ≠ 实际 {sender_mac}"
+
+        # ② Sender = 本机 IP × MAC 不匹配（IP 冲突）
+        elif sender_ip in self._local_ips and sender_mac != local_mac:
+            poisoned = True
+            reason = f"IP 冲突！本机 {sender_ip} 的 MAC 被篡改为 {sender_mac}"
+
+        # ③ Target = 网关 IP × MAC 不匹配（中间人回复劫持）
+        elif target_ip == gw_ip and self._baseline_mac and target_mac and target_mac != self._baseline_mac:
+            poisoned = True
+            reason = f"MITM 劫持！回复目标 {target_ip} → 期望 MAC {self._baseline_mac} ≠ 实际 {target_mac}"
+
+        # ④ GARP 宣告伪造（Opcode=2 且 Sender=Target=网关, MAC 不对）
+        elif is_garp and opcode == 2 and sender_ip in gw_ips and self._baseline_mac and \
+                sender_mac != self._baseline_mac:
+            poisoned = True
+            reason = f"GARP 投毒！{sender_ip} 宣告 MAC={sender_mac}，期望 {self._baseline_mac}"
+
+        if poisoned:
+            self._last_alert_mac = sender_mac
+            self._last_alert_time = now
+            self._poison_detected.set()
+            self._arp_attack_logged = True
+            logger.warning("ARP 嗅探: %s", reason)
+            return reason
+
+        return ""
+
+    async def _arp_sniffer_worker_loop(self):
+        """
+        Worker 5: ARP 嗅探防护 — 跨平台实时检测 ARP 投毒和 IP 冲突。
+
+        优先级:
+          1. scapy 可用 → 跨平台实时抓包（事件驱动，零延迟）
+          2. Linux → AF_PACKET 原始套接字
+          3. Windows → arp -a 轮询兜底
+        """
+        gw_ip = self.gateway_ip
+        # 收集本机所有 IPv4 地址（避免 _local_ipv4 单值残留旧临时 IP）
+        self._local_ips = await ARPProtection._fetch_local_ips(self._interface_name or "")
+        # MAC 统一冒号大写格式（scapy 返回冒号格式，arp -a 返回横线格式）
+        self._baseline_mac = self._baseline_mac.replace("-", ":").upper() if self._baseline_mac else ""
+
+        # ==================== 路径 1: scapy 嗅探（跨平台，最快） ====================
+        if _SCAPY_AVAILABLE:
+            from scapy.all import conf, ARP as ScapyARP
+            try:
+                if self._interface_name:
+                    conf.iface = self._interface_name
+            except Exception:
+                pass
+
+            pkt_queue = asyncio.Queue()
+            sniff_failed = False
+
+            def _handle_pkt(pkt):
+                """scapy 回调（在 executor 线程中运行），收到 ARP 包就丢进 asyncio 队列"""
+                if pkt.haslayer(ScapyARP):
+                    try:
+                        pkt_queue.put_nowait(pkt)
+                    except Exception:
+                        pass
+
+            loop = asyncio.get_event_loop()
+
+            sniffer_task = None
+            try:
+                sniffer_task = loop.run_in_executor(
+                    None,
+                    lambda: scapy.sniff(
+                        prn=_handle_pkt, store=False,
+                        filter="arp", timeout=None,
+                    ),
+                )
+                logger.info("ARP 防护: scapy 嗅探已启动")
+            except Exception as e:
+                logger.warning("ARP 防护: scapy sniff 启动失败 (%s)，使用备用方案", e)
+                sniff_failed = True
+
+            if not sniff_failed:
+                while self._arp_running:
+                    try:
+                        pkt = await asyncio.wait_for(pkt_queue.get(), timeout=0.5)
+                    except asyncio.TimeoutError:
+                        if sniffer_task and sniffer_task.done() and not sniffer_task.cancelled():
+                            try:
+                                sniffer_task.result()
+                            except Exception as e:
+                                logger.warning("ARP 防护: scapy sniff 已停止 (%s)，切换到 arp 轮询", e)
+                                sniff_failed = True
+                                break
+                        continue
+                    except Exception:
+                        break
+                    try:
+                        arp = pkt[ScapyARP]
+                        await self._check_arp_packet(
+                            sender_ip=arp.psrc,
+                            sender_mac=arp.hwsrc.upper(),
+                            target_ip=arp.pdst,
+                            target_mac=arp.hwdst.upper() if arp.hwdst else "",
+                            opcode=arp.op,
+                        )
+                    except Exception:
+                        continue
+
+            if not sniff_failed:
+                return
+            logger.info("ARP 防护: scapy 嗅探不可用，回退到 arp 轮询。"
+                        "如需实时抓包，Windows 请安装 Npcap (https://npcap.com/)")
+
+        # ==================== 路径 2: AF_PACKET 原始套接字（Linux） ====================
+        if sys.platform != "win32":
+            ARP_ETH_TYPE = 0x0806
+            arp_sock = None
+            try:
+                arp_sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW,
+                                         socket.htons(ARP_ETH_TYPE))
+                arp_sock.bind((self._interface_name or "", 0))
+                arp_sock.setblocking(True)
+                logger.info("ARP 防护: AF_PACKET 嗅探已启动")
+            except Exception as e:
+                logger.warning("ARP 防护: 无法创建原始套接字 (%s)，回退到 arp 轮询", e)
+
+            if arp_sock:
+                while self._arp_running:
+                    try:
+                        frame = await asyncio.get_event_loop().sock_recv(arp_sock, 65535)
+                    except (asyncio.CancelledError, OSError):
+                        break
+                    except Exception:
+                        continue
+                    if len(frame) < 42:
+                        continue
+                    # ARP header: htype(2) ptype(2) hlen(1) plen(1) opcode(2) smac(6) sip(4) tmac(6) tip(4)
+                    arp = frame[14:42]
+                    htype, ptype = struct.unpack('!HH', arp[:4])
+                    if htype != 1 or ptype != ARP_ETH_TYPE:
+                        continue
+                    opcode = struct.unpack('!H', arp[6:8])[0]
+                    try:
+                        await self._check_arp_packet(
+                            sender_ip=socket.inet_ntoa(arp[14:18]),
+                            sender_mac=':'.join(f'{b:02x}' for b in arp[8:14]).upper(),
+                            target_ip=socket.inet_ntoa(arp[24:28]),
+                            target_mac=':'.join(f'{b:02x}' for b in arp[18:24]).upper(),
+                            opcode=opcode,
+                        )
+                    except Exception:
+                        continue
+                try:
+                    arp_sock.close()
+                except Exception:
+                    pass
+                return
+
+        # ==================== 路径 3: arp -a 轮询（Windows 兜底） ====================
+        while self._arp_running:
+            poisoned = await self._check_arp_poisoning()
+            if poisoned:
+                for gw_ip_p, expected, actual in poisoned:
+                    logger.warning("ARP 防护: 检测到 ARP 投毒！网关 %s → 预期 %s ≠ 实际 %s",
+                                   gw_ip_p, expected, actual)
+                self._poison_detected.set()
+            await asyncio.sleep(self._ping_interval)
 
     @staticmethod
     def _parse_gateway_field(gw_field: str) -> list:
@@ -1227,8 +1597,6 @@ class ARPProtection:
                 self._arp_attack_logged = True
         return poisoned
 
-    # ======================== 刷新路由器 ARP 表 ========================
-
     async def refresh_router_arp(self, abort_check=None) -> bool:
         """
         针对路由器 ARP 表被篡改或 IP 冲突的高级修复策略：
@@ -1254,8 +1622,15 @@ class ARPProtection:
         self._arp_attack_logged = False
         logger.info("ARP 防护: 正在修复路由器 ARP 表 (网关=%s)...", gw_ip)
 
-        # 定义 abort 检查辅助
+        # 触发常驻 recovery worker（后台并行监控网关+外网，一通就设 recovery_detected）
+        self._recovery_detected.clear()
+        self._recovery_trigger.set()
+
+        # 定义 abort 检查辅助（检查常驻 worker 的恢复信号 + 主循环滑动窗口）
         async def _check_abort():
+            if self._recovery_detected.is_set():
+                logger.info("ARP 防护: 网络已恢复（后台 worker），提前中止修复")
+                return True
             if abort_check:
                 try:
                     if abort_check():
@@ -1265,154 +1640,155 @@ class ARPProtection:
                     pass
             return False
 
+        try:
+
         # 0. ARP 投毒检测：检查本机 ARP 表中各网关 MAC 是否被篡改
-        poisoned = await self._check_arp_poisoning()
-        if poisoned:
-            for gw_ip_poisoned, expected, actual in poisoned:
-                logger.warning("ARP 防护: 检测到本机 ARP 表被篡改！"
-                               "网关 %s → 预期 %s ≠ 实际 %s（MITM 攻击）",
-                               gw_ip_poisoned, expected, actual)
-            logger.warning("ARP 防护: 正在执行抗投毒修复...")
-        else:
-            logger.info("ARP 防护: 本机 ARP 表正常，未检测到投毒")
+            poisoned = await self._check_arp_poisoning()
+            if poisoned:
+                for gw_ip_poisoned, expected, actual in poisoned:
+                    logger.warning("ARP 防护: 检测到本机 ARP 表被篡改！"
+                                   "网关 %s → 预期 %s ≠ 实际 %s（MITM 攻击）",
+                                   gw_ip_poisoned, expected, actual)
+                logger.warning("ARP 防护: 正在执行抗投毒修复...")
+            else:
+                logger.info("ARP 防护: 本机 ARP 表正常，未检测到投毒")
 
-        # 1. 爆发 ping 网关（10 次，10ms 间隔，100ms 超时）
-        #    路由器收到本机 IP 包 → 看到源 MAC → 更新 ARP 表中本机 IP↔MAC
-        logger.info("ARP 防护: 爆发 ping 网关 %s x10", gw_ip)
-        for _ in range(10):
-            await self._ping_gateway_fast(gw_ip)
-            await asyncio.sleep(0.01)
+            # 1. (跳过爆发 ping — recovery worker 已在后台持续 ping 网关)
+            if await _check_abort():
+                return True
 
-        if await _check_abort():
-            return True
+            # 检查本机是否为 APIPA 地址（169.254.x.x）
+            # APIPA 时网关在不同子网，所有 ping 必然失败，无需跑丢包检测
+            current_ip = self._local_ipv4 or ""
+            is_apipa = current_ip.startswith("169.254.")
+            if is_apipa:
+                logger.warning("ARP 防护: 本机 IP %s 为 APIPA 地址，"
+                               "跳过丢包检测，直接执行 IP 冲突修复", current_ip)
+                # 构建一个全丢包的 loss_info，直接导向 ip_conflict 分支
+                loss_info = {"loss_rate": 1.0, "success": 0, "total": 10,
+                             "diagnosis": "ip_conflict"}
+            else:
+                # 2-3-4. 触发常驻 workers 并发执行（无需 create_task 开销）
+                self._loss_result = None
+                self._garp_done = False
+                self._conflict_result = None
+                self._garp_done_event.clear()
+                self._loss_done_event.clear()
+                self._run_loss.set()
+                self._run_garp.set()
+                self._run_conflict.set()
 
-        # 检查本机是否为 APIPA 地址（169.254.x.x）
-        # APIPA 时网关在不同子网，所有 ping 必然失败，无需跑丢包检测
-        current_ip = self._local_ipv4 or ""
-        is_apipa = current_ip.startswith("169.254.")
-        if is_apipa:
-            logger.warning("ARP 防护: 本机 IP %s 为 APIPA 地址，"
-                           "跳过丢包检测，直接执行 IP 冲突修复", current_ip)
-            # 构建一个全丢包的 loss_info，直接导向 ip_conflict 分支
-            loss_info = {"loss_rate": 1.0, "success": 0, "total": 10,
-                         "diagnosis": "ip_conflict"}
-        else:
-            # 2-3. 并发执行：丢包模式分析 + GARP 爆发
-            #     GARP 内置每 3 轮 ping 检查，网络恢复可提前退出
-            #     丢包分析提供诊断信息
-            loss_task = asyncio.create_task(
-                self._detect_packet_loss_pattern(gw_ip, count=10))
-            garp_task = asyncio.create_task(
-                self._garp_broadcast_burst(count=10))
-
-            done, pending = await asyncio.wait(
-                [loss_task, garp_task],
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-
-            # 取消仍在运行的任务
-            for task in pending:
-                task.cancel()
+                # 等待 GARP 完成（事件通知，不轮询；最多等 2s）
+                loss_info = None
+                conflict = None
                 try:
-                    await task
-                except (asyncio.CancelledError, Exception):
+                    await asyncio.wait_for(self._garp_done_event.wait(), timeout=2.0)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
                     pass
 
-            # 获取丢包分析结果（可能已被取消，此时用 None 兜底）
-            loss_info = None
-            if loss_task in done and not loss_task.exception():
-                try:
-                    loss_info = loss_task.result()
-                except Exception:
-                    pass
+                if await _check_abort():
+                    return True
 
-            # GARP 完成后立即验证网关
-            if await self._ping_gateway_fast(gw_ip):
-                logger.info("ARP 防护: GARP 爆发后网关 %s 已恢复可达", gw_ip)
+                # GARP 完成后验证网关
+                if await self._ping_gateway_fast(gw_ip):
+                    logger.info("ARP 防护: GARP 爆发后网关 %s 已恢复可达", gw_ip)
+                    if self.gateway_mac:
+                        if await self._protect_gateway_arp():
+                            logger.info("ARP 防护: 静态 ARP 已绑定")
+                        else:
+                            await self._garp_sustain(gw_ip, duration=3, interval=0.5)
+                    return True
+
+                # 等待丢包检测结果（最多等 1s）
+                if self._loss_result is None:
+                    try:
+                        await asyncio.wait_for(self._loss_done_event.wait(), timeout=1.0)
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        pass
+                loss_info = self._loss_result
+
+                # 读取 IP 冲突检测结果（worker 已完成，直接取）
+                conflict = self._conflict_result
+
+            # 有丢包分析结果时才打印诊断日志
+            if loss_info:
+                if loss_info["diagnosis"] == "ip_conflict":
+                    loss_pct = round(loss_info["loss_rate"] * 100)
+                    logger.warning("ARP 防护: 网关丢包 %d%% (%d/%d), "
+                                   "诊断=IP冲突(攻击者使用相同静态IP)",
+                                   loss_pct, loss_info["success"], loss_info["total"])
+                elif loss_info["diagnosis"] == "arp_poisoning":
+                    loss_pct = round(loss_info["loss_rate"] * 100)
+                    logger.warning("ARP 防护: 网关丢包 %d%% (%d/%d), "
+                                   "诊断=ARP投毒(流量被劫持到攻击者)",
+                                   loss_pct, loss_info["success"], loss_info["total"])
+                elif loss_info["diagnosis"] == "network_down":
+                    logger.warning("ARP 防护: 网关完全不可达，诊断=网络断开")
+            else:
+                # 没有丢包分析结果（GARP 跑完但网关不通，loss 被取消），手动检查
+                if not await self._ping_gateway_fast(gw_ip):
+                    logger.warning("ARP 防护: 网关完全不可达，诊断=网络断开")
+                loss_info = loss_info or {"loss_rate": 1.0, "success": 0, "total": 10,
+                                           "diagnosis": "network_down"}
+
+            if await _check_abort():
+                return True
+
+            # 4. IP 冲突检测 + 自动修复（冲突检测已与 GARP 爆发并发执行）
+            #    丢包 ~50% 说明有设备用相同静态 IP，即使 ARP 表没显示也要处理
+            if (loss_info and loss_info["diagnosis"] == "ip_conflict") or conflict:
+                if not conflict:
+                    logger.warning("ARP 防护: 丢包模式指向 IP 冲突（ARP 表未捕获），"
+                                   "尝试自动 IP +1")
+                else:
+                    logger.warning("ARP 防护: %s", conflict)
+                self._arp_attack_logged = True
+                ip_ok = False
+                if sys.platform == "win32":
+                    ip_ok = await self._resolve_ip_conflict_windows()
+                else:
+                    ip_ok = await self._resolve_ip_conflict_linux()
+                if ip_ok:
+                    # netsh 已同步完成，无需额外等待；用快速 ping 验证
+                    if await self._ping_gateway_fast(gw_ip) and self.gateway_mac:
+                        if await self._protect_gateway_arp():
+                            logger.info("ARP 防护: IP 冲突修复后静态 ARP 已绑定")
+                        else:
+                            await self._garp_sustain(gw_ip, duration=3, interval=0.5)
+                    return True
+
+            # 5. 验证 ping（快速版：此时已确定网络异常，80ms 超时足够判断）
+            ping_ok = await self._ping_gateway_fast(gw_ip)
+            if ping_ok:
+                logger.info("ARP 防护: 网关 %s 可达", gw_ip)
+                # 设静态 ARP 保护本机缓存（静态度 ARP 后 OS 不再发 ARP 请求，
+                # 攻击者无法再投毒本机 ARP 表，无需额外 GARP 对抗）
                 if self.gateway_mac:
                     if await self._protect_gateway_arp():
-                        logger.info("ARP 防护: 静态 ARP 已绑定")
+                        logger.info("ARP 防护: 静态 ARP 已绑定，跳过持续 GARP 对抗")
                     else:
+                        # 静态 ARP 绑定失败，简短 GARP 对抗兜底
                         await self._garp_sustain(gw_ip, duration=3, interval=0.5)
+                if self._arp_attack_logged and not self._conflict_resolved:
+                    logger.warning("ARP 防护: 网络已恢复但检测到 ARP 异常，建议检查局域网设备")
                 return True
 
-        # 有丢包分析结果时才打印诊断日志
-        if loss_info:
-            if loss_info["diagnosis"] == "ip_conflict":
-                loss_pct = round(loss_info["loss_rate"] * 100)
-                logger.warning("ARP 防护: 网关丢包 %d%% (%d/%d), "
-                               "诊断=IP冲突(攻击者使用相同静态IP)",
-                               loss_pct, loss_info["success"], loss_info["total"])
-            elif loss_info["diagnosis"] == "arp_poisoning":
-                loss_pct = round(loss_info["loss_rate"] * 100)
-                logger.warning("ARP 防护: 网关丢包 %d%% (%d/%d), "
-                               "诊断=ARP投毒(流量被劫持到攻击者)",
-                               loss_pct, loss_info["success"], loss_info["total"])
-            elif loss_info["diagnosis"] == "network_down":
-                logger.warning("ARP 防护: 网关完全不可达，诊断=网络断开")
-        else:
-            # 没有丢包分析结果（GARP 跑完但网关不通，loss 被取消），手动检查
-            if not await self._ping_gateway_fast(gw_ip):
-                logger.warning("ARP 防护: 网关完全不可达，诊断=网络断开")
-            loss_info = loss_info or {"loss_rate": 1.0, "success": 0, "total": 10,
-                                       "diagnosis": "network_down"}
-
-        if await _check_abort():
-            return True
-
-        # 4. IP 冲突检测 + 自动修复
-        #    丢包 ~50% 说明有设备用相同静态 IP，即使 ARP 表没显示也要处理
-        conflict = await self._detect_ip_conflict()
-        if loss_info["diagnosis"] == "ip_conflict" or conflict:
-            if not conflict:
-                logger.warning("ARP 防护: 丢包模式指向 IP 冲突（ARP 表未捕获），"
-                               "尝试自动 IP +1")
-            else:
-                logger.warning("ARP 防护: %s", conflict)
-            self._arp_attack_logged = True
-            ip_ok = False
-            if sys.platform == "win32":
-                ip_ok = await self._resolve_ip_conflict_windows()
-            else:
-                ip_ok = await self._resolve_ip_conflict_linux()
-            if ip_ok:
-                await asyncio.sleep(1.0)
-                # IP 冲突修复后验证网关可达性，并设置静态 ARP
-                # 防止攻击者立即重新投毒网关条目导致新一轮切换
-                if await self._ping_gateway(gw_ip) and self.gateway_mac:
-                    if await self._protect_gateway_arp():
-                        logger.info("ARP 防护: IP 冲突修复后静态 ARP 已绑定")
-                    else:
-                        await self._garp_sustain(gw_ip, duration=3, interval=0.5)
+            # 6. 网关仍不可达 → 持续 ARP 中毒 → 两阶段 IP 切换抗毒
+            if await _check_abort():
+                return True
+            logger.warning("ARP 防护: 网关 %s 仍不可达，尝试两阶段 IP 切换抗 ARP 中毒...", gw_ip)
+            if await self._garp_ip_switch_defense(abort_check=abort_check):
+                logger.info("ARP 防护: 两阶段 GARP 切换后网关 %s 可达", gw_ip)
                 return True
 
-        # 5. 验证 ping
-        ping_ok = await self._ping_gateway(gw_ip)
-        if ping_ok:
-            logger.info("ARP 防护: 网关 %s 可达", gw_ip)
-            # 设静态 ARP 保护本机缓存（静态度 ARP 后 OS 不再发 ARP 请求，
-            # 攻击者无法再投毒本机 ARP 表，无需额外 GARP 对抗）
-            if self.gateway_mac:
-                if await self._protect_gateway_arp():
-                    logger.info("ARP 防护: 静态 ARP 已绑定，跳过持续 GARP 对抗")
-                else:
-                    # 静态 ARP 绑定失败，简短 GARP 对抗兜底
-                    await self._garp_sustain(gw_ip, duration=3, interval=0.5)
-            if self._arp_attack_logged and not self._conflict_resolved:
-                logger.warning("ARP 防护: 网络已恢复但检测到 ARP 异常，建议检查局域网设备")
-            return True
-
-        # 6. 网关仍不可达 → 持续 ARP 中毒 → 两阶段 IP 切换抗毒
-        if await _check_abort():
-            return True
-        logger.warning("ARP 防护: 网关 %s 仍不可达，尝试两阶段 IP 切换抗 ARP 中毒...", gw_ip)
-        if await self._garp_ip_switch_defense():
-            logger.info("ARP 防护: 两阶段 GARP 切换后网关 %s 可达", gw_ip)
-            return True
-
-        logger.warning("ARP 防护: 网关 %s 仍不可达，可能存在持续 ARP 攻击或 IP 冲突", gw_ip)
-        self._arp_attack_detected = True
-        return False
+            logger.warning("ARP 防护: 网关 %s 仍不可达，可能存在持续 ARP 攻击或 IP 冲突", gw_ip)
+            self._arp_attack_detected = True
+            return False
+        finally:
+            # 恢复 worker 不再需要监控本轮修复，清除 trigger 使其回等待状态
+            # recovery_detected 不清除（如果已经恢复，上层会读取），
+            # 但 trigger 需清除让 worker 不再循环
+            self._recovery_trigger.clear()
 
     async def _send_single_garp(self) -> bool:
         """
@@ -1735,7 +2111,7 @@ class ARPProtection:
                 except (asyncio.TimeoutError, FileNotFoundError, OSError):
                     pass
 
-    async def _garp_ip_switch_defense(self) -> bool:
+    async def _garp_ip_switch_defense(self, abort_check=None) -> bool:
         """
         两阶段 GARP 抗 ARP 中毒（MITM）：
 
@@ -1755,9 +2131,23 @@ class ARPProtection:
         攻击者在阶段 1 期间投毒的条目（原始 IP → 攻击者 MAC）
         在阶段 2 开始后会被我们的宣告覆盖。
 
+        Args:
+            abort_check: 可选回调，操作间检查，若返回 True 则提前中止
+
         Returns:
             True 表示切换后网关可达
         """
+        # 定义 abort 检查辅助
+        async def _check_abort():
+            if abort_check:
+                try:
+                    if abort_check():
+                        logger.info("ARP 防护: 网络已恢复，提前中止两阶段切换")
+                        return True
+                except Exception:
+                    pass
+            return False
+
         original_ip = self._local_ipv4
         if not original_ip or not self._subnet_mask:
             logger.warning("ARP 防护: 缺少 IP 或子网掩码，无法执行两阶段 GARP")
@@ -1776,6 +2166,9 @@ class ARPProtection:
         logger.warning("ARP 防护: 两阶段 GARP 抗中毒: %s → %s → %s",
                         original_ip, decoy_ip, original_ip)
 
+        if await _check_abort():
+            return True
+
         # --- 阶段 1：切换到临时 IP，宣告解绑 ---
         logger.info("ARP 防护: 阶段 1 — 切换到临时 IP %s", decoy_ip)
         if not await self._switch_ip(decoy_ip):
@@ -1783,9 +2176,11 @@ class ARPProtection:
             return False
 
         self._local_ipv4 = decoy_ip
-        await self._garp_broadcast_burst(count=10)
-        # 短暂等待让 ARP 表传播
-        await asyncio.sleep(0.3)
+        await self._garp_broadcast_burst(count=5)
+        await asyncio.sleep(0.1)
+
+        if await _check_abort():
+            return True
 
         # --- 阶段 2：切回原始 IP，宣告正确绑定 ---
         logger.info("ARP 防护: 阶段 2 — 切回原始 IP %s", original_ip)
@@ -1799,15 +2194,15 @@ class ARPProtection:
                 logger.warning("ARP 防护: 已切换到备用 IP %s（原 IP %s 冲突中）",
                                fallback_ip, original_ip)
                 self._local_ipv4 = fallback_ip
-                await self._garp_broadcast_burst(count=10)
-                await asyncio.sleep(0.3)
+                await self._garp_broadcast_burst(count=5)
+                await asyncio.sleep(0.1)
                 reachable = False
-                for attempt in range(3):
-                    reachable = await self._ping_gateway(gw_ip)
+                for attempt in range(2):
+                    reachable = await self._ping_gateway_fast(gw_ip)
                     if reachable:
                         break
-                    if attempt < 2:
-                        await asyncio.sleep(0.5)
+                    if attempt < 1:
+                        await asyncio.sleep(0.1)
                 # IP 切换后 TCP 监听器 socket 可能失效，触发重启
                 await self._fire_restart_hooks()
                 # 刷新 DNS 缓存（IP 变更后旧 DNS 缓存可能指向错误 IP）
@@ -1824,18 +2219,20 @@ class ARPProtection:
             return False
 
         self._local_ipv4 = original_ip
-        await self._garp_broadcast_burst(count=10)
-        await asyncio.sleep(0.3)
+        await self._garp_broadcast_burst(count=5)
+        await asyncio.sleep(0.1)
 
-        # 确认网关可达：多轮重试，给接口/路由/ARP 足够时间稳定
-        # netsh 切换 IP 后 Windows 需时间更新路由表和 ARP 缓存
+        if await _check_abort():
+            return True
+
+        # 确认网关可达：快速验证
         reachable = False
-        for attempt in range(3):
-            reachable = await self._ping_gateway(gw_ip)
+        for attempt in range(2):
+            reachable = await self._ping_gateway_fast(gw_ip)
             if reachable:
                 break
-            if attempt < 2:
-                await asyncio.sleep(0.5)
+            if attempt < 1:
+                await asyncio.sleep(0.1)
         if reachable and self.gateway_mac:
             await self._protect_gateway_arp()
         # IP 切换后 TCP 监听器 socket 可能失效，触发重启
@@ -2230,6 +2627,58 @@ class ARPProtection:
         return None
 
     @staticmethod
+    async def _fetch_local_ips(interface_name: str) -> set:
+        """
+        获取指定网卡的所有 IPv4 地址。
+        用于嗅探 worker 比对 IP 冲突（本机可能有多 IP）。
+        """
+        ips: set = set()
+        if not interface_name:
+            return ips
+        try:
+            if sys.platform == "win32":
+                proc = await asyncio.create_subprocess_exec(
+                    "ipconfig",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+                text = stdout.decode("utf-8", errors="replace")
+                in_adapter = False
+                for line in text.splitlines():
+                    s = line.strip()
+                    # 检测到本网卡段
+                    if interface_name.lower() in s.lower() and ("适配器" in s or "adapter" in s):
+                        in_adapter = True
+                        continue
+                    if in_adapter:
+                        # 空行 = 网卡段结束
+                        if not s:
+                            break
+                        # 提取 IPv4 地址
+                        for key in ("IPv4", "IP Address", "IPv4 地址", "IP 地址"):
+                            if key in s and ":" in s:
+                                ip = s.split(":", 1)[1].strip()
+                                if "." in ip:
+                                    m = re.match(r'(\d+\.\d+\.\d+\.\d+)', ip)
+                                    if m:
+                                        ips.add(m.group(1))
+            else:
+                proc = await asyncio.create_subprocess_exec(
+                    "ip", "-4", "addr", "show", "dev", interface_name,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+                for line in stdout.decode("utf-8", errors="replace").splitlines():
+                    m = re.search(r'inet\s+(\d+\.\d+\.\d+\.\d+)', line)
+                    if m:
+                        ips.add(m.group(1))
+        except Exception as e:
+            logger.debug("ARP 防护: 获取本机 IP 列表失败: %s", e)
+        return ips
+
+    @staticmethod
     def _is_valid_ip(ip: str) -> bool:
         """
         检查 IP 地址是否合法且可用于局域网。
@@ -2251,14 +2700,14 @@ class ARPProtection:
             return False
 
     async def _ping_gateway(self, gw_ip: str) -> bool:
-        """ping 网关（使用配置的 ping_timeout，公式 max(ping_timeout*100, 80)ms，默认 80ms）"""
-        timeout_ms = max(int(self._ping_timeout * 100), 80)
+        """ping 网关（直接使用 ping_interval 转为毫秒，公式 ping_interval×1000 ms）"""
+        timeout_ms = int(self._ping_interval * 1000)
         return await ARPProtection._ping_icmp(gw_ip, timeout_ms=timeout_ms)
 
-    @staticmethod
-    async def _ping_gateway_fast(gw_ip: str) -> bool:
-        """ping 网关（快速版：80ms 超时，用于 GARP 爆发场景的快速验证，不启用 TCP 兜底）"""
-        return await ARPProtection._ping_icmp(gw_ip, timeout_ms=80, use_tcp_fallback=False)
+    async def _ping_gateway_fast(self, gw_ip: str) -> bool:
+        """ping 网关（使用 ping_interval 超时，用于 GARP 爆发场景的快速验证，不启用 TCP 兜底）"""
+        timeout_ms = int(self._ping_interval * 1000)
+        return await ARPProtection._ping_icmp(gw_ip, timeout_ms=timeout_ms, use_tcp_fallback=False)
 
     @staticmethod
     async def _ping_icmp(ip: str, timeout_ms: int,

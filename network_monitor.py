@@ -73,10 +73,16 @@ class NetworkMonitor:
 
         # ARP 防护
         self._arp_protection = ARPProtection(config.arp_protection_config,
-                                              ping_timeout=self._ping_timeout)
+                                              ping_interval=self._interval,
+                                              ping_targets_v4=self._ping_targets_v4)
 
         # 外网 ping 轮询索引（轮流 ping 多个 v4 目标，每轮一个）
         self._ext_ping_index = 0
+
+        # 常驻恢复 worker（事件触发，用完冻结）
+        self._run_recover = asyncio.Event()
+        self._recover_task: Optional[asyncio.Task] = None
+        self._consecutive_network_down = 0         # 连续 network_down 计数
 
     @property
     def enabled(self) -> bool:
@@ -98,13 +104,30 @@ class NetworkMonitor:
         logger.info("网络连通性监控已启动 (网关检测=%gs, ping目标=%s)",
                      self._interval, self._ping_targets_v4 + self._ping_targets_v6)
 
-        # ARP 防护：自动探测网关（手动配置了 IP+MAC 则跳过）
-        if self._arp_protection.enabled and not self._arp_protection.is_manual:
-            await self._arp_protection.detect_gateway()
+        # ARP 防护：自动探测网关，然后启动常驻 worker
+        if self._arp_protection.enabled:
+            if not self._arp_protection.is_manual:
+                await self._arp_protection.detect_gateway()
+            # 启动常驻 worker（程序启动时创建一次，后续通过事件触发，无需反复 create_task）
+            await self._arp_protection._start_workers()
+
+        # 启动常驻恢复 worker（Worker 5）
+        self._recover_task = asyncio.create_task(self._recover_worker_loop())
+        logger.debug("网络监控: 常驻恢复 worker 已启动")
 
     async def stop(self):
         """停止监控循环"""
         self._running = False
+        await self._arp_protection._stop_workers()
+        # 停止常驻恢复 worker
+        if self._recover_task:
+            self._run_recover.set()
+            self._recover_task.cancel()
+            try:
+                await self._recover_task
+            except asyncio.CancelledError:
+                pass
+            self._recover_task = None
         if self._task:
             self._task.cancel()
             try:
@@ -140,6 +163,23 @@ class NetworkMonitor:
                     ext_ok = await self._ping(self._ping_targets_v4[idx])
                 self._ext_results.append(ext_ok)
 
+                # ========== 1.5 ARP 投毒检测（_poison_worker_loop 异步检查，这里取结果） ==========
+                if self._arp_protection._poison_detected.is_set() and not self._arp_network_down:
+                    self._arp_protection._poison_detected.clear()
+                    logger.warning("ARP 防护: 检测到 ARP 投毒！立即抑制 DNS 并启动修复")
+                    self._arp_network_down = True
+                    self.resolver_manager.set_network_down(True)
+                    # 直接刷新路由器 ARP，绕过 _run_arp_defense 的接口检查（已知是投毒）
+                    if await self._arp_protection.refresh_router_arp(
+                            lambda: self._is_recovered()):
+                        if await self._arp_protection._ping_gateway_fast(gw_ip):
+                            logger.info("ARP 防护: 投毒修复完成，网关已恢复")
+                            self._arp_protection._baseline_mac = (
+                                self._arp_protection.gateway_mac or "").replace("-", ":").upper()
+                            self._arp_protection._last_alert_mac = ""  # 重置告警 MAC，允许再次检测
+                            self._arp_network_down = False
+                            self.resolver_manager.set_network_down(False)
+
                 # ========== 2. 从滑动窗口计算丢包分级 ==========
                 loss_pct, diagnosis = self._classify_loss()
 
@@ -148,25 +188,31 @@ class NetworkMonitor:
                     # 窗口内大部分成功 → 网络已正常
                     if self._arp_network_down or self.resolver_manager._network_down:
                         logger.info("网络已恢复 (网关丢包=%d%%, 外网正常)", loss_pct)
-                        self._arp_network_down = False
-                        self.resolver_manager.set_network_down(False)
-                        # 从断网恢复时重建上游连接，避免 DNS 继续失败 19s
-                        await self._recover()
+                        # 触发常驻 recover worker（event.set 天然防并发：已运行时无效）
+                        self._run_recover.set()
                     # 取消还在运行的 ARP 防护任务
                     if self._arp_task and not self._arp_task.done():
                         self._arp_task.cancel()
                         self._arp_task = None
+                    self._consecutive_network_down = 0
 
                 elif diagnosis == "network_down":
                     # 全丢包 + 外网不通 → 确认断网，抑制 DNS
-                    if not self._arp_network_down:
-                        logger.warning("网络断开确认 (网关丢包=%d%%, 外网不可达)", loss_pct)
-                        self._arp_network_down = True
-                        self.resolver_manager.set_network_down(True)
-                    # 取消可能还在跑的 ARP 防护任务（断网没必要跑）
-                    if self._arp_task and not self._arp_task.done():
-                        self._arp_task.cancel()
-                        self._arp_task = None
+                    self._consecutive_network_down += 1
+                    if self._consecutive_network_down >= 2:
+                        if not self._arp_network_down:
+                            logger.warning("网络断开确认 (连续 %d 轮, 网关丢包=%d%%, 外网不可达)",
+                                           self._consecutive_network_down, loss_pct)
+                            self._arp_network_down = True
+                            self.resolver_manager.set_network_down(True)
+                        # 取消可能还在跑的 ARP 防护任务（断网没必要跑）
+                        if self._arp_task and not self._arp_task.done():
+                            self._arp_task.cancel()
+                            self._arp_task = None
+                    else:
+                        # 第一次检测到 network_down，打印一次日志但不切断 DNS（等下一轮确认）
+                        logger.warning("网络连通性严重异常 (网关丢包=%d%%, 外网不可达), 等待下轮确认",
+                                       loss_pct)
 
                 elif diagnosis == "arp_issue":
                     # 部分丢包 → 需要 ARP 防护（启动后台任务）
@@ -193,7 +239,7 @@ class NetworkMonitor:
                 elif ext_ok and self._degraded:
                     self._recovery_successes += 1
                     if self._recovery_successes >= self._recovery_check_count:
-                        await self._recover()
+                        asyncio.create_task(self._recover())
                         self._recovery_successes = 0
                 elif ext_ok:
                     self._consecutive_failures = 0
@@ -297,11 +343,13 @@ class NetworkMonitor:
                 # ARP 防护成功
                 if abort_check() or await self._arp_protection._ping_gateway_fast(gw_ip):
                     logger.info("ARP 防护: 后台修复完成，网关已恢复")
-                    self._arp_network_down = False
-                    self.resolver_manager.set_network_down(False)
-                    # 如果是从 network_down 恢复，重建上游连接
+                    # 如果是从 network_down 恢复，触发常驻 recover worker
                     if self.resolver_manager._network_down:
-                        await self._recover()
+                        self._run_recover.set()
+                    else:
+                        # 未标记断网（波动中快速修复），直接恢复 DNS
+                        self._arp_network_down = False
+                        self.resolver_manager.set_network_down(False)
             else:
                 # ARP 防护后网关仍不通 → 检查外网
                 ext_ok = abort_check() or (len(self._ext_results) > 0 and
@@ -445,9 +493,9 @@ class NetworkMonitor:
         logger.info("网络已恢复，执行自动恢复...")
 
         # 0. 短暂延迟，让 Windows 网络栈完全初始化
-        #    网卡启用后，ICMP ping 可能先于 TCP/UDP 恢复，等待 2 秒确保稳定
-        logger.info("  等待网络栈稳定 (2s)...")
-        await asyncio.sleep(2.0)
+        #    主循环已经确认了多轮成功 ping，网络已通，0.5s 足够
+        logger.info("  等待网络栈稳定 (0.5s)...")
+        await asyncio.sleep(0.5)
 
         # 1. 重置所有持久连接（关闭失效的 aiohttp 会话、QUIC 配置等）
         #    这是解决"网卡禁用/启用后上游持续失败"的关键步骤
@@ -486,3 +534,51 @@ class NetworkMonitor:
         total = len(self.resolver_manager._upstream_servers)
         logger.info("自动恢复完成: %d/%d 个上游可用", enabled, total)
         logger.info("=" * 50)
+
+    async def _recover_worker_loop(self):
+        """
+        常驻恢复 worker（Worker 5）：永久等待 _run_recover 事件 → 执行恢复操作 → 冻结。
+        由 NetworkMonitor.start() 创建一次，后续通过 _run_recover.set() 触发。
+        天然防并发：worker 正在恢复时再次 set() 无效，恢复完回 wait() 后下一次触发才生效。
+        """
+        while True:
+            await self._run_recover.wait()
+            if not self._running:
+                return
+            self._run_recover.clear()
+
+            # 执行恢复操作（与原来的 _delayed_recover 一致）
+            try:
+                await asyncio.sleep(0.5)  # 网络栈短暂稳定
+
+                await self.resolver_manager.reset_all_connections()
+                logger.info("  [后台恢复] 持久连接已重置")
+
+                self.resolver_manager.enter_recovery_mode()
+                self.resolver_manager.reenable_all()
+                logger.info("  [后台恢复] 已重新启用所有上游")
+
+                refreshed = await self.resolver_manager.refresh_all_upstream_ips()
+                logger.info("  [后台恢复] 已刷新 %d 个上游域名缓存", refreshed)
+
+                if self.filter_engine:
+                    self.filter_engine.clear_filter_cache()
+                    logger.info("  [后台恢复] 已清除过滤引擎缓存")
+
+                # 重置降级状态
+                self._degraded = False
+                self._consecutive_failures = 0
+                self._recovery_successes = 0
+                self._last_recovery_time = asyncio.get_event_loop().time()
+
+                # === 所有恢复操作完成，最后才放行 DNS 查询 ===
+                self._arp_network_down = False
+                self.resolver_manager.set_network_down(False)
+
+                enabled = sum(1 for s in self.resolver_manager._upstream_servers if s.enabled)
+                total = len(self.resolver_manager._upstream_servers)
+                logger.info("  [后台恢复] 完成: %d/%d 个上游可用，DNS 查询已恢复", enabled, total)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error("后台恢复异常: %s", e)

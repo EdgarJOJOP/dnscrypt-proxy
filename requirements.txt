@@ -6,3 +6,6 @@ psutil>=5.8.0
 aioquic>=0.9.0
 httpx[http2]
 certifi
+# ARP 嗅探（可选）：安装后实时抓包检测 ARP 攻击，大幅提升检测速度
+# Windows 需要额外安装 Npcap: https://npcap.com/#download
+scapy>=2.5.0
