@@ -7,51 +7,51 @@ server:
   # 本地 DoH 服务（HTTPS 加密 DNS）
   doh:
     enabled: true
-    host: "127.0.0.1"            # IPv4 监听地址
+    host: 127.0.0.1              # IPv4 监听地址
     port: 8443                  # DoH 端口
-    path: "/dns-query"
-    cert_path: "certs/localhost.crt"
-    key_path: "certs/localhost.key"
+    path: /dns-query
+    cert_path: certs/localhost.crt
+    key_path: certs/localhost.key
     # IPv6 支持（同时监听 IPv6）
     ipv6:
       enabled: true
-      host: "::1"
+      host: ::1
       port: 8443
 
   # 本地 DoT 服务（DNS over TLS，RFC 7858）
   dot:
     enabled: false               # 默认关闭，设为 true 开启
-    host: "127.0.0.1"           # IPv4 监听地址
+    host: 127.0.0.1             # IPv4 监听地址
     port: 853                   # 标准 DoT 端口
-    domain: ""                  # 服务器域名（SNI），留空则使用证书 CN
-    cert_path: "certs/localhost.crt"
-    key_path: "certs/localhost.key"
+    domain: ''                  # 服务器域名（SNI），留空则使用证书 CN
+    cert_path: certs/localhost.crt
+    key_path: certs/localhost.key
     ipv6:
       enabled: false
-      host: "::1"
+      host: ::1
       port: 853
 
   # 本地 DoQ 服务（DNS over QUIC，RFC 9250）
   doq:
     enabled: false               # 默认关闭，设为 true 开启
-    host: "127.0.0.1"           # IPv4 监听地址
+    host: 127.0.0.1             # IPv4 监听地址
     port: 784                   # 标准 DoQ 端口
-    domain: ""                  # 服务器域名（SNI），留空则使用证书 CN
-    cert_path: "certs/localhost.crt"
-    key_path: "certs/localhost.key"
+    domain: ''                  # 服务器域名（SNI），留空则使用证书 CN
+    cert_path: certs/localhost.crt
+    key_path: certs/localhost.key
     ipv6:
       enabled: false
-      host: "::1"
+      host: ::1
       port: 784
 
   # 本地纯 DNS 服务器（UDP 53，不加密，默认关闭）
   plain_dns:
     enabled: false               # 默认关闭，设为 true 开启
-    host: "127.0.0.1"           # IPv4 监听地址
+    host: 127.0.0.1             # IPv4 监听地址
     port: 53                    # 标准 DNS 端口（需要管理员权限）
     ipv6:
       enabled: false
-      host: "::1"
+      host: ::1
 
 # ============================================================
 # 上游 DNS 服务器
@@ -61,38 +61,28 @@ upstream:
   # bootstrap DNS：仅用于解析 DoH/DoT/DoQ 服务器的 IP 地址
   # 包含 IPv4 + IPv6 双栈 DNS 服务器
   bootstrap_resolvers:
-    - "9.9.9.9"
-    - "223.5.5.5"               # 阿里 DNS (IPv4)
-    - "114.114.114.114"         # 114 DNS (IPv4)
-    - "119.29.29.29"            # 腾讯 DNS (IPv4)
-    - "2400:3200::1"            # 阿里 DNS (IPv6)
-    - "2400:da00::6666"         # 114 DNS (IPv6)
-
-  # DNS over HTTPS
+    - 9.9.9.9
+    - 223.5.5.5
+    - 114.114.114.114
+    - 119.29.29.29
+    - 2400:3200::1
+    - 2400:da00::6666
   doh:
-    - "https://dns.alidns.com/dns-query"
-    - "https://doh.pub/dns-query"
-    - "https://dns.adguard-dns.com/dns-query"
-    - "https://dns.cloudflare.com/dns-query"
-    - "https://dns11.quad9.net/dns-query"
-
-  # DNS over TLS
+    - https://dns.alidns.com/dns-query
+    - https://doh.pub/dns-query
+    - https://dns.adguard-dns.com/dns-query
+    - https://dns.cloudflare.com/dns-query
+    - https://dns11.quad9.net/dns-query
   dot:
-    - "dns.alidns.com"
-    - "dns.pub"
-    - "dns.adguard-dns.com"
-    - "one.one.one.one"
-    - "1dot1dot1dot1.cloudflare-dns.com"
-
-  # DNS over QUIC
+    - dns.alidns.com
+    - dns.pub
+    - dns.adguard-dns.com
+    - one.one.one.one
+    - 1dot1dot1dot1.cloudflare-dns.com
   doq:
-    - "quic://dns9.quad9.net:853"         # Quad9 DoQ（已验证可用）
-    - "quic://dns.caliph.dev:853"
-    - "quic://dns.alidns.com:853"         # 阿里 DNS（部分环境可能不支持）
-
-# ============================================================
-# DNS 缓存配置
-# ============================================================
+    - quic://dns9.quad9.net:853
+    - quic://dns.caliph.dev:853
+    - quic://dns.alidns.com:853
 cache:
   enabled: true
   max_size: 10000           # 最大缓存条目数，超限 LRU 淘汰
@@ -110,7 +100,7 @@ dnssec:
   # 验证模式:
   #   ad_check       - 仅检查 AD 位（快速，依赖上游验证）
   #   strict         - 严格本地验证 RRSIG 签名链（安全但较慢）
-  mode: "ad_check"
+  mode: ad_check
   # 是否丢弃验证失败的响应（bogus）
   drop_bogus: false
 
@@ -135,17 +125,12 @@ filter:
   rules_files:
   # 远程规则列表（定时自动更新）
   rules_urls:
-    - "https://proxy.gitwarp.top/https://raw.githubusercontent.com/hululu1068/AdGuard-Rule/main/rule/all.txt"
-    # AdGuard 官方推荐规则列表（按需启用）
-    # - "https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt"
-    # - "https://raw.githubusercontent.com/AdguardTeam/FiltersRegistry/master/filters/filter_2_Chinese/filter.txt"
-    # - "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
-  # 远程规则更新间隔（小时，0=不自动更新）
+    - https://proxy.gitwarp.top/https://raw.githubusercontent.com/hululu1068/AdGuard-Rule/main/rule/all.txt
   update_interval: 24
   # 是否拦截后返回 NXDOMAIN
   block_nxdomain: true
   # 自定义拦截页面 IP（NXDOMAIN 模式下无效）
-  block_ip: "0.0.0.0"
+  block_ip: 0.0.0.0
 
 # ============================================================
 # 请求日志（异步缓冲写入）
@@ -154,8 +139,8 @@ logging:
   enabled: true
   buffer_size: 500          # 内存缓冲条目数，达到后写入文件并清空
   flush_interval: 10        # 定时刷新间隔（秒）
-  log_dir: "logs"
-  log_file: "dns_queries.log"
+  log_dir: logs
+  log_file: dns_queries.log
   detailed: true
   max_log_size_mb: 10      # 日志文件最大大小（MB），超限自动裁剪保留后半部分
 
@@ -168,16 +153,16 @@ tls:
   # 注意：需要 OpenSSL 4.0+ 才能真正启用 ECH
   ech_enabled: false
   # 密码套件（默认安全配置）
-  ciphers: "HIGH:!aNULL:!kRSA:!PSK:!SRP:!MD5:!RC4"
+  ciphers: HIGH:!aNULL:!kRSA:!PSK:!SRP:!MD5:!RC4
   # OpenSSL 4.0 DLL 路径（用于上游 ECH 连接）
   # 下载: https://github.com/TaurusTLS-Developers/OpenSSL-Distribution/releases/tag/v4.0.0
   # 解压后将 libssl-4-x64.dll 和 libcrypto-4-x64.dll 所在目录填在这里
   # 支持正斜杠和反斜杠两种格式:
   #   Windows: "D:/dns/openssl4" 或 'D:\dns\openssl4' 或 "D:\\dns\\openssl4"
   #   Linux:   "/usr/local/openssl4"
-  openssl4_dll_path: "D:/dns/1/dnscrypt-proxy/openssl-4.0.0-Windows-x64"
+  openssl4_dll_path: D:/dns/1/dnscrypt-proxy/openssl-4.0.0-Windows-x64
   # 留空则尝试使用 certifi（推荐）: pip install certifi(默认安装了)
-  ca_path: ""
+  ca_path: ''
 
   # ============================================================
   # ECH 配置（每台上游服务器）
@@ -191,8 +176,9 @@ tls:
   # ============================================================
   ech:
     # Cloudflare DNS 的 ECH 配置：查询 cloudflare-ech.com 的 HTTPS 记录
-    "dns.cloudflare.com": "cloudflare-ech.com+https://1.1.1.1/dns-query"
-    "1dot1dot1dot1.cloudflare-dns.com": "cloudflare-ech.com+https://1.1.1.1/dns-query"
+    dns.cloudflare.com: cloudflare-ech.com+https://1.1.1.1/dns-query
+    1dot1dot1dot1.cloudflare-dns.com: 
+      cloudflare-ech.com+https://1.1.1.1/dns-query
 
 # ============================================================
 # 网络连通性监控（自动恢复上游服务器连接）
@@ -205,16 +191,14 @@ network_monitor:
   ping_timeout: 0.07       # ping 超时（秒，与 ping_interval 一致）
   # ICMP ping 检测目标（IPv4 + IPv6 双栈）
   ping_targets_v4:
-    - "223.5.5.5"
-    - "114.114.114.114"
+    - 223.5.5.5
+    - 114.114.114.114
   ping_targets_v6:
-    - "2400:3200::1"
-    - "2400:da00::6666"
-  # DNS 探测域名（向公共 DNS 发送 DNS 查询验证）
+    - 2400:3200::1
+    - 2400:da00::6666
   dns_probe_domains:
-    - "www.baidu.com"
-    - "www.qq.com"
-  # 连续检测失败多少次后进入降级模式
+    - www.baidu.com
+    - www.qq.com
   failure_threshold: 3
   # 退出降级需要连续成功检测次数
   recovery_check_count: 2
@@ -237,12 +221,24 @@ network_monitor:
     #       多组: "192.168.1.1,00-11-22-33-44-55,10.0.0.1,aa-bb-cc-dd-ee-ff"
     #       或者: "192.168.1.1,"
     # 注意: 只填 IP 不填 MAC, 自动探测 MAC; 都留空则完全自动探测
-    gateway: ""
+    gateway: ''
 
   # ============================================================
   # NDP 防护（IPv6 版 ARP 防护 — 邻居发现协议欺骗防护）
   # 当 ping 检测失败但本地网卡正常时，检测 IPv6 NDP 缓存是否被投毒，
   # 发送 Unsolicited NA 刷新路由器邻居表，设静态 NDP 条目防篡改。
+  #
+  # 覆盖攻击面（RFC 3756）:
+  #   T1  NA 欺骗       — 常驻嗅探实时基线比对
+  #   T2  NS 欺骗       — 主动 NS 探测验证网关真实性
+  #   T3  RA 欺骗       — 非信任 MAC 源发 RA 即告警（源 MAC 自动学习）
+  #   T4  DAD DoS       — 追踪 DAD NS 重复地址检测
+  #   T5  NUD 失败      — 窗口内 NS 重传超阈值告警
+  #   T6  Redirect 欺骗 — 非信任源 Redirect 丢弃
+  #   T7  NDP 泛洪      — 邻居表增长率超限检测
+  #   T8  Replay 攻击   — 静态 NDP 条目终局防御
+  #   T9  Rogue DHCPv6  — Event 驱动嗅探检测
+  # 5 个常驻 Worker，Event 驱动，不用就冻结。
   # 需要安装 Npcap 以使用 scapy 发包（否则降级为 ping 等效方案）。
   # ============================================================
   ndp_protection:
@@ -256,13 +252,18 @@ network_monitor:
     #   "2001:db8::1,"                           指定 IPv6, MAC 自动探测
     #   ",00-11-22-33-44-55"                     IPv6 自动探测, 校验此 MAC
     #   "2001:db8::1,,fe80::1,aa-bb-cc-dd-ee-ff" 多组（逗号占位表示 MAC 自动探测）
-    gateway_ipv6: ""
-    # 周期性综合检测间隔（秒）
-    check_interval: 30
-    # RA 嗅探超时（秒）
-    ra_sniff_timeout: 5.0
-    # 期望的最大路由器数量（>此值说明有 Rogue RA）
-    max_ra_routers: 1
+    gateway_ipv6: ''
+    # NUD 检测窗口（毫秒），内网 <1ms，默认 80
+    # 窗口内追踪对网关的 NS 重传次数，超过 nud_threshold 则触发告警（T5）
+    nud_window_ms: 80
+    # NUD 失败阈值：窗口内 NS 重传超过此数则告警，默认 3
+    nud_threshold: 3
+    # 基线 MAC 学习确认时间（毫秒），默认 1
+    # 首次捕获到网关 NA 后等待此时间确认 MAC 稳定，再写入静态 NDP 条目
+    baseline_learn_ms: 1
+    # 主动 NS 探测：构造 NS 查询验证网关真实性，检测 T2 NS 欺骗攻击
+    # 有 scapy 时必启用
+    send_ns_probe: true
 
 # ============================================================
 # 性能与资源优化
