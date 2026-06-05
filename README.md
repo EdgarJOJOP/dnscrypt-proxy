@@ -7,7 +7,7 @@
 
 新增自动提权为管理员和root，如果不给，可能只影响arp防护功能。
 
-## 1.支持ipv4的arp防护避免流量劫持的高危风险(ipv6不用担心)：
+## 1.支持ipv4的arp防护避免流量劫持的高危风险(ipv6是NDP防护)：
 
 win安装npcap （https://npcap.com/#download ），linux不管有root就行。
 
@@ -26,7 +26,26 @@ win记得安装360杀毒(https://sd.360.cn/ )比360安全管家管用。
     8	Opcode=2 回复劫持	正常请求 谁有网关IP? 后被攻击者抢先用错误 MAC 回复
     9	ARP Flood/风暴	短时间内大量不同 MAC 声称是网关/本机
 
-## 2.支持config.yaml自定义根目录证书集验证上游加密dns是否可靠：
+## 2.支持ipv6的NDP防护避免流量劫持的高危风险：
+
+1.里提到的npcap和360杀毒，这个功能默认开启。
+
+    攻击类型           说明
+    4.1.1	NS/NA 欺骗	  常驻嗅探基线 + 主动 NS 探测
+    4.1.2	NUD 失败	  _nud_tracker 80ms 窗口追踪
+    4.1.3	DAD DoS	sniff   检测 ≥3 次 DAD NS
+    4.2.1	恶意路由器 (Rogue RA)  	  检测未知 MAC 源发 RA
+    4.2.2	默认路由器被"杀死"	  NUD 失败可感知，无主动切换
+    4.2.3	合法路由器变坏	  硬件 MAC 不变时无法检测（需 SEND）
+    4.2.4	伪造 Redirect	  sniff 非网关源 Redirect
+    4.2.5	虚假 on-link 前缀	  RA 携带假前缀——检测到未知 RA 源可覆盖
+    4.2.6	虚假地址配置前缀	  同上，本质是 RA 子类
+    4.2.7	参数欺骗 (hop limit / M/O 标志)	  未检查——RA 中 CurHopLimit、M/O 标志未校验
+    4.3.1	Replay 攻击	  静态 NDP 终局防御
+    4.3.2	远程 NDP DoS	  T7 邻居表增长率监控
+
+
+## 3.支持config.yaml自定义根目录证书集验证上游加密dns是否可靠：
 
       根目录证书集下载链接: https://curl.se/ca/cacert.pem
       
