@@ -125,6 +125,13 @@ class NDPProtection:
         self._poison_detected = asyncio.Event()
         self._run_dhcpv6_check = asyncio.Event()
 
+        # ========== 反击统计 ==========
+        self._ndp_attack_stats: dict = {}
+        self._ndp_sender_queue: asyncio.Queue = asyncio.Queue()
+        self._ndp_sender_ready: bool = False
+        self._ndp_counterstrike_cooldown: float = 0.0
+        self._ndp_ip_migrated: bool = False             # 全局NDP是否已标记迁移（仅首次攻击触发一次）
+
         # T5 NUD 追踪
         self._nud_tracker: Dict[str, list] = {}
 
@@ -268,6 +275,10 @@ class NDPProtection:
         self._na_burst_done.set()
         self._detect_done_event.set()
         self._poison_detected.set()
+        try:
+            self._ndp_sender_queue.put_nowait(None)
+        except Exception:
+            pass
         for w in self._ndp_workers:
             w.cancel()
             try:
@@ -322,8 +333,9 @@ class NDPProtection:
             asyncio.create_task(self._detect_worker_loop()),
             asyncio.create_task(self._ndp_sniffer_worker_loop()),
             asyncio.create_task(self._dhcpv6_worker_loop()),
+            asyncio.create_task(self._ndp_sender_worker_loop()),
         ]
-        logger.debug("NDP 防护: 5 个常驻 worker 已启动")
+        logger.debug("NDP 防护: 6 个常驻 worker(含NDP发送器)已启动")
 
     async def _recovery_worker_loop(self):
         while self._ndp_running:
@@ -532,10 +544,27 @@ class NDPProtection:
                     })
                     logger.warning("NDP 嗅探 [T1]: NA 投毒! %s -> 预期 %s != 实际 %s",
                                    gw_ip, baseline, src_mac)
+                    # 自适应防抖：根据攻击频率缩短间隔，同ARP逻辑
+                    _now_t1 = time.time()
+                    _stats_t1 = self._ndp_attack_stats.get(src_mac, {})
+                    _rate_t1 = _stats_t1.get("count", 0)
+                    if _rate_t1 > 200:
+                        _debounce_t1 = 0.0
+                    elif _rate_t1 > 100:
+                        _debounce_t1 = 0.1
+                    elif _rate_t1 > 50:
+                        _debounce_t1 = 0.3
+                    elif _rate_t1 > 10:
+                        _debounce_t1 = 1.0
+                    else:
+                        _debounce_t1 = 3.0
+                    _last_time = _stats_t1.get("last_attack", 0)
+                    if _now_t1 - _last_time < _debounce_t1:
+                        break
                     if not self._poison_detected.is_set():
                         self._poison_detected.set()
                         asyncio.get_event_loop().call_soon_threadsafe(
-                            lambda: asyncio.create_task(self._on_poison_detected()))
+                            lambda: asyncio.create_task(self._on_poison_detected(attacker_mac=src_mac, attacker_ip=src_ip)))
                     break
 
         # ==================== IP 冲突 ====================
@@ -548,16 +577,48 @@ class NDPProtection:
                     "ip": local_ip, "attacker_mac": src_mac,
                 })
                 logger.warning("NDP 嗅探: IP 冲突! %s 被 %s 宣告", local_ip, src_mac)
+                _now_ipc = time.time()
+                _stats_ipc = self._ndp_attack_stats.get(src_mac, {})
+                _rate_ipc = _stats_ipc.get("count", 0)
+                if _rate_ipc > 200:
+                    _debounce_ipc = 0.0
+                elif _rate_ipc > 100:
+                    _debounce_ipc = 0.1
+                elif _rate_ipc > 50:
+                    _debounce_ipc = 0.3
+                elif _rate_ipc > 10:
+                    _debounce_ipc = 1.0
+                else:
+                    _debounce_ipc = 3.0
+                _last_time_ipc = _stats_ipc.get("last_attack", 0)
+                if _now_ipc - _last_time_ipc < _debounce_ipc:
+                    break
                 self._poison_detected.set()
                 asyncio.get_event_loop().call_soon_threadsafe(
-                    lambda: asyncio.create_task(self._on_poison_detected()))
+                    lambda: asyncio.create_task(self._on_poison_detected(attacker_mac=src_mac, attacker_ip=src_ip)))
                 break
 
-    async def _on_poison_detected(self):
+    async def _on_poison_detected(self, attacker_mac: str = "", attacker_ip: str = ""):
         if not self._enabled:
             return
+        now = time.time()
+        # 更新攻击统计（清理超300s + 60s窗口，同ARP逻辑）
+        stale_macs = [m for m, s in self._ndp_attack_stats.items() if now - s.get("last_attack", 0) > 300.0]
+        for m in stale_macs:
+            del self._ndp_attack_stats[m]
+        if attacker_mac:
+            stats = self._ndp_attack_stats.setdefault(attacker_mac, {"count": 0, "bursts_sent": 0, "last_attack": 0.0, "last_counterstrike": 0.0, "window_start": now, "ip_switched": False})
+            if now - stats.get("window_start", now) > 60.0:
+                stats["count"] = 0
+                stats["bursts_sent"] = 0
+                stats["window_start"] = now
+            stats["count"] += 1
+            stats["last_attack"] = now
+
         logger.info("NDP 防护: 嗅探检测到投毒，触发修复")
         await self.refresh_router_ndp()
+        # 投毒检测后立即触发 NA 反制（异步不阻塞）
+        asyncio.create_task(self._ndp_counterstrike(attacker_mac=attacker_mac, attacker_ip=attacker_ip))
 
     # ======================== Worker 5: DHCPv6 ========================
 
@@ -1070,6 +1131,117 @@ class NDPProtection:
             return await self._send_na_scapy_all(target)
         else:
             return await self._send_na_system_all()
+
+    @staticmethod
+    def _get_ndp_intensity(attack_rate: int) -> tuple:
+        """根据 attack_rate 返回 (na_rounds, inter, tag)"""
+        if attack_rate > 200:
+            return (50, 0.00025, "MAX")
+        elif attack_rate > 100:
+            return (30, 0.0005, "L3")
+        elif attack_rate > 50:
+            return (20, 0.001, "L2")
+        elif attack_rate > 30:
+            return (10, 0.0015, "L1")
+        elif attack_rate > 10:
+            return (10, 0.0015, "L1")
+        else:
+            return (5, 0.002, "")
+
+    async def _ndp_counterstrike(self, attacker_mac: str = "", attacker_ip: str = ""):
+        """NDP 反制：定向 NA 打残攻击者 + 广播 NA 恢复网络"""
+        if not self._scapy_available or not self._enabled:
+            return
+        now = time.time()
+        stats = self._ndp_attack_stats.get(attacker_mac, {})
+        attack_rate = stats.get("count", 0)
+
+        # 全局唯一一次标记（仅首次攻击触发，后续任何攻击者只用反制）
+        if attacker_mac and not self._ndp_ip_migrated:
+            self._ndp_ip_migrated = True
+            logger.warning("NDP 反制: 全局首次攻击(%s %s)，标记已防御", attacker_mac, attacker_ip)
+
+        # 选择压制等级
+        if attack_rate > 200:
+            na_rounds = attack_rate + 10
+            inter = 0.0
+            logger.warning("NDP 反制 [COUNTERSTRIKE-UNLIMITED]: %s %d次/60s -> %d轮NA 无间隔！",
+                           attacker_mac or "?", attack_rate, na_rounds)
+        else:
+            na_rounds, inter, tag = self._get_ndp_intensity(attack_rate)
+            log_tag = f"[COUNTERSTRIKE-{tag}]" if tag else "[COUNTERSTRIKE]"
+            logger.warning("NDP 反制 %s: %s %d次/60s -> %d轮NA @%.0fms",
+                           log_tag, attacker_mac or "?", attack_rate, na_rounds, inter*1000)
+
+        # 定向反制：单播 NA 到攻击者网卡，毒化其邻居缓存
+        if attacker_mac and self._ndp_sender_ready:
+            # 收集本机 IPv6 和 MAC 信息
+            for iface in self.interfaces:
+                local_ip = iface.ipv6_global or iface.ipv6_ll
+                local_mac_real = iface.mac
+                if local_ip and local_mac_real:
+                    # 网关 IPv6 -> 00:00:00:00:00:00 毒化包（打残攻击者）
+                    null_mac = "00:00:00:00:00:00"
+                    self._ndp_sender_queue.put_nowait(
+                        (attacker_mac, local_ip, null_mac, attacker_ip or self.gateway_ipv6 or local_ip, na_rounds, inter)
+                    )
+                    # 正确 NA 广播（固定 1 轮，仅恢复路由器 NDP 表；定向反制保持原量）
+                    self._ndp_sender_queue.put_nowait(
+                        ("ff:ff:ff:ff:ff:ff", local_ip, local_mac_real, local_ip, 1, inter)
+                    )
+                    break
+
+        # 回退：如果 sender 就绪就用队列，否则走原广播逻辑
+        if not self._ndp_sender_ready:
+            for i in range(1):  # 广播只需 1 轮
+                try:
+                    await self.send_unsolicited_na()
+                    if inter > 0:
+                        await asyncio.sleep(inter)
+                except Exception as e:
+                    logger.debug("NDP 反制: NA 发送失败 (%s)", e)
+                    break
+        logger.info("NDP 反制: %d 轮 NA 完成", na_rounds)
+
+    async def _ndp_sender_worker_loop(self):
+        """常驻 NDP 发送器：一次性导入 scapy，从队列取任务发送，进程冻结"""
+        if not self._scapy_available:
+            self._ndp_sender_ready = False
+            await asyncio.Event().wait()
+            return
+        try:
+            from scapy.all import Ether, IPv6, ICMPv6ND_NA, ICMPv6NDOptDstLLAddr, sendp
+        except Exception as e:
+            logger.debug("NDP 防护: NDP 发送器初始化失败 (%s)", e)
+            self._ndp_sender_ready = False
+            await asyncio.Event().wait()
+            return
+        self._ndp_sender_ready = True
+        logger.debug("NDP 防护: NDP 发送器已就绪")
+        while self._ndp_running:
+            try:
+                task = await asyncio.wait_for(self._ndp_sender_queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            except Exception:
+                break
+            if task is None:
+                break
+            try:
+                dst_mac, local_ip, local_mac, target_ip, count, inter = task
+                eth = Ether(dst=dst_mac, src=local_mac)
+                na = ICMPv6ND_NA(R=0, S=0, O=1, target=target_ip)
+                lla = ICMPv6NDOptDstLLAddr(lladdr=local_mac)
+                ipv6 = IPv6(src=local_ip, dst=dst_mac if dst_mac != "ff:ff:ff:ff:ff:ff" else "ff02::1", hlim=255)
+                pkt = eth / ipv6 / na / lla
+                for _ in range(count):
+                    sendp(pkt, iface=self._interface_name or "", verbose=False)
+                    if inter > 0:
+                        await asyncio.sleep(inter)
+                log_target = f"定向 {dst_mac}" if dst_mac != "ff:ff:ff:ff:ff:ff" else "广播"
+                logger.warning("NDP 反制: 定向 NA %s %s(%s) -> %s x%d", log_target, target_ip, dst_mac, local_mac, count)
+            except Exception as e:
+                logger.debug("NDP 防护: NDP 发送失败 (%s)", e)
 
     async def _send_na_scapy_all(self, target: str) -> bool:
         if not self._scapy_available:

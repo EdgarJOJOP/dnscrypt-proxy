@@ -963,6 +963,48 @@ class ResolverManager:
                 logger.debug("解析管理器关闭共享 DoH session 异常: %s", e)
             self._shared_doh_session = None
 
+    async def close_idle_connections(self):
+        """关闭所有空闲持久连接（在内存紧张时调用），保留活跃连接不受影响
+        
+        区别于 reset_all_connections() 的暴力重置，此方法仅关闭可安全释放的空闲连接：
+        - DoT 连接池: 关闭空闲 TLS 连接
+        - DoQ 连接池: 关闭空闲 QUIC 连接
+        - bootstrap 解析器: 释放空闲 UDP 套接字
+        """
+        closed = 0
+        for server in self._upstream_servers:
+            try:
+                if hasattr(server.resolver, 'close_idle'):
+                    await server.resolver.close_idle()
+                    closed += 1
+                elif hasattr(server.resolver, 'reset_connections'):
+                    await server.resolver.reset_connections()
+                    closed += 1
+            except Exception as e:
+                logger.debug("关闭 %s 空闲连接失败: %s", server.name, e)
+        for server in self._bootstrap_resolvers:
+            try:
+                if hasattr(server.resolver, 'close_idle'):
+                    await server.resolver.close_idle()
+                    closed += 1
+                elif hasattr(server.resolver, 'reset_connections'):
+                    await server.resolver.reset_connections()
+                    closed += 1
+            except Exception as e:
+                logger.debug("关闭 bootstrap %s 空闲连接失败: %s", server.name, e)
+        if closed:
+            logger.info("关闭了 %d 个解析器的空闲连接", closed)
+
+
+
+        # 关闭全局共享 DoH session
+        if self._shared_doh_session and not self._shared_doh_session.closed:
+            try:
+                await self._shared_doh_session.close()
+            except Exception as e:
+                logger.debug("解析管理器关闭共享 DoH session 异常: %s", e)
+            self._shared_doh_session = None
+
     @property
     def stats(self) -> Dict[str, Any]:
         """获取所有上游服务器的统计信息"""

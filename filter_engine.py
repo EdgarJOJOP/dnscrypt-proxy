@@ -744,6 +744,10 @@ class FilterEngine:
         # 例如: {"my.dns": [("127.0.0.1", dns.rdatatype.A), ("192.168.1.1", dns.rdatatype.A)]}
         self._custom_hosts: Dict[str, List[Tuple[str, int]]] = {}
         self._custom_hosts_enabled = True
+        # 内存压力下暂停过滤缓存写入（由优化器控制）
+        self._cache_suspended = False
+        # 纯域名快速查找集合（无通配符/正则的规则）
+        self._plain_domains: Set[str] = set()
 
     @property
     def title(self) -> str:
@@ -870,6 +874,13 @@ class FilterEngine:
         else:
             index_domain = self._extract_index_domain(rule_text)
             self._block_index.add_rule(rule, index_domain)
+
+        # 为纯域名规则（无通配符/正则）添加快速 set-lookup
+        if not rule.is_regex and not rule._skip:
+            domain = rule_text.strip().lower().rstrip('^')
+            # 仅当规则是普通域名（不含 * ? 等特殊字符）
+            if domain and '.' in domain and '*' not in domain and '/' not in domain:
+                self._plain_domains.add(domain)
 
     def _compile_rules(self, cleaned_text: str, source: str = "memory"):
         """
@@ -1209,6 +1220,13 @@ class FilterEngine:
             self._filter_cache[domain] = (True, "custom_hosts", now, True)
             return True, "custom_hosts"
 
+        # 0b. 快速纯域名 set 查找（跳过正则匹配的开销）
+        if domain in self._plain_domains:
+            reason = "plain_domain_block"
+            self._filter_cache[domain] = (True, reason, now, False)
+            self._trim_filter_cache()
+            return True, reason
+
         # 1. 检查统一过滤结果缓存
         cached = self._filter_cache.get(domain)
         if cached is not None:
@@ -1233,7 +1251,8 @@ class FilterEngine:
             rule, method = block_match
             if rule.is_important:
                 reason = f"重要规则拦截: {rule.raw}"
-                self._filter_cache[domain] = (True, reason, now, False)
+                if not self._cache_suspended:
+                    self._filter_cache[domain] = (True, reason, now, False)
                 self._trim_filter_cache()
                 logger.debug("拦截(重要规则): %s | %s", domain, rule.raw[:60])
                 return True, reason
@@ -1244,8 +1263,8 @@ class FilterEngine:
         match = self._allow_index.match(domain)
         if match is not None:
             rule, method = match
-            self._filter_cache[domain] = (False, "", now, False)
-            self._trim_filter_cache()
+            if not self._cache_suspended:
+                self._filter_cache[domain] = (False, "", now, False)
             logger.debug("放行(白名单): %s | %s: %s", domain, method, rule.raw[:60])
             return False, ""
 
@@ -1253,7 +1272,8 @@ class FilterEngine:
         if block_rule_result is not None:
             rule, method = block_rule_result
             reason = f"{method}: {rule.raw}"
-            self._filter_cache[domain] = (True, reason, now, False)
+            if not self._cache_suspended:
+                self._filter_cache[domain] = (True, reason, now, False)
             self._trim_filter_cache()
             logger.debug("拦截: %s | %s (%s)", domain, method, rule.raw[:80])
             return True, reason
@@ -1325,6 +1345,18 @@ class FilterEngine:
         """获取自定义 hosts 中域名对应的 IP 列表"""
         domain = domain.lower().rstrip(".")
         return self._custom_hosts.get(domain)
+
+    def suspend_cache(self, suspended: bool):
+        """在内存压力下暂停/恢复过滤缓存写入（priority 条目不受影响）
+        
+        Args:
+            suspended: True=暂停写入新条目, False=恢复写入
+        """
+        self._cache_suspended = suspended
+        if suspended:
+            logger.info("过滤缓存写入已暂停（内存压力）")
+        else:
+            logger.info("过滤缓存写入已恢复")
 
     def clear_filter_cache(self):
         """清除过滤结果缓存（保留 priority 条目如自定义 hosts）"""

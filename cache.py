@@ -26,6 +26,10 @@ import dns.rdatatype
 logger = logging.getLogger("dns-proxy.cache")
 
 
+MAX_CACHED_WIRE_SIZE = 8 * 1024
+
+
+
 # ======================== 查询模板缓存 ========================
 # 预构建常见 DNS 查询的 wire_bytes，避免每次 make_query() 重建对象
 
@@ -63,19 +67,24 @@ def clear_query_cache():
 
 
 class CacheEntry:
-    """缓存条目 — 同时缓存 wire 和反序列化后的 Message 对象"""
+    """缓存条目 — 仅缓存反序列化后的 Message，不保存 wire 以节省内存"""
 
-    __slots__ = ("response_wire", "response_msg", "ttl",
-                 "created_at", "is_negative")
+    __slots__ = ("response_msg", "ttl",
+                 "created_at", "_estimated_bytes")
 
     def __init__(self, response: dns.message.Message, ttl: int):
-        # 缓存序列化后的字节数据（用于持久化和校验）
-        self.response_wire: bytes = response.to_wire()
         # 缓存反序列化后的 Message 对象，避免每次 get 都 from_wire()
         # 注意：传出时通过 copy 避免修改缓存内容
         self.response_msg: dns.message.Message = response
         self.ttl: int = ttl
         self.created_at: float = time.time()
+        # 存储 wire 字节数，供优化器按大小淘汰
+        self._estimated_bytes: int = len(response.to_wire())
+
+    @property
+    def estimated_bytes(self) -> int:
+        """返回该缓存条目的估算字节数（用于内存优化器按大小淘汰）"""
+        return self._estimated_bytes
 
     def is_expired(self, now: Optional[float] = None) -> bool:
         """判断是否过期"""
@@ -201,6 +210,7 @@ class DNSCache:
         """
         设置缓存条目
         key: (qname, qtype, qclass)
+        超过 MAX_CACHED_WIRE_SIZE 的响应不被缓存，避免单个大条目撑破内存
         """
         async with self._lock:
             # 如果已存在，先删除
@@ -209,6 +219,14 @@ class DNSCache:
 
             # 计算 TTL
             ttl = self._calculate_ttl(response) if not is_negative else self.negative_ttl
+
+            # 检查单条目最大尺寸，超过则不缓存
+            wire_len = len(response.to_wire())
+            if wire_len > MAX_CACHED_WIRE_SIZE:
+                logger.debug("跳过缓存超大 DNS 响应: %d bytes (限制 %d)，key=%s",
+                             wire_len, MAX_CACHED_WIRE_SIZE, key)
+                self._stats["misses"] += 1
+                return
 
             # 创建缓存条目
             entry = CacheEntry(response, ttl)
@@ -230,6 +248,36 @@ class DNSCache:
                     min_ttl = rd.ttl
         # 约束到配置范围
         return max(self.min_ttl, min(min_ttl, self.max_ttl))
+
+    async def evict_largest(self, ratio: float = 0.2) -> int:
+        """按估算字节大小淘汰最大的 N% 条目（用于内存紧张时主动压缩）。
+        跳过已过期条目（它们应由 cleanup_expired 处理）。
+        Args:
+            ratio: 淘汰比例（0.2 = 淘汰最大的 20%）
+        Returns:
+            实际淘汰的条目数
+        """
+        async with self._lock:
+            if not self._cache:
+                return 0
+            target = max(1, int(len(self._cache) * ratio))
+            # 按估算字节数排序，淘汰最大的
+            sorted_by_size = sorted(
+                self._cache.items(),
+                key=lambda item: item[1].estimated_bytes,
+                reverse=True,
+            )
+            evicted = 0
+            for k, _ in sorted_by_size[:target]:
+                if k in self._cache:
+                    del self._cache[k]
+                    evicted += 1
+            self._stats["size"] = len(self._cache)
+            self._stats["evictions"] += evicted
+            if evicted:
+                logger.info("按字节大小淘汰了 %d 个最大缓存条目 (目标 %d)，剩余 %d",
+                            evicted, target, len(self._cache))
+            return evicted
 
     async def cleanup_expired(self):
         """清理过期条目"""

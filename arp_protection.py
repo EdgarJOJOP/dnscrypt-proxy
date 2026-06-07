@@ -119,7 +119,52 @@ class ARPProtection:
         self._last_alert_time: float = 0.0         # 上次告警时间戳
         self._baseline_learned: bool = False       # 基线 MAC 是否已通过多次确认学习
         self._baseline_proposed_mac: str = ""      # 首次候选基线 MAC（待二次确认）
-        self._baseline_proposed_time: float = 0.0  # 首次候选时间
+        self._baseline_proposed_time: float = 0.0
+
+        # ========== 反击统计 ==========
+        self._attack_stats: dict = {}
+        self._counterstrike_cooldown: float = 0.0
+        self._counterstrike_count: int = 0          # 反击轮次计数（用于交替毒化MAC）
+        self._ip_migrated: bool = False             # 全局IP是否已迁移（仅首次攻击触发一次）
+
+        # ========== 常驻 scapy 发送器 worker（进程冻结，避免重复创建）==========
+        self._scapy_sender_queue: asyncio.Queue = asyncio.Queue()
+        self._scapy_sender_ready: bool = False      # scapy 发送器是否已就绪
+
+    async def _scapy_sender_worker_loop(self):
+        """常驻 scapy 发送器：一次性导入 scapy，从队列取任务发送，进程冻结"""
+        if not _SCAPY_AVAILABLE:
+            self._scapy_sender_ready = False
+            await asyncio.Event().wait()
+            return
+        try:
+            from scapy.all import Ether, ARP, sendp
+        except Exception as e:
+            logger.debug("ARP 防护: scapy 发送器初始化失败 (%s)", e)
+            self._scapy_sender_ready = False
+            await asyncio.Event().wait()
+            return
+        self._scapy_sender_ready = True
+        logger.debug("ARP 防护: scapy 发送器已就绪")
+        while self._arp_running:
+            try:
+                task = await asyncio.wait_for(self._scapy_sender_queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            except Exception:
+                break
+            if task is None:
+                break
+            try:
+                dst_mac, src_mac, src_ip, poison_mac, count, inter = task
+                spoof_pkt = Ether(dst=dst_mac) / ARP(
+                    op=2, hwsrc=poison_mac, psrc=src_ip,
+                    hwdst=dst_mac, pdst=src_ip,
+                )
+                sendp(spoof_pkt, iface=self._interface_name or "", verbose=False, count=count, inter=inter)
+                logger.warning("ARP 反制: 定向反击 %s (%s) -> %s x%d", src_ip, dst_mac, poison_mac, count)
+            except Exception as e:
+                logger.debug("ARP 反制: 定向发送失败 (%s)", e)
 
     def register_restart_hook(self, hook):
         """注册 IP 切换后的 TCP 监听器重启回调"""
@@ -151,8 +196,9 @@ class ARPProtection:
             asyncio.create_task(self._garp_worker_loop()),
             asyncio.create_task(self._conflict_worker_loop()),
             asyncio.create_task(self._arp_sniffer_worker_loop()),
+            asyncio.create_task(self._scapy_sender_worker_loop()),
         ]
-        logger.debug("ARP 防护: 5 个常驻 worker(含嗅探)已启动")
+        logger.debug("ARP 防护: 6 个常驻 worker(含嗅探+scapy发送器)已启动")
 
     async def _stop_workers(self):
         """停止所有常驻 worker"""
@@ -165,6 +211,11 @@ class ARPProtection:
         self._garp_done_event.set()
         self._loss_done_event.set()
         self._poison_detected.set()
+        # 发送 None 唤醒 scapy 发送器并让其退出
+        try:
+            self._scapy_sender_queue.put_nowait(None)
+        except Exception:
+            pass
         # 嗅探 worker 不依赖 event，靠 _arp_running=False 和 socket.close 退出
         for w in self._arp_workers:
             w.cancel()
@@ -276,11 +327,27 @@ class ARPProtection:
         local_mac = (self._local_mac or "").replace("-", ":").upper()
         is_garp = (sender_ip == target_ip)
 
-        # === 防抖 ===
-        if self._poison_detected.is_set():
-            return ""
+        # === 防抖：根据攻击频率自适应（频率越高，防抖越短）===
         now = asyncio.get_event_loop().time()
-        if sender_mac == self._last_alert_mac and now - self._last_alert_time < 3.0:
+        is_zero_mac = (sender_mac == "00:00:00:00:00:00")
+        # 从攻击统计读取当前频率来决定防抖间隔
+        existing_stats = self._attack_stats.get(sender_mac, {})
+        existing_rate = existing_stats.get("count", 0)
+        if is_zero_mac:
+            debounce_interval = 0.5
+        elif existing_rate > 200:
+            debounce_interval = 0.0  # 每个包都检测
+        elif existing_rate > 100:
+            debounce_interval = 0.1
+        elif existing_rate > 50:
+            debounce_interval = 0.3
+        elif existing_rate > 10:
+            debounce_interval = 1.0
+        else:
+            debounce_interval = 3.0
+        if now < self._counterstrike_cooldown and sender_mac == self._last_alert_mac:
+            return ""
+        if sender_mac == self._last_alert_mac and now - self._last_alert_time < debounce_interval:
             return ""
 
         # === 安全基线学习（启动时防投毒）===
@@ -334,6 +401,21 @@ class ARPProtection:
             self._poison_detected.set()
             self._arp_attack_logged = True
             logger.warning("ARP 嗅探: %s", reason)
+            # 清理超 300 秒无活动的攻击源（停火检测）
+            stale_macs = [m for m, s in self._attack_stats.items() if now - s.get("last_attack", 0) > 300.0]
+            for m in stale_macs:
+                del self._attack_stats[m]
+            # 更新攻击统计（60 秒窗口计数）
+            stats = self._attack_stats.setdefault(sender_mac, {"count": 0, "bursts_sent": 0, "last_attack": 0.0, "last_counterstrike": 0.0, "window_start": now, "ip_switched": False})
+            # 如果窗口超过 60 秒，重置计数
+            if now - stats.get("window_start", now) > 60.0:
+                stats["count"] = 0
+                stats["bursts_sent"] = 0
+                stats["window_start"] = now
+            stats["count"] += 1
+            stats["last_attack"] = now
+            # 异步触发即时反击
+            asyncio.create_task(self._on_arp_attack(sender_ip, sender_mac, reason))
             return reason
 
         return ""
@@ -1803,7 +1885,7 @@ class ARPProtection:
             # 但 trigger 需清除让 worker 不再循环
             self._recovery_trigger.clear()
 
-    async def _send_single_garp(self) -> bool:
+    async def _send_single_garp(self, skip_arp_del: bool = False) -> bool:
         """
         发送一个真正的 Gratuitous ARP 数据包，向全网宣告本机 IP↔MAC 绑定。
 
@@ -1812,6 +1894,10 @@ class ARPProtection:
                  "清空网关 ARP 缓存 + ping 网关" 的方式。
                  Ping 前 OS 会发送 ARP 请求（Sender IP/可信 IP, Sender MAC/本机 MAC），
                  路由器收到 ARP 请求后会根据 RFC 826 更新其 ARP 表。
+
+        Args:
+            skip_arp_del: 如果为 True，跳过 arp -d 步骤（用于爆发模式，
+                         由 _garp_broadcast_burst 在循环前一次删除）
         """
         gw_ip = self.gateway_ip
         if not gw_ip:
@@ -1859,21 +1945,22 @@ class ARPProtection:
                 return await self._ping_gateway_fast(gw_ip)
         else:
             # Windows: 清空网关 ARP 缓存 + ping → 触发 ARP 请求
-            try:
-                # 清空本机 ARP 表中网关的缓存，强制 ARP 重新解析
-                proc = await asyncio.create_subprocess_exec(
-                    "arp", "-d", gw_ip,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-                await asyncio.wait_for(proc.wait(), timeout=5)
-            except (asyncio.TimeoutError, FileNotFoundError, OSError):
-                pass
+            if not skip_arp_del:
+                try:
+                    # 清空本机 ARP 表中网关的缓存，强制 ARP 重新解析
+                    proc = await asyncio.create_subprocess_exec(
+                        "arp", "-d", gw_ip,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except (asyncio.TimeoutError, FileNotFoundError, OSError):
+                    pass
             # Ping 网关 → OS 发送 ARP 请求（Sender IP=本机IP, Sender MAC=本机MAC）
             # 路由器根据 RFC 826 更新 ARP 表
             return await self._ping_gateway_fast(gw_ip)
 
-    async def _garp_broadcast_burst(self, count: int = 20):
+    async def _garp_broadcast_burst(self, count: int = 20, inter: float = 0.01):
         """
         爆发式 GARP 广播：发送真实 GARP 数据包 + ping 网关。
         真实 GARP 是二层 ARP 包（EtherType 0x0806, Sender IP = Target IP），
@@ -1884,29 +1971,43 @@ class ARPProtection:
                  Sender MAC/本机MAC），路由器据此更新 ARP 表。
 
         Args:
-            count: 发送次数（默认 20 次，间隔 10ms）
+            count: 发送次数（默认 20 次）
+            inter: 包间间隔（秒），0=无间隔连续发送
         """
         gw_ip = self.gateway_ip
         if not gw_ip:
             return
 
-        logger.info("ARP 防护: 爆发真实 GARP x%d (网关=%s)", count, gw_ip)
+        logger.info("ARP 防护: 爆发真实 GARP x%d (网关=%s, 间隔=%.4fs)", count, gw_ip, inter)
+        # Windows: 循环前统一删除一次网关 ARP 缓存，避免循环内反复删除导致的重复丢包
+        if sys.platform == "win32":
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "arp", "-d", gw_ip,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except (asyncio.TimeoutError, FileNotFoundError, OSError):
+                pass
         for i in range(count):
-            # 发送真实 GARP 宣告
-            await self._send_single_garp()
+            # 发送真实 GARP 宣告（skip_arp_del=True，已由循环前统一删除）
+            await self._send_single_garp(skip_arp_del=True)
             # 每 3 次加一次网关快速 ping（双重确认），成功则提前结束
             if i % 3 == 0:
                 if await self._ping_gateway_fast(gw_ip):
                     logger.info("ARP 防护: GARP 爆发中网关已恢复 (第 %d 轮)", i + 1)
                     return
-            await asyncio.sleep(0.01)
+            if inter > 0:
+                await asyncio.sleep(inter)
 
         # 最后再 ping 一次广播地址（作为辅助，部分交换机可能需要）
-        broadcast_ip = self._get_broadcast_address()
-        if broadcast_ip:
-            for _ in range(min(count // 4, 5)):
-                await self._ping_broadcast(broadcast_ip)
-                await asyncio.sleep(0.01)
+        if inter > 0:
+            broadcast_ip = self._get_broadcast_address()
+            if broadcast_ip:
+                for _ in range(min(count // 4, 5)):
+                    await self._ping_broadcast(broadcast_ip)
+                    await asyncio.sleep(inter)
 
     async def _garp_sustain(self, gw_ip: str, duration: int = 5, interval: float = 0.3):
         """
@@ -1947,6 +2048,98 @@ class ARPProtection:
             await asyncio.sleep(interval)
         total = asyncio.get_event_loop().time() - start_time
         logger.info("ARP 防护: 持续 GARP 对抗结束（共 %d 轮, 耗时 %.0fs）", rounds, total)
+
+    @staticmethod
+    def _get_intensity(attack_rate: int) -> tuple:
+        """根据 attack_rate 返回 (burst_size, directed_count, inter, tag)"""
+        if attack_rate > 200:
+            return (50, 30, 0.00025, "MAX")
+        elif attack_rate > 100:
+            return (30, 20, 0.0005, "L3")
+        elif attack_rate > 50:
+            return (20, 15, 0.001, "L2")
+        elif attack_rate > 30:
+            return (10, 8, 0.0015, "L1")
+        elif attack_rate > 10:
+            return (10, 8, 0.0015, "L1")
+        else:
+            return (5, 5, 0.002, "")
+
+    async def _on_arp_attack(self, sender_ip: str, sender_mac: str, reason: str):
+        """检测到 ARP 攻击时即时触发反击（嗅探驱动，来一枪回一枪）"""
+        if not self._enabled:
+            return
+        now = asyncio.get_event_loop().time()
+        mac_stats = self._attack_stats.get(sender_mac, {})
+        attack_rate = mac_stats.get("count", 0)
+
+        # 全局唯一一次 IP 永久迁移（仅首次攻击触发，后续任何攻击者只用反制）
+        if not self._ip_migrated:
+            self._ip_migrated = True
+            logger.warning("ARP 反制: 全局首次攻击(%s %s)，执行唯一一次 IP 永久迁移", sender_mac, sender_ip)
+            asyncio.create_task(self._garp_ip_switch_defense())
+            await self._garp_counterstrike(sender_ip, sender_mac, burst_size=5, directed_count=5, inter=0.01)
+            if self._poison_detected.is_set():
+                self._poison_detected.clear()
+            return
+
+        # IP已迁移 -> 纯渐进式压制（攻击越猛，反制越狠）
+        mac_stats["bursts_sent"] = mac_stats.get("bursts_sent", 0) + 1
+        mac_stats["last_counterstrike"] = now
+        self._counterstrike_count = self._counterstrike_count + 1
+
+        # >200 次/60s -> 无限制火力全开：不设间隔，包数 = attack_rate+10
+        if attack_rate > 200:
+            burst_size = attack_rate + 10
+            directed_count = attack_rate + 10
+            inter = 0.0
+            logger.warning("ARP 反制 [COUNTERSTRIKE-UNLIMITED]: %s %d次/60s(%s) -> %d包GARP+%d包定向 无间隔！",
+                           sender_mac, attack_rate, reason[:40], burst_size, directed_count)
+        else:
+            burst_size, directed_count, inter, tag = self._get_intensity(attack_rate)
+            log_tag = f"[COUNTERSTRIKE-{tag}]" if tag else "[COUNTERSTRIKE]"
+            logger.warning("ARP 反制 %s: %s %d次/60s(%s) -> %d包GARP+%d包定向 @%.0fms",
+                           log_tag, sender_mac, attack_rate, reason[:40], burst_size, directed_count, inter*1000)
+
+        await self._garp_counterstrike(sender_ip, sender_mac, burst_size=burst_size, directed_count=directed_count, inter=inter)
+
+        if self._poison_detected.is_set():
+            self._poison_detected.clear()
+
+    async def _garp_counterstrike(self, attacker_ip: str, attacker_mac: str, burst_size: int = 5, directed_count: int = 5, inter: float = 0.01):
+        """增强 GARP 反制：定向反制（常驻 sender 并行）+ GARP 广播"""
+        gw_ip = self.gateway_ip
+        if not gw_ip:
+            return
+
+        # 定向反制：使用攻击者真实 MAC 单播射它，误导其网络栈中断
+        # 不再区分 GARP/ARP 攻击（GARP 攻击 attacker_ip=网关，但 attacker_mac 是攻击者真实的）
+        is_local = attacker_ip and self._local_ipv4 and attacker_ip == self._local_ipv4
+        if attacker_mac and not is_local:
+            poison_mac = "FF:FF:FF:FF:FF:FE" if (self._counterstrike_count % 2 == 0) else "00:00:00:00:00:00"
+            if _SCAPY_AVAILABLE and self._scapy_sender_ready:
+                # 通过常驻 sender 队列发送（一次性导入 scapy，不重复创建）
+                self._scapy_sender_queue.put_nowait(
+                    (attacker_mac, None, attacker_ip, poison_mac, directed_count, inter)
+                )
+            elif sys.platform == "win32":
+                # Windows 回退：netsh 设攻击者静态 ARP
+                try:
+                    poison_fmt = "FF-FF-FF-FF-FF-FE" if (self._counterstrike_count % 2 == 0) else "00-00-00-00-00-00"
+                    proc = await asyncio.create_subprocess_exec(
+                        "netsh", "interface", "ipv4", "set", "neighbors",
+                        f"name={self._interface_name or ''}",
+                        f"address={attacker_ip or gw_ip}",
+                        f"neighbor={poison_fmt}",
+                        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                    logger.warning("ARP 反制: netsh 设 %s -> %s", attacker_ip or gw_ip, poison_fmt)
+                except Exception as e:
+                    logger.debug("ARP 反制: netsh 反击失败 (%s)", e)
+
+        # GARP 广播（固定 1 包，仅恢复路由器 ARP 表；定向反制已在队列中并行）
+        await self._garp_broadcast_burst(count=1)
 
     async def _switch_ip(self, new_ip: str) -> bool:
         """
@@ -2195,64 +2388,51 @@ class ARPProtection:
         if await _check_abort():
             return True
 
-        # --- 阶段 2：切回原始 IP，宣告正确绑定 ---
-        logger.info("ARP 防护: 阶段 2 — 切回原始 IP %s", original_ip)
-        if not await self._switch_ip(original_ip):
-            logger.warning("ARP 防护: 切回原始 IP %s 失败"
-                          "（可能是 Windows 内置冲突检测拒绝），"
-                          "尝试切换到备用 IP...", original_ip)
-            # 放弃原 IP，改用 original+1（避免接口失去 IP 配置被 APIPA 接管）
+        # --- 阶段 2：永久迁移到邻接 IP（只切一次，不切回原 IP）---
+        new_ip = self._increment_ip(original_ip, self._subnet_mask, offset=-1)
+        if not new_ip or new_ip == original_ip:
+            new_ip = self._increment_ip(original_ip, self._subnet_mask, offset=1)
+        if not new_ip or new_ip == original_ip:
+            new_ip = self._increment_ip(original_ip, self._subnet_mask, offset=2)
+        logger.info("ARP 防护: 阶段 2 — 永久迁移 %s → %s（废弃 %s 让攻击者自娱）", original_ip, new_ip, original_ip)
+
+        # 单次切换（不切回，不双击）
+        migrated_ok = False
+        if new_ip and new_ip != original_ip and await self._switch_ip(new_ip):
+            self._local_ipv4 = new_ip
+            migrated_ok = True
+        else:
+            # 主 IP 失败 -> 尝试备用 IP（original+2）
             fallback_ip = self._increment_ip(original_ip, self._subnet_mask, offset=2)
             if fallback_ip and fallback_ip != original_ip and await self._switch_ip(fallback_ip):
-                logger.warning("ARP 防护: 已切换到备用 IP %s（原 IP %s 冲突中）",
-                               fallback_ip, original_ip)
+                logger.warning("ARP 防护: 已切换到备用 IP %s（原 IP %s 冲突中）", fallback_ip, original_ip)
                 self._local_ipv4 = fallback_ip
-                await self._garp_broadcast_burst(count=5)
-                await asyncio.sleep(0.1)
-                reachable = False
-                for attempt in range(2):
-                    reachable = await self._ping_gateway_fast(gw_ip)
-                    if reachable:
-                        break
-                    if attempt < 1:
-                        await asyncio.sleep(0.1)
-                # IP 切换后 TCP 监听器 socket 可能失效，触发重启
-                await self._fire_restart_hooks()
-                # 刷新 DNS 缓存（IP 变更后旧 DNS 缓存可能指向错误 IP）
-                await self._flush_network_stack()
-                if reachable and self.gateway_mac:
-                    await self._protect_gateway_arp()
-                return reachable
-            # 所有尝试都失败 → 接口可能处于无 IP 状态，尝试 DHCP 恢复
-            logger.critical("ARP 防护: 无法设置任何静态 IP，尝试 DHCP 恢复")
-            await self._recover_interface_dhcp()
-            # DHCP 后无论拿到什么 IP（可能 APIPA），都重启 TCP 监听器
-            await self._fire_restart_hooks()
+                migrated_ok = True
+
+        if migrated_ok:
+            # GARP 爆发 + ping 验证 + 静态 ARP
+            await self._garp_broadcast_burst(count=5)
+            await asyncio.sleep(0.1)
+            reachable = False
+            for attempt in range(2):
+                reachable = await self._ping_gateway_fast(gw_ip)
+                if reachable:
+                    break
+                if attempt < 1:
+                    await asyncio.sleep(0.1)
+            if reachable and self.gateway_mac:
+                await self._protect_gateway_arp()
+            # 刷新 DNS 缓存（IP 变更后旧 DNS 缓存可能指向错误 IP）
+            # 注意：不重启 DoH 服务器（DoH 绑定 127.0.0.1 不受 LAN IP 变更影响）
             await self._flush_network_stack()
-            return False
+            return reachable
 
-        self._local_ipv4 = original_ip
-        await self._garp_broadcast_burst(count=5)
-        await asyncio.sleep(0.1)
-
-        if await _check_abort():
-            return True
-
-        # 确认网关可达：快速验证
-        reachable = False
-        for attempt in range(2):
-            reachable = await self._ping_gateway_fast(gw_ip)
-            if reachable:
-                break
-            if attempt < 1:
-                await asyncio.sleep(0.1)
-        if reachable and self.gateway_mac:
-            await self._protect_gateway_arp()
-        # IP 切换后 TCP 监听器 socket 可能失效，触发重启
-        await self._fire_restart_hooks()
-        # 刷新 DNS 缓存（IP 变更后旧 DNS 缓存可能指向错误 IP）
+        # 所有尝试都失败 -> DHCP 恢复
+        logger.critical("ARP 防护: 无法设置任何静态 IP，尝试 DHCP 恢复")
+        await self._recover_interface_dhcp()
+        await self._fire_restart_hooks()  # DHCP 可能拿到不同子网 IP，需重启 TCP
         await self._flush_network_stack()
-        return reachable
+        return False
 
     async def _is_router_changed(self) -> Optional[str]:
         """

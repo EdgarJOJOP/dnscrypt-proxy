@@ -3,7 +3,8 @@
 - 定期 ping/探测网络连通性（IPv4 + IPv6 双栈）
 - 检测网络中断/恢复，自动重新启用上游服务器
 - 支持 ICMP ping 和 DNS 探测两种检测方式
-- 集成 ARP 防护：网络检测失败时自动刷新网关 ARP 缓存
+- 集成 ARP 防护：IPv4 网络检测失败时自动刷新网关 ARP 缓存
+- 集成 NDP 防护：IPv6 网络检测失败时自动刷新路由器邻居表
 """
 
 import sys
@@ -17,6 +18,7 @@ import dns.rdatatype
 import dns.asyncquery
 
 from arp_protection import ARPProtection
+from NDP_protection import NDPProtection
 
 logger = logging.getLogger("dns-proxy.network")
 
@@ -56,6 +58,13 @@ class NetworkMonitor:
         self._arp_task: Optional[asyncio.Task] = None
         self._arp_last_end_time: float = 0.0  # 上次 ARP 防护结束时间，用于防抖
 
+        # NDP 防护（IPv6 版 ARP 防护）后台任务
+        self._ndp_network_down = False
+        self._ndp_task: Optional[asyncio.Task] = None
+        self._ndp_last_end_time: float = 0.0  # 上次 NDP 防护结束时间，用于防抖
+        # IPv6 网关 ping 滑动窗口
+        self._ndp_gw_results: collections.deque = collections.deque(maxlen=5)
+
         # 从配置读取
         nm = config.get_raw().get("network_monitor", {})
         self._enabled = nm.get("enabled", True)
@@ -75,6 +84,11 @@ class NetworkMonitor:
         self._arp_protection = ARPProtection(config.arp_protection_config,
                                               ping_interval=self._interval,
                                               ping_targets_v4=self._ping_targets_v4)
+
+        # NDP 防护（IPv6）
+        self._ndp_protection = NDPProtection(config.ndp_protection_config,
+                                              ping_interval=self._interval,
+                                              ping_targets_v6=self._ping_targets_v6)
 
         # 外网 ping 轮询索引（轮流 ping 多个 v4 目标，每轮一个）
         self._ext_ping_index = 0
@@ -120,6 +134,12 @@ class NetworkMonitor:
             # 启动常驻 worker（程序启动时创建一次，后续通过事件触发，无需反复 create_task）
             await self._arp_protection._start_workers()
 
+        # NDP 防护：自动探测 IPv6 网关，然后启动 5 个常驻 worker + 30s 主动 NS 探测
+        if self._ndp_protection.enabled:
+            await self._ndp_protection.start()
+            if not self._ndp_protection.enabled:
+                logger.info("NDP 防护: 未检测到 IPv6 网关，保持待机")
+
         # 启动常驻恢复 worker（Worker 5）
         self._recover_task = asyncio.create_task(self._recover_worker_loop())
         logger.debug("网络监控: 常驻恢复 worker 已启动")
@@ -128,6 +148,7 @@ class NetworkMonitor:
         """停止监控循环"""
         self._running = False
         await self._arp_protection._stop_workers()
+        await self._ndp_protection.stop()
         # 停止常驻恢复 worker
         if self._recover_task:
             self._run_recover.set()
@@ -164,6 +185,13 @@ class NetworkMonitor:
                     gw_ok = await self._arp_protection._ping_gateway(gw_ip)
                 self._gw_results.append(gw_ok)
 
+                # IPv6 网关 ping（NDP 防护用）
+                ndp_gw = self._ndp_protection.gateway_ipv6
+                ndp_gw_ok = True
+                if ndp_gw:
+                    ndp_gw_ok = await self._ndp_protection._ping_ipv6(ndp_gw)
+                self._ndp_gw_results.append(ndp_gw_ok)
+
                 # 每轮顺便 ping 一个外网 IPv4 目标（轮流）
                 ext_ok = True
                 if self._ping_targets_v4:
@@ -172,12 +200,10 @@ class NetworkMonitor:
                     ext_ok = await self._ping(self._ping_targets_v4[idx])
                 self._ext_results.append(ext_ok)
 
-                # ========== 1.5 ARP 投毒检测（_poison_worker_loop 异步检查，这里取结果） ==========
+                # ========== 1.5 ARP 投毒检测（反制已在 _on_arp_attack 中并行执行，不暂停 DNS） ==========
                 if self._arp_protection._poison_detected.is_set() and not self._arp_network_down:
                     self._arp_protection._poison_detected.clear()
-                    logger.warning("ARP 防护: 检测到 ARP 投毒！立即抑制 DNS 并启动修复")
-                    self._arp_network_down = True
-                    self.resolver_manager.set_network_down(True)
+                    logger.info("ARP 防护: 检测到 ARP 投毒，反制已在并行执行")
                     # 直接刷新路由器 ARP，绕过 _run_arp_defense 的接口检查（已知是投毒）
                     if await self._arp_protection.refresh_router_arp(
                             lambda: self._is_recovered()):
@@ -185,9 +211,15 @@ class NetworkMonitor:
                             logger.info("ARP 防护: 投毒修复完成，网关已恢复")
                             self._arp_protection._baseline_mac = (
                                 self._arp_protection.gateway_mac or "").replace("-", ":").upper()
-                            self._arp_protection._last_alert_mac = ""  # 重置告警 MAC，允许再次检测
-                            self._arp_network_down = False
-                            self.resolver_manager.set_network_down(False)
+                            self._arp_protection._last_alert_mac = ""
+
+                # ========== 1.6 NDP 投毒检测（IPv6，不暂停 DNS） ==========
+                if self._ndp_protection.enabled and self._ndp_protection._poison_detected.is_set() and not self._ndp_network_down:
+                    self._ndp_protection._poison_detected.clear()
+                    logger.info("NDP 防护: 检测到 NDP 投毒，反制已在并行执行")
+                    if await self._ndp_protection.refresh_router_ndp(
+                            lambda: self._is_recovered()):
+                        logger.info("NDP 防护: 投毒修复完成，IPv6 网关已恢复")
 
                 # ========== 2. 从滑动窗口计算丢包分级 ==========
                 loss_pct, diagnosis = self._classify_loss()
@@ -209,10 +241,11 @@ class NetworkMonitor:
                     # 全丢包 + 外网不通 → 确认断网，抑制 DNS
                     self._consecutive_network_down += 1
                     if self._consecutive_network_down >= 2:
-                        if not self._arp_network_down:
+                        if not self._arp_network_down and not self._ndp_network_down:
                             logger.warning("网络断开确认 (连续 %d 轮, 网关丢包=%d%%, 外网不可达)",
                                            self._consecutive_network_down, loss_pct)
                             self._arp_network_down = True
+                            self._ndp_network_down = True
                             self.resolver_manager.set_network_down(True)
                         # 取消可能还在跑的 ARP 防护任务（断网没必要跑）
                         if self._arp_task and not self._arp_task.done():
@@ -229,13 +262,28 @@ class NetworkMonitor:
                             and not self._arp_protection.is_manual:
                         self.resolver_manager.set_network_down(True)
                         if not self._arp_task or self._arp_task.done():
-                            logger.warning("ARP 防护: 网关丢包 %d%%，启动后台 ARP 修复", loss_pct)
+                            logger.warning("ARP 防护: IPv4 网关丢包 %d%%，启动后台 ARP 修复", loss_pct)
                             self._arp_task = asyncio.create_task(
                                 self._run_arp_defense(gw_ip, lambda: self._is_recovered())
                             )
                         else:
-                            # 已有 ARP 防护任务在运行，主循环继续采样
                             pass
+                            pass
+
+                # ========== 3.5 NDP 防护（IPv6 丢包检测） ==========
+                if self._ndp_protection.enabled and not self._ndp_network_down:
+                    ndp_len = len(self._ndp_gw_results)
+                    if ndp_len >= 2:
+                        ndp_fails = ndp_len - sum(self._ndp_gw_results)
+                        ndp_loss = int(ndp_fails / ndp_len * 100)
+                        if ndp_loss >= 20:
+                            self.resolver_manager.set_network_down(True)
+                            if not self._ndp_task or self._ndp_task.done():
+                                logger.warning("NDP 防护: IPv6 网关丢包 %d%%，启动后台 NDP 修复", ndp_loss)
+                                ndp_gw = self._ndp_protection.gateway_ipv6
+                                self._ndp_task = asyncio.create_task(
+                                    self._run_ndp_defense(ndp_gw, lambda: self._is_recovered())
+                                )
 
                 # ========== 4. 外网降级跟踪（全量 check 每 15s 做一次，非每轮） ==========
                 # 这里简化：降级状态仅用于触发全量 recover
@@ -346,10 +394,10 @@ class NetworkMonitor:
                 iface_ok, iface_details = await self._arp_protection.check_interface_healthy()
                 loss_pct, _ = self._classify_loss()
                 if iface_ok:
-                    logger.warning("ARP 防护: 网关丢包 %d%%，本地网卡正常 (%s), 启动后台 ARP 修复",
+                    logger.warning("ARP 防护: IPv4 网关丢包 %d%%，本地网卡正常 (%s), 启动后台 ARP 修复",
                                    loss_pct, iface_details)
                 else:
-                    logger.warning("ARP 防护: 网关丢包 %d%%，接口检查异常 (%s)"
+                    logger.warning("ARP 防护: IPv4 网关丢包 %d%%，接口检查异常 (%s)"
                                    "（可能为 ipconfig/route 解析误判），仍尝试 ARP 刷新",
                                    loss_pct, iface_details)
 
@@ -382,6 +430,7 @@ class NetworkMonitor:
                                             sum(self._ext_results) > 0)
                 if not ext_ok:
                     self._arp_network_down = True
+                    self._ndp_network_down = True
                     self.resolver_manager.set_network_down(True)
                     logger.warning("ARP 防护: 后台修复无效且外网不可达，确认网络断开")
                 else:
@@ -392,6 +441,37 @@ class NetworkMonitor:
             logger.error("ARP 防护: 后台任务异常: %s", e)
         finally:
             self._arp_last_end_time = asyncio.get_event_loop().time()
+
+    async def _run_ndp_defense(self, gw_ip: str, abort_check: Callable[[], bool]):
+        """NDP 防护后台任务：在后台运行 refresh_router_ndp"""
+        if not gw_ip or not self._ndp_protection.enabled:
+            return
+        now = asyncio.get_event_loop().time()
+        if now - self._ndp_last_end_time < 3.0:
+            return
+        try:
+            result = await self._ndp_protection.refresh_router_ndp(abort_check=abort_check)
+            if result:
+                ndp_gw = self._ndp_protection.gateway_ipv6
+                if abort_check() or (ndp_gw and await self._ndp_protection._ping_ipv6(ndp_gw)):
+                    logger.info("NDP 防护: 后台修复完成，IPv6 网关已恢复")
+                    if self.resolver_manager._network_down and not self._arp_network_down:
+                        self.resolver_manager.set_network_down(False)
+                    self._ndp_network_down = False
+            else:
+                ext_ok = abort_check() or (len(self._ext_results) > 0 and sum(self._ext_results) > 0)
+                if not ext_ok:
+                    self._ndp_network_down = True
+                    self.resolver_manager.set_network_down(True)
+                    logger.warning("NDP 防护: 后台修复无效且外网不可达，确认网络断开")
+                else:
+                    logger.warning("NDP 防护: 后台修复无效但外网可达，IPv6 网关可能自身故障")
+        except asyncio.CancelledError:
+            logger.info("NDP 防护: 后台任务被取消（网络已恢复）")
+        except Exception as e:
+            logger.error("NDP 防护: 后台任务异常: %s", e)
+        finally:
+            self._ndp_last_end_time = asyncio.get_event_loop().time()
 
     # ======================== 连通性检测 ========================
 
@@ -558,6 +638,8 @@ class NetworkMonitor:
             self._consecutive_failures = 0
             self._recovery_successes = 0
             self._last_recovery_time = asyncio.get_event_loop().time()
+            self._arp_network_down = False
+            self._ndp_network_down = False
 
             # 重新统计可用上游
             enabled = sum(1 for s in self.resolver_manager._upstream_servers if s.enabled)
@@ -609,6 +691,7 @@ class NetworkMonitor:
 
                 # === 所有恢复操作完成，最后才放行 DNS 查询 ===
                 self._arp_network_down = False
+                self._ndp_network_down = False
                 self.resolver_manager.set_network_down(False)
 
                 enabled = sum(1 for s in self.resolver_manager._upstream_servers if s.enabled)
