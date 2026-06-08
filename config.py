@@ -408,6 +408,32 @@ class Config:
         raw.setdefault("baseline_learn_ms", 1)
         raw.setdefault("send_ns_probe", True)
         return raw
+    @property
+    def response_verification_config(self) -> dict:
+        """DNS 响应验证配置（多上游一致性 + 异常检测）"""
+        return dict(self._data.get("network_monitor", {}).get("response_verification", {}))
+    @property
+    def response_consistency_enabled(self) -> bool:
+        return self._data.get("network_monitor", {}).get("response_verification", {}).get("consistency", {}).get("enabled", True)
+    @property
+    def response_consistency_min_responses(self) -> int:
+        return self._data.get("network_monitor", {}).get("response_verification", {}).get("consistency", {}).get("min_responses", 2)
+    @property
+    def response_consistency_window_ms(self) -> float:
+        return float(self._data.get("network_monitor", {}).get("response_verification", {}).get("consistency", {}).get("consistency_window_ms", 800.0))
+    @property
+    def anomaly_detection_enabled(self) -> bool:
+        return self._data.get("network_monitor", {}).get("response_verification", {}).get("anomaly_detection", {}).get("enabled", True)
+    @property
+    def anomaly_detection_learning_samples(self) -> int:
+        return self._data.get("network_monitor", {}).get("response_verification", {}).get("anomaly_detection", {}).get("learning_samples", 200)
+    @property
+    def anomaly_detection_z_score_threshold(self) -> float:
+        return float(self._data.get("network_monitor", {}).get("response_verification", {}).get("anomaly_detection", {}).get("z_score_threshold", 3.0))
+    @property
+    def response_verification_max_background_servers(self) -> int:
+        """后台验证时最多查询的上游数（随机抽样），减少连接开销。"""
+        return int(self._data.get("network_monitor", {}).get("response_verification", {}).get("consistency", {}).get("max_background_servers", 5))
     def get_raw(self) -> Dict[str, Any]:
         return dict(self._data)
     def update_section(self, section: str, data: dict):

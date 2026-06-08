@@ -53,6 +53,8 @@ from plain_dns_server import PlainDNSServer
 from optimizer import ResourceOptimizer
 from network_monitor import NetworkMonitor
 from dnssec import DNSSECValidator, DNSSECQueryWrapper
+from consistency_verifier import ResponseConsistencyVerifier
+from anomaly_detector import AnomalyDetector
 
 # ======================== 日志配置 ========================
 LOG_FORMAT = "[%(asctime)s] %(levelname)s [%(name)s] %(message)s"
@@ -112,6 +114,9 @@ class DNSProxyApp:
         # DNSSEC
         self._dnssec_validator: Optional[DNSSECValidator] = None
         self._dnssec_wrapper: Optional[DNSSECQueryWrapper] = None
+        # DNS 响应验证
+        self._consistency_verifier: Optional[ResponseConsistencyVerifier] = None
+        self._anomaly_detector: Optional[AnomalyDetector] = None
 
         self._config_reload_task: Optional[asyncio.Task] = None
         self._cache_cleanup_task: Optional[asyncio.Task] = None
@@ -202,10 +207,38 @@ class DNSProxyApp:
             max_log_size_mb=self.config.logging_max_log_size_mb,
         )
         await self.request_logger.start()
+        # 4.5. DNS 响应验证器（多上游一致性 + 统计异常检测）
+        logger.info("[4.5/11] 初始化 DNS 响应验证器...")
+        if self.config.response_consistency_enabled:
+            self._consistency_verifier = ResponseConsistencyVerifier(
+                enabled=self.config.response_consistency_enabled,
+                min_responses=self.config.response_consistency_min_responses,
+                consistency_window_ms=self.config.response_consistency_window_ms,
+                max_background_servers=self.config.response_verification_max_background_servers,
+            )
+            logger.info("  多上游一致性验证: 启用 (min_responses=%d, window=%dms, max_bg=%d)",
+                         self.config.response_consistency_min_responses,
+                         self.config.response_consistency_window_ms,
+                         self.config.response_verification_max_background_servers)
+        else:
+            logger.info("  多上游一致性验证: 禁用")
+        if self.config.anomaly_detection_enabled:
+            self._anomaly_detector = AnomalyDetector(
+                enabled=self.config.anomaly_detection_enabled,
+                learning_samples=self.config.anomaly_detection_learning_samples,
+                z_score_threshold=self.config.anomaly_detection_z_score_threshold,
+            )
+            logger.info("  统计异常检测: 启用 (learning_samples=%d, z_score_threshold=%.1f)",
+                         self.config.anomaly_detection_learning_samples,
+                         self.config.anomaly_detection_z_score_threshold)
+        else:
+            logger.info("  统计异常检测: 禁用")
 
         # 5. 并行解析管理器（带 DNSSEC）
         logger.info("[5/11] 初始化并行解析管理器...")
-        self.resolver_manager = ResolverManager(self.config, dnssec_wrapper=self._dnssec_wrapper)
+        self.resolver_manager = ResolverManager(self.config, dnssec_wrapper=self._dnssec_wrapper,
+                                                 consistency_verifier=self._consistency_verifier,
+                                                 anomaly_detector=self._anomaly_detector)
         await self.resolver_manager.initialize()
 
         # 6. 资源优化器

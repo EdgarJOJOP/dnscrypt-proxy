@@ -23,6 +23,8 @@ import dns.asyncquery
 import aiohttp
 
 from config import Config
+from consistency_verifier import ResponseConsistencyVerifier, ResponseRecord, ConsistencyVerdict
+from anomaly_detector import AnomalyDetector
 from crypto.ech_fetcher import ECHConfigFetcher
 from dnssec import DNSSECQueryWrapper, DNSSECValidator
 from resolvers.base import BaseResolver
@@ -124,7 +126,9 @@ class UpstreamServer:
 class ResolverManager:
     """并行解析管理器"""
 
-    def __init__(self, config: Config, dnssec_wrapper: Optional[DNSSECQueryWrapper] = None):
+    def __init__(self, config: Config, dnssec_wrapper: Optional[DNSSECQueryWrapper] = None,
+                 consistency_verifier: Optional[ResponseConsistencyVerifier] = None,
+                 anomaly_detector: Optional[AnomalyDetector] = None):
         self.config = config
         self._upstream_servers: List[UpstreamServer] = []
         self._bootstrap_resolvers: List[UpstreamServer] = []
@@ -153,6 +157,17 @@ class ResolverManager:
         # 全局共享的 aiohttp.ClientSession（所有 DoH 上游共用，消除多个连接池）
         self._shared_doh_session: Optional[aiohttp.ClientSession] = None
         self._shared_doh_resolver: Optional[_MultiHostResolver] = None
+        # DNS 响应一致性验证器（多上游交叉验证，可选）
+        self._consistency_verifier = consistency_verifier
+        # DNS 响应异常检测器（RTT/大小/TTL 基线，可选）
+        self._anomaly_detector = anomaly_detector
+        # 最近一次成功解析的最快上游名称（用于后台一致性验证）
+        self._last_fast_server: Optional[str] = None
+        self._last_fast_server_obj: Optional[UpstreamServer] = None
+        # 后台一致性验证节流
+        self._consistency_check_count = 0  # 1/10 采样计数器
+        # 定期清理空闲连接的任务
+        self._cleanup_idle_task: Optional[asyncio.Task] = None
 
     async def initialize(self):
         """初始化所有解析器"""
@@ -205,6 +220,8 @@ class ResolverManager:
         # 5. 将 connection_pool_size 注入 DoQ 全局并发限制
         from resolvers.doq import set_doq_global_concurrency
         set_doq_global_concurrency(self.config.connection_pool_size)
+        # 5b. 启动定期空闲连接清理（每 30 秒）
+        self._cleanup_idle_task = asyncio.create_task(self._periodic_idle_cleanup())
 
         self._bootstrap_ready.set()
         enabled_count = sum(1 for s in self._upstream_servers if s.enabled)
@@ -581,6 +598,7 @@ class ResolverManager:
         """
         并行查询所有上游，返回最快响应。
         如果启用了 DNSSEC，自动添加 DO 位。
+        返回后对可疑响应（异常检测标记）启动多上游一致性验证。
         """
         async with self._concurrent_semaphore:
             # DNSSEC: 包装查询添加 DO 位
@@ -589,7 +607,41 @@ class ResolverManager:
                 dnssec_query = self._dnssec.wrap_query(query_bytes)
 
             result = await self._parallel_resolve(dnssec_query)
-            return result
+
+        # 异常检测 + 可疑域名触发交叉验证（不阻塞响应返回）
+        should_verify = False
+        if result is not None:
+            fast_srv = self._last_fast_server_obj
+            # 先送入异常检测器，获取异常评分
+            if self._anomaly_detector is not None and fast_srv is not None:
+                try:
+                    avg_rtt = fast_srv.avg_response_time
+                    anomaly_score = self._anomaly_detector.record_response(
+                        fast_srv.name, avg_rtt, result
+                    )
+                    # 只有异常评分 > 0（z-score > 阈值）才触发交叉验证
+                    if anomaly_score > 0 and self._consistency_verifier is not None:
+                        should_verify = True
+                except Exception as e:
+                    logger.debug("resolve 异常检测失败: %s", e)
+
+            # 无异常检测器时：1/10 采样触发交叉验证
+            if not should_verify and self._consistency_verifier is not None:
+                self._consistency_check_count += 1
+                if self._consistency_check_count % 10 == 0:
+                    should_verify = True
+
+        # 后台一致性验证（复用健康评分，只选最优 5 个加密上游）
+        if should_verify and result is not None:
+            selected = self._select_encrypted_upstreams(count=5)
+            if selected:
+                asyncio.create_task(
+                    self._background_consistency_check(
+                        dnssec_query, result, selected
+                    )
+                )
+
+        return result
 
     async def _auto_recover(self):
         """
@@ -804,6 +856,9 @@ class ResolverManager:
 
         for task in remaining:
             task.cancel()
+        # await 被取消的 task 使 CancelledError 在 DoQ 内部传播，触发连接清理
+        if remaining:
+            await asyncio.gather(*remaining, return_exceptions=True)
 
         if successful:
             successful.sort(key=lambda x: x[1])
@@ -831,6 +886,8 @@ class ResolverManager:
                 first_wave, query_bytes, timeout,
             )
             if result is not None:
+                self._last_fast_server = result[2].name
+                self._last_fast_server_obj = result[2]
                 return result[0]
 
         # 第二波：剩余加密上游
@@ -845,10 +902,65 @@ class ResolverManager:
                 remaining, query_bytes, timeout * 0.5,
             )
             if result is not None:
+                self._last_fast_server = result[2].name
+                self._last_fast_server_obj = result[2]
                 return result[0]
 
         logger.warning("并行查询: 全部 %d 个上游均失败", len(enabled))
         return None
+
+    async def _background_consistency_check(
+        self,
+        query_bytes: bytes,
+        fast_response: bytes,
+        enabled_servers: List,
+    ):
+        """
+        后台一致性验证任务（不阻塞主响应返回）。
+        收集其余上游的响应，执行多源交叉验证和异常检测。
+        """
+        if not self._consistency_verifier:
+            return
+
+        # 用第一个 server 作为"最快"标识（调用方已通过健康评分预选）
+        fast_srv = enabled_servers[0] if enabled_servers else None
+        if fast_srv is None:
+            return
+
+        # 从一致性验证器获取等待窗口
+        window = self._consistency_verifier.consistency_window_ms / 1000.0
+        if window <= 0:
+            window = 0.8  # 默认 800ms
+
+        # 收集其他上游响应并做一致性验证
+        try:
+            await self._consistency_verifier.collect_and_verify(
+                fast_result=(fast_response, 0.0, None),
+                fast_server=fast_srv.name,
+                all_servers=enabled_servers,
+                query_bytes=query_bytes,
+                timeout=window,
+            )
+        except Exception as e:
+            logger.debug("后台一致性验证异常: %s", e)
+        finally:
+            # 验证完成后释放临时连接
+            try:
+                await self.close_idle_connections()
+            except Exception:
+                pass
+
+    async def _periodic_idle_cleanup(self):
+        """定期清理空闲连接（每 30 秒），防止 UDP/TCP 连接积压。"""
+        while True:
+            try:
+                await asyncio.sleep(120)
+                logger.debug("定期清理：执行空闲连接关闭...")
+                await self.close_idle_connections()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug("定期清理异常: %s", e)
 
     async def refresh_upstream_ips(self, hostname: str):
         """刷新特定上游服务器的 IP 地址"""
@@ -928,6 +1040,10 @@ class ResolverManager:
 
     async def close_all(self):
         """关闭所有解析器"""
+        # 停止定期清理任务
+        if self._cleanup_idle_task:
+            self._cleanup_idle_task.cancel()
+            self._cleanup_idle_task = None
         # 停止自动重连任务
         if self._recovery_task:
             self._recovery_task.cancel()
@@ -993,17 +1109,7 @@ class ResolverManager:
             except Exception as e:
                 logger.debug("关闭 bootstrap %s 空闲连接失败: %s", server.name, e)
         if closed:
-            logger.info("关闭了 %d 个解析器的空闲连接", closed)
-
-
-
-        # 关闭全局共享 DoH session
-        if self._shared_doh_session and not self._shared_doh_session.closed:
-            try:
-                await self._shared_doh_session.close()
-            except Exception as e:
-                logger.debug("解析管理器关闭共享 DoH session 异常: %s", e)
-            self._shared_doh_session = None
+            logger.debug("关闭了 %d 个解析器的空闲连接", closed)
 
     @property
     def stats(self) -> Dict[str, Any]:

@@ -45,6 +45,7 @@ class NetworkMonitor:
         self._degraded = False          # 是否处于降级模式（网络异常）
         self._consecutive_failures = 0  # 连续检测失败次数
         self._last_recovery_time = 0.0  # 上次恢复时间戳
+        self._recovery_in_progress = False  # 恢复互斥锁（防止并发恢复）
 
         # 滑动窗口：记录最近 N 次 ping 结果
         self._gw_results: collections.deque = collections.deque(maxlen=5)   # 网关 ping 结果窗口 (~4s)
@@ -106,6 +107,9 @@ class NetworkMonitor:
         self._run_recover = asyncio.Event()
         self._recover_task: Optional[asyncio.Task] = None
         self._consecutive_network_down = 0         # 连续 network_down 计数
+
+        # 日志抑制："网络已恢复" 防洪（ARP 攻击期间 GARP 脉冲反复触发）
+        self._last_recovery_log_time: float = 0.0
 
     @property
     def enabled(self) -> bool:
@@ -203,23 +207,29 @@ class NetworkMonitor:
                 # ========== 1.5 ARP 投毒检测（反制已在 _on_arp_attack 中并行执行，不暂停 DNS） ==========
                 if self._arp_protection._poison_detected.is_set() and not self._arp_network_down:
                     self._arp_protection._poison_detected.clear()
-                    logger.info("ARP 防护: 检测到 ARP 投毒，反制已在并行执行")
-                    # 直接刷新路由器 ARP，绕过 _run_arp_defense 的接口检查（已知是投毒）
-                    if await self._arp_protection.refresh_router_arp(
-                            lambda: self._is_recovered()):
-                        if await self._arp_protection._ping_gateway_fast(gw_ip):
-                            logger.info("ARP 防护: 投毒修复完成，网关已恢复")
-                            self._arp_protection._baseline_mac = (
-                                self._arp_protection.gateway_mac or "").replace("-", ":").upper()
-                            self._arp_protection._last_alert_mac = ""
+                    # 如果 scapy 反制系统活跃（常驻 sender 已就绪），全量修复已不需要
+                    if self._arp_protection._scapy_sender_ready:
+                        logger.debug("ARP 防护: 反制激活中，跳过 monitor 级全量修复")
+                    else:
+                        logger.info("ARP 防护: 检测到 ARP 投毒（无 scapy），走 fallback 修复")
+                        if await self._arp_protection.refresh_router_arp(
+                                lambda: self._is_recovered()):
+                            if await self._arp_protection._ping_gateway_fast(gw_ip):
+                                logger.info("ARP 防护: 投毒修复完成，网关已恢复")
+                                self._arp_protection._baseline_mac = (
+                                    self._arp_protection.gateway_mac or "").replace("-", ":").upper()
+                                self._arp_protection._last_alert_mac = ""
 
                 # ========== 1.6 NDP 投毒检测（IPv6，不暂停 DNS） ==========
                 if self._ndp_protection.enabled and self._ndp_protection._poison_detected.is_set() and not self._ndp_network_down:
                     self._ndp_protection._poison_detected.clear()
-                    logger.info("NDP 防护: 检测到 NDP 投毒，反制已在并行执行")
-                    if await self._ndp_protection.refresh_router_ndp(
-                            lambda: self._is_recovered()):
-                        logger.info("NDP 防护: 投毒修复完成，IPv6 网关已恢复")
+                    if self._ndp_protection._ndp_sender_ready:
+                        logger.debug("NDP 防护: NDP 反制激活中，跳过 monitor 级全量修复")
+                    else:
+                        logger.info("NDP 防护: 检测到 NDP 投毒（无 scapy），走 fallback 修复")
+                        if await self._ndp_protection.refresh_router_ndp(
+                                lambda: self._is_recovered()):
+                            logger.info("NDP 防护: 投毒修复完成，IPv6 网关已恢复")
 
                 # ========== 2. 从滑动窗口计算丢包分级 ==========
                 loss_pct, diagnosis = self._classify_loss()
@@ -228,9 +238,18 @@ class NetworkMonitor:
                 if diagnosis == "recovered":
                     # 窗口内大部分成功 → 网络已正常
                     if self._arp_network_down or self.resolver_manager._network_down:
-                        logger.info("网络已恢复 (网关丢包=%d%%, 外网正常)", loss_pct)
-                        # 触发常驻 recover worker（event.set 天然防并发：已运行时无效）
-                        self._run_recover.set()
+                        now = asyncio.get_event_loop().time()
+                        if now - self._last_recovery_log_time >= 3.0:
+                            logger.info("网络已恢复 (网关丢包=%d%%, 外网正常)", loss_pct)
+                            self._last_recovery_log_time = now
+                        # ARP 攻击活跃期间：仅清除标志让 DNS 继续，不触发完整恢复
+                        if self._has_active_arp_attacks(seconds=5.0) or self._has_active_ndp_attacks(seconds=5.0):
+                            self._arp_network_down = False
+                            self._ndp_network_down = False
+                            self.resolver_manager.set_network_down(False)
+                        else:
+                            # ARP/NDP 安静期：触发完整恢复
+                            self._run_recover.set()
                     # 取消还在运行的 ARP 防护任务
                     if self._arp_task and not self._arp_task.done():
                         self._arp_task.cancel()
@@ -296,8 +315,12 @@ class NetworkMonitor:
                 elif ext_ok and self._degraded:
                     self._recovery_successes += 1
                     if self._recovery_successes >= self._recovery_check_count:
-                        asyncio.create_task(self._recover())
+                        self._degraded = False
+                        self._consecutive_failures = 0
                         self._recovery_successes = 0
+                        if not self._recovery_in_progress:
+                            self._recovery_in_progress = True
+                            asyncio.create_task(self._recover())
                 elif ext_ok:
                     self._consecutive_failures = 0
                     self._recovery_successes = 0
@@ -373,6 +396,14 @@ class NetworkMonitor:
             if gw_ok_count >= max(3, gw_len // 2 + 1):
                 return True
         return diagnosis == "recovered"
+
+    def _has_active_arp_attacks(self, seconds: float = 5.0) -> bool:
+        """检查过去 seconds 秒内 ARP 防护是否检测到攻击。"""
+        return self._arp_protection.has_recent_attacks(seconds)
+
+    def _has_active_ndp_attacks(self, seconds: float = 5.0) -> bool:
+        """检查过去 seconds 秒内 NDP 防护是否检测到攻击。"""
+        return self._ndp_protection.enabled and self._ndp_protection.has_recent_attacks(seconds)
 
     async def _run_arp_defense(self, gw_ip: str, abort_check: Callable[[], bool]):
         """
@@ -647,10 +678,11 @@ class NetworkMonitor:
             logger.info("自动恢复完成: %d/%d 个上游可用", enabled, total)
         except Exception as e:
             logger.error("自动恢复异常: %s", e, exc_info=True)
-            # 不要因恢复失败而让 _degraded 保持在"恢复中"状态
             self._degraded = False
             self._consecutive_failures = 0
             self._recovery_successes = 0
+        finally:
+            self._recovery_in_progress = False
         logger.info("=" * 50)
 
     async def _recover_worker_loop(self):
@@ -664,6 +696,19 @@ class NetworkMonitor:
             if not self._running:
                 return
             self._run_recover.clear()
+
+            if self._recovery_in_progress:
+                continue
+            self._recovery_in_progress = True
+
+            # ARP/NDP 攻击活跃期间跳过连接重置 —— 连接并未失效，是攻击导致的反制波动
+            if self._has_active_arp_attacks(seconds=5.0) or self._has_active_ndp_attacks(seconds=5.0):
+                logger.info("  [后台恢复] ARP/NDP 攻击仍活跃中，跳过连接重置，仅放行 DNS")
+                self._arp_network_down = False
+                self._ndp_network_down = False
+                self.resolver_manager.set_network_down(False)
+                self._recovery_in_progress = False
+                continue
 
             # 执行恢复操作（与原来的 _delayed_recover 一致）
             try:

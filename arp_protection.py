@@ -2049,6 +2049,24 @@ class ARPProtection:
         total = asyncio.get_event_loop().time() - start_time
         logger.info("ARP 防护: 持续 GARP 对抗结束（共 %d 轮, 耗时 %.0fs）", rounds, total)
 
+    def has_recent_attacks(self, seconds: float = 5.0) -> bool:
+        """检查指定秒数内是否有任何 ARP 攻击被检测到。
+
+        Args:
+            seconds: 检测时间窗口（秒），默认 5 秒
+
+        Returns:
+            True 表示窗口内有攻击事件
+        """
+        if not self._attack_stats:
+            return False
+        now = asyncio.get_event_loop().time()
+        for mac, stats in self._attack_stats.items():
+            last_attack = stats.get("last_attack", 0)
+            if now - last_attack < seconds:
+                return True
+        return False
+
     @staticmethod
     def _get_intensity(attack_rate: int) -> tuple:
         """根据 attack_rate 返回 (burst_size, directed_count, inter, tag)"""

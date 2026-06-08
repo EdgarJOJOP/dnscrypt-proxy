@@ -598,6 +598,24 @@ class NDPProtection:
                     lambda: asyncio.create_task(self._on_poison_detected(attacker_mac=src_mac, attacker_ip=src_ip)))
                 break
 
+    def has_recent_attacks(self, seconds: float = 5.0) -> bool:
+        """检查指定秒数内是否有任何 NDP 攻击被检测到。
+
+        Args:
+            seconds: 检测时间窗口（秒），默认 5 秒
+
+        Returns:
+            True 表示窗口内有攻击事件
+        """
+        if not self._ndp_attack_stats:
+            return False
+        now = time.time()
+        for mac, stats in self._ndp_attack_stats.items():
+            last_attack = stats.get("last_attack", 0)
+            if now - last_attack < seconds:
+                return True
+        return False
+
     async def _on_poison_detected(self, attacker_mac: str = "", attacker_ip: str = ""):
         if not self._enabled:
             return
