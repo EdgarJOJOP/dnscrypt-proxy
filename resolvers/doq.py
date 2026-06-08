@@ -60,7 +60,7 @@ def force_dns_id_zero(query: bytes) -> bytes:
 _ATTEMPT_TIMEOUT = 5.0
 
 # 空闲连接保活时间（秒）
-_IDLE_KEEPALIVE = 30.0
+_IDLE_KEEPALIVE = 15.0
 
 # 连接健康检查间隔
 _HEALTH_CHECK_INTERVAL = 10.0
@@ -216,6 +216,17 @@ if HAS_AIOQUIC:
                 self._stream_futures.pop(stream_id, None)
                 self._recv_buffers.pop(stream_id, None)
                 raise
+            except asyncio.CancelledError:
+                # 查询被取消：清理本 stream 资源，但保留 QUIC 连接供后续复用
+                self._stream_futures.pop(stream_id, None)
+                self._recv_buffers.pop(stream_id, None)
+                raise
+            except Exception:
+                self._stream_futures.pop(stream_id, None)
+                self._recv_buffers.pop(stream_id, None)
+                self._closed = True
+                self._close_transport()
+                raise
 
         def close(self):
             """关闭 QUIC 连接"""
@@ -250,6 +261,7 @@ if HAS_AIOQUIC:
             self._last_used = 0.0
             self._cleanup_task: Optional[asyncio.Task] = None
             self._closed = False
+            self._created_at = time.time()
 
         async def connect(self):
             """建立 QUIC 连接（等待握手完成或超时）"""
@@ -264,10 +276,15 @@ if HAS_AIOQUIC:
             protocol.set_connected_future(connected_future)
 
             loop = asyncio.get_running_loop()
-            transport, _ = await loop.create_datagram_endpoint(
-                lambda: protocol,
-                remote_addr=(self._target, self._port),
-            )
+            try:
+                transport, _ = await loop.create_datagram_endpoint(
+                    lambda: protocol,
+                    remote_addr=(self._target, self._port),
+                )
+            except BaseException:
+                # create_datagram_endpoint 可能在 transport 创建后、protocol 注册前被取消
+                protocol.close()
+                raise
 
             self._protocol = protocol
             self._last_used = time.time()
@@ -280,30 +297,50 @@ if HAS_AIOQUIC:
                 protocol.close()
                 self._protocol = None
                 raise
+            except asyncio.CancelledError:
+                logger.debug("DoQ %s:%d 连接被取消", self._target, self._port)
+                protocol.close()
+                self._protocol = None
+                raise
+            except BaseException:
+                # 兜底：任何其他异常也要确保 protocol 被清理
+                protocol.close()
+                self._protocol = None
+                raise
 
             # 启动后台保活/健康检查任务
             self._cleanup_task = asyncio.create_task(self._keepalive_loop())
 
         async def _keepalive_loop(self):
-            """后台保活循环：定期刷新数据、检查连接健康"""
-            while not self._closed:
-                await asyncio.sleep(_HEALTH_CHECK_INTERVAL)
+            """后台保活循环：定期刷新数据、检查连接健康，超 300 秒强制关闭"""
+            try:
+                while not self._closed:
+                    await asyncio.sleep(_HEALTH_CHECK_INTERVAL)
+                    try:
+                        if self._protocol is None or self._protocol.is_closed:
+                            break
+                        now = time.time()
+                        self._protocol._process_quic_events(now)
+                        self._protocol._flush_send(now)
+                        if now - self._created_at > 300.0:
+                            logger.debug("DoQ %s:%d 达到最大生命周期 300s，关闭重建",
+                                         self._target, self._port)
+                            self._protocol.close()
+                            break
+                        if now - self._last_used > _IDLE_KEEPALIVE:
+                            logger.debug("DoQ %s:%d 空闲超时，关闭连接",
+                                         self._target, self._port)
+                            self._protocol.close()
+                            break
+                    except Exception:
+                        break
+            finally:
+                # 确保循环退出时 transport 和 protocol 被关闭
                 try:
-                    if self._protocol is None or self._protocol.is_closed:
-                        break
-                    now = time.time()
-                    # 处理 QUIC 事件（如空闲超时 → ConnectionTerminated）
-                    self._protocol._process_quic_events(now)
-                    # 发送保活/ACK
-                    self._protocol._flush_send(now)
-                    # 如果空闲太久，关闭连接
-                    if now - self._last_used > _IDLE_KEEPALIVE:
-                        logger.debug("DoQ %s:%d 空闲超时，关闭连接",
-                                     self._target, self._port)
+                    if self._protocol and not self._protocol.is_closed:
                         self._protocol.close()
-                        break
                 except Exception:
-                    break
+                    pass
 
         async def execute(self, query_bytes: bytes) -> Optional[bytes]:
             """在持久连接上执行 DNS 查询（QUIC 多路复用，无需串行化锁）"""
@@ -314,8 +351,12 @@ if HAS_AIOQUIC:
             self._last_used = time.time()
             try:
                 return await self._protocol.send_query(query_bytes)
-            except ConnectionError:
-                self._protocol.close()
+            except asyncio.CancelledError:
+                # 查询被取消 ≠ 连接不可用；QUIC 连接仍健康，让它继续复用
+                raise
+            except Exception:
+                if self._protocol:
+                    self._protocol.close()
                 raise
 
         async def close(self):
@@ -350,6 +391,7 @@ if HAS_AIOQUIC:
             self._session_ticket_callback = session_ticket_callback
             self._handles: Dict[str, _QuicConnectionHandle] = {}
             self._lock = asyncio.Lock()
+            self._max_handles = 3
             self._target_locks: Dict[str, asyncio.Lock] = {}
             self._closed = False
 
@@ -388,6 +430,15 @@ if HAS_AIOQUIC:
                 if handle and handle._protocol and not handle._protocol.is_closed:
                     return handle
 
+                # 检查连接数上限，超出则驱逐最久未用的
+                if len(self._handles) >= self._max_handles:
+                    oldest_target = min(
+                        self._handles,
+                        key=lambda t: self._handles[t]._last_used
+                    )
+                    oldest = self._handles.pop(oldest_target)
+                    await oldest.close()
+
                 # 创建新连接
                 try:
                     handle = _QuicConnectionHandle(
@@ -400,10 +451,17 @@ if HAS_AIOQUIC:
                     async with self._lock:
                         old = self._handles.get(target)
                         if old:
-                            await old.close()
+                            try:
+                                await old.close()
+                            except Exception:
+                                pass
                         self._handles[target] = handle
                     return handle
                 except (ConnectionError, asyncio.TimeoutError, OSError) as e:
+                    if handle:
+                        await handle.close()
+                    raise
+                except asyncio.CancelledError:
                     if handle:
                         await handle.close()
                     raise
@@ -420,11 +478,18 @@ if HAS_AIOQUIC:
                 try:
                     handle = await self._get_or_create_handle(target)
                     return await handle.execute(query_bytes)
-                except (ConnectionError, asyncio.TimeoutError) as e:
+                except asyncio.CancelledError:
+                    # 查询被取消 ≠ 连接损坏。QUIC 原生支持多流复用，
+                    # 取消单个 stream 不影响同一连接上的其他 stream。
+                    # 保留 handle 在 _handles 中供后续查询复用。
+                    raise
+                except Exception as e:
                     last_error = e
-                    # 连接失效，从缓存中移除
+                    # 连接失效，从缓存中移除并关闭
                     async with self._lock:
-                        self._handles.pop(target, None)
+                        old_handle = self._handles.pop(target, None)
+                    if old_handle:
+                        await old_handle.close()
                     cert_err = str(e).lower()
                     if "certificate" in cert_err or "hostname" in cert_err:
                         logger.warning(
@@ -446,6 +511,23 @@ if HAS_AIOQUIC:
                 for target, handle in list(self._handles.items()):
                     await handle.close()
                 self._handles.clear()
+
+        async def close_idle(self):
+            """仅关闭空闲或已死亡的连接，保留活跃连接。"""
+            now = time.time()
+            async with self._lock:
+                dead_targets = [
+                    (t, h) for t, h in list(self._handles.items())
+                    if (h._protocol is None or h._protocol.is_closed
+                        or now - h._last_used > _IDLE_KEEPALIVE)
+                ]
+                for target, _ in dead_targets:
+                    self._handles.pop(target, None)
+            for _, handle in dead_targets:
+                try:
+                    await handle.close()
+                except Exception:
+                    pass
 
         async def reset(self):
             """重置所有连接（网络恢复时调用）"""
@@ -579,6 +661,11 @@ if HAS_AIOQUIC:
             self._config_cache.clear()
             logger.debug("DoQ解析器 %s 连接已重置", self.host)
 
+        async def close_idle(self):
+            """仅关闭空闲连接（供定期清理使用，不破坏活跃连接）。"""
+            if self._pool and not self._pool_closed:
+                await self._pool.close_idle()
+
 
 else:
     # aioquic 不可用时的桩实现
@@ -600,4 +687,8 @@ else:
             pass
 
         async def reset_connections(self):
+            pass
+
+        async def close_idle(self):
+            """仅关闭空闲连接（桩实现，无操作）"""
             pass
