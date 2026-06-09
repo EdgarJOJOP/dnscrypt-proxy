@@ -72,7 +72,7 @@ win记得安装360杀毒(https://sd.360.cn/ )比360安全管家管用。
  
 # 1. 安装库
 
-我使用的是python3.11版本
+使用python3.13+版本，无论是python官方版还是conda版。
 
 `pip install -r requirements.txt`
 
