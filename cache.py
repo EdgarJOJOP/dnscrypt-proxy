@@ -11,6 +11,7 @@ DNS 缓存模块
 import time
 import asyncio
 import copy
+import gc
 import logging
 from typing import Optional, Tuple, Dict, Any
 from collections import OrderedDict
@@ -66,25 +67,66 @@ def clear_query_cache():
     _query_template_cache.clear()
 
 
+def evict_cold_query_templates():
+    """保留最近 256 条查询模板，其余清空重建。
+
+    查询模板缓存是 Dict[Tuple, bytes]，key 是包含 str 的 tuple。
+    长时间运行后积累大量冷模板，散布在 pymalloc arena 中。
+    定期重建可让活跃模板聚集在更少 arena 中。
+    """
+    if len(_query_template_cache) <= 256:
+        return
+    items = list(_query_template_cache.items())
+    _query_template_cache.clear()
+    # 保留后半部分（最近添加的条目）
+    for k, v in items[-256:]:
+        _query_template_cache[k] = v
+    logger.debug("查询模板缓存重建: %d -> %d", len(items), len(_query_template_cache))
+
+
 class CacheEntry:
-    """缓存条目 — 仅缓存反序列化后的 Message，不保存 wire 以节省内存"""
+    """缓存条目 — Wire-First 双轨存储
 
-    __slots__ = ("response_msg", "ttl",
-                 "created_at", "_estimated_bytes")
+    主存储是紧凑的 wire bytes（单个连续内存块），`dns.message.Message` 降级为
+    可丢弃的加速缓存。在内存压力下可丢弃 Message 对象，仅保留 wire bytes，
+    下次访问时通过 from_wire() 惰性水合。
+    """
 
-    def __init__(self, response: dns.message.Message, ttl: int):
-        # 缓存反序列化后的 Message 对象，避免每次 get 都 from_wire()
-        # 注意：传出时通过 copy 避免修改缓存内容
-        self.response_msg: dns.message.Message = response
+    __slots__ = ("_wire", "_response_msg", "ttl", "created_at", "epoch", "_hit_count")
+
+    def __init__(self, response: dns.message.Message, ttl: int, epoch: int = 0):
+        # 主存储：序列化为紧凑的 wire bytes
+        self._wire: bytes = response.to_wire()
+        # 加速缓存：保留反序列化后的 Message 对象（可被 drop）
+        self._response_msg: Optional[dns.message.Message] = response
         self.ttl: int = ttl
         self.created_at: float = time.time()
-        # 存储 wire 字节数，供优化器按大小淘汰
-        self._estimated_bytes: int = len(response.to_wire())
+        self.epoch: int = epoch  # 分配世代（用于 arena 生命周期追踪）
+        self._hit_count: int = 0  # 命中次数（用于智能 Message 丢弃）
+
+    @property
+    def response_msg(self) -> dns.message.Message:
+        """惰性水合：按需从 wire bytes 重建 Message 对象"""
+        if self._response_msg is None:
+            self._response_msg = dns.message.from_wire(self._wire)
+        return self._response_msg
+
+    @response_msg.setter
+    def response_msg(self, value: dns.message.Message):
+        self._response_msg = value
+
+    def has_message(self) -> bool:
+        """检查 Message 对象是否仍在内存中（无需水合）"""
+        return self._response_msg is not None
+
+    def drop_message(self):
+        """丢弃 Message 对象，仅保留 wire bytes（节省内存）"""
+        self._response_msg = None
 
     @property
     def estimated_bytes(self) -> int:
-        """返回该缓存条目的估算字节数（用于内存优化器按大小淘汰）"""
-        return self._estimated_bytes
+        """返回该缓存条目的估算字节数（wire 长度，紧凑且准确）"""
+        return len(self._wire)
 
     def is_expired(self, now: Optional[float] = None) -> bool:
         """判断是否过期"""
@@ -95,15 +137,15 @@ class CacheEntry:
     def get_adjusted_response(self) -> dns.message.Message:
         """
         获取已调整 TTL 的响应（浅拷贝 + TTL 覆写，避免 from_wire 全量反序列化）。
+        通过 self.response_msg property 获取 Message（必要时从 wire 惰性水合）。
         """
         elapsed = time.time() - self.created_at
         remaining = max(1, int(self.ttl - elapsed))
 
-        # 从缓存的 Message 浅拷贝，避免 from_wire() 全量解析
-        response = copy.copy(self.response_msg)
-        # 浅拷贝 answer 列表，但复用底层的 rrset 和 rdata 对象
-        # 然后逐个覆写 TTL（不影响缓存中的原始值）
-        response.answer = list(self.response_msg.answer)
+        # 通过 property 获取 Message（惰性水合），然后浅拷贝
+        msg = self.response_msg
+        response = copy.copy(msg)
+        response.answer = list(msg.answer)
         # 为每个 RRset 创建新实例以安全修改 TTL
         new_answer = []
         for rrset in response.answer:
@@ -120,7 +162,7 @@ class CacheEntry:
         response.answer = new_answer
 
         # 同样处理 authority 和 additional 段
-        response.authority = list(self.response_msg.authority)
+        response.authority = list(msg.authority)
         new_auth = []
         for rrset in response.authority:
             new_rrset = dns.rrset.RRset(
@@ -135,7 +177,7 @@ class CacheEntry:
             new_auth.append(new_rrset)
         response.authority = new_auth
 
-        response.additional = list(self.response_msg.additional)
+        response.additional = list(msg.additional)
         new_add = []
         for rrset in response.additional:
             new_rrset = dns.rrset.RRset(
@@ -182,6 +224,16 @@ class DNSCache:
             "evictions": 0,
         }
 
+        # ===== Arena 世代追踪 =====
+        self._current_epoch: int = 0          # 当前活跃世代编号
+        self._epoch_stats: Dict[int, int] = {}  # epoch -> 存活条目数
+
+    def _bump_epoch(self):
+        """递增世代编号（在 rebuild 时调用），标记 arena 代际边界"""
+        self._current_epoch += 1
+        self._epoch_stats = {self._current_epoch: 0}
+        logger.debug("升级到世代 %d", self._current_epoch)
+
     async def get(self, key: Tuple) -> Optional[dns.message.Message]:
         """
         获取缓存条目。
@@ -201,6 +253,7 @@ class DNSCache:
 
             # LRU: 移动到末尾（最近使用）
             self._cache.move_to_end(key)
+            entry._hit_count += 1
             self._stats["hits"] += 1
             return entry.get_adjusted_response()
 
@@ -229,7 +282,7 @@ class DNSCache:
                 return
 
             # 创建缓存条目
-            entry = CacheEntry(response, ttl)
+            entry = CacheEntry(response, ttl, epoch=self._current_epoch)
 
             # LRU 淘汰
             while len(self._cache) >= self.max_size:
@@ -291,6 +344,111 @@ class DNSCache:
             self._stats["size"] = len(self._cache)
             if expired_keys:
                 logger.debug("清理了 %d 个过期缓存条目", len(expired_keys))
+
+    async def drop_messages_lru(self, ratio: float = 0.3) -> int:
+        """丢弃 LRU 尾部 N% 条目的 Message 对象，仅保留 wire bytes。
+
+        从 OrderedDict 头部（最久未使用）开始遍历，丢弃 Message 加速缓存。
+        这样在下次访问这些条目时会触发惰性水合（from_wire），
+        但释放了复杂对象图占用的 pymalloc arena 空间。
+
+        Args:
+            ratio: 丢弃比例（0.3 = 丢弃 LRU 尾部 30% 的 Message 对象）
+        Returns:
+            实际丢弃的条目数
+        """
+        async with self._lock:
+            if not self._cache:
+                return 0
+            target = max(1, int(len(self._cache) * ratio))
+            dropped = 0
+            # OrderedDict 头部是最久未使用的
+            for i, key in enumerate(self._cache):
+                if i >= target:
+                    break
+                entry = self._cache[key]
+                if entry.has_message():
+                    entry.drop_message()
+                    dropped += 1
+            if dropped:
+                logger.debug("丢弃了 %d 个条目的 Message 对象 (LRU 尾部 %.0f%%)",
+                             dropped, ratio * 100)
+            return dropped
+
+    async def compact_messages(self, ratio: float = 0.3) -> int:
+        """智能丢弃低命中率条目的 Message 对象。
+
+        当前简化实现：丢弃未被访问次数最多的条目。
+        完整版本可追踪 _hit_count。
+
+        Args:
+            ratio: 丢弃比例
+        Returns:
+            实际丢弃的条目数
+        """
+        # 复用 drop_messages_lru 的逻辑
+        return await self.drop_messages_lru(ratio)
+
+    async def rebuild(self) -> int:
+        """全量撤离+重建 — TLB 友好分配版本
+
+        TLB (Thread-Local Buffer) 分配策略：
+        所有新 CacheEntry 在 GC 后的紧循环中连续分配，
+        保证它们落入同一批新 pymalloc arena，arena 利用率最大化。
+
+        流程：
+        1. 持有锁：收集存活条目 (key, wire_bytes, ttl, created_at)
+        2. 持有锁：清空缓存 + 提升世代
+        3. 释放锁：4 轮全量 GC → 让旧 arena 变成 fully-free → munmap
+        4. 重新持有锁：TLB 批量分配所有新 CacheEntry（无 Message 对象）
+        5. 新条目标记为新世代，初始 _hit_count = 0
+
+        Returns:
+            幸存条目数
+        """
+        # 第一阶段：在锁内收集存活数据并清空缓存
+        async with self._lock:
+            if not self._cache:
+                return 0
+            now = time.time()
+            # 收集（跳过过期），使用 list() 快照避免迭代时修改
+            items = [(key, entry._wire, entry.ttl, entry.created_at)
+                     for key, entry in list(self._cache.items())
+                     if not entry.is_expired(now)]
+            old_count = len(self._cache)
+            self._cache.clear()
+            # 提升世代，标记 arena 代际边界
+            new_epoch = self._current_epoch + 1
+            self._current_epoch = new_epoch
+            self._epoch_stats = {new_epoch: len(items)}
+
+        # 第二阶段：释放锁后执行 4 轮全量 GC
+        # pymalloc 在 GC 时会扫描所有 arena，将完全空闲的 pool 合并后 munmap
+        # 4 轮确保所有链式引用被彻底遍历
+        for _ in range(4):
+            gc.collect(generation=2)
+
+        # 第三阶段：TLB 批量分配 — 重新持有锁，从 wire bytes 紧凑重建
+        async with self._lock:
+            survived = 0
+            for key, wire, ttl, created_at in items:
+                # 通过 __new__ + 手动赋值（TLB 友好：无额外对象分配）
+                entry = CacheEntry.__new__(CacheEntry)
+                entry._wire = wire
+                entry._response_msg = None  # 惰性水合，首次访问时 from_wire
+                entry.ttl = ttl
+                entry.created_at = created_at
+                entry.epoch = new_epoch       # 标记新世代
+                entry._hit_count = 0          # 重置命中计数
+                self._cache[key] = entry
+                survived += 1
+
+            self._stats["size"] = len(self._cache)
+            self._stats["evictions"] += old_count - survived
+
+        logger.info("缓存重建完成: 旧条目 %d -> 新世代 %d 幸存 %d (淘汰 %d 过期)",
+                    old_count, new_epoch, survived, old_count - survived)
+        return survived
 
     async def clear(self):
         """清空缓存"""

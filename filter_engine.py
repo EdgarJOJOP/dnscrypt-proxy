@@ -1394,6 +1394,43 @@ class FilterEngine:
             logger.debug("过滤缓存已达上限 %d，已裁剪 %d 条",
                          self._filter_cache_maxsize, removed)
 
+
+    def rebuild_filter_cache(self):
+        """撤离重建过滤缓存 — 释放碎片化 pymalloc arena
+
+        过滤缓存最大 100000 条 Dict[str, Tuple[bool, str, float, bool]]，
+        大量 tuple + str 散布在 arena 中。重建让所有存活条目
+        重新分配进更少、更紧凑的新 arena。
+        """
+        if not self._filter_cache:
+            return
+        # 分离 priority 条目（自定义 hosts，永不淘汰）
+        priority_items = [
+            (k, v) for k, v in self._filter_cache.items()
+            if len(v) >= 4 and v[3]
+        ]
+        # 保留未过期的非 priority 条目
+        now = __import__('time').monotonic()
+        timeout = self._filter_cache_timeout
+        active_items = [
+            (k, v) for k, v in self._filter_cache.items()
+            if not (len(v) >= 4 and v[3])
+            and (len(v) >= 3 and now - v[2] < timeout)
+        ]
+        old_count = len(self._filter_cache)
+        # 清空旧 dict
+        self._filter_cache.clear()
+        # 重建：新 dict 条目在连续 arena 中分配
+        for k, v in priority_items:
+            self._filter_cache[k] = v
+        for k, v in active_items:
+            self._filter_cache[k] = v
+        logger = __import__('logging').getLogger("dns-proxy.filter")
+        logger.debug("Filter cache 撤离重建: %d -> %d (priority=%d, active=%d)",
+                     old_count, len(self._filter_cache), len(priority_items), len(active_items))
+
+
+
     # ======================== 定时更新 ========================
 
     def on_update(self, callback: Callable):
