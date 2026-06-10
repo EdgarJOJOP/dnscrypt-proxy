@@ -35,6 +35,7 @@ import struct
 import asyncio
 import logging
 import random
+import locale
 from typing import Optional, List, Tuple, Dict, Callable, Any
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -65,9 +66,13 @@ class InterfaceInfo:
     """单个网卡的 IPv6 信息"""
     name: str = ""
     mac: str = ""
-    ipv6_global: str = ""
+    ipv6_globals: List[str] = field(default_factory=list)
     ipv6_ll: str = ""
     gateways: List[Tuple[str, str, str]] = field(default_factory=list)
+
+    @property
+    def ipv6_global(self) -> str:
+        return self.ipv6_globals[0] if self.ipv6_globals else ""
 
 
 class NDPProtection:
@@ -221,8 +226,7 @@ class NDPProtection:
     def all_local_ipv6(self) -> List[str]:
         addrs = []
         for iface in self.interfaces:
-            if iface.ipv6_global:
-                addrs.append(iface.ipv6_global)
+            addrs.extend(iface.ipv6_globals)
             if iface.ipv6_ll:
                 addrs.append(iface.ipv6_ll)
         return addrs
@@ -255,7 +259,36 @@ class NDPProtection:
             groups.append((ip, mac, vlan))
         return groups
 
+    @staticmethod
+    def _decode_win_output(data: bytes) -> str:
+        """Decode Windows cmd output: try system encoding, then utf-8/gbk.
+        Never depends on keyword validation — returns cleanly decoded text."""
+        seen = set()
+        for enc in (locale.getpreferredencoding(False), 'utf-8', 'gbk'):
+            if enc in seen:
+                continue
+            seen.add(enc)
+            try:
+                return data.decode(enc, errors='replace')
+            except LookupError:
+                continue
+        return data.decode('utf-8', errors='replace')
+
     # ======================== 生命周期 ========================
+
+
+    async def _ping_ipv6(self, target: str) -> bool:
+        """Ping an IPv6 target using system ping -6."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ping", "-6", "-n", "1", "-w", "1000", target,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=5)
+            return proc.returncode == 0
+        except Exception:
+            return False
 
     async def start(self):
         if not self._enabled:
@@ -760,7 +793,7 @@ class NDPProtection:
             for iface in self.interfaces:
                 gw_str = ", ".join(f"{g[0]}({g[1] or '?'})" for g in iface.gateways)
                 logger.info("  接口 %s [%s] IPv6=%s LL=%s 网关=[%s]",
-                            iface.name, iface.mac, iface.ipv6_global or "-",
+                            iface.name, iface.mac, ", ".join(iface.ipv6_globals) or "-",
                             iface.ipv6_ll or "-", gw_str)
         else:
             logger.debug("NDP 防护: 未检测到 IPv6 网络")
@@ -822,18 +855,29 @@ class NDPProtection:
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-            for line in stdout.decode("utf-8", errors="replace").splitlines():
+            for line in self._decode_win_output(stdout).splitlines():
                 s = line.strip()
-                if s.startswith("::/0"):
-                    parts = s.replace("::/0", "").strip().split()
-                    if len(parts) >= 2:
-                        gw = parts[0].strip()
+                if "::/0" in s:
+                    # netsh output format: e.g. "No  System  4256  ::/0  14  fe80::1"
+                    parts = s.split()
+                    try:
+                        idx = next(i for i, t in enumerate(parts) if t == "::/0")
+                    except StopIteration:
+                        continue
+                    gw = None
+                    zone_id = 0
+                    for t in parts[idx+1:]:
+                        if ":" in t and not t.startswith("ff"):
+                            gw = t
+                            break
                         try:
-                            iface_idx = int(parts[1].strip())
+                            zone_id = int(t)
                         except ValueError:
-                            iface_idx = 0
-                        if ":" in gw and not gw.startswith("ff"):
-                            default_routes.append((gw, iface_idx))
+                            pass
+                    if gw:
+                        if gw.startswith("fe80") and zone_id:
+                            gw = f"{gw}%{zone_id}"
+                        default_routes.append((gw, zone_id))
         except Exception as e:
             logger.debug("NDP 防护: netsh route 失败: %s", e)
         try:
@@ -841,7 +885,7 @@ class NDPProtection:
                 "ipconfig", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-            text = stdout.decode("utf-8", errors="replace")
+            text = self._decode_win_output(stdout)
         except Exception as e:
             logger.debug("NDP 防护: ipconfig 失败: %s", e)
             return
@@ -852,34 +896,30 @@ class NDPProtection:
                 continue
             name_line = lines[0].strip()
             current_name = None
-            for prefix in ("以太网适配器 ", "Ethernet adapter ",
-                           "无线局域网适配器 ", "Wireless LAN adapter ",
-                           "WLAN 适配器 ", "WLAN adapter ",
-                           "本地连接", "Local Area Connection"):
+            for prefix in ("以太网适配器 ", "Ethernet adapter ", "无线局域网适配器 ", "Wireless LAN adapter ", "WLAN 适配器 ", "WLAN adapter ", "本地连接", "Local Area Connection"):
                 if name_line.startswith(prefix):
                     current_name = name_line[len(prefix):].rstrip(":")
                     break
             if not current_name:
-                continue
+                current_name = name_line.rstrip(":")
             iface = InterfaceInfo(name=current_name)
             for line in lines:
                 s = line.strip()
-                if "IPv6 地址" in s or "IPv6 Address" in s:
-                    parts = s.split(":")
-                    if len(parts) >= 2:
-                        ip = parts[-1].strip().split("%")[0].strip()
-                        if ":" in ip:
-                            if ip.startswith("fe80"):
-                                if not iface.ipv6_ll:
-                                    iface.ipv6_ll = ip
-                            elif not iface.ipv6_global:
-                                iface.ipv6_global = ip
-                if "物理地址" in s or "Physical Address" in s:
-                    parts = s.split(":")
-                    if len(parts) >= 2:
-                        mac = parts[-1].strip().replace("-", ":").upper()
-                        if re.match(r'^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$', mac):
-                            iface.mac = mac
+                # IPv6 via regex — no Chinese matching
+                m = re.search(r"((?:[0-9a-fA-F]{0,4}:){2,}[0-9a-fA-F:]+(?:%\d+)?)", s)
+                if m:
+                    ip = m.group(1).strip()
+                    if ip.startswith("fe80"):
+                        if not iface.ipv6_ll:
+                            iface.ipv6_ll = ip
+                    else:
+                        iface.ipv6_globals.append(ip)
+                # MAC via regex — no Chinese matching
+                m = re.search(r"((?:[0-9A-Fa-f]{2}[-:]){5}[0-9A-Fa-f]{2})(?:\s|$)", s)
+                if m:
+                    mac = m.group(1).replace("-", ":").upper()
+                    if not iface.mac:
+                        iface.mac = mac
             if iface.ipv6_ll or iface.ipv6_global:
                 for gw, idx in default_routes:
                     if not any(g == gw for g, _ in iface.gateways):
@@ -902,7 +942,7 @@ class NDPProtection:
         for line in text.splitlines():
             s = line.strip()
             if not s.startswith(" ") and ":" in s:
-                if current_iface and (current_iface.ipv6_ll or current_iface.ipv6_global):
+                if current_iface and (current_iface.ipv6_ll or current_iface.ipv6_globals):
                     self.interfaces.append(current_iface)
                 name = s.split(":")[1].strip()
                 current_iface = InterfaceInfo(name=name)
@@ -916,12 +956,12 @@ class NDPProtection:
                         if ip.startswith("fe80"):
                             current_iface.ipv6_ll = ip
                         elif ":" in ip:
-                            current_iface.ipv6_global = ip if not current_iface.ipv6_global else current_iface.ipv6_global
+                            current_iface.ipv6_globals.append(ip)
             if "link/ether" in s:
                 for p in s.split():
                     if ":" in p and re.match(r'^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$', p.upper()):
                         current_iface.mac = p.upper()
-        if current_iface and (current_iface.ipv6_ll or current_iface.ipv6_global):
+        if current_iface and (current_iface.ipv6_ll or current_iface.ipv6_globals):
             self.interfaces.append(current_iface)
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -964,8 +1004,8 @@ class NDPProtection:
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 )
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-                for line in stdout.decode("utf-8", errors="replace").splitlines():
-                    if ipv6.lower() in line.lower():
+                for line in self._decode_win_output(stdout).splitlines():
+                    if ipv6.split("%")[0].lower() in line.lower():
                         parts = line.split()
                         if len(parts) >= 3:
                             mac = parts[1].strip().replace("-", ":").upper()
@@ -999,33 +1039,31 @@ class NDPProtection:
                     "ipconfig", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 )
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-                text = stdout.decode("utf-8", errors="replace")
+                text = self._decode_win_output(stdout)
+                ipv6_pat = re.compile(r"((?:[0-9a-fA-F]{0,4}:){2,}[0-9a-fA-F:]+(?:%\d+)?)")
+                mac_pat = re.compile(r"((?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2})(?:\s|$)")
                 for line in text.splitlines():
                     s = line.strip()
-                    if "IPv6" in s and ":" in s:
-                        parts = s.split(":")
-                        if len(parts) >= 2:
-                            ip = parts[-1].strip().split("%")[0].strip()
-                            if ":" in ip:
-                                if "fe80" in ip.lower():
-                                    for iface in self.interfaces:
-                                        if not iface.ipv6_ll:
-                                            iface.ipv6_ll = ip
-                                            break
-                                elif not any(i.ipv6_global == ip for i in self.interfaces):
-                                    for iface in self.interfaces:
-                                        if not iface.ipv6_global and iface.mac:
-                                            iface.ipv6_global = ip
-                                            break
-                    if "物理地址" in s or "Physical Address" in s:
-                        parts = s.split(":")
-                        if len(parts) >= 2:
-                            mac = parts[-1].strip().replace("-", ":").upper()
-                            if re.match(r'^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$', mac):
-                                for iface in self.interfaces:
-                                    if not iface.mac:
-                                        iface.mac = mac
-                                        break
+                    m = ipv6_pat.search(s)
+                    if m:
+                        ip = m.group(1).strip()
+                        if "fe80" in ip.lower():
+                            for iface in self.interfaces:
+                                if not iface.ipv6_ll:
+                                    iface.ipv6_ll = ip
+                                    break
+                        else:
+                            for iface in self.interfaces:
+                                if iface.mac:
+                                    iface.ipv6_globals.append(ip)
+                                    break
+                    m = mac_pat.search(s)
+                    if m:
+                        mac = m.group(1).replace("-", ":").upper()
+                        for iface in self.interfaces:
+                            if not iface.mac:
+                                iface.mac = mac
+                                break
             except Exception:
                 pass
         else:
@@ -1149,7 +1187,7 @@ class NDPProtection:
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 )
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-                return len(stdout.decode().splitlines())
+                return len(self._decode_win_output(stdout).splitlines())
             else:
                 proc = await asyncio.create_subprocess_exec(
                     "ip", "-6", "neigh", "show",
@@ -1456,7 +1494,7 @@ class NDPProtection:
                     iface_name = f"{iface_name}.{vlan_id}"
                 proc = await asyncio.create_subprocess_exec(
                     "netsh", "interface", "ipv6", "set", "neighbors",
-                    f"name={iface_name}", f"address={gw}", f"neighbor={mac_fmt}",
+                    f"name={iface_name}", f"address={gw.split(chr(37))[0]}", f"neighbor={mac_fmt}",
                     stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
                 )
                 await asyncio.wait_for(proc.wait(), timeout=10)
@@ -1495,7 +1533,7 @@ class NDPProtection:
             "suspicious_ra_sources": len(self._suspicious_ra_sources),
             "interface_details": [{
                 "name": iface.name, "mac": iface.mac,
-                "ipv6_global": iface.ipv6_global, "ipv6_ll": iface.ipv6_ll,
+                "ipv6_globals": iface.ipv6_globals, "ipv6_globals": iface.ipv6_globals, "ipv6_global": iface.ipv6_global, "ipv6_ll": iface.ipv6_ll,
                 "gateways": iface.gateways,
             } for iface in self.interfaces],
         }
