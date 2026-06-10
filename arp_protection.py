@@ -46,8 +46,11 @@ class ARPProtection:
         self._ping_interval = ping_interval
         self._ping_targets_v4 = ping_targets_v4 or ["223.5.5.5"]
 
+        # VLAN/VXLAN 配置
+        self._vxlan_enabled = config_arp.get("vxlan_enabled", False)
+
         # 解析 gateway 逗号格式（支持多组 "IP1,MAC1,IP2,MAC2" 交替逗号格式）
-        self._manual_gateways: list = []  # [(ip, mac), ...] — 手动配置的全部网关
+        self._manual_gateways: list = []  # [(ip, mac, vlan_id), ...] — 手动配置的全部网关
         gw_field = config_arp.get("gateway", "") or ""
         if isinstance(gw_field, str) and gw_field:
             pairs = self._parse_gateway_field(gw_field)
@@ -58,15 +61,16 @@ class ARPProtection:
                 old_ip = config_arp.get("gateway_ip", "") or ""
                 old_mac = config_arp.get("gateway_mac", "") or ""
                 if old_ip:
-                    self._manual_gateways = [(old_ip, old_mac)]
+                    self._manual_gateways = [(old_ip, old_mac, "")]
         if not self._manual_gateways:
             old_ip = config_arp.get("gateway_ip", "") or ""
             old_mac = config_arp.get("gateway_mac", "") or ""
             if old_ip:
-                self._manual_gateways = [(old_ip, old_mac)]
+                self._manual_gateways = [(old_ip, old_mac, "")]
 
         self._manual_gateway_ip = self._manual_gateways[0][0] if self._manual_gateways else ""
         self._manual_gateway_mac = self._manual_gateways[0][1] if self._manual_gateways else ""
+        self._manual_gateway_vlan = self._manual_gateways[0][2] if self._manual_gateways and len(self._manual_gateways[0]) > 2 and self._manual_gateways[0][2] else ""
 
         # 自动探测结果（手动设置时这些保持 None）
         self._auto_gateway_ip: Optional[str] = None
@@ -156,11 +160,31 @@ class ARPProtection:
             if task is None:
                 break
             try:
-                dst_mac, src_mac, src_ip, poison_mac, count, inter = task
+                dst_mac, src_mac, src_ip, poison_mac, count, inter, vlan_id = task
                 spoof_pkt = Ether(dst=dst_mac) / ARP(
                     op=2, hwsrc=poison_mac, psrc=src_ip,
                     hwdst=dst_mac, pdst=src_ip,
                 )
+                # VLAN 802.1Q tag when vlan_id is set and not VXLAN
+                if vlan_id and not self._vxlan_enabled:
+                    try:
+                        from scapy.all import Dot1Q
+                        spoof_pkt = Ether(dst=dst_mac) / Dot1Q(vlan=int(vlan_id)) / ARP(
+                            op=2, hwsrc=poison_mac, psrc=src_ip,
+                            hwdst=dst_mac, pdst=src_ip,
+                        )
+                    except Exception:
+                        pass
+                elif vlan_id and self._vxlan_enabled:
+                    try:
+                        from scapy.all import VXLAN, IP, UDP
+                        inner_pkt = Ether(dst=dst_mac) / ARP(
+                            op=2, hwsrc=poison_mac, psrc=src_ip,
+                            hwdst=dst_mac, pdst=src_ip,
+                        )
+                        spoof_pkt = Ether(dst=dst_mac, src=src_mac) / IP(dst=src_ip) / UDP(sport=4789, dport=4789) / VXLAN(vni=int(vlan_id)) / inner_pkt
+                    except Exception:
+                        pass
                 sendp(spoof_pkt, iface=self._interface_name or "", verbose=False, count=count, inter=inter)
                 logger.warning("ARP 反制: 定向反击 %s (%s) -> %s x%d", src_ip, dst_mac, poison_mac, count)
             except Exception as e:
@@ -323,7 +347,7 @@ class ARPProtection:
             "" (正常) 或 描述字符串 (检测到攻击)
         """
         gw_ip = self.gateway_ip
-        gw_ips = set(ip for ip, _ in self.gateway_pairs)
+        gw_ips = set(ip for ip, _, _ in self.gateway_pairs)
         local_mac = (self._local_mac or "").replace("-", ":").upper()
         is_garp = (sender_ip == target_ip)
 
@@ -561,47 +585,39 @@ class ARPProtection:
     @staticmethod
     def _parse_gateway_field(gw_field: str) -> list:
         """
-        解析 gateway 逗号格式，支持单组和多组。
-        格式: "IP1,MAC1,IP2,MAC2" (交替逗号分隔)
+        解析 gateway 逗号格式，仅支持 3 元素交替格式:
+        "IP1,MAC1,VLAN1,IP2,MAC2,VLAN2"
 
-        IP 含 `.`，MAC 含 `-` 或 `:`，根据内容区分。
-        MAC 可留空（自动探测），但逗号占位不能省略。
+        IP 含 `.`，MAC 含 `-` 或 `:`，VLAN_ID 为纯数字或空。
+        vxlan_enabled=true 时 VLAN_ID 解释为 VXLAN VNI。
+
         示例:
-          "192.168.1.1,00-11-22-33-44-55"                    → 1 组
-          "192.168.1.1,00-11-22-33-44-55,10.0.0.1,aa-bb-cc-dd-ee-ff"  → 2 组
-          "192.168.1.1,"                                       → IP 手动，MAC 自动
-          "192.168.1.1"                                        → 仅有 IP（无逗号）
+          "192.168.1.1,00-11-22-33-44-55,12"          → 1组(IP+MAC+VLAN)
+          "192.168.1.1,00-11-22-33-44-55,"             → 1组(IP+MAC,无VLAN)
+          "192.168.1.1,,"                               → 仅IP
+          "192.168.1.1,aa-bb,10,10.0.0.1,cc-dd,20"    → 2组
 
         Returns:
-            [(ip, mac), ...] 列表，解析失败返回 []
+            [(ip, mac, vlan_id), ...] 列表
         """
         parts = [p.strip() for p in gw_field.split(",")]
-        pairs = []
+        n = len(parts)
+        if n == 0 or (n == 1 and not parts[0]):
+            return []
+
+        # 每 3 个一组：每组为 (IP, MAC, VLAN_ID)
+        groups = []
         i = 0
-        while i < len(parts):
-            val = parts[i]
-            if not val:
-                i += 1
-                continue
-            if "." in val:
-                # 这是 IP
-                ip = val
-                mac = ""
-                if i + 1 < len(parts):
-                    next_val = parts[i + 1]
-                    # 下一个值如果是 MAC（含 - 或 :）或者是空，则是当前 IP 的 MAC
-                    if not next_val or "-" in next_val or ":" in next_val:
-                        mac = next_val
-                        i += 2
-                    else:
-                        i += 1
-                else:
-                    i += 1
-                pairs.append((ip, mac))
-            else:
-                # 不是 IP 也不是 MAC → 跳过（格式异常）
-                i += 1
-        return pairs
+        while i + 2 < n:
+            groups.append((parts[i], parts[i+1], parts[i+2]))
+            i += 3
+        # 处理尾部不足 3 个的情况
+        if i < n:
+            ip = parts[i] if i < n else ""
+            mac = parts[i+1] if i + 1 < n else ""
+            vlan = parts[i+2] if i + 2 < n else ""
+            groups.append((ip, mac, vlan))
+        return groups
 
     @property
     def enabled(self) -> bool:
@@ -622,13 +638,23 @@ class ARPProtection:
         return self._auto_gateway_mac
 
     @property
+    def gateway_vlan(self) -> str:
+        """获取网关 VLAN ID / VXLAN VNI（仅手动配置）"""
+        return self._manual_gateway_vlan if self._manual_gateway_vlan else ""
+
+    @property
     def gateway_pairs(self) -> list:
-        """返回全部网关 (IP, MAC) 列表（手动 + 自动）"""
-        pairs = list(self._manual_gateways)
+        """返回全部网关 (IP, MAC, VLAN_ID) 列表（手动 + 自动）"""
+        pairs = []
+        for gw in self._manual_gateways:
+            if len(gw) >= 3:
+                pairs.append((gw[0], gw[1], gw[2]))
+            else:
+                pairs.append((gw[0], gw[1], ""))
         if self._auto_gateway_ip:
-            # 如果自动探测的网关不在手动列表中，追加
-            if not any(ip == self._auto_gateway_ip for ip, _ in pairs):
-                pairs.append((self._auto_gateway_ip, self._auto_gateway_mac or ""))
+            # 如果自动探测的网关不在手动列表中，追加（自动探测无 VLAN）
+            if not any(ip == self._auto_gateway_ip for ip, _, _ in pairs):
+                pairs.append((self._auto_gateway_ip, self._auto_gateway_mac or "", ""))
         return pairs
 
     @property
@@ -636,7 +662,7 @@ class ARPProtection:
         """全部网关均为手动配置（每组都有 IP+MAC）时跳过自动探测"""
         if not self._manual_gateways:
             return False
-        return all(bool(ip) and bool(mac) for ip, mac in self._manual_gateways)
+        return all(bool(ip) and bool(mac) for ip, mac, _ in self._manual_gateways)
 
     # ======================== 自动探测 ========================
 
@@ -658,11 +684,13 @@ class ARPProtection:
         if ok:
             src = "手动配置" if self._manual_gateway_ip else "自动探测"
             if len(self._manual_gateways) > 1:
-                pairs_str = "; ".join(f"{ip},{mac or '*'}" for ip, mac in self._manual_gateways)
+                pairs_str = "; ".join(f"{ip},{mac or '*'},{vlan or '*'}" for ip, mac, vlan in self._manual_gateways)
                 logger.info("ARP 防护: 多网关 %s -> %s", src, pairs_str)
             else:
                 logger.info("ARP 防护: 网关 %s -> IP=%s, MAC=%s",
                              src, self.gateway_ip, self.gateway_mac or "未知")
+            # 确保 VLAN 子接口存在
+            await self._ensure_vlan_interface()
             # 网关 MAC 已知时设静态 ARP 防止本机缓存被投毒
             if self.gateway_mac:
                 await self._protect_gateway_arp()
@@ -670,20 +698,68 @@ class ARPProtection:
             logger.warning("ARP 防护: 无法自动探测网关地址（防火墙可能阻止了探测）")
         return ok
 
+
+    async def _ensure_vlan_interface(self) -> bool:
+        """确保 VLAN 子接口存在（vlan_id 非空且非 VXLAN 时自动创建）"""
+        vlan_id = self._manual_gateway_vlan
+        if not vlan_id or self._vxlan_enabled or not self._interface_name:
+            return True  # 不需要 VLAN 子接口
+        iface = self._interface_name
+        vlan_iface = f"{iface}.{vlan_id}"
+        if sys.platform == "win32":
+            # Windows: netsh interface ipv4 add vlan
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "netsh", "interface", "ipv4", "add", "vlan",
+                    f"name={iface}", f"vlanid={vlan_id}",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                _, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+                if proc.returncode == 0:
+                    logger.info("ARP 防护: VLAN 子接口 %s 已创建", vlan_iface)
+                    return True
+                # 非零返回通常表示子接口已存在，不视为错误
+                logger.debug("ARP 防护: VLAN 子接口 %s 创建返回 %d（可能已存在）", vlan_iface, proc.returncode)
+                return True
+            except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
+                logger.debug("ARP 防护: VLAN 子接口创建失败 %s", e)
+                return False
+        else:
+            # Linux: ip link add link {iface} name {vlan_iface} type vlan id {vlan_id}
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "ip", "link", "add", "link", iface,
+                    "name", vlan_iface,
+                    "type", "vlan", "id", str(vlan_id),
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(proc.wait(), timeout=10)
+                if proc.returncode == 0:
+                    logger.info("ARP 防护: VLAN 子接口 %s 已创建", vlan_iface)
+                    return True
+                logger.debug("ARP 防护: VLAN 子接口 %s 创建返回 %d（可能已存在）", vlan_iface, proc.returncode)
+                return True
+            except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
+                logger.debug("ARP 防护: VLAN 子接口创建失败 %s", e)
+                return False
+
     async def _detect_windows(self) -> bool:
         """Windows 上探测网关 IP + MAC，通过路由表精确定位网卡"""
         # 1. 如果已有手动 IP 但无 MAC，为所有手动网关查 MAC
         if self._manual_gateway_ip and not self._manual_gateway_mac:
             all_ok = True
-            for i, (ip, mac) in enumerate(self._manual_gateways):
+            for i, (ip, mac, vlan) in enumerate(self._manual_gateways):
                 if ip and not mac:
                     detected_mac = await self._arp_get_mac_windows(ip)
                     if detected_mac:
-                        self._manual_gateways[i] = (ip, detected_mac)
+                        self._manual_gateways[i] = (ip, detected_mac, self._manual_gateways[i][2] if len(self._manual_gateways[i]) > 2 else "")
                     else:
                         all_ok = False
             if all_ok:
                 self._manual_gateway_mac = self._manual_gateways[0][1]
+                self._manual_gateway_vlan = self._manual_gateways[0][2] if self._manual_gateways and len(self._manual_gateways[0]) > 2 else ""
                 return True
             return False
 
@@ -721,15 +797,16 @@ class ARPProtection:
         # 1. 如果已有手动 IP 但无 MAC，为所有手动网关查 MAC
         if self._manual_gateway_ip and not self._manual_gateway_mac:
             all_ok = True
-            for i, (ip, mac) in enumerate(self._manual_gateways):
+            for i, (ip, mac, vlan) in enumerate(self._manual_gateways):
                 if ip and not mac:
                     detected_mac = await self._arp_get_mac_linux(ip)
                     if detected_mac:
-                        self._manual_gateways[i] = (ip, detected_mac)
+                        self._manual_gateways[i] = (ip, detected_mac, self._manual_gateways[i][2] if len(self._manual_gateways[i]) > 2 else "")
                     else:
                         all_ok = False
             if all_ok:
                 self._manual_gateway_mac = self._manual_gateways[0][1]
+                self._manual_gateway_vlan = self._manual_gateways[0][2] if self._manual_gateways and len(self._manual_gateways[0]) > 2 else ""
                 return True
             return False
 
@@ -1514,9 +1591,14 @@ class ARPProtection:
         logger.warning("ARP 防护: 自动修复 IP 冲突 %s → %s (掩码=%s, 网关=%s)",
                         self._local_ipv4, new_ip, self._subnet_mask, gw_ip or "无")
 
+        # VLAN 子接口
+        vlan_iface = self._interface_name
+        vlan_id = self._manual_gateway_vlan
+        if vlan_id and not self._vxlan_enabled:
+            vlan_iface = f"{self._interface_name}.{vlan_id}"
         try:
             cmd = ["netsh", "interface", "ipv4", "set", "address",
-                   f"name={self._interface_name}",
+                   f"name={vlan_iface}",
                    f"source=static",
                    f"address={new_ip}",
                    f"mask={self._subnet_mask}"]
@@ -1622,11 +1704,16 @@ class ARPProtection:
         logger.warning("ARP 防护: 自动修复 IP 冲突 %s → %s (掩码=%s, 网关=%s)",
                         self._local_ipv4, new_ip, self._subnet_mask, gw_ip or "无")
 
+        # VLAN 子接口
+        vlan_iface = self._interface_name
+        vlan_id = self._manual_gateway_vlan
+        if vlan_id and not self._vxlan_enabled:
+            vlan_iface = f"{self._interface_name}.{vlan_id}"
         try:
             # 先删除旧 IP
             proc = await asyncio.create_subprocess_exec(
                 "ip", "addr", "del", f"{self._local_ipv4}/{prefix}",
-                "dev", self._interface_name,
+                "dev", vlan_iface,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -1638,7 +1725,7 @@ class ARPProtection:
             # 添加新 IP
             proc = await asyncio.create_subprocess_exec(
                 "ip", "addr", "add", f"{new_ip}/{prefix}",
-                "dev", self._interface_name,
+                "dev", vlan_iface,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -1652,7 +1739,7 @@ class ARPProtection:
             if gw_ip:
                 await asyncio.create_subprocess_exec(
                     "ip", "route", "replace", "default", "via", gw_ip,
-                    "dev", self._interface_name,
+                    "dev", vlan_iface,
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.DEVNULL,
                 )
@@ -1680,7 +1767,7 @@ class ARPProtection:
             被投毒的网关列表 [(gateway_ip, 预期MAC, 实际MAC), ...]
         """
         poisoned = []
-        for gw_ip, expected_mac in self.gateway_pairs:
+        for gw_ip, expected_mac, vlan_id in self.gateway_pairs:
             if not gw_ip or not expected_mac:
                 continue
             if sys.platform == "win32":
@@ -1933,7 +2020,24 @@ class ARPProtection:
 
                 arp_payload = (htype + ptype + hlen + plen + opcode +
                                sender_mac + sender_ip + target_mac + target_ip)
-                frame = dest_mac + mac_bytes + eth_type + arp_payload
+                # VLAN 802.1Q 标签：vlan_id 非空且非 VXLAN 时在以太网头后插入 4 字节
+                vlan_id = self._manual_gateway_vlan
+                if vlan_id and not self._vxlan_enabled:
+                    vlan_tag = struct.pack('!HH', 0x8100, int(vlan_id) & 0xFFF)
+                    frame = dest_mac + mac_bytes + vlan_tag + eth_type + arp_payload
+                elif vlan_id and self._vxlan_enabled:
+                    # VXLAN 封装
+                    try:
+                        from vxlan_encap import encap_vxlan
+                        inner_arp = dest_mac + mac_bytes + eth_type + arp_payload
+                        frame = encap_vxlan(inner_arp, int(vlan_id),
+                                             self._local_mac or mac_bytes.hex(), dest_mac.hex(),
+                                             self._local_ipv4 or "0.0.0.0", gw_ip)
+                    except Exception:
+                        logger.debug("ARP 防护: VXLAN 封装失败，回退到无标签")
+                        frame = dest_mac + mac_bytes + eth_type + arp_payload
+                else:
+                    frame = dest_mac + mac_bytes + eth_type + arp_payload
 
                 with socket.socket(socket.AF_PACKET, socket.SOCK_RAW,
                                    socket.htons(0x0806)) as s:
@@ -2144,9 +2248,13 @@ class ARPProtection:
                 # Windows 回退：netsh 设攻击者静态 ARP
                 try:
                     poison_fmt = "FF-FF-FF-FF-FF-FE" if (self._counterstrike_count % 2 == 0) else "00-00-00-00-00-00"
+                    vlan_iface = self._interface_name or ""
+                    vlan_id = self._manual_gateway_vlan
+                    if vlan_id and not self._vxlan_enabled:
+                        vlan_iface = f"{vlan_iface}.{vlan_id}"
                     proc = await asyncio.create_subprocess_exec(
                         "netsh", "interface", "ipv4", "set", "neighbors",
-                        f"name={self._interface_name or ''}",
+                        f"name={vlan_iface}",
                         f"address={attacker_ip or gw_ip}",
                         f"neighbor={poison_fmt}",
                         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
@@ -2185,9 +2293,14 @@ class ARPProtection:
         old_ip = self._local_ipv4
         gw_ip = self.gateway_ip
 
+        # VLAN 子接口
+        vlan_iface = self._interface_name
+        vlan_id = self._manual_gateway_vlan
+        if vlan_id and not self._vxlan_enabled:
+            vlan_iface = f"{self._interface_name}.{vlan_id}"
         if sys.platform == "win32":
             cmd = ["netsh", "interface", "ipv4", "set", "address",
-                   f"name={self._interface_name}",
+                   f"name={vlan_iface}",
                    "source=static",
                    f"address={new_ip}",
                    f"mask={self._subnet_mask}"]
@@ -2227,7 +2340,7 @@ class ARPProtection:
                 # 删除旧 IP（忽略删除失败 — 可能已被其他进程删除）
                 proc = await asyncio.create_subprocess_exec(
                     "ip", "addr", "del", f"{self._local_ipv4}/{prefix}",
-                    "dev", self._interface_name,
+                    "dev", vlan_iface,
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.DEVNULL,
                 )
@@ -2235,7 +2348,7 @@ class ARPProtection:
                 # 添加新 IP
                 proc = await asyncio.create_subprocess_exec(
                     "ip", "addr", "add", f"{new_ip}/{prefix}",
-                    "dev", self._interface_name,
+                    "dev", vlan_iface,
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.PIPE,
                 )
@@ -2248,7 +2361,7 @@ class ARPProtection:
                 if gw_ip:
                     await asyncio.create_subprocess_exec(
                         "ip", "route", "replace", "default", "via", gw_ip,
-                        "dev", self._interface_name,
+                        "dev", vlan_iface,
                         stdout=asyncio.subprocess.DEVNULL,
                         stderr=asyncio.subprocess.DEVNULL,
                     )
@@ -2670,7 +2783,8 @@ class ARPProtection:
                             self.gateway_mac, new_mac)
             # 更新手动/自动 MAC
             if self._manual_gateways and self._manual_gateways[0][0] == gw_ip:
-                self._manual_gateways[0] = (gw_ip, new_mac)
+                old_vlan = self._manual_gateways[0][2] if self._manual_gateways and len(self._manual_gateways[0]) > 2 else ""
+                self._manual_gateways[0] = (gw_ip, new_mac, old_vlan)
             self._manual_gateway_mac = new_mac
             self._auto_gateway_mac = new_mac
             gw_mac = new_mac
@@ -2755,9 +2869,13 @@ class ARPProtection:
         else:
             mac_fmt = gw_mac.replace("-", ":")
             try:
+                dev = iface
+                vlan_id = self._manual_gateway_vlan
+                if vlan_id and not self._vxlan_enabled:
+                    dev = f"{iface}.{vlan_id}"
                 proc = await asyncio.create_subprocess_exec(
                     "ip", "neigh", "replace", gw_ip,
-                    "dev", iface, "lladdr", mac_fmt, "nud", "permanent",
+                    "dev", dev, "lladdr", mac_fmt, "nud", "permanent",
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
@@ -3108,6 +3226,9 @@ class ARPProtection:
             "enabled": self._enabled,
             "gateway_ip": self.gateway_ip,
             "gateway_mac": self.gateway_mac,
+            "gateway_vlan": self.gateway_vlan or "",
+            "vxlan_enabled": self._vxlan_enabled,
+            "manual_gateway_count": len(self._manual_gateways),
             "local_ipv4": self._local_ipv4,
             "local_mac": self._local_mac,
             "subnet_mask": self._subnet_mask,

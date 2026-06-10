@@ -53,7 +53,7 @@ try:
         ICMPv6ND_RA, ICMPv6NDOptPrefixInformation,
         ICMPv6ND_RS,
         ICMPv6NDOptRedirectedHdr, ICMPv6Error,
-        sniff, sendp,
+        Dot1Q, sniff, sendp,
     )
     _HAS_SCAPY = True
 except ImportError:
@@ -92,17 +92,25 @@ class NDPProtection:
         self._baseline_learn_time = self._baseline_learn_ms / 1000.0
         self._send_ns_probe = cfg.get("send_ns_probe", True)
 
+        # VLAN/VXLAN 配置
+        self._vxlan_enabled = cfg.get("vxlan_enabled", False)
+
         self.interfaces: List[InterfaceInfo] = []
-        self._manual_gateways: List[Tuple[str, str]] = []
+        self._manual_gateways: List[Tuple[str, str, str]] = []  # [(ip, mac, vlan_id), ...]
         self._baseline_gateway_mac: str = ""
         gw_field = cfg.get("gateway_ipv6", "") or ""
         if isinstance(gw_field, str) and gw_field:
             pairs = self._parse_gateway_ipv6_field(gw_field)
             if pairs:
                 self._manual_gateways = pairs
-                for ip, mac in pairs:
+                for gw in pairs:
+                    ip = gw[0]
+                    mac = gw[1]
                     if not ip and mac:
                         self._baseline_gateway_mac = mac
+
+        # VLAN/VXLAN: 提取第一个手动网关的 VLAN ID
+        self._manual_gateway_vlan = self._manual_gateways[0][2] if self._manual_gateways and len(self._manual_gateways[0]) > 2 and self._manual_gateways[0][2] else ""
 
         self._detected = False
         self._last_refresh_time = 0.0
@@ -158,12 +166,17 @@ class NDPProtection:
         return self._enabled
 
     @property
-    def gateway_pairs(self) -> List[Tuple[str, str]]:
-        pairs = list(self._manual_gateways)
+    def gateway_pairs(self) -> List[Tuple[str, str, str]]:
+        pairs = []
+        for gw in self._manual_gateways:
+            if len(gw) >= 3:
+                pairs.append((gw[0], gw[1], gw[2]))
+            else:
+                pairs.append((gw[0], gw[1], ""))
         for iface in self.interfaces:
-            for gw_ip, gw_mac in iface.gateways:
-                if not any(ip == gw_ip for ip, _ in pairs):
-                    pairs.append((gw_ip, gw_mac))
+            for gw_ip, gw_mac, _ in iface.gateways:
+                if not any(ip == gw_ip for ip, _, _ in pairs):
+                    pairs.append((gw_ip, gw_mac, ""))
         return pairs
 
     @property
@@ -171,14 +184,14 @@ class NDPProtection:
         if self._manual_gateways and self._manual_gateways[0][0]:
             return self._manual_gateways[0][0]
         for iface in self.interfaces:
-            for gw_ip, _ in iface.gateways:
+            for gw_ip, _, _ in iface.gateways:
                 if gw_ip:
                     return gw_ip
         return None
 
     @property
     def gateway_mac(self) -> Optional[str]:
-        for ip, mac in self.gateway_pairs:
+        for ip, mac, _ in self.gateway_pairs:
             if ip == self.gateway_ipv6 and mac:
                 return mac
         return None
@@ -216,37 +229,31 @@ class NDPProtection:
 
     @staticmethod
     def _parse_gateway_ipv6_field(gw_field: str) -> list:
-        _MAC_RE = re.compile(r'^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$')
-        _IPV6_RE = re.compile(r'^[0-9a-fA-F:]+$')
+        """
+        解析 gateway_ipv6 逗号格式，仅支持 3 元素交替格式:
+        "IPv6,MAC,VLAN_ID,IPv6,MAC,VLAN_ID"
+
+        IPv6 含 :: 或超过 2 个冒号，MAC 为 6 组双位十六进制数，
+        VLAN_ID 为纯数字或空。
+        vxlan_enabled=true 时 VLAN_ID 解释为 VXLAN VNI。
+        """
         parts = [p.strip() for p in gw_field.split(",")]
-        pairs = []
+        n = len(parts)
+        if n == 0 or (n == 1 and not parts[0]):
+            return []
+
+        # 每 3 个一组：每组为 (IPv6, MAC, VLAN_ID)
+        groups = []
         i = 0
-        while i < len(parts):
-            val = parts[i]
-            if not val:
-                i += 1
-                continue
-            is_mac = bool(_MAC_RE.match(val))
-            is_ipv6 = not is_mac and bool(_IPV6_RE.match(val)) and ("::" in val or val.count(":") > 1)
-            if is_ipv6:
-                ip = val
-                mac = ""
-                if i + 1 < len(parts):
-                    nv = parts[i + 1]
-                    if not nv or _MAC_RE.match(nv):
-                        mac = nv
-                        i += 2
-                    else:
-                        i += 1
-                else:
-                    i += 1
-                pairs.append((ip, mac))
-            elif is_mac:
-                pairs.append(("", val))
-                i += 1
-            else:
-                i += 1
-        return pairs
+        while i + 2 < n:
+            groups.append((parts[i], parts[i+1], parts[i+2]))
+            i += 3
+        if i < n:
+            ip = parts[i] if i < n else ""
+            mac = parts[i+1] if i + 1 < n else ""
+            vlan = parts[i+2] if i + 2 < n else ""
+            groups.append((ip, mac, vlan))
+        return groups
 
     # ======================== 生命周期 ========================
 
@@ -304,7 +311,7 @@ class NDPProtection:
                 self._run_dhcpv6_check.set()
                 results = await self.run_all_checks()
                 if self._send_ns_probe:
-                    for gw_ip, known_mac in self.gateway_pairs[:5]:
+                    for gw_ip, known_mac, _ in self.gateway_pairs[:5]:
                         if not gw_ip:
                             continue
                         actual_mac = await self._probe_gateway_ns(gw_ip, timeout=1.5)
@@ -344,7 +351,7 @@ class NDPProtection:
                 return
             self._recovery_trigger.clear()
             self._recovery_detected.clear()
-            for gw_ip, _ in self.gateway_pairs[:3]:
+            for gw_ip, _, _ in self.gateway_pairs[:3]:
                 if not gw_ip:
                     continue
                 for _ in range(5):
@@ -424,7 +431,7 @@ class NDPProtection:
             return
         src_mac = pkt[Ether].src.upper()
         src_ip = str(pkt[IPv6].src)
-        all_gw_ips = {ip for ip, _ in self.gateway_pairs if ip}
+        all_gw_ips = {ip for ip, _, _ in self.gateway_pairs if ip}
         all_local_ips = set(self.all_local_ipv6)
 
         # ==================== RA 处理 ====================
@@ -471,7 +478,7 @@ class NDPProtection:
 
                 # --- RA 源自动学习（替代 max_ra_routers）---
                 # 从手动配置的网关 MAC 或已确认的接口网关 MAC 发来的 RA = 信任
-                known_gw_macs = {mac.upper() for _, mac in self.gateway_pairs if mac}
+                known_gw_macs = {mac.upper() for _, mac, _ in self.gateway_pairs if mac}
                 known_baseline_macs = set(self._baseline_mac_per_gw.values())
                 all_trusted = known_gw_macs | known_baseline_macs | self._trusted_ra_sources
 
@@ -479,7 +486,7 @@ class NDPProtection:
                     # 新 RA 源但不属于信任/可疑列表 → 检查是否在手动网关列表中
                     is_known = any(
                         src_ip == gw or src_mac == m.upper()
-                        for gw, m in self.gateway_pairs if m
+                        for gw, m, _ in self.gateway_pairs if m
                     )
                     if is_known:
                         self._trusted_ra_sources.add(src_mac)
@@ -716,13 +723,19 @@ class NDPProtection:
             return
         if self._manual_gateways:
             logger.info("NDP 防护: 使用手动配置 %d 个 IPv6 网关", len(self._manual_gateways))
-            for i, (ip, mac) in enumerate(self._manual_gateways):
+            for i, (ip, mac, vlan) in enumerate(self._manual_gateways):
                 if ip and not mac:
                     resolved = await self._resolve_mac_single(ip)
                     if resolved:
-                        self._manual_gateways[i] = (ip, resolved)
+                        self._manual_gateways[i] = (ip, resolved, vlan if len(self._manual_gateways[i]) > 2 else "")
             self._detected = True
             await self._detect_local_info()
+            # 确保 VLAN 子接口存在
+            if self._manual_gateway_vlan and not self._vxlan_enabled:
+                for iface in self.interfaces:
+                    if iface.name:
+                        await self._ensure_vlan_interface(iface.name, self._manual_gateway_vlan)
+                        break
             return
         if sys.platform == "win32":
             await self._detect_all_windows()
@@ -740,6 +753,54 @@ class NDPProtection:
         else:
             logger.debug("NDP 防护: 未检测到 IPv6 网络")
         await self._detect_local_info()
+        # 确保 VLAN 子接口存在（以第一个接口为准）
+        if self._manual_gateway_vlan and not self._vxlan_enabled:
+            for iface in self.interfaces:
+                if iface.name:
+                    await self._ensure_vlan_interface(iface.name, self._manual_gateway_vlan)
+                    break
+
+
+    async def _ensure_vlan_interface(self, iface_name: str, vlan_id: str) -> bool:
+        """确保 VLAN 子接口存在（vlan_id 非空且非 VXLAN 时自动创建）"""
+        if not vlan_id or self._vxlan_enabled or not iface_name:
+            return True
+        vlan_iface = f"{iface_name}.{vlan_id}"
+        if sys.platform == "win32":
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "netsh", "interface", "ipv4", "add", "vlan",
+                    f"name={iface_name}", f"vlanid={vlan_id}",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                _, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+                if proc.returncode == 0:
+                    logger.info("NDP 防护: VLAN 子接口 %s 已创建", vlan_iface)
+                else:
+                    logger.debug("NDP 防护: VLAN 子接口 %s 创建返回 %d（可能已存在）", vlan_iface, proc.returncode)
+                return True
+            except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
+                logger.debug("NDP 防护: VLAN 子接口创建失败 %s", e)
+                return False
+        else:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "ip", "link", "add", "link", iface_name,
+                    "name", vlan_iface,
+                    "type", "vlan", "id", str(vlan_id),
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(proc.wait(), timeout=10)
+                if proc.returncode == 0:
+                    logger.info("NDP 防护: VLAN 子接口 %s 已创建", vlan_iface)
+                else:
+                    logger.debug("NDP 防护: VLAN 子接口 %s 创建返回 %d（可能已存在）", vlan_iface, proc.returncode)
+                return True
+            except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
+                logger.debug("NDP 防护: VLAN 子接口创建失败 %s", e)
+                return False
 
     async def _detect_all_windows(self):
         default_routes = []
@@ -810,7 +871,7 @@ class NDPProtection:
             if iface.ipv6_ll or iface.ipv6_global:
                 for gw, idx in default_routes:
                     if not any(g == gw for g, _ in iface.gateways):
-                        iface.gateways.append((gw, ""))
+                        iface.gateways.append((gw, "", ""))
                 self.interfaces.append(iface)
         await self._resolve_all_gateway_macs()
 
@@ -869,19 +930,19 @@ class NDPProtection:
                     if gw and iface_name:
                         for iface in self.interfaces:
                             if iface.name == iface_name:
-                                iface.gateways.append((gw, ""))
+                                iface.gateways.append((gw, "", ""))
         except Exception as e:
             logger.debug("NDP 防护: Linux 路由失败: %s", e)
         await self._resolve_all_gateway_macs()
 
     async def _resolve_all_gateway_macs(self):
         for iface in self.interfaces:
-            for i, (gw_ip, _) in enumerate(iface.gateways):
+            for i, (gw_ip, _, _) in enumerate(iface.gateways):
                 if not gw_ip:
                     continue
                 mac = await self._resolve_mac_single(gw_ip)
                 if mac:
-                    iface.gateways[i] = (gw_ip, mac)
+                    iface.gateways[i] = (gw_ip, mac, "")
 
     async def _resolve_mac_single(self, ipv6: str) -> Optional[str]:
         if sys.platform == "win32":
@@ -1029,7 +1090,9 @@ class NDPProtection:
 
     async def check_ndp_poisoning(self) -> list:
         poisoned = []
-        for ip, expected in self._manual_gateways:
+        for gw in self._manual_gateways:
+            ip = gw[0]
+            expected = gw[1]
             if not ip:
                 continue
             actual = await self._resolve_mac_single(ip)
@@ -1039,7 +1102,7 @@ class NDPProtection:
                 if actual.upper() != self._baseline_gateway_mac.upper():
                     poisoned.append(("手动-基线", ip, self._baseline_gateway_mac, actual))
         for iface in self.interfaces:
-            for gw_ip, expected in iface.gateways:
+            for gw_ip, expected, _ in iface.gateways:
                 if not gw_ip or not expected:
                     continue
                 actual = await self._resolve_mac_single(gw_ip)
@@ -1104,7 +1167,7 @@ class NDPProtection:
             logger.debug("NDP 防护: sniff 失败: %s", e)
             return {"t2_ns": [], "t3_ra": [], "t4_dad": [], "t6_redirect": []}
 
-        known_gw_macs = {mac.upper() for _, mac in self.gateway_pairs if mac}
+        known_gw_macs = {mac.upper() for _, mac, _ in self.gateway_pairs if mac}
         ra_sources = {}
         ns_targets = defaultdict(int)
         dad_targets = defaultdict(int)
@@ -1200,12 +1263,13 @@ class NDPProtection:
                 if local_ip and local_mac_real:
                     # 网关 IPv6 -> 00:00:00:00:00:00 毒化包（打残攻击者）
                     null_mac = "00:00:00:00:00:00"
+                    vlan_id = self._manual_gateway_vlan
                     self._ndp_sender_queue.put_nowait(
-                        (attacker_mac, local_ip, null_mac, attacker_ip or self.gateway_ipv6 or local_ip, na_rounds, inter)
+                        (attacker_mac, local_ip, null_mac, attacker_ip or self.gateway_ipv6 or local_ip, na_rounds, inter, vlan_id)
                     )
                     # 正确 NA 广播（固定 1 轮，仅恢复路由器 NDP 表；定向反制保持原量）
                     self._ndp_sender_queue.put_nowait(
-                        ("ff:ff:ff:ff:ff:ff", local_ip, local_mac_real, local_ip, 1, inter)
+                        ("ff:ff:ff:ff:ff:ff", local_ip, local_mac_real, local_ip, 1, inter, vlan_id)
                     )
                     break
 
@@ -1246,12 +1310,25 @@ class NDPProtection:
             if task is None:
                 break
             try:
-                dst_mac, local_ip, local_mac, target_ip, count, inter = task
+                dst_mac, local_ip, local_mac, target_ip, count, inter, vlan_id = task
                 eth = Ether(dst=dst_mac, src=local_mac)
                 na = ICMPv6ND_NA(R=0, S=0, O=1, target=target_ip)
                 lla = ICMPv6NDOptDstLLAddr(lladdr=local_mac)
                 ipv6 = IPv6(src=local_ip, dst=dst_mac if dst_mac != "ff:ff:ff:ff:ff:ff" else "ff02::1", hlim=255)
                 pkt = eth / ipv6 / na / lla
+                # VLAN 802.1Q tag when vlan_id is set and not VXLAN
+                if vlan_id and not self._vxlan_enabled:
+                    try:
+                        pkt = Ether(dst=dst_mac, src=local_mac) / Dot1Q(vlan=int(vlan_id)) / ipv6 / na / lla
+                    except Exception:
+                        pass
+                elif vlan_id and self._vxlan_enabled:
+                    try:
+                        from scapy.all import VXLAN, IP, UDP
+                        inner_pkt = eth / ipv6 / na / lla
+                        pkt = Ether(dst=dst_mac, src=local_mac) / IP(dst=dst_mac, src=local_ip) / UDP(sport=4789, dport=4789) / VXLAN(vni=int(vlan_id)) / inner_pkt
+                    except Exception:
+                        pass
                 for _ in range(count):
                     sendp(pkt, iface=self._interface_name or "", verbose=False)
                     if inter > 0:
@@ -1341,24 +1418,30 @@ class NDPProtection:
     async def protect_ndp_entry(self) -> bool:
         success = True
         for iface in self.interfaces:
-            for gw_ip, gw_mac in iface.gateways:
+            for gw_ip, gw_mac, vlan_id in iface.gateways:
                 if not gw_ip or not gw_mac:
                     continue
-                ok = await self._protect_entry(iface.name, gw_ip, gw_mac)
+                ok = await self._protect_entry(iface.name, gw_ip, gw_mac, vlan_id)
                 if not ok:
                     success = False
-        for ip, mac in self._manual_gateways:
+        for gw in self._manual_gateways:
+            ip = gw[0]
+            mac = gw[1]
+            vlan_id = gw[2] if len(gw) > 2 else ""
             if ip and mac:
-                ok = await self._protect_entry("", ip, mac)
+                ok = await self._protect_entry("", ip, mac, vlan_id)
                 if not ok:
                     success = False
         return success
 
-    async def _protect_entry(self, iface: str, gw: str, mac: str) -> bool:
+    async def _protect_entry(self, iface: str, gw: str, mac: str, vlan_id: str = "") -> bool:
         if sys.platform == "win32":
             try:
                 mac_fmt = mac.replace(":", "-").upper()
+                # VLAN 子接口：如果 vlan_id 非空且非 vxlan，附加 .{vlan} 到接口名
                 iface_name = iface or "以太网"
+                if vlan_id and not self._vxlan_enabled:
+                    iface_name = f"{iface_name}.{vlan_id}"
                 proc = await asyncio.create_subprocess_exec(
                     "netsh", "interface", "ipv6", "set", "neighbors",
                     f"name={iface_name}", f"address={gw}", f"neighbor={mac_fmt}",
@@ -1366,93 +1449,26 @@ class NDPProtection:
                 )
                 await asyncio.wait_for(proc.wait(), timeout=10)
                 if proc.returncode == 0:
-                    logger.info("NDP 防护: 静态 NDP %s -> %s (%s)", gw, mac, iface)
+                    iface_log = iface_name if vlan_id else iface
+                    logger.info("NDP 防护: 静态 NDP %s -> %s (%s)", gw, mac, iface_log)
                     return True
                 return False
             except Exception:
                 return False
         else:
             try:
+                dev = iface
+                if vlan_id and not self._vxlan_enabled:
+                    dev = f"{iface}.{vlan_id}"
                 proc = await asyncio.create_subprocess_exec(
                     "ip", "-6", "neigh", "replace", gw, "lladdr", mac,
-                    "dev", iface, "nud", "permanent",
+                    "dev", dev, "nud", "permanent",
                     stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
                 )
                 await asyncio.wait_for(proc.wait(), timeout=5)
                 return proc.returncode == 0
             except Exception:
                 return False
-
-    async def refresh_router_ndp(self, abort_check=None) -> bool:
-        if not self.enabled or not self.gateway_pairs:
-            return False
-        self._last_fix_time = time.monotonic()
-        logger.info("NDP 防护: 修复 NDP (接口=%d, 网关=%d)...",
-                    len(self.interfaces), len(self.gateway_pairs))
-        t1_task = asyncio.create_task(self.check_ndp_poisoning())
-        t7_task = asyncio.create_task(self._ndp_flood_detect())
-        sniff_task = asyncio.create_task(self._sniff_all()) if self._scapy_available else None
-        await asyncio.wait_for(t1_task, timeout=10)
-        na_task = asyncio.create_task(self.send_unsolicited_na())
-        rs_task = asyncio.create_task(self._send_rs())
-        if sniff_task:
-            await asyncio.wait_for(sniff_task, timeout=8)
-        await t7_task
-        await asyncio.gather(na_task, rs_task, return_exceptions=True)
-        await asyncio.sleep(0.2)
-        if abort_check:
-            try:
-                if abort_check():
-                    return True
-            except Exception:
-                pass
-        all_ok = True
-        for gw_ip, _ in self.gateway_pairs[:3]:
-            if gw_ip and not await self._ping_ipv6(gw_ip):
-                all_ok = False
-                break
-        if not all_ok:
-            logger.warning("NDP 防护: 修复后网关不可达")
-            return False
-        await self.protect_ndp_entry()
-        logger.info("NDP 防护: 修复完成")
-        asyncio.create_task(self._na_sustain(duration=3))
-        return True
-
-    async def _na_sustain(self, duration: int = 3):
-        if not self._scapy_available:
-            return
-        logger.debug("NDP 防护: 持续 NA 对抗 %ds...", duration)
-        end = time.monotonic() + duration
-        while self._ndp_running and time.monotonic() < end:
-            all_ok = True
-            for gw_ip, _ in self.gateway_pairs[:3]:
-                if gw_ip and not await self._ping_ipv6(gw_ip):
-                    all_ok = False
-                    break
-            if not all_ok:
-                logger.warning("NDP 防护: 持续 NA 对抗中发现网关不可达，重发 NA")
-                await self.send_unsolicited_na()
-            await asyncio.sleep(1.0)
-        logger.debug("NDP 防护: 持续 NA 对抗结束")
-
-    async def _ping_ipv6(self, target: str) -> bool:
-        if sys.platform == "win32":
-            proc = await asyncio.create_subprocess_exec(
-                "ping", "-6", "-n", "1", "-w", str(int(self._ping_interval * 1000)),
-                target, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-            )
-        else:
-            proc = await asyncio.create_subprocess_exec(
-                "ping6", "-c", "1", "-W", str(self._ping_interval), target,
-                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-            )
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=max(self._ping_interval + 2, 5))
-            return proc.returncode == 0
-        except Exception:
-            return False
-
     @property
     def stats(self) -> dict:
         return {

@@ -215,12 +215,15 @@ network_monitor:
   arp_protection:
     enabled: true                  # ARP 防护总开关
     # 手动指定网关（自动探测的高优先级替代）
-    # 格式: "网关IP,网关MAC" (英文逗号隔开), 留空则自动探测
-    # 多组: "IP1,MAC1,IP2,MAC2" (交替逗号隔开), 适配多网关场景
-    # 例如: "192.168.1.1,00-11-22-33-44-55"
-    #       多组: "192.168.1.1,00-11-22-33-44-55,10.0.0.1,aa-bb-cc-dd-ee-ff"
-    #       或者: "192.168.1.1,"
+    # 格式: "网关IP,网关MAC,VLAN_ID" (英文逗号隔开), 留空则自动探测
+    # VLAN_ID 默认为空（无 VLAN/VXLAN）；vxlan_enabled=true 时解释为 VXLAN VNI
+    # 多组: "IP1,MAC1,VLAN1,IP2,MAC2,VLAN2" (交替逗号隔开), 适配多网关场景
+    # 例如: "192.168.1.1,00-11-22-33-44-55,12"    IP+MAC+VLAN 12
+    #       "192.168.1.1,00-11-22-33-44-55,"       IP+MAC, 无 VLAN
+    #       "192.168.1.1,,"                        仅 IP, MAC/VLAN 自动
+    #       多组: "192.168.1.1,aa-bb,10,10.0.0.1,cc-dd,20"
     # 注意: 只填 IP 不填 MAC, 自动探测 MAC; 都留空则完全自动探测
+    vxlan_enabled: false           # false=VLAN(802.1Q), true=VXLAN(VNI)
     gateway: ''
 
   # ============================================================
@@ -244,14 +247,16 @@ network_monitor:
   ndp_protection:
     enabled: true                 # 默认开启，未检测到 IPv6 时自动关闭
     # 手动指定 IPv6 网关（自动探测的高优先级替代）
-    # 格式: "网关IPv6,网关MAC" (英文逗号隔开), 留空则自动探测
+    # 格式: "网关IPv6,网关MAC,VLAN_ID" (英文逗号隔开), 留空则自动探测
+    # VLAN_ID 默认为空（无 VLAN/VXLAN）；vxlan_enabled=true 时解释为 VXLAN VNI
     # IPv6 与 MAC 的区分: MAC 为 6 组 2 位十六进制数 (xx:xx:xx:xx:xx:xx)
     #                      IPv6 含 :: 或超过 2 个冒号
     # 示例:
-    #   "2001:db8::1,00-11-22-33-44-55"         指定 IPv6 + MAC
-    #   "2001:db8::1,"                           指定 IPv6, MAC 自动探测
-    #   ",00-11-22-33-44-55"                     IPv6 自动探测, 校验此 MAC
-    #   "2001:db8::1,,fe80::1,aa-bb-cc-dd-ee-ff" 多组（逗号占位表示 MAC 自动探测）
+    #   "2001:db8::1,00-11-22-33-44-55,100"      指定 IPv6 + MAC + VLAN 100
+    #   "2001:db8::1,00-11-22-33-44-55,"         指定 IPv6 + MAC, 无 VLAN
+    #   "2001:db8::1,,"                           指定 IPv6, MAC/VLAN 自动探测
+    #   "fe80::1,aa-bb,10,2001:db8::1,cc-dd,20"  多组（3 元素交替格式）
+    vxlan_enabled: false           # false=VLAN(802.1Q), true=VXLAN(VNI)
     gateway_ipv6: ''
     # NUD 检测窗口（毫秒），内网 <1ms，默认 80
     # 窗口内追踪对网关的 NS 重传次数，超过 nud_threshold 则触发告警（T5）

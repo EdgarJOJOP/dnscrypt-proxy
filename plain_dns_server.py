@@ -341,3 +341,8 @@ class PlainDNSServer:
         self._transport_v4 = None
         self._transport_v6 = None
         logger.info("普通 DNS 服务器已停止")
+
+    async def restart(self):
+        """重启普通 DNS 服务器（IP 切换后恢复监听）"""
+        await self.stop()
+        await self.start()
