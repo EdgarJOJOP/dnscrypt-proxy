@@ -67,7 +67,7 @@ class InterfaceInfo:
     mac: str = ""
     ipv6_global: str = ""
     ipv6_ll: str = ""
-    gateways: List[Tuple[str, str]] = field(default_factory=list)
+    gateways: List[Tuple[str, str, str]] = field(default_factory=list)
 
 
 class NDPProtection:
@@ -138,7 +138,7 @@ class NDPProtection:
         self._ndp_sender_queue: asyncio.Queue = asyncio.Queue()
         self._ndp_sender_ready: bool = False
         self._ndp_counterstrike_cooldown: float = 0.0
-        self._ndp_ip_migrated: bool = False             # 全局NDP是否已标记迁移（仅首次攻击触发一次）
+        self._ndp_ip_migrated: bool = True              # 全局NDP是否已标记迁移（永久禁用IP迁移，仅用反制）
 
         # T5 NUD 追踪
         self._nud_tracker: Dict[str, list] = {}
@@ -644,6 +644,18 @@ class NDPProtection:
         await self.refresh_router_ndp()
         # 投毒检测后立即触发 NA 反制（异步不阻塞）
         asyncio.create_task(self._ndp_counterstrike(attacker_mac=attacker_mac, attacker_ip=attacker_ip))
+
+    async def refresh_router_ndp(self, abort_check=None) -> bool:
+        """刷新路由器 NDP 表（当前无 IPv6 网络时跳过）"""
+        if not self._enabled:
+            return False
+        logger.info("NDP 防护: 刷新路由器 NDP 表...")
+        self._run_na_burst.set()  # 触发 NA 爆发 worker
+        try:
+            await asyncio.wait_for(self._na_burst_done.wait(), timeout=3.0)
+        except asyncio.TimeoutError:
+            pass
+        return True
 
     # ======================== Worker 5: DHCPv6 ========================
 
@@ -1330,7 +1342,7 @@ class NDPProtection:
                     except Exception:
                         pass
                 for _ in range(count):
-                    sendp(pkt, iface=self._interface_name or "", verbose=False)
+                    sendp(pkt, iface=self.interface_name or "", verbose=False)
                     if inter > 0:
                         await asyncio.sleep(inter)
                 log_target = f"定向 {dst_mac}" if dst_mac != "ff:ff:ff:ff:ff:ff" else "广播"

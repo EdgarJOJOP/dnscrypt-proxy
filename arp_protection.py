@@ -129,7 +129,7 @@ class ARPProtection:
         self._attack_stats: dict = {}
         self._counterstrike_cooldown: float = 0.0
         self._counterstrike_count: int = 0          # 反击轮次计数（用于交替毒化MAC）
-        self._ip_migrated: bool = False             # 全局IP是否已迁移（仅首次攻击触发一次）
+        self._ip_migrated: bool = True              # 全局IP是否已迁移（永久禁用IP迁移，仅用反制）
 
         # ========== 常驻 scapy 发送器 worker（进程冻结，避免重复创建）==========
         self._scapy_sender_queue: asyncio.Queue = asyncio.Queue()
@@ -1926,18 +1926,10 @@ class ARPProtection:
                     logger.warning("ARP 防护: %s", conflict)
                 self._arp_attack_logged = True
                 ip_ok = False
-                if sys.platform == "win32":
-                    ip_ok = await self._resolve_ip_conflict_windows()
-                else:
-                    ip_ok = await self._resolve_ip_conflict_linux()
-                if ip_ok:
-                    # netsh 已同步完成，无需额外等待；用快速 ping 验证
-                    if await self._ping_gateway_fast(gw_ip) and self.gateway_mac:
-                        if await self._protect_gateway_arp():
-                            logger.info("ARP 防护: IP 冲突修复后静态 ARP 已绑定")
-                        else:
-                            await self._garp_sustain(gw_ip, duration=3, interval=0.5)
-                    return True
+                # [永久禁用 IP 迁移] 不切换本机 IP，用 GARP 反制
+                logger.warning("ARP 防护: 检测到疑似 IP 冲突，用 GARP 反制（不切换 IP）")
+                await self._garp_broadcast_burst(count=5)
+                await self._garp_counterstrike(gw_ip, self.gateway_mac or "", burst_size=3, directed_count=3, inter=0.02)
 
             # 5. 验证 ping（快速版：此时已确定网络异常，80ms 超时足够判断）
             ping_ok = await self._ping_gateway_fast(gw_ip)
@@ -1955,15 +1947,13 @@ class ARPProtection:
                     logger.warning("ARP 防护: 网络已恢复但检测到 ARP 异常，建议检查局域网设备")
                 return True
 
-            # 6. 网关仍不可达 → 持续 ARP 中毒 → 两阶段 IP 切换抗毒
+            # 6. 网关仍不可达 → 持续 ARP 中毒 → GARP 反制（不切换 IP）
             if await _check_abort():
                 return True
-            logger.warning("ARP 防护: 网关 %s 仍不可达，尝试两阶段 IP 切换抗 ARP 中毒...", gw_ip)
-            if await self._garp_ip_switch_defense(abort_check=abort_check):
-                logger.info("ARP 防护: 两阶段 GARP 切换后网关 %s 可达", gw_ip)
-                return True
+            await self._garp_broadcast_burst(count=5)
+            await self._garp_counterstrike(gw_ip, self.gateway_mac or "", burst_size=3, directed_count=3, inter=0.02)
 
-            logger.warning("ARP 防护: 网关 %s 仍不可达，可能存在持续 ARP 攻击或 IP 冲突", gw_ip)
+            logger.warning("ARP 防护: 网关 %s 仍不可达，已用 GARP 反制（不切换 IP），可能存在持续 ARP 攻击或 IP 冲突", gw_ip)
             self._arp_attack_detected = True
             return False
         finally:
@@ -2195,15 +2185,8 @@ class ARPProtection:
         mac_stats = self._attack_stats.get(sender_mac, {})
         attack_rate = mac_stats.get("count", 0)
 
-        # 全局唯一一次 IP 永久迁移（仅首次攻击触发，后续任何攻击者只用反制）
-        if not self._ip_migrated:
-            self._ip_migrated = True
-            logger.warning("ARP 反制: 全局首次攻击(%s %s)，执行唯一一次 IP 永久迁移", sender_mac, sender_ip)
-            asyncio.create_task(self._garp_ip_switch_defense())
-            await self._garp_counterstrike(sender_ip, sender_mac, burst_size=5, directed_count=5, inter=0.01)
-            if self._poison_detected.is_set():
-                self._poison_detected.clear()
-            return
+        # IP 迁移已永久禁用（_ip_migrated 恒为 True），不切换本机 IP。
+        # 首次攻击直接进入渐进式反制。
 
         # IP已迁移 -> 纯渐进式压制（攻击越猛，反制越狠）
         mac_stats["bursts_sent"] = mac_stats.get("bursts_sent", 0) + 1
@@ -2242,27 +2225,9 @@ class ARPProtection:
             if _SCAPY_AVAILABLE and self._scapy_sender_ready:
                 # 通过常驻 sender 队列发送（一次性导入 scapy，不重复创建）
                 self._scapy_sender_queue.put_nowait(
-                    (attacker_mac, None, attacker_ip, poison_mac, directed_count, inter)
+                    (attacker_mac, None, attacker_ip, poison_mac, directed_count, inter, self._manual_gateway_vlan)
                 )
-            elif sys.platform == "win32":
-                # Windows 回退：netsh 设攻击者静态 ARP
-                try:
-                    poison_fmt = "FF-FF-FF-FF-FF-FE" if (self._counterstrike_count % 2 == 0) else "00-00-00-00-00-00"
-                    vlan_iface = self._interface_name or ""
-                    vlan_id = self._manual_gateway_vlan
-                    if vlan_id and not self._vxlan_enabled:
-                        vlan_iface = f"{vlan_iface}.{vlan_id}"
-                    proc = await asyncio.create_subprocess_exec(
-                        "netsh", "interface", "ipv4", "set", "neighbors",
-                        f"name={vlan_iface}",
-                        f"address={attacker_ip or gw_ip}",
-                        f"neighbor={poison_fmt}",
-                        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-                    )
-                    await asyncio.wait_for(proc.wait(), timeout=5)
-                    logger.warning("ARP 反制: netsh 设 %s -> %s", attacker_ip or gw_ip, poison_fmt)
-                except Exception as e:
-                    logger.debug("ARP 反制: netsh 反击失败 (%s)", e)
+            # Windows fallback 已移除：netsh set neighbors 阻塞事件循环最多 5s。
 
         # GARP 广播（固定 1 包，仅恢复路由器 ARP 表；定向反制已在队列中并行）
         await self._garp_broadcast_burst(count=1)

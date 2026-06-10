@@ -1,4 +1,4 @@
-"""
+﻿"""
 DNS 缓存模块
 - LRU 淘汰策略
 - 可配置 TTL
@@ -21,8 +21,6 @@ import dns.message
 import dns.name
 import dns.rdatatype
 import dns.rrset
-import dns.name
-import dns.rdatatype
 
 logger = logging.getLogger("dns-proxy.cache")
 

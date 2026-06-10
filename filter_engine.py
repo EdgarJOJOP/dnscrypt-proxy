@@ -1,4 +1,4 @@
-"""
+﻿"""
 域名过滤引擎 - 支持 AdGuard Home 规则语法
 拦截匹配规则的域名 DNS 请求
 
@@ -1384,7 +1384,8 @@ class FilterEngine:
                 # priority 条目永不淘汰
                 if len(v) >= 4 and v[3]:
                     # 移到末尾再试下一个
-                    self._filter_cache.move_to_end(k)
+                    val = self._filter_cache.pop(k)
+                    self._filter_cache[k] = val
                     continue
                 del self._filter_cache[k]
                 removed += 1
@@ -1410,7 +1411,7 @@ class FilterEngine:
             if len(v) >= 4 and v[3]
         ]
         # 保留未过期的非 priority 条目
-        now = __import__('time').monotonic()
+        now = time.monotonic()
         timeout = self._filter_cache_timeout
         active_items = [
             (k, v) for k, v in self._filter_cache.items()
@@ -1425,7 +1426,6 @@ class FilterEngine:
             self._filter_cache[k] = v
         for k, v in active_items:
             self._filter_cache[k] = v
-        logger = __import__('logging').getLogger("dns-proxy.filter")
         logger.debug("Filter cache 撤离重建: %d -> %d (priority=%d, active=%d)",
                      old_count, len(self._filter_cache), len(priority_items), len(active_items))
 

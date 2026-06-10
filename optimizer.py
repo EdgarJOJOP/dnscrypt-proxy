@@ -1,4 +1,4 @@
-"""
+﻿"""
 
 资源优化器
 
@@ -336,17 +336,6 @@ class ResourceOptimizer:
 
                 await asyncio.sleep(10)
 
-            except asyncio.CancelledError:
-
-                break
-
-            except Exception as e:
-
-                logger.error("资源监控异常: %s", e, exc_info=True)
-
-                await asyncio.sleep(10)
-
-
     async def _check_resources(self) -> Optional[float]:
         """检查并优化资源使用，返回当前 RSS MB"""
         if not HAS_PSUTIL or self._process is None:
@@ -424,23 +413,19 @@ class ResourceOptimizer:
 
 
 
-        # 2. 清除过滤结果缓存（跳过 priority 自定义 hosts 条目）
-
-        await self._compact_filter_cache_global()
-
-        # 2a. filter cache 撤离重建（条目 > 10000 时执行）
+        # 2. 过滤缓存清理+撤离重建（大量条目时全量重建，少量时仅清理过期）
         try:
             import sys as _sys
             app = getattr(_sys.modules.get("main"), "app", None)
             if app and hasattr(app, "filter_engine"):
                 fe = app.filter_engine
-                if (hasattr(fe, "_filter_cache") and len(fe._filter_cache) > 10000 and hasattr(fe, "rebuild_filter_cache")):
-                    fe.rebuild_filter_cache()
-                    logger.debug("Filter cache 撤离重建完成")
+                if hasattr(fe, "_filter_cache") and len(fe._filter_cache) > 0:
+                    if len(fe._filter_cache) > self.config.cache_max_size and hasattr(fe, "rebuild_filter_cache"):
+                        fe.rebuild_filter_cache()
+                    else:
+                        await self._compact_filter_cache_global()
         except Exception:
             pass
-
-        # 2b. 淘汰冷查询模板缓存
         try:
             from cache import evict_cold_query_templates
             evict_cold_query_templates()
@@ -552,10 +537,16 @@ class ResourceOptimizer:
 
 
 
-        # 3. 强制清除过滤缓存（保留 priority）
-
-        await self._compact_filter_cache_global()
-
+        # 3. 全量重建过滤缓存（释放旧 arena）
+        try:
+            import sys as _sys
+            app = getattr(_sys.modules.get("main"), "app", None)
+            if app and hasattr(app, "filter_engine"):
+                fe = app.filter_engine
+                if hasattr(fe, "_filter_cache") and hasattr(fe, "rebuild_filter_cache"):
+                    fe.rebuild_filter_cache()
+        except Exception:
+            pass
 
 
         # 4. 多次 GC + CRT 堆压缩
@@ -591,8 +582,6 @@ class ResourceOptimizer:
         if self.config.aggressive_gc:
 
             gc.collect()
-
-    @staticmethod
 
     @staticmethod
 
@@ -661,57 +650,14 @@ class ResourceOptimizer:
         """大量清理过滤缓存，保留 priority 条目（自定义 hosts）"""
 
         try:
-
             import sys as _sys
-
             app = getattr(_sys.modules.get('main'), 'app', None)
-
             if app and hasattr(app, 'filter_engine'):
-
                 fe = app.filter_engine
-
-                cache = getattr(fe, '_filter_cache', None)
-
-                if cache is not None:
-
-                    import time as _time
-
-                    now = _time.monotonic()
-
-                    timeout = getattr(fe, '_filter_cache_timeout', 5.0)
-
-                    expired = []
-
-                    for k, v in list(cache.items()):
-
-                        if len(v) >= 4 and v[3]:
-
-                            continue  # priority 条目，保留
-
-                        ts = v[2] if len(v) >= 3 else 0
-
-                        if now - ts > timeout:
-
-                            expired.append(k)
-
-                    for k in expired:
-
-                        try:
-
-                            del cache[k]
-
-                        except KeyError:
-
-                            pass
-
-                    if expired:
-
-                        logger.debug("过滤缓存清理: 移除了 %d 个过期非 priority 条目", len(expired))
-
+                if hasattr(fe, '_filter_cache') and hasattr(fe, 'rebuild_filter_cache'):
+                    fe.rebuild_filter_cache()
         except Exception:
-
             pass
-
 
     async def _gc_loop(self):
 
