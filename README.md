@@ -69,6 +69,10 @@ win记得安装360杀毒(https://sd.360.cn/ )比360安全管家管用。
       示例：
       
       `openssl s_client -connect dns.alidns.com:443 -servername dns.alidns.com </dev/null | openssl x509 -outform PEM > alidns-cert.pem`
+      
+## 4.config.yaml支持与划分vlan或vxlan的上层交换机或路由进行通信和修复：
+
+    设置在config.yaml下的arp_protection和ndp_protection配置项中，不支持自动嗅探vlan和vxlan(当然运行软件的机子上设置了vlan或vxlan后再配置文件中设置vlan或vxlan，是让软件与上层交换机或路由进行正常通信或存在的内网通信问题会自动修复)。
  
 # 1. 安装库
 
