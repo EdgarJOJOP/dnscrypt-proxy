@@ -3016,16 +3016,134 @@ class ARPProtection:
             timeout_ms: ping 内部超时（毫秒）
             use_tcp_fallback: 是否在 ICMP 失败时尝试 TCP 兜底
         """
+        result = await ARPProtection._ping_icmp_detailed(ip, timeout_ms,
+                                                          use_tcp_fallback=use_tcp_fallback)
+        return result["reachable"]
+
+    @staticmethod
+    async def _ping_icmp_detailed(ip: str, timeout_ms: int,
+                                   use_tcp_fallback: bool = True,
+                                   gateway_ip: str = None) -> dict:
+        """
+        底层 ICMP 详细探测 — 返回结构化结果而非仅 bool。
+
+        Args:
+            ip: 目标 IP
+            timeout_ms: ping 内部超时（毫秒）
+            use_tcp_fallback: 是否在 ICMP 失败时尝试 TCP 兜底
+            gateway_ip: 本机网关 IP，用于判断 ICMP 回复是否来自网关
+
+        Returns:
+            {"reachable": bool, "icmp_type": int|None, "icmp_code": int|None,
+             "from_ip": str|None, "saw_reply": bool,
+             "gateway_unreachable": bool, "diagnosis": str}
+            - reachable: True 仅当收到来自目标的有效 Echo Reply
+            - icmp_type / icmp_code / from_ip: 从 ICMP 响应解析
+            - saw_reply: 是否收到任何 ICMP 响应（vs. 超时无响应）
+            - gateway_unreachable: 是否来自网关的 Destination Unreachable
+            - diagnosis: "destination_unreachable" | "timeout" | "echo_reply" | "tcp_ok" | "tcp_fail"
+        """
         if sys.platform == "win32":
-            ok = await ARPProtection._ping_icmp_windows(ip, timeout_ms)
+            result = await ARPProtection._ping_icmp_windows_detailed(ip, timeout_ms)
         else:
-            ok = await ARPProtection._ping_icmp_linux(ip, timeout_ms)
-        if ok:
-            return True
+            result = await ARPProtection._ping_icmp_linux_detailed(ip, timeout_ms)
+
+        # 分析诊断结果
+        if result.get("reachable"):
+            result["diagnosis"] = "echo_reply"
+            result["gateway_unreachable"] = False
+            return result
+
+        # 检查是否为来自网关的 Destination Unreachable
+        from_ip = result.get("from_ip")
+        icmp_type = result.get("icmp_type")
+        icmp_code = result.get("icmp_code") if result.get("icmp_code") is not None else -1
+        gw_unreach = (icmp_type == 3 and icmp_code in (0, 1)
+                      and from_ip is not None
+                      and (gateway_ip is None or from_ip == gateway_ip))
+
+        if gw_unreach:
+            result["diagnosis"] = "destination_unreachable"
+            result["gateway_unreachable"] = True
+            return result
+
+        if result.get("saw_reply"):
+            # 收到了 ICMP 响应但不是有效的 Echo Reply
+            result["reachable"] = False
+            result["diagnosis"] = f"icmp_type_{icmp_type}"
+            result["gateway_unreachable"] = False
+            return result
+
+        # 超时 — 尝试 TCP 兜底
+        result["gateway_unreachable"] = False
         if not use_tcp_fallback:
-            return False
-        # ICMP 失败 → TCP 兜底：尝试连接常见端口
-        return await ARPProtection._ping_tcp(ip, timeout_ms=3000)
+            result["diagnosis"] = "timeout"
+            return result
+
+        tcp_ok = await ARPProtection._ping_tcp(ip, timeout_ms=3000)
+        if tcp_ok:
+            result["reachable"] = True
+            result["diagnosis"] = "tcp_ok"
+        else:
+            result["diagnosis"] = "tcp_fail"
+        # TCP 兜底不改 ICMP 详情
+        return result
+
+    @staticmethod
+    def _is_destination_unreachable(result: dict, unreachable_codes: list = None) -> bool:
+        """
+        判断 ICMP 详细探测结果是否为来自网关的 Destination Unreachable。
+
+        Args:
+            result: _ping_icmp_detailed 的返回字典
+            unreachable_codes: 哪些 code 算断网（默认 [0, 1]）
+        Returns:
+            True 当 type=3 且 code 在列表中且 from_ip 是网关
+        """
+        if unreachable_codes is None:
+            unreachable_codes = [0, 1]
+        icmp_code = result.get("icmp_code")
+        return (result.get("icmp_type") == 3
+                and icmp_code is not None
+                and icmp_code in unreachable_codes
+                and result.get("from_ip") is not None
+                and result.get("gateway_unreachable", False))
+
+    @staticmethod
+    async def probe_wan_unreachable(target_ip: str, gateway_ip: str = None,
+                                     timeout_ms: int = 3000) -> dict:
+        """
+        对外网目标发送 ICMP，检测是否收到来自网关的 Destination Unreachable。
+
+        这是 WAN 断连检测的核心方法：当光猫运行但光纤断开时，
+        光猫（网关）会对外网目标回复 ICMP type=3 Destination Unreachable。
+
+        Args:
+            target_ip: 外网探测目标 IP
+            gateway_ip: 本机网关 IP（用于判断回复来源）
+            timeout_ms: 探测超时（毫秒）
+
+        Returns:
+            {"wan_dead": bool, "unreachable_code": int|None,
+             "from_ip": str|None, "timeout": bool, "detail": dict}
+            - wan_dead: True 确认 WAN 断连（收到来自网关的 Dest Unreachable）
+            - unreachable_code: ICMP code (0=Network, 1=Host)
+            - from_ip: 回复来源 IP
+            - timeout: 是否超时（可能被防火墙丢弃，不判定）
+        """
+        result = await ARPProtection._ping_icmp_detailed(
+            target_ip, timeout_ms=timeout_ms,
+            use_tcp_fallback=False, gateway_ip=gateway_ip)
+
+        is_unreachable = ARPProtection._is_destination_unreachable(result, [0, 1])
+        icmp_code = result.get("icmp_code")
+        return {
+            "wan_dead": is_unreachable,
+            "unreachable_code": int(icmp_code) if icmp_code is not None else None,
+            "from_ip": result.get("from_ip"),
+            "timeout": result.get("diagnosis") == "timeout",
+            "detail": result,
+        }
 
     @staticmethod
     async def _ping_tcp(ip: str, timeout_ms: int = 3000) -> bool:
@@ -3079,17 +3197,69 @@ class ARPProtection:
     @staticmethod
     async def _ping_icmp_windows(ip: str, timeout_ms: int) -> bool:
         """Windows ICMP Echo：跑 ping.exe，带超时安全包装"""
+        result = await ARPProtection._ping_icmp_windows_detailed(ip, timeout_ms)
+        return result["reachable"]
+
+    @staticmethod
+    async def _ping_icmp_windows_detailed(ip: str, timeout_ms: int) -> dict:
+        """
+        Windows ICMP 详细探测 — 解析 ping.exe 输出提取 Dest Unreachable。
+
+        Returns:
+            {"reachable": bool, "icmp_type": int|None, "icmp_code": int|None,
+             "from_ip": str|None, "saw_reply": bool, "stdout_lines": list}
+        """
         try:
             proc = await asyncio.create_subprocess_exec(
                 "ping", "-n", "1", "-w", str(timeout_ms), ip,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
             )
-            # 总超时 = ping 内部超时 + 5s 余量，防止 ping.exe 异常挂起
-            await asyncio.wait_for(proc.wait(), timeout=(timeout_ms / 1000) + 5)
-            return proc.returncode == 0
+            stdout_bytes, _ = await asyncio.wait_for(
+                proc.communicate(), timeout=(timeout_ms / 1000) + 5)
+            stdout_text = stdout_bytes.decode("utf-8", errors="replace")
+            lines = stdout_text.splitlines()
+
+            # ping.exe exit code: 0=success, 1=unreachable/timeout
+            reachable = (proc.returncode == 0)
+
+            # 解析 Dest Unreachable 关键词
+            from_ip = None
+            icmp_type = None
+            icmp_code = None
+            saw_reply = False
+
+            for line in lines:
+                # 匹配 "Reply from X.X.X.X: Destination net unreachable" 等
+                # 或者 "来自 X.X.X.X 的回复: 无法访问目标主机"
+                if "unreachable" in line.lower() or "无法访问" in line or "目标不可达" in line:
+                    icmp_type = 3  # Destination Unreachable
+                    if "net" in line.lower() or "network" in line.lower():
+                        icmp_code = 0  # Network Unreachable
+                    elif "host" in line.lower():
+                        icmp_code = 1  # Host Unreachable
+                    else:
+                        icmp_code = 1  # 默认 Host Unreachable
+                    saw_reply = True
+                    # 尝试提取来源 IP（模块级已 import re）
+                    m = re.search(r'(\d+\.\d+\.\d+\.\d+)', line)
+                    if m:
+                        from_ip = m.group(1)
+                elif "Reply from" in line or "来自" in line:
+                    saw_reply = True
+                    if reachable:
+                        icmp_type = 0  # Echo Reply
+                        icmp_code = 0
+                    m = re.search(r'(\d+\.\d+\.\d+\.\d+)', line)
+                    if m:
+                        from_ip = m.group(1)
+
+            return {"reachable": reachable, "icmp_type": icmp_type, "icmp_code": icmp_code,
+                    "from_ip": from_ip, "saw_reply": saw_reply, "stdout_lines": lines}
+
         except (asyncio.TimeoutError, FileNotFoundError):
-            return False
+            return {"reachable": False, "icmp_type": None, "icmp_code": None,
+                    "from_ip": None, "saw_reply": False, "stdout_lines": []}
 
     @staticmethod
     def _icmp_checksum(data: bytes) -> int:
@@ -3104,7 +3274,22 @@ class ARPProtection:
     @staticmethod
     async def _ping_icmp_linux(ip: str, timeout_ms: int) -> bool:
         """Linux：使用 raw ICMP 套接字发送 Echo 请求"""
-        # 使用类级别的持久 socket（避免每 ping 创建/销毁）
+        result = await ARPProtection._ping_icmp_linux_detailed(ip, timeout_ms)
+        return result["reachable"]
+
+    @staticmethod
+    async def _ping_icmp_linux_detailed(ip: str, timeout_ms: int) -> dict:
+        """
+        Linux ICMP 详细探测 — 解析 ICMP 响应的 type/code/source IP。
+
+        Returns:
+            {"reachable": bool, "icmp_type": int|None, "icmp_code": int|None,
+             "from_ip": str|None, "saw_reply": bool}
+            - reachable: True 仅当收到来自目标 IP 的 Echo Reply (type=0)
+            - icmp_type / icmp_code: 收到的 ICMP 响应的 type/code（无论来自谁）
+            - from_ip: 发回 ICMP 响应的设备 IP（网关在光纤断开时会回复）
+            - saw_reply: 是否收到了任何 ICMP 响应（用于区分超时 vs 被回复）
+        """
         cls = ARPProtection
         try:
             if cls._icmp_sock is None:
@@ -3112,7 +3297,6 @@ class ARPProtection:
                                                socket.IPPROTO_ICMP)
                 cls._icmp_sock.setblocking(False)
             sock = cls._icmp_sock
-            sock.settimeout(timeout_ms / 1000.0)
 
             pid = os.getpid() & 0xFFFF
             data = struct.pack('!d', asyncio.get_event_loop().time()) + b'\x00' * 24
@@ -3125,18 +3309,41 @@ class ARPProtection:
             pkt = header + data
 
             sock.sendto(pkt, (ip, 0))
-            # 等回复（非阻塞模式，用 select 或 settimeout 处理）
+
+            # 等回复
             sock.settimeout(timeout_ms / 1000.0)
             sock.setblocking(True)
-            sock.recvfrom(4096)
-            return True
+            resp, addr = sock.recvfrom(4096)
+            # addr = (source_ip, port) — port is 0 for raw sockets
+
+            # 解析 IP 头 + ICMP 载荷
+            # IP 头最小 20 字节（ihl * 4）
+            ip_ihl = (resp[0] & 0x0F) * 4
+            src_ip = socket.inet_ntoa(resp[12:16])  # 源 IP 在偏移 12-15
+
+            if len(resp) < ip_ihl + 8:
+                # 包太短，无法解析 ICMP 头
+                return {"reachable": False, "icmp_type": None, "icmp_code": None,
+                        "from_ip": src_ip, "saw_reply": True}
+
+            # ICMP 头在 IP 头之后
+            icmp_type = resp[ip_ihl]
+            icmp_code = resp[ip_ihl + 1]
+
+            # type=0 (Echo Reply) 且源 IP == 目标 → 真正的可达
+            reachable = (icmp_type == 0 and src_ip == ip)
+            return {"reachable": reachable, "icmp_type": icmp_type, "icmp_code": icmp_code,
+                    "from_ip": src_ip, "saw_reply": True}
+
         except socket.timeout:
-            return False
+            return {"reachable": False, "icmp_type": None, "icmp_code": None,
+                    "from_ip": None, "saw_reply": False}
         except PermissionError:
             # 没有 raw socket 权限，回退
             pass
         except Exception:
-            return False
+            return {"reachable": False, "icmp_type": None, "icmp_code": None,
+                    "from_ip": None, "saw_reply": False}
         finally:
             # 恢复非阻塞供下次复用
             if cls._icmp_sock is not None:
@@ -3144,6 +3351,7 @@ class ARPProtection:
                     cls._icmp_sock.setblocking(False)
                 except Exception:
                     pass
+
         # 回退：使用 timeout 包装的子进程 ping
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -3152,14 +3360,16 @@ class ARPProtection:
                 stderr=asyncio.subprocess.DEVNULL,
             )
             await asyncio.wait_for(proc.wait(), timeout=(timeout_ms / 1000) + 1)
-            return proc.returncode == 0
+            reachable = (proc.returncode == 0)
+            return {"reachable": reachable, "icmp_type": None, "icmp_code": None,
+                    "from_ip": None, "saw_reply": reachable}
         except (asyncio.TimeoutError, FileNotFoundError, OSError):
             try:
                 proc.kill()
-            except Exception as e:
-                logger.debug("ARP 防护: 终止 ping 进程异常: %s", e)
+            except Exception:
                 pass
-            return False
+            return {"reachable": False, "icmp_type": None, "icmp_code": None,
+                    "from_ip": None, "saw_reply": False}
 
     @staticmethod
     async def _ping_broadcast(broadcast_ip: str) -> bool:

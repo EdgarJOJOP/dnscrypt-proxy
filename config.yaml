@@ -202,6 +202,15 @@ network_monitor:
   failure_threshold: 3
   # 退出降级需要连续成功检测次数
   recovery_check_count: 2
+  # ============================================================
+  # Destination Unreachable 快速断网检测
+  # 当光猫仍在运行但光纤已断开时，光猫会对外网 ping 回复 ICMP
+  # type=3 (Destination Unreachable)。启用此选项后，收到来自网关
+  # 的 Destination Unreachable 立即判定为 WAN 断连，跳过滑动窗口等待。
+  # ============================================================
+  detect_destination_unreachable: true
+  # 认为是断网的 ICMP 不可达代码（0=Network Unreachable, 1=Host Unreachable）
+  unreachable_codes: [0, 1]
 
   # ============================================================
   # ARP 防护（检测并修复因 ARP 投毒/IP 冲突导致的网络中断）

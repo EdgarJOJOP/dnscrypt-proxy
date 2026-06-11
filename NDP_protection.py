@@ -279,16 +279,111 @@ class NDPProtection:
 
     async def _ping_ipv6(self, target: str) -> bool:
         """Ping an IPv6 target using system ping -6."""
+        result = await self._ping_ipv6_detailed(target)
+        return result["reachable"]
+
+    async def _ping_ipv6_detailed(self, target: str, timeout_sec: int = 3) -> dict:
+        """
+        IPv6 ICMP 详细探测 — 解析 ping -6 输出提取 ICMPv6 信息。
+
+        IPv6 ICMPv6 Destination Unreachable 是 type=1：
+          code=0 (No Route to Destination)
+          code=3 (Address Unreachable)
+
+        当光猫仍在运行但光纤断开时，光猫会对 IPv6 外网 ping 回复
+        ICMPv6 type=1 (Destination Unreachable)。
+
+        Returns:
+            {"reachable": bool, "icmp_type": int|None, "icmp_code": int|None,
+             "from_ip": str|None, "saw_reply": bool}
+        """
         try:
             proc = await asyncio.create_subprocess_exec(
-                "ping", "-6", "-n", "1", "-w", "1000", target,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
+                "ping", "-6", "-n", "1", "-w", str(int(timeout_sec * 1000)), target,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-            await asyncio.wait_for(proc.wait(), timeout=5)
-            return proc.returncode == 0
-        except Exception:
-            return False
+            stdout_bytes, _ = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout_sec + 2)
+            stdout_text = stdout_bytes.decode("utf-8", errors="replace")
+            lines = stdout_text.splitlines()
+
+            reachable = (proc.returncode == 0)
+            icmp_type = None
+            icmp_code = None
+            from_ip = None
+            saw_reply = False
+
+            for line in lines:
+                # Windows ping -6 output patterns
+                # "来自 2001:db8::1 的回复: 无法访问目标主机"
+                # "Reply from 2001:db8::1: Destination net unreachable"
+                if "unreachable" in line.lower() or "无法访问" in line or "目标不可达" in line:
+                    icmp_type = 1  # ICMPv6 Destination Unreachable
+                    if "net" in line.lower() or "network" in line.lower() or "路由" in line:
+                        icmp_code = 0  # No Route
+                    elif "host" in line.lower() or "主机" in line:
+                        icmp_code = 3  # Address Unreachable
+                    else:
+                        icmp_code = 0
+                    saw_reply = True
+                    # Extract source IP (IPv6)
+                    m = re.search(r'([0-9a-fA-F:]+(?::[0-9a-fA-F:]+)*)', line)
+                    if m:
+                        from_ip = m.group(1)
+                elif "Reply from" in line or "来自" in line:
+                    saw_reply = True
+                    if reachable:
+                        icmp_type = 129  # ICMPv6 Echo Reply
+                        icmp_code = 0
+                    m = re.search(r'([0-9a-fA-F:]+(?::[0-9a-fA-F:]+)*)', line)
+                    if m:
+                        from_ip = m.group(1)
+
+            return {"reachable": reachable, "icmp_type": icmp_type, "icmp_code": icmp_code,
+                    "from_ip": from_ip, "saw_reply": saw_reply}
+
+        except (asyncio.TimeoutError, FileNotFoundError, OSError):
+            return {"reachable": False, "icmp_type": None, "icmp_code": None,
+                    "from_ip": None, "saw_reply": False}
+
+    async def probe_wan_unreachable_v6(self, target_ip: str,
+                                         timeout_sec: int = 3,
+                                         gateway_ipv6: str = None) -> dict:
+        """
+        IPv6 WAN 断连探测：对外网 IPv6 目标发 ping -6，检测是否收到
+        来自网关的 ICMPv6 Destination Unreachable (type=1, code=0/3)。
+
+        当光猫运行但光纤断开时，光猫会对 IPv6 外网目标回复
+        ICMPv6 type=1 (Destination Unreachable)。
+
+        Args:
+            target_ip: IPv6 外网探测目标
+            timeout_sec: 探测超时（秒）
+            gateway_ipv6: 本机网关 IPv6，用于判断回复来源
+
+        Returns:
+            {"wan_dead": bool, "unreachable_code": int|None,
+             "from_ip": str|None, "timeout": bool, "detail": dict}
+        """
+        result = await self._ping_ipv6_detailed(target_ip, timeout_sec=timeout_sec)
+
+        from_ip = result.get("from_ip")
+        icmp_type = result.get("icmp_type")
+        icmp_code = result.get("icmp_code") if result.get("icmp_code") is not None else -1
+
+        # ICMPv6 Destination Unreachable is type=1, code=0 (No Route) or code=3 (Address Unreachable)
+        is_v6_unreach = (icmp_type == 1 and icmp_code in (0, 3)
+                         and from_ip is not None
+                         and (gateway_ipv6 is None or from_ip == gateway_ipv6))
+
+        return {
+            "wan_dead": is_v6_unreach,
+            "unreachable_code": int(icmp_code) if icmp_code is not None else None,
+            "from_ip": from_ip,
+            "timeout": not result.get("saw_reply", False),
+            "detail": result,
+        }
 
     async def start(self):
         if not self._enabled:
