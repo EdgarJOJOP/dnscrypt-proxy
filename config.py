@@ -242,7 +242,7 @@ class Config:
         return self._data.get("performance", {}).get("max_concurrent_per_ip", 50)
     @property
     def memory_limit_mb(self) -> int:
-        return self._data.get("performance", {}).get("memory_limit_mb", 256)
+        return self._data.get("performance", {}).get("memory_limit_mb", 768)
     @property
     def cpu_core_limit(self) -> int:
         return self._data.get("performance", {}).get("cpu_core_limit", 0)

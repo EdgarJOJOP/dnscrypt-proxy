@@ -221,8 +221,9 @@ class ARPProtection:
             asyncio.create_task(self._conflict_worker_loop()),
             asyncio.create_task(self._arp_sniffer_worker_loop()),
             asyncio.create_task(self._scapy_sender_worker_loop()),
+            asyncio.create_task(self._static_arp_monitor_loop()),
         ]
-        logger.debug("ARP 防护: 6 个常驻 worker(含嗅探+scapy发送器)已启动")
+        logger.debug("ARP 防护: 7 个常驻 worker(含嗅探+scapy发送器)已启动")
 
     async def _stop_workers(self):
         """停止所有常驻 worker"""
@@ -330,6 +331,28 @@ class ARPProtection:
                 except Exception as e:
                     logger.debug("ARP 防护: 冲突检测 worker 异常: %s", e)
 
+    async def _static_arp_monitor_loop(self):
+        """Worker 7: 每 60 秒检测静态 ARP 绑定是否被篡改，若被篡改则重新绑定"""
+        while self._arp_running:
+            await asyncio.sleep(60)
+            if not self._arp_running:
+                return
+            gw_ip = self.gateway_ip
+            gw_mac = self.gateway_mac
+            if not gw_ip or not gw_mac:
+                continue
+            try:
+                if sys.platform == "win32":
+                    current_mac = await self._arp_get_mac_windows(gw_ip)
+                else:
+                    current_mac = await self._arp_get_mac_linux(gw_ip)
+                if current_mac and self._mac_normalize(current_mac) != self._mac_normalize(gw_mac):
+                    logger.warning("ARP 防护: 静态 ARP 绑定被篡改！%s → %s（预期 %s），重新绑定...",
+                                   gw_ip, current_mac, gw_mac)
+                    await self._protect_gateway_arp()
+            except Exception as e:
+                logger.debug("ARP 防护: 静态 ARP 监控异常: %s", e)
+
     async def _check_arp_packet(self, sender_ip: str, sender_mac: str,
                                   target_ip: str, target_mac: str,
                                   opcode: int) -> str:
@@ -399,23 +422,23 @@ class ARPProtection:
         reason = ""
 
         # ① Sender = 网关 IP × MAC 不匹配（ARP 投毒/网关冒充）
-        if sender_ip in gw_ips and self._baseline_mac and sender_mac != self._baseline_mac:
+        if sender_ip in gw_ips and self._baseline_mac and self._mac_normalize(sender_mac) != self._mac_normalize(self._baseline_mac):
             poisoned = True
             reason = f"ARP 投毒！网关 {sender_ip} → 期望 {self._baseline_mac} ≠ 实际 {sender_mac}"
 
         # ② Sender = 本机 IP × MAC 不匹配（IP 冲突）
-        elif sender_ip in self._local_ips and sender_mac != local_mac:
+        elif sender_ip in self._local_ips and self._mac_normalize(sender_mac) != self._mac_normalize(local_mac):
             poisoned = True
             reason = f"IP 冲突！本机 {sender_ip} 的 MAC 被篡改为 {sender_mac}"
 
         # ③ Target = 网关 IP × MAC 不匹配（中间人回复劫持）
-        elif target_ip == gw_ip and self._baseline_mac and target_mac and target_mac != self._baseline_mac:
+        elif target_ip == gw_ip and self._baseline_mac and target_mac and self._mac_normalize(target_mac) != self._mac_normalize(self._baseline_mac):
             poisoned = True
             reason = f"MITM 劫持！回复目标 {target_ip} → 期望 MAC {self._baseline_mac} ≠ 实际 {target_mac}"
 
         # ④ GARP 宣告伪造（Opcode=2 且 Sender=Target=网关, MAC 不对）
         elif is_garp and opcode == 2 and sender_ip in gw_ips and self._baseline_mac and \
-                sender_mac != self._baseline_mac:
+                self._mac_normalize(sender_mac) != self._mac_normalize(self._baseline_mac):
             poisoned = True
             reason = f"GARP 投毒！{sender_ip} 宣告 MAC={sender_mac}，期望 {self._baseline_mac}"
 
@@ -1192,6 +1215,13 @@ class ARPProtection:
             return None
 
     @staticmethod
+    def _mac_normalize(mac: str) -> str:
+        """去掉 MAC 中所有分隔符（:-. ）后统一大写，用于可靠比较不同来源的 MAC"""
+        if not mac:
+            return ""
+        return re.sub(r'[:-]', '', mac).upper()
+
+    @staticmethod
     async def _arp_get_mac_linux(ip: str) -> Optional[str]:
         """Linux: 通过 ip neigh 获取指定 IP 的 MAC 地址"""
         try:
@@ -1774,7 +1804,7 @@ class ARPProtection:
                 actual_mac = await self._arp_get_mac_windows(gw_ip)
             else:
                 actual_mac = await self._arp_get_mac_linux(gw_ip)
-            if actual_mac and actual_mac.upper() != expected_mac.upper():
+            if actual_mac and self._mac_normalize(actual_mac) != self._mac_normalize(expected_mac):
                 poisoned.append((gw_ip, expected_mac, actual_mac))
                 self._arp_attack_logged = True
         return poisoned
@@ -1823,8 +1853,7 @@ class ARPProtection:
             return False
 
         try:
-
-        # 0. ARP 投毒检测：检查本机 ARP 表中各网关 MAC 是否被篡改
+            # 0. ARP 投毒检测：检查本机 ARP 表中各网关 MAC 是否被篡改
             poisoned = await self._check_arp_poisoning()
             if poisoned:
                 for gw_ip_poisoned, expected, actual in poisoned:
@@ -1925,11 +1954,10 @@ class ARPProtection:
                 else:
                     logger.warning("ARP 防护: %s", conflict)
                 self._arp_attack_logged = True
-                ip_ok = False
                 # [永久禁用 IP 迁移] 不切换本机 IP，用 GARP 反制
                 logger.warning("ARP 防护: 检测到疑似 IP 冲突，用 GARP 反制（不切换 IP）")
                 await self._garp_broadcast_burst(count=5)
-                await self._garp_counterstrike(gw_ip, self.gateway_mac or "", burst_size=3, directed_count=3, inter=0.02)
+                await self._garp_counterstrike(gw_ip, "", burst_size=3, directed_count=3, inter=0.02)
 
             # 5. 验证 ping（快速版：此时已确定网络异常，80ms 超时足够判断）
             ping_ok = await self._ping_gateway_fast(gw_ip)
@@ -1951,7 +1979,7 @@ class ARPProtection:
             if await _check_abort():
                 return True
             await self._garp_broadcast_burst(count=5)
-            await self._garp_counterstrike(gw_ip, self.gateway_mac or "", burst_size=3, directed_count=3, inter=0.02)
+            await self._garp_counterstrike(gw_ip, "", burst_size=3, directed_count=3, inter=0.02)
 
             logger.warning("ARP 防护: 网关 %s 仍不可达，已用 GARP 反制（不切换 IP），可能存在持续 ARP 攻击或 IP 冲突", gw_ip)
             self._arp_attack_detected = True
@@ -2038,31 +2066,64 @@ class ARPProtection:
                 logger.debug("ARP 防护: 真实 GARP 发送失败 (%s)，回退到 ping 网关", e)
                 return await self._ping_gateway_fast(gw_ip)
         else:
-            # Windows: 清空网关 ARP 缓存 + ping → 触发 ARP 请求
-            if not skip_arp_del:
+            # Windows: 优先用 scapy 发送真实 GARP（需 Npcap），
+            # 不可用时回退到静态 ARP 绑定 + ping
+            if _SCAPY_AVAILABLE and self._local_mac and self._local_ipv4:
                 try:
-                    # 清空本机 ARP 表中网关的缓存，强制 ARP 重新解析
-                    proc = await asyncio.create_subprocess_exec(
-                        "arp", "-d", gw_ip,
-                        stdout=asyncio.subprocess.DEVNULL,
-                        stderr=asyncio.subprocess.DEVNULL,
+                    from scapy.all import Ether, ARP, sendp
+                    garp_pkt = (
+                        Ether(dst="ff:ff:ff:ff:ff:ff", src=self._local_mac) /
+                        ARP(op=1,
+                            hwsrc=self._local_mac,
+                            psrc=self._local_ipv4,
+                            hwdst="00:00:00:00:00:00",
+                            pdst=self._local_ipv4)
                     )
-                    await asyncio.wait_for(proc.wait(), timeout=5)
-                except (asyncio.TimeoutError, FileNotFoundError, OSError):
-                    pass
-            # Ping 网关 → OS 发送 ARP 请求（Sender IP=本机IP, Sender MAC=本机MAC）
-            # 路由器根据 RFC 826 更新 ARP 表
+                    vlan_id = self._manual_gateway_vlan
+                    if vlan_id and not self._vxlan_enabled:
+                        try:
+                            from scapy.all import Dot1Q
+                            garp_pkt = (
+                                Ether(dst="ff:ff:ff:ff:ff:ff", src=self._local_mac) /
+                                Dot1Q(vlan=int(vlan_id)) /
+                                ARP(op=1,
+                                    hwsrc=self._local_mac,
+                                    psrc=self._local_ipv4,
+                                    hwdst="00:00:00:00:00:00",
+                                    pdst=self._local_ipv4)
+                            )
+                        except Exception:
+                            pass
+                    sendp(garp_pkt, iface=self._interface_name or "",
+                          verbose=False, count=1, inter=0)
+                    return True
+                except Exception as e:
+                    logger.debug("ARP 防护: scapy GARP 发送失败 (%s)，回退到静态 ARP", e)
+
+            # 兔底：检测本机 ARP 表中网关 MAC 是否被投毒，若被篡改则设静态 ARP 绑定
+            actual_mac = await self._arp_get_mac_windows(gw_ip)
+            if actual_mac and self._baseline_mac and self._mac_normalize(actual_mac) != self._mac_normalize(self._baseline_mac):
+                logger.warning("ARP 防护: 检测到本机 ARP 表中网关 MAC 被篡改 "
+                               "%s → %s（实际），正在设置静态 ARP 绑定...",
+                               self._baseline_mac, actual_mac)
+                bound = await self._protect_gateway_arp()
+                if bound:
+                    return await self._ping_gateway_fast(gw_ip)
+                # 静态绑定失败，回退到 ping 验证
+                logger.warning("ARP 防护: 静态 ARP 绑定失败，回退到 ping 网关")
+                return await self._ping_gateway_fast(gw_ip)
+            # MAC 一致或无法检测，仅做 ping 验证连通性
             return await self._ping_gateway_fast(gw_ip)
 
     async def _garp_broadcast_burst(self, count: int = 20, inter: float = 0.01):
         """
-        爆发式 GARP 广播：发送真实 GARP 数据包 + ping 网关。
+        爆发式 GARP 广播：检测本机 ARP 表 + 静态绑定 + ping 验证。
         真实 GARP 是二层 ARP 包（EtherType 0x0806, Sender IP = Target IP），
         路由器收到后强制更新 ARP 表，不再依赖 ICMP 的"附带学习"。
 
         Linux: 使用 AF_PACKET 原始套接字发送真实 GARP ARP 包。
-        Windows: 通过清空网关 ARP 缓存 + ping 触发 ARP 请求（Sender IP/本机IP,
-                 Sender MAC/本机MAC），路由器据此更新 ARP 表。
+        Windows: 优先用 scapy 发送真实 GARP（需 Npcap），
+                 不可用时回退到静态 ARP 绑定 + ping。
 
         Args:
             count: 发送次数（默认 20 次）
@@ -2072,25 +2133,15 @@ class ARPProtection:
         if not gw_ip:
             return
 
-        logger.info("ARP 防护: 爆发真实 GARP x%d (网关=%s, 间隔=%.4fs)", count, gw_ip, inter)
-        # Windows: 循环前统一删除一次网关 ARP 缓存，避免循环内反复删除导致的重复丢包
-        if sys.platform == "win32":
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    "arp", "-d", gw_ip,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-                await asyncio.wait_for(proc.wait(), timeout=5)
-            except (asyncio.TimeoutError, FileNotFoundError, OSError):
-                pass
+        logger.info("ARP 防护: 检测 ARP 表并修复 x%d (网关=%s, 间隔=%.4fs)", count, gw_ip, inter)
+
         for i in range(count):
             # 发送真实 GARP 宣告（skip_arp_del=True，已由循环前统一删除）
             await self._send_single_garp(skip_arp_del=True)
             # 每 3 次加一次网关快速 ping（双重确认），成功则提前结束
             if i % 3 == 0:
                 if await self._ping_gateway_fast(gw_ip):
-                    logger.info("ARP 防护: GARP 爆发中网关已恢复 (第 %d 轮)", i + 1)
+                    logger.info("ARP 防护: ARP 修复中网关已恢复 (第 %d 轮)", i + 1)
                     return
             if inter > 0:
                 await asyncio.sleep(inter)
@@ -2254,8 +2305,6 @@ class ARPProtection:
             logger.critical("ARP 防护: 本机 IP '%s' 非法，跳过 IP 切换", self._local_ipv4)
             return False
 
-        # 保存旧 IP 用于失败回滚
-        old_ip = self._local_ipv4
         gw_ip = self.gateway_ip
 
         # VLAN 子接口
@@ -2415,7 +2464,8 @@ class ARPProtection:
 
     async def _garp_ip_switch_defense(self, abort_check=None) -> bool:
         """
-        两阶段 GARP 抗 ARP 中毒（MITM）：
+        [DEPRECATED] 两阶段 GARP 抗 ARP 中毒（MITM）—— IP 迁移已永久禁用，不再调用。
+        保留以防将来需要恢复此策略。
 
         原理：
           如果攻击者持续向路由器发送伪造 ARP 应答（本机 IP → 攻击者 MAC），
@@ -2552,7 +2602,7 @@ class ARPProtection:
         if not current_mac:
             return None
 
-        if current_mac.upper() == expected_mac.upper():
+        if self._mac_normalize(current_mac) == self._mac_normalize(expected_mac):
             return None  # MAC 一致，没换路由器
 
         # MAC 变了，看是否还能 ping 通
@@ -2717,9 +2767,6 @@ class ARPProtection:
                         for i in range(4)
                     )
                     return mask
-        return None
-        return None
-
         return None
 
     async def _protect_gateway_arp(self) -> bool:

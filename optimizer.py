@@ -91,7 +91,7 @@ else:
 # 如果显著高于正常值 (~300 bytes/obj)，说明大量 arena 处于
 # 半满状态（碎片化），需要触发提前重建。
 
-_arena_pressure_history_global: list[float] = []
+
 
 
 def _estimate_arena_pressure(cache_size: int, rss_mb: float) -> float:
@@ -138,6 +138,8 @@ class ResourceOptimizer:
 
         request_logger: RequestLogger,
 
+        filter_engine=None,
+
     ):
 
         self.config = config
@@ -148,10 +150,13 @@ class ResourceOptimizer:
 
         self.request_logger = request_logger
 
+        self._filter_engine = filter_engine
 
         self._monitor_task: Optional[asyncio.Task] = None
 
         self._gc_task: Optional[asyncio.Task] = None
+
+        self._defrag_task: Optional[asyncio.Task] = None
 
         self._running = False
 
@@ -178,7 +183,11 @@ class ResourceOptimizer:
 
         self._rebuild_cooldown: float = 180.0  # 最小间隔 3 分钟
 
+        self._last_critical_reduce: float = 0.0  # 上次激进回收时间（防同一周期双重触发）
+
         self._arena_pressure_enabled: bool = HAS_PSUTIL  # 需要 psutil 才启用
+
+        self._defrag_enabled: bool = True  # defrag 纯操作 OrderedDict，不依赖 psutil
 
 
     async def start(self):
@@ -192,6 +201,10 @@ class ResourceOptimizer:
         if self.config.aggressive_gc and HAS_PSUTIL:
 
             self._gc_task = asyncio.create_task(self._gc_loop())
+
+        if self._defrag_enabled and self.config.cache_enabled:
+
+            self._defrag_task = asyncio.create_task(self._defrag_loop())
 
         logger.info("资源优化器已启动")
 
@@ -226,6 +239,18 @@ class ResourceOptimizer:
 
                 pass
 
+        if self._defrag_task:
+
+            self._defrag_task.cancel()
+
+            try:
+
+                await self._defrag_task
+
+            except asyncio.CancelledError:
+
+                pass
+
         logger.info("资源优化器已停止")
 
 
@@ -254,7 +279,6 @@ class ResourceOptimizer:
                     else:
 
                         no_decrease_count = 0
-
                     prev_memory_mb = memory_mb
 
 
@@ -274,6 +298,10 @@ class ResourceOptimizer:
 
                             no_decrease_count = 0
 
+
+                        else:
+
+                            no_decrease_count = 0
                 # ===== Arena 碎片压力检测 =====
 
                 if (self._arena_pressure_enabled
@@ -306,7 +334,9 @@ class ResourceOptimizer:
 
                         and now - self._last_rebuild_time > self._rebuild_cooldown
 
-                        and memory_mb > self.config.memory_limit_mb * 0.75):
+                        and memory_mb > self.config.memory_limit_mb * 0.85
+
+                        and now - self._last_critical_reduce > self._rebuild_cooldown):
 
                         logger.warning("Arena 碎片压力 %.0f%%，提前触发撤离重建",
 
@@ -353,6 +383,7 @@ class ResourceOptimizer:
                     memory_mb,
                     memory_limit,
                 )
+                self._last_critical_reduce = time.monotonic()
                 await self._critical_reduce_memory()
                 self._log_gc_stats()
 
@@ -371,7 +402,7 @@ class ResourceOptimizer:
                 await self._light_optimize()
 
             # CPU 检查（cpu_percent 是多核总和，例如 4 核满 = 400%）
-            cpu_percent = self._process.cpu_percent(interval=0.1)
+            cpu_percent = self._process.cpu_percent(interval=0)
             cpu_count = os.cpu_count() or 1
             core_limit = self.config.cpu_core_limit
             if core_limit <= 0:
@@ -382,6 +413,19 @@ class ResourceOptimizer:
                     "CPU 使用 %.1f 核 (%.0f%%)，超过限制 %d 核，降低并发",
                     cpu_cores_used, cpu_percent, core_limit,
                 )
+                # 实际限流：降低连接池上限
+                if not hasattr(self, '_cpu_throttle'):
+                    self._cpu_throttle = self.config.max_concurrent
+                curr = self._cpu_throttle
+                if curr and curr > 200:
+                    self._cpu_throttle = max(200, int(curr * 0.8))
+                    logger.info("CPU 超限，并发上限从 %d 降至 %d", curr, self._cpu_throttle)
+                # 传递限流值给调用方检查
+                if hasattr(self.resolver_manager, "_concurrent_throttle"):
+                    try:
+                        self.resolver_manager._concurrent_throttle = self._cpu_throttle
+                    except AttributeError:
+                        pass
 
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
@@ -407,23 +451,21 @@ class ResourceOptimizer:
 
             await self.cache.drop_messages_lru(ratio=0.4)
 
-            # 1b. 按字节大小淘汰 20% 最大的
+            # 1b. 按字节大小淘汰 10% 最大的（保守策略，配合 rebuild 排序整理）
 
-            await self.cache.evict_largest(ratio=0.2)
+            await self.cache.evict_largest(ratio=0.1)
 
 
 
-        # 2. 过滤缓存清理+撤离重建（大量条目时全量重建，少量时仅清理过期）
+        # 2. 过滤缓存撤离重建（释放旧 arena）
         try:
-            import sys as _sys
-            app = getattr(_sys.modules.get("main"), "app", None)
-            if app and hasattr(app, "filter_engine"):
-                fe = app.filter_engine
-                if hasattr(fe, "_filter_cache") and len(fe._filter_cache) > 0:
-                    if len(fe._filter_cache) > self.config.cache_max_size and hasattr(fe, "rebuild_filter_cache"):
-                        fe.rebuild_filter_cache()
-                    else:
-                        await self._compact_filter_cache_global()
+            fe = self._filter_engine
+            if fe is None:
+                import sys as _sys
+                app = getattr(_sys.modules.get("__main__"), "app", None)
+                fe = app.filter_engine if app and hasattr(app, "filter_engine") else None
+            if fe and hasattr(fe, "_filter_cache") and len(fe._filter_cache) > 0 and hasattr(fe, "rebuild_filter_cache"):
+                fe.rebuild_filter_cache()
         except Exception:
             pass
         try:
@@ -449,7 +491,7 @@ class ResourceOptimizer:
 
             kept = 0
 
-            for hostname in list(bs_cache.keys()):
+            for hostname, _ in sorted_items:
 
                 if kept < 10:
 
@@ -509,19 +551,19 @@ class ResourceOptimizer:
 
             await self.cache.evict_largest(ratio=0.3)
 
-            logger.info("临时缩小缓存到 %d", reduced)
+            try:
 
+                logger.info("临时缩小缓存到 %d", reduced)
 
+                # 1a. ★ 全量撤离+重建（核心动作：释放旧 pymalloc arena）
 
-            # 1a. ★ 全量撤离+重建（核心动作：释放旧 pymalloc arena）
+                await self.cache.rebuild()
 
-            await self.cache.rebuild()
+            finally:
 
+                self.cache.max_size = original_max
 
-
-            self.cache.max_size = original_max
-
-            logger.info("缓存大小已恢复至 %d", original_max)
+                logger.info("缓存大小已恢复至 %d", original_max)
 
 
 
@@ -539,12 +581,13 @@ class ResourceOptimizer:
 
         # 3. 全量重建过滤缓存（释放旧 arena）
         try:
-            import sys as _sys
-            app = getattr(_sys.modules.get("main"), "app", None)
-            if app and hasattr(app, "filter_engine"):
-                fe = app.filter_engine
-                if hasattr(fe, "_filter_cache") and hasattr(fe, "rebuild_filter_cache"):
-                    fe.rebuild_filter_cache()
+            fe = self._filter_engine
+            if fe is None:
+                import sys as _sys
+                app = getattr(_sys.modules.get("__main__"), "app", None)
+                fe = app.filter_engine if app and hasattr(app, "filter_engine") else None
+            if fe and hasattr(fe, "_filter_cache") and hasattr(fe, "rebuild_filter_cache"):
+                fe.rebuild_filter_cache()
         except Exception:
             pass
 
@@ -571,13 +614,7 @@ class ResourceOptimizer:
 
         await self.cache.cleanup_expired()
 
-
-
-        # 轻度级别也丢弃 LRU 尾部 15% 的 Message 对象
-
         await self.cache.drop_messages_lru(ratio=0.15)
-
-
 
         if self.config.aggressive_gc:
 
@@ -589,19 +626,9 @@ class ResourceOptimizer:
 
 
 
-        """将空闲内存归还 OS
+        "将空闲内存归还 OS — CRT 堆压缩（HeapCompact / malloc_trim）合并空闲碎片"
 
-
-
-        策略：
-
-        1. CRT 堆压缩（HeapCompact / malloc_trim）— 合并空闲碎片
-
-        2. SetProcessWorkingSetSize — 换出不活跃物理页到 pagefile
-
-        """
-
-        # 第一层：CRT 堆压缩（安全，无副作用）
+        # CRT 堆压缩（安全，无副作用）
 
         try:
 
@@ -611,53 +638,18 @@ class ResourceOptimizer:
 
             pass
 
-
-
-        # 第二层：SetProcessWorkingSetSize（Windows）或 malloc_trim（Linux）
-
-        try:
-
-            if os.name == 'nt':
-
-                import ctypes
-
-                kernel32 = ctypes.windll.kernel32
-
-                kernel32.SetProcessWorkingSetSize(-1, -1)
-
-            else:
-
-                try:
-
-                    import ctypes
-
-                    import ctypes.util
-
-                    libc = ctypes.CDLL(ctypes.util.find_library('c'))
-
-                    libc.malloc_trim(0)
-
-                except Exception:
-
-                    pass
-
-        except Exception:
-
-            pass
-
-    async def _compact_filter_cache_global(self):
-
-        """大量清理过滤缓存，保留 priority 条目（自定义 hosts）"""
-
-        try:
-            import sys as _sys
-            app = getattr(_sys.modules.get('main'), 'app', None)
-            if app and hasattr(app, 'filter_engine'):
-                fe = app.filter_engine
-                if hasattr(fe, '_filter_cache') and hasattr(fe, 'rebuild_filter_cache'):
-                    fe.rebuild_filter_cache()
-        except Exception:
-            pass
+    async def _defrag_loop(self):
+        while self._running:
+            try:
+                await asyncio.sleep(600)
+                if not self._running:
+                    break
+                if self.cache.current_size > 500:
+                    await self.cache.defrag()
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
 
     async def _gc_loop(self):
 
@@ -744,10 +736,13 @@ class ResourceOptimizer:
 
         # 尝试获取过滤缓存大小
         try:
-            import sys as _sys
-            app = getattr(_sys.modules.get('main'), 'app', None)
-            if app and hasattr(app, 'filter_engine') and hasattr(app.filter_engine, '_filter_cache'):
-                result["filter_cache_size"] = len(app.filter_engine._filter_cache)
+            fe = self._filter_engine
+            if fe is None:
+                import sys as _sys
+                app = getattr(_sys.modules.get('__main__'), 'app', None)
+                fe = app.filter_engine if app and hasattr(app, 'filter_engine') else None
+            if fe and hasattr(fe, '_filter_cache'):
+                result["filter_cache_size"] = len(fe._filter_cache)
         except Exception:
             pass
 
@@ -769,10 +764,9 @@ class ResourceOptimizer:
 
         return result
 
-
     def _log_gc_stats(self):
 
-        """输出 GC 对象统计，帮助诊断内存泄漏"""
+        """轻量版 GC 统计，使用 get_count 避免遍历所有对象"""
 
         if not HAS_PSUTIL:
 
@@ -780,18 +774,14 @@ class ResourceOptimizer:
 
         try:
 
-            import collections
+            g0, g1, g2 = gc.get_count()
 
-            obj_counts = collections.Counter(type(o).__name__ for o in gc.get_objects())
+            stats = gc.get_stats()
 
-            top10 = obj_counts.most_common(10)
+            collected = [s.get("collected", 0) for s in stats]
 
-            total = sum(obj_counts.values())
-
-            logger.info("GC 存活对象: %d 个, Top10: %s", total, dict(top10))
+            logger.info("GC 统计: gen0=%d gen1=%d gen2=%d | 累计回收: %s", g0, g1, g2, collected)
 
         except Exception:
 
             pass
-
-

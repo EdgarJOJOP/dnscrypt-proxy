@@ -11,11 +11,10 @@ import sys
 import asyncio
 import logging
 import collections
-from typing import List, Optional, Callable
+from typing import Dict, List, Optional, Callable
 
 import dns.message
 import dns.rdatatype
-import dns.asyncquery
 
 from arp_protection import ARPProtection
 from NDP_protection import NDPProtection
@@ -75,6 +74,7 @@ class NetworkMonitor:
         self._ping_targets_v6 = nm.get("ping_targets_v6", ["2400:3200::1", "2400:da00::6666"])
         self._dns_probe_domains = nm.get("dns_probe_domains", ["www.baidu.com", "www.qq.com"])
         self._failure_threshold = nm.get("failure_threshold", 3)  # 连续多少次失败后进入降级
+        self._external_interval = nm.get("external_interval", 15)  # 外网探测间隔（秒）
         self._recovery_check_count = nm.get("recovery_check_count", 2)  # 恢复需要连续成功次数
         self._recovery_successes = 0  # 恢复检测连续成功计数
 
@@ -93,6 +93,7 @@ class NetworkMonitor:
 
         # 外网 ping 轮询索引（轮流 ping 多个 v4 目标，每轮一个）
         self._ext_ping_index = 0
+        self._last_ext_check_time: float = 0.0  # 上次外网探测时间戳
 
         # 净化 dns_probe_domains：启动时移除非法域名
         self._dns_probe_domains = [
@@ -118,6 +119,7 @@ class NetworkMonitor:
         self._last_wan_probe_time: float = 0.0
         # 外网 ping 的轮换索引（用于 WAN 探测）
         self._wan_probe_index = 0
+        self._wan_probe_index_v6 = 0  # IPv6 WAN 探测独立索引
         # WAN 断开确认时间戳（防止首轮误判恢复）
         self._wan_dead_confirmed_at: float = 0.0
 
@@ -206,12 +208,15 @@ class NetworkMonitor:
                     ndp_gw_ok = await self._ndp_protection._ping_ipv6(ndp_gw)
                 self._ndp_gw_results.append(ndp_gw_ok)
 
-                # 每轮顺便 ping 一个外网 IPv4 目标（轮流）
+                # 外网探测：按 external_interval 间隔执行，不每轮都 ping
                 ext_ok = True
                 if self._ping_targets_v4:
-                    idx = self._ext_ping_index % len(self._ping_targets_v4)
-                    self._ext_ping_index += 1
-                    ext_ok = await self._ping(self._ping_targets_v4[idx])
+                    now = asyncio.get_event_loop().time()
+                    if now - self._last_ext_check_time >= self._external_interval:
+                        self._last_ext_check_time = now
+                        idx = self._ext_ping_index % len(self._ping_targets_v4)
+                        self._ext_ping_index += 1
+                        ext_ok = await self._ping(self._ping_targets_v4[idx])
                 self._ext_results.append(ext_ok)
 
                 # ========== WAN 断连快速检测（Dest Unreachable） ==========
@@ -256,10 +261,10 @@ class NetworkMonitor:
                                 lambda: self._is_recovered()):
                             logger.info("NDP 防护: 投毒修复完成，IPv6 网关已恢复")
 
-                # ========== 2. 从\u6ed1\u52a8\u7a97\u53e3\u8ba1\u7b97\u4e22\u5305\u5206\u7ea7 ==========
-                # 始终调用 _classify_loss 让\u6ed1\u52a8\u7a97\u53e3真实数据判断，不会因 wan_dead 永久卡在 network_down
+                # ========== 2. 从滑动窗口计算丢包分级 ==========
+                # 始终调用 _classify_loss 让滑动窗口真实数据判断，不会因 wan_dead 永久卡在 network_down
                 loss_pct, diagnosis = self._classify_loss()
-                # wan_dead 已经标记断网，但\u6ed1\u52a8\u7a97\u53e3还未恢复时保持 network_down
+                # wan_dead 已经标记断网，但滑动窗口还未恢复时保持 network_down
                 # Bug #1: WAN 断开确认后 ping_interval*5 内强制 network_down（给 ext_results 滑动窗口时间填充 False）
                 if self._arp_network_down:
                     if diagnosis == "recovered" and self._wan_dead_confirmed_at > 0:
@@ -419,8 +424,8 @@ class NetworkMonitor:
             return
 
         try:
-            idx = self._wan_probe_index % len(self._ping_targets_v6)
-            self._wan_probe_index += 1
+            idx = self._wan_probe_index_v6 % len(self._ping_targets_v6)
+            self._wan_probe_index_v6 += 1
             target = self._ping_targets_v6[idx]
 
             result = await self._ndp_protection.probe_wan_unreachable_v6(
@@ -453,6 +458,7 @@ class NetworkMonitor:
     def _classify_loss(self) -> tuple:
         """
         根据滑动窗口计算丢包率并分级。
+        优先使用 IPv4 网关窗口；无 IPv4 网关时回退到 IPv6 网关窗口。
 
         Returns:
             (loss_pct, diagnosis)
@@ -460,12 +466,17 @@ class NetworkMonitor:
                        "arp_issue" (丢包 20~89%)
                        "network_down" (丢包 ≥90% 且外网不通)
         """
-        gw_len = len(self._gw_results)
+        # 优先使用 IPv4 网关窗口；无 IPv4 网关时回退到 IPv6
+        gw_results = self._gw_results
+        if self._arp_protection.gateway_ip is None and self._ndp_protection.gateway_ipv6:
+            gw_results = self._ndp_gw_results
+
+        gw_len = len(gw_results)
         if gw_len < 2:
             # 窗口未填满，不做决策
             return (0, "normal")
 
-        gw_fails = gw_len - sum(self._gw_results)
+        gw_fails = gw_len - sum(gw_results)
         gw_loss = int(gw_fails / gw_len * 100)
 
         ext_len = len(self._ext_results)
@@ -578,7 +589,8 @@ class NetworkMonitor:
                                             sum(self._ext_results) > 0)
                 if not ext_ok:
                     self._arp_network_down = True
-                    self._ndp_network_down = True
+                    # 注意：IPv4 ARP 修复失败时不标记 _ndp_network_down，
+                    # IPv6 可能仍可达，由 NDP 防护独立判断
                     self.resolver_manager.set_network_down(True)
                     logger.warning("ARP 防护: 后台修复无效且外网不可达，确认网络断开")
                 else:

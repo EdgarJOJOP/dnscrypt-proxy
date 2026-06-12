@@ -268,19 +268,25 @@ class DNSCache:
             if key in self._cache:
                 del self._cache[key]
 
-            # 计算 TTL
-            ttl = self._calculate_ttl(response) if not is_negative else self.negative_ttl
-
-            # 检查单条目最大尺寸，超过则不缓存
-            wire_len = len(response.to_wire())
-            if wire_len > MAX_CACHED_WIRE_SIZE:
+            # 一次性序列化 wire，避免重复 to_wire() 调用
+            wire = response.to_wire()
+            if len(wire) > MAX_CACHED_WIRE_SIZE:
                 logger.debug("跳过缓存超大 DNS 响应: %d bytes (限制 %d)，key=%s",
-                             wire_len, MAX_CACHED_WIRE_SIZE, key)
+                             len(wire), MAX_CACHED_WIRE_SIZE, key)
                 self._stats["misses"] += 1
                 return
 
-            # 创建缓存条目
-            entry = CacheEntry(response, ttl, epoch=self._current_epoch)
+            # 计算 TTL
+            ttl = self._calculate_ttl(response) if not is_negative else self.negative_ttl
+
+            # 创建缓存条目（传入预序列化的 wire）
+            entry = CacheEntry.__new__(CacheEntry)
+            entry._wire = wire
+            entry._response_msg = response
+            entry.ttl = ttl
+            entry.created_at = time.time()
+            entry.epoch = self._current_epoch
+            entry._hit_count = 0
 
             # LRU 淘汰
             while len(self._cache) >= self.max_size:
@@ -301,8 +307,7 @@ class DNSCache:
         return max(self.min_ttl, min(min_ttl, self.max_ttl))
 
     async def evict_largest(self, ratio: float = 0.2) -> int:
-        """按估算字节大小淘汰最大的 N% 条目（用于内存紧张时主动压缩）。
-        跳过已过期条目（它们应由 cleanup_expired 处理）。
+        """按估算字节大小淘汰最大的 N% 条目（跳过已过期条目）。
         Args:
             ratio: 淘汰比例（0.2 = 淘汰最大的 20%）
         Returns:
@@ -311,10 +316,14 @@ class DNSCache:
         async with self._lock:
             if not self._cache:
                 return 0
-            target = max(1, int(len(self._cache) * ratio))
+            now = time.time()
+            candidates = [(k, v) for k, v in self._cache.items() if not v.is_expired(now)]
+            if not candidates:
+                return 0
+            target = max(1, int(len(candidates) * ratio))
             # 按估算字节数排序，淘汰最大的
             sorted_by_size = sorted(
-                self._cache.items(),
+                candidates,
                 key=lambda item: item[1].estimated_bytes,
                 reverse=True,
             )
@@ -429,6 +438,8 @@ class DNSCache:
         # 第三阶段：TLB 批量分配 — 重新持有锁，从 wire bytes 紧凑重建
         async with self._lock:
             survived = 0
+            # 按 wire 大小升序回填：同大小 wire 连续分配，减少堆碎片
+            items.sort(key=lambda x: len(x[1]))
             for key, wire, ttl, created_at in items:
                 # 通过 __new__ + 手动赋值（TLB 友好：无额外对象分配）
                 entry = CacheEntry.__new__(CacheEntry)
@@ -438,8 +449,9 @@ class DNSCache:
                 entry.created_at = created_at
                 entry.epoch = new_epoch       # 标记新世代
                 entry._hit_count = 0          # 重置命中计数
-                self._cache[key] = entry
-                survived += 1
+                if key not in self._cache:
+                    self._cache[key] = entry
+                    survived += 1
 
             self._stats["size"] = len(self._cache)
             self._stats["evictions"] += old_count - survived
@@ -447,6 +459,30 @@ class DNSCache:
         logger.info("缓存重建完成: 旧条目 %d -> 新世代 %d 幸存 %d (淘汰 %d 过期)",
                     old_count, new_epoch, survived, old_count - survived)
         return survived
+
+    async def defrag(self) -> int:
+        """轻量碎片整理：仅重排条目顺序，跳过过期条目，不触发全量 GC"""
+        async with self._lock:
+            if not self._cache:
+                return 0
+            now = time.time()
+            items = [(key, entry._wire, entry.ttl, entry.created_at, entry._hit_count)
+                     for key, entry in self._cache.items()
+                     if not entry.is_expired(now)]
+            self._cache.clear()
+            items.sort(key=lambda x: len(x[1]))
+            for key, wire, ttl, created_at, hit_count in items:
+                entry = CacheEntry.__new__(CacheEntry)
+                entry._wire = wire
+                entry._response_msg = None
+                entry.ttl = ttl
+                entry.created_at = created_at
+                entry.epoch = self._current_epoch
+                entry._hit_count = hit_count
+                self._cache[key] = entry
+            self._stats["size"] = len(self._cache)
+            logger.debug("缓存轻量碎片整理完成，条目数: %d", len(self._cache))
+            return len(self._cache)
 
     async def clear(self):
         """清空缓存"""

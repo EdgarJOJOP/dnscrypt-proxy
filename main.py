@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 SecureDNS Proxy - 安全 DNS 加密代理
 ====================================
@@ -120,7 +120,6 @@ class DNSProxyApp:
 
         self._config_reload_task: Optional[asyncio.Task] = None
         self._cache_cleanup_task: Optional[asyncio.Task] = None
-        self._filter_update_task: Optional[asyncio.Task] = None
         self._filter_reload_task: Optional[asyncio.Task] = None  # 跟踪后台过滤规则重载
         self._filter_reload_gen = 0  # 递增 generation，防止过期重载覆盖
         self._running = False
@@ -198,7 +197,7 @@ class DNSProxyApp:
         # 4. 日志记录器
         logger.info("[4/11] 初始化异步日志记录器...")
         self.request_logger = RequestLogger(
-            log_dir=str(PROJECT_ROOT / self.config.logging_dir),
+            log_dir=str(self.config.logging_dir),
             log_file=self.config.logging_file,
             buffer_size=self.config.logging_buffer_size,
             flush_interval=self.config.logging_flush_interval,
@@ -244,7 +243,8 @@ class DNSProxyApp:
         # 6. 资源优化器
         logger.info("[6/11] 初始化资源优化器...")
         self.resource_optimizer = ResourceOptimizer(
-            self.config, self.cache, self.resolver_manager, self.request_logger
+            self.config, self.cache, self.resolver_manager, self.request_logger,
+            filter_engine=self.filter_engine
         )
         await self.resource_optimizer.start()
 
@@ -648,7 +648,7 @@ class DNSProxyApp:
 
         # 取消后台任务
         for task in [self._config_reload_task, self._cache_cleanup_task,
-                     self._filter_update_task, self._filter_reload_task]:
+                     self._filter_reload_task]:
             if task:
                 task.cancel()
                 try:
