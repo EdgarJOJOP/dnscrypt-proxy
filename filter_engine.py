@@ -976,10 +976,10 @@ class FilterEngine:
         """
         try:
             async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=35),
+                timeout=aiohttp.ClientTimeout(total=80),
                 headers={"User-Agent": "SecureDNS-Proxy/1.0"},
             ) as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=35)) as resp:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=80)) as resp:
                     if resp.status != 200:
                         logger.error("获取 URL %s 失败: HTTP %d", url, resp.status)
                         return False
@@ -1058,7 +1058,7 @@ class FilterEngine:
                     return rule_count > 0
 
         except asyncio.TimeoutError:
-            logger.error("从 URL %s 加载规则超时 (35s)", url)
+            logger.error("从 URL %s 加载规则超时 (80s)", url)
             return False
         except Exception as e:
             logger.error("从 URL %s 加载规则失败: %s", url, e)

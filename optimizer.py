@@ -189,6 +189,15 @@ class ResourceOptimizer:
 
         self._defrag_enabled: bool = True  # defrag 纯操作 OrderedDict，不依赖 psutil
 
+        # ===== 低负载内存归还 OS =====
+        self._last_return_to_os: float = 0.0          # 上次 _return_unused_memory_to_os 调用时间
+        self._return_to_os_cooldown: float = 300.0     # 最小间隔 5 分钟
+        self._high_water_ratio: float = 0.70           # 高水位阈值（memory_limit 的 70%）
+        self._gc_last_total_logged: int = 0
+        self._gc_last_loop_time: float = 0.0
+        self._defrag_last_total_logged: int = 0
+        self._defrag_last_loop_time: float = 0.0
+
 
     async def start(self):
 
@@ -644,6 +653,29 @@ class ResourceOptimizer:
                 await asyncio.sleep(600)
                 if not self._running:
                     break
+                # ===== 低负载时归还内存给 OS =====
+                if HAS_PSUTIL and self._process is not None:
+                    try:
+                        _now = time.monotonic()
+                        _mem_mb = self._process.memory_info().rss / (1024 * 1024)
+                        _mem_limit = self.config.memory_limit_mb
+                        _total = getattr(self.request_logger, "_total_logged", 0)
+                        _dt = _now - self._defrag_last_loop_time
+                        if _dt > 0 and self._defrag_last_loop_time > 0:
+                            _req_ps = (_total - self._defrag_last_total_logged) / _dt
+                        else:
+                            _req_ps = 0.0
+                        self._defrag_last_total_logged = _total
+                        self._defrag_last_loop_time = _now
+                        if (_req_ps < 10.0
+                            and _mem_mb > _mem_limit * self._high_water_ratio
+                            and _now - self._last_return_to_os > self._return_to_os_cooldown):
+                            self._return_unused_memory_to_os()
+                            self._last_return_to_os = _now
+                            logger.debug("低负载下已归还内存给 OS (%.0fMB > %dMB * %.0f%%, %.1f req/s)",
+                                         _mem_mb, _mem_limit, self._high_water_ratio * 100, _req_ps)
+                    except Exception:
+                        pass
                 if self.cache.current_size > 500:
                     await self.cache.defrag()
             except asyncio.CancelledError:
@@ -699,6 +731,30 @@ class ResourceOptimizer:
                 # 低内存压力: 轻量 GC
 
                 gc.collect(generation=1)
+
+                # ===== 低负载时归还内存给 OS =====
+                if HAS_PSUTIL and self._process is not None:
+                    try:
+                        _now = time.monotonic()
+                        _mem_mb = self._process.memory_info().rss / (1024 * 1024)
+                        _mem_limit = self.config.memory_limit_mb
+                        _total = getattr(self.request_logger, "_total_logged", 0)
+                        _dt = _now - self._gc_last_loop_time
+                        if _dt > 0 and self._gc_last_loop_time > 0:
+                            _req_ps = (_total - self._gc_last_total_logged) / _dt
+                        else:
+                            _req_ps = 0.0
+                        self._gc_last_total_logged = _total
+                        self._gc_last_loop_time = _now
+                        if (_req_ps < 10.0
+                            and _mem_mb > _mem_limit * self._high_water_ratio
+                            and _now - self._last_return_to_os > self._return_to_os_cooldown):
+                            self._return_unused_memory_to_os()
+                            self._last_return_to_os = _now
+                            logger.debug("低负载下已归还内存给 OS (%.0fMB > %dMB * %.0f%%, %.1f req/s)",
+                                         _mem_mb, _mem_limit, self._high_water_ratio * 100, _req_ps)
+                    except Exception:
+                        pass
 
                 if hasattr(self, "_gc_count"):
 
