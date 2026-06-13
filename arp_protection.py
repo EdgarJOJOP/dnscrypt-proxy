@@ -14,9 +14,13 @@ import asyncio
 import socket
 import logging
 import random
+import locale
 from typing import Optional, Tuple
 
 logger = logging.getLogger("dns-proxy.arp")
+
+# 系统编码：Windows 中文为 gbk，Linux 为 utf-8
+_SYS_ENCODING = locale.getpreferredencoding()
 
 # ARP 嗅探：scapy 跨平台抓包（可选，需 libpcap/Npcap 驱动支持）
 _SCAPY_AVAILABLE = False
@@ -110,7 +114,6 @@ class ARPProtection:
         self._run_garp = asyncio.Event()          # 信号：GARP 爆发
         self._run_conflict = asyncio.Event()      # 信号：IP 冲突检测
         self._loss_result = None                  # 丢包检测结果
-        self._garp_done = False                   # GARP 完成标记
         self._conflict_result = None              # IP 冲突检测结果
         self._garp_done_event = asyncio.Event()   # GARP 完成通知（替代轮询）
         self._loss_done_event = asyncio.Event()   # 丢包检测完成通知
@@ -119,6 +122,8 @@ class ARPProtection:
         self._baseline_mac = self.gateway_mac or ""  # 首次正确的网关 MAC
         self._poison_detected = asyncio.Event()    # 信号：检测到 ARP 投毒/IP冲突
         self._local_ips: set = set()               # 本机所有 IPv4 地址（嗅探用）
+        self._local_macs: set = set()              # 本机所有网络接口的 MAC 地址（防自伤反制）
+        self._local_macs_loaded: bool = False      # 本地 MAC 是否已加载
         self._last_alert_mac: str = ""             # 上次告警的攻击者 MAC（同 MAC <3s 不重复触发）
         self._last_alert_time: float = 0.0         # 上次告警时间戳
         self._baseline_learned: bool = False       # 基线 MAC 是否已通过多次确认学习
@@ -127,7 +132,6 @@ class ARPProtection:
 
         # ========== 反击统计 ==========
         self._attack_stats: dict = {}
-        self._counterstrike_cooldown: float = 0.0
         self._counterstrike_count: int = 0          # 反击轮次计数（用于交替毒化MAC）
         self._ip_migrated: bool = True              # 全局IP是否已迁移（永久禁用IP迁移，仅用反制）
 
@@ -312,7 +316,6 @@ class ARPProtection:
             if gw_ip:
                 try:
                     await self._garp_broadcast_burst(count=10)
-                    self._garp_done = True
                 except Exception as e:
                     logger.debug("ARP 防护: GARP worker 异常: %s", e)
             self._garp_done_event.set()
@@ -392,8 +395,6 @@ class ARPProtection:
             debounce_interval = 1.0
         else:
             debounce_interval = 3.0
-        if now < self._counterstrike_cooldown and sender_mac == self._last_alert_mac:
-            return ""
         if sender_mac == self._last_alert_mac and now - self._last_alert_time < debounce_interval:
             return ""
 
@@ -431,10 +432,20 @@ class ARPProtection:
             poisoned = True
             reason = f"IP 冲突！本机 {sender_ip} 的 MAC 被篡改为 {sender_mac}"
 
+        # ⑤ 本地 MAC 冒用攻击 — 攻击者冒用本机 MAC 发送 ARP，陷害本地程序（防自伤）
+        #    条件：sender_mac 是本机某接口的 MAC，但 sender_ip 不是本机 IP（否则就是本机自己发出的包）
+        elif self._local_macs and any(self._mac_normalize(sender_mac) == self._mac_normalize(m) for m in self._local_macs)                 and sender_ip not in self._local_ips and sender_mac != "00:00:00:00:00:00":
+            poisoned = True
+            reason = f"本地 MAC 冒用攻击！攻击者冒用本机 MAC {sender_mac} 以 {sender_ip} 身份发送 ARP"
+
         # ③ Target = 网关 IP × MAC 不匹配（中间人回复劫持）
         elif target_ip == gw_ip and self._baseline_mac and target_mac and self._mac_normalize(target_mac) != self._mac_normalize(self._baseline_mac):
             poisoned = True
-            reason = f"MITM 劫持！回复目标 {target_ip} → 期望 MAC {self._baseline_mac} ≠ 实际 {target_mac}"
+            # ⑥ 细化日志：全零目标 MAC 是一种特定的路由器侧投毒攻击模式
+            if self._mac_normalize(target_mac) == "000000000000":
+                reason = f"MITM 劫持！攻击者向网关 {target_ip} 发送全零 MAC 回复（期望 {self._baseline_mac}），路由器 ARP 表被污染"
+            else:
+                reason = f"MITM 劫持！回复目标 {target_ip} → 期望 MAC {self._baseline_mac} ≠ 实际 {target_mac}"
 
         # ④ GARP 宣告伪造（Opcode=2 且 Sender=Target=网关, MAC 不对）
         elif is_garp and opcode == 2 and sender_ip in gw_ips and self._baseline_mac and \
@@ -479,6 +490,10 @@ class ARPProtection:
         gw_ip = self.gateway_ip
         # 收集本机所有 IPv4 地址（避免 _local_ipv4 单值残留旧临时 IP）
         self._local_ips = await ARPProtection._fetch_local_ips(self._interface_name or "")
+        # 收集本机所有 MAC 地址（用于检测本地 MAC 冒用攻击+防自伤）
+        if not self._local_macs_loaded:
+            self._local_macs = await ARPProtection._fetch_all_local_macs()
+            self._local_macs_loaded = True
         # MAC 统一冒号大写格式（scapy 返回冒号格式，arp -a 返回横线格式）
         self._baseline_mac = self._baseline_mac.replace("-", ":").upper() if self._baseline_mac else ""
 
@@ -510,7 +525,8 @@ class ARPProtection:
                     None,
                     lambda: scapy.sniff(
                         prn=_handle_pkt, store=False,
-                        filter="arp", timeout=None,
+                        filter="arp", timeout=5,
+                        stop_filter=lambda pkt: not self._arp_running,
                     ),
                 )
                 logger.info("ARP 防护: scapy 嗅探已启动")
@@ -705,6 +721,10 @@ class ARPProtection:
         self._detected = True
 
         if ok:
+            # 收集本机所有 MAC 地址（用于检测本地 MAC 冒用攻击+防自伤）
+            if not self._local_macs_loaded:
+                self._local_macs = await ARPProtection._fetch_all_local_macs()
+                self._local_macs_loaded = True
             src = "手动配置" if self._manual_gateway_ip else "自动探测"
             if len(self._manual_gateways) > 1:
                 pairs_str = "; ".join(f"{ip},{mac or '*'},{vlan or '*'}" for ip, mac, vlan in self._manual_gateways)
@@ -881,7 +901,7 @@ class ARPProtection:
                 stderr=asyncio.subprocess.DEVNULL,
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-            text = stdout.decode("utf-8", errors="replace")
+            text = stdout.decode(_SYS_ENCODING, errors="replace")
             for line in text.splitlines():
                 parts = line.strip().split()
                 # 0.0.0.0  0.0.0.0  192.168.1.1  192.168.1.100  25
@@ -928,7 +948,7 @@ class ARPProtection:
                 stderr=asyncio.subprocess.DEVNULL,
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-            text = stdout.decode("utf-8", errors="replace")
+            text = stdout.decode(_SYS_ENCODING, errors="replace")
         except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
             logger.warning("ARP 防护: ipconfig 失败: %s", e)
             text = ""
@@ -1072,7 +1092,7 @@ class ARPProtection:
                 stderr=asyncio.subprocess.DEVNULL,
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-            text = stdout.decode("utf-8", errors="replace")
+            text = stdout.decode(_SYS_ENCODING, errors="replace")
             for line in text.splitlines():
                 # default via 192.168.1.1 dev eth0  metric 100
                 m = re.match(
@@ -1108,7 +1128,7 @@ class ARPProtection:
                 stderr=asyncio.subprocess.DEVNULL,
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-            text = stdout.decode("utf-8", errors="replace")
+            text = stdout.decode(_SYS_ENCODING, errors="replace")
             for line in text.splitlines():
                 m = re.search(r'inet\s+(\d+\.\d+\.\d+\.\d+)/(\d+)', line)
                 if m and not m.group(1).startswith("127."):
@@ -1150,7 +1170,7 @@ class ARPProtection:
                 stderr=asyncio.subprocess.DEVNULL,
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-            text = stdout.decode("utf-8", errors="replace")
+            text = stdout.decode(_SYS_ENCODING, errors="replace")
 
             # 解析 route print 输出中的默认网关
             # 匹配: 0.0.0.0          0.0.0.0         192.168.1.1      192.168.1.100    25
@@ -1176,7 +1196,7 @@ class ARPProtection:
                 stderr=asyncio.subprocess.DEVNULL,
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-            text = stdout.decode("utf-8", errors="replace")
+            text = stdout.decode(_SYS_ENCODING, errors="replace")
             # 匹配: default via 192.168.1.1 dev eth0
             for line in text.splitlines():
                 m = re.match(r'default\s+via\s+(\d+\.\d+\.\d+\.\d+)', line.strip())
@@ -1199,7 +1219,7 @@ class ARPProtection:
                 stderr=asyncio.subprocess.DEVNULL,
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-            text = stdout.decode("utf-8", errors="replace")
+            text = stdout.decode(_SYS_ENCODING, errors="replace")
 
             # 匹配: 192.168.1.1         00-11-22-33-44-55     dynamic
             # MAC 格式: xx-xx-xx-xx-xx-xx
@@ -1231,7 +1251,7 @@ class ARPProtection:
                 stderr=asyncio.subprocess.DEVNULL,
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-            text = stdout.decode("utf-8", errors="replace")
+            text = stdout.decode(_SYS_ENCODING, errors="replace")
             # 匹配: 192.168.1.1 dev eth0 lladdr 00:11:22:33:44:55 REACHABLE
             m = re.search(r'lladdr\s+(([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2})', text)
             if m:
@@ -1265,6 +1285,10 @@ class ARPProtection:
                 self._last_known_ip = self._local_ipv4
             if iface_info.get("local_mac"):
                 self._local_mac = iface_info["local_mac"]
+            # 收集本机所有 MAC 地址
+            if not self._local_macs_loaded:
+                self._local_macs = await ARPProtection._fetch_all_local_macs()
+                self._local_macs_loaded = True
             if iface_info["subnet_mask"]:
                 self._subnet_mask = iface_info["subnet_mask"]
             if iface_info["interface_name"]:
@@ -1289,7 +1313,7 @@ class ARPProtection:
                 stderr=asyncio.subprocess.DEVNULL,
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-            text = stdout.decode("utf-8", errors="replace")
+            text = stdout.decode(_SYS_ENCODING, errors="replace")
             for line in text.splitlines():
                 s = line.strip()
                 if "IPv6" in s or "IPv6 地址" in s:
@@ -1311,7 +1335,7 @@ class ARPProtection:
                 stderr=asyncio.subprocess.DEVNULL,
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-            text = stdout.decode("utf-8", errors="replace")
+            text = stdout.decode(_SYS_ENCODING, errors="replace")
         except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
             return False, f"ipconfig 执行失败: {e}"
 
@@ -1379,6 +1403,10 @@ class ARPProtection:
                 self._last_known_ip = self._local_ipv4
             if iface_info.get("local_mac"):
                 self._local_mac = iface_info["local_mac"]
+            # 收集本机所有 MAC 地址
+            if not self._local_macs_loaded:
+                self._local_macs = await ARPProtection._fetch_all_local_macs()
+                self._local_macs_loaded = True
             if iface_info["subnet_mask"]:
                 self._subnet_mask = iface_info["subnet_mask"]
             if iface_info["interface_name"]:
@@ -1402,7 +1430,7 @@ class ARPProtection:
                 stderr=asyncio.subprocess.DEVNULL,
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-            text = stdout.decode("utf-8", errors="replace")
+            text = stdout.decode(_SYS_ENCODING, errors="replace")
             for line in text.splitlines():
                 m = re.search(r'inet6\s+([0-9a-f:]+)', line.lower())
                 if m and m.group(1) != "::1":
@@ -1451,7 +1479,7 @@ class ARPProtection:
                     stderr=asyncio.subprocess.DEVNULL,
                 )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-            text = stdout.decode("utf-8", errors="replace")
+            text = stdout.decode(_SYS_ENCODING, errors="replace")
 
             # Windows: arp -a 输出中找本机 IP
             if sys.platform == "win32" and self._local_ipv4 in text:
@@ -1654,7 +1682,7 @@ class ARPProtection:
                 await self._flush_network_stack()
                 return True
             else:
-                err_text = stderr.decode("utf-8", errors="replace")[:200]
+                err_text = stderr.decode(_SYS_ENCODING, errors="replace")[:200]
                 if err_text:
                     logger.warning("ARP 防护: netsh 执行失败 (code=%d): %s",
                                    proc.returncode, err_text)
@@ -1749,7 +1777,7 @@ class ARPProtection:
             )
             _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
             if proc.returncode != 0:
-                err = stderr.decode("utf-8", errors="replace")[:200]
+                err = stderr.decode(_SYS_ENCODING, errors="replace")[:200]
                 logger.warning("ARP 防护: ip addr del 失败: %s", err)
 
             # 添加新 IP
@@ -1761,7 +1789,7 @@ class ARPProtection:
             )
             _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
             if proc.returncode != 0:
-                err = stderr.decode("utf-8", errors="replace")[:200]
+                err = stderr.decode(_SYS_ENCODING, errors="replace")[:200]
                 logger.warning("ARP 防护: ip addr add 失败: %s", err)
                 return False
 
@@ -1863,6 +1891,9 @@ class ARPProtection:
                 logger.warning("ARP 防护: 正在执行抗投毒修复...")
             else:
                 logger.info("ARP 防护: 本机 ARP 表正常，未检测到投毒")
+                # 本地 ARP 表正常但网关丢包 → 可能是路由器侧 ARP 投毒
+                # 异步触发交叉检测（不阻塞主流程）
+                asyncio.create_task(self._log_router_poison_if_detected())
 
             # 1. (跳过爆发 ping — recovery worker 已在后台持续 ping 网关)
             if await _check_abort():
@@ -1881,7 +1912,6 @@ class ARPProtection:
             else:
                 # 2-3-4. 触发常驻 workers 并发执行（无需 create_task 开销）
                 self._loss_result = None
-                self._garp_done = False
                 self._conflict_result = None
                 self._garp_done_event.clear()
                 self._loss_done_event.clear()
@@ -1989,6 +2019,80 @@ class ARPProtection:
             # recovery_detected 不清除（如果已经恢复，上层会读取），
             # 但 trigger 需清除让 worker 不再循环
             self._recovery_trigger.clear()
+
+    async def _detect_router_poison_cross_check(self) -> bool:
+        """
+        路由器侧 ARP 投毒交叉检测。
+        当本机 ARP 表正常但网关不可达时，尝试发送定向 ARP 请求探测
+        网关的真实 MAC，判断路由器 ARP 表是否被投毒。
+
+        Returns:
+            True 表示检测到路由器侧 ARP 投毒
+        """
+        gw_ip = self.gateway_ip
+        expected_mac = self.gateway_mac
+        if not gw_ip or not expected_mac:
+            return False
+
+        # 方法：清除本机网关 ARP 缓存 → 立即 ping 网关触发 ARP 请求
+        # → 检查回复的 MAC 是否等于预期
+        if sys.platform == "win32":
+            # Windows: arp -d 删除网关条目（需要管理员权限，但失败也不影响）
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "arp", "-d", gw_ip,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(proc.wait(), timeout=3)
+            except Exception:
+                pass
+            # 立即 ping 网关触发 ARP 请求
+            await self._ping_gateway_fast(gw_ip)
+            await asyncio.sleep(0.1)
+            # 检查 ARP 表中网关的 MAC
+            actual_mac = await self._arp_get_mac_windows(gw_ip)
+        else:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "ip", "neigh", "del", gw_ip, "dev", self._interface_name or "",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(proc.wait(), timeout=3)
+            except Exception:
+                pass
+            await self._ping_gateway_fast(gw_ip)
+            await asyncio.sleep(0.1)
+            actual_mac = await self._arp_get_mac_linux(gw_ip)
+
+        if actual_mac and self._mac_normalize(actual_mac) != self._mac_normalize(expected_mac):
+            logger.warning("ARP 防护: 路由器侧 ARP 表被篡改！"
+                           "网关 %s 回复 MAC=%s ≠ 预期 %s",
+                           gw_ip, actual_mac, expected_mac)
+            return True
+        elif actual_mac:
+            logger.info("ARP 防护: 路由器侧 ARP 表正常，网关 MAC=%s 匹配预期", actual_mac)
+            return False
+        else:
+            logger.warning("ARP 防护: 无法获取网关 %s 的 MAC（ARP 请求无响应）", gw_ip)
+            return False
+
+    async def _log_router_poison_if_detected(self):
+        """后台检测路由器侧 ARP 投毒并记录日志（不阻塞主修复流程）"""
+        try:
+            poisoned = await self._detect_router_poison_cross_check()
+            if poisoned:
+                logger.warning("ARP 防护: 交叉检测确认路由器侧 ARP 投毒，"
+                               "将触发强化 GARP 修复")
+                # 触发强化修复：广播 GARP 宣告本机真实 IP-MAC
+                if self._local_ipv4 and self._local_mac:
+                    await self._garp_broadcast_burst(count=10)
+                # 静态绑定网关 ARP
+                if self.gateway_mac:
+                    await self._protect_gateway_arp()
+        except Exception as e:
+            logger.debug("ARP 防护: 路由器侧投毒交叉检测异常: %s", e)
 
     async def _send_single_garp(self, skip_arp_del: bool = False) -> bool:
         """
@@ -2180,7 +2284,6 @@ class ARPProtection:
                                "(第 %d 轮, 剩余 %.1fs), 发送 GARP...",
                                rounds, remain)
                 await self._garp_broadcast_burst(count=3)
-                await self._ping_gateway_fast(gw_ip)
                 # 如果还不行，加量
                 if not await self._ping_gateway_fast(gw_ip):
                     await self._garp_broadcast_burst(count=10)
@@ -2271,6 +2374,17 @@ class ARPProtection:
         # 定向反制：使用攻击者真实 MAC 单播射它，误导其网络栈中断
         # 不再区分 GARP/ARP 攻击（GARP 攻击 attacker_ip=网关，但 attacker_mac 是攻击者真实的）
         is_local = attacker_ip and self._local_ipv4 and attacker_ip == self._local_ipv4
+        # 防自伤检测：如果 attacker_mac 属于本机接口的 MAC，跳过定向反制
+        # （攻击者冒用本机 MAC 陷害本地程序，定向反制会伤及自身）
+        is_local_mac = attacker_mac and self._local_macs and             any(self._mac_normalize(attacker_mac) == self._mac_normalize(m) for m in self._local_macs)
+        if is_local_mac:
+            logger.warning("ARP 反制: 攻击者冒用本机 MAC %s，跳过定向反制（防自伤），仅用广播 GARP 修复", attacker_mac)
+            # 广播 GARP 按攻击强度等比放大（burst_size 已由 _get_intensity 按 attack_rate 计算）
+            await self._garp_broadcast_burst(count=max(burst_size, 5))
+            # 立即尝试静态 ARP 绑定保护网关
+            if self.gateway_mac:
+                await self._protect_gateway_arp()
+            return
         if attacker_mac and not is_local:
             poison_mac = "FF:FF:FF:FF:FF:FE" if (self._counterstrike_count % 2 == 0) else "00:00:00:00:00:00"
             if _SCAPY_AVAILABLE and self._scapy_sender_ready:
@@ -2280,8 +2394,8 @@ class ARPProtection:
                 )
             # Windows fallback 已移除：netsh set neighbors 阻塞事件循环最多 5s。
 
-        # GARP 广播（固定 1 包，仅恢复路由器 ARP 表；定向反制已在队列中并行）
-        await self._garp_broadcast_burst(count=1)
+        # GARP 广播按攻击强度等比放大（burst_size 已由 _get_intensity 按 attack_rate 计算）
+        await self._garp_broadcast_burst(count=max(burst_size, 1))
 
     async def _switch_ip(self, new_ip: str) -> bool:
         """
@@ -2328,7 +2442,7 @@ class ARPProtection:
                 )
                 _, stderr = await asyncio.wait_for(proc.communicate(), timeout=8)
                 if proc.returncode != 0:
-                    err = stderr.decode("utf-8", errors="replace")[:200]
+                    err = stderr.decode(_SYS_ENCODING, errors="replace")[:200]
                     if err:
                         logger.warning("ARP 防护: netsh 切换 IP 失败 (code=%d): %s",
                                        proc.returncode, err)
@@ -2368,7 +2482,7 @@ class ARPProtection:
                 )
                 _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
                 if proc.returncode != 0:
-                    err = stderr.decode("utf-8", errors="replace")[:200]
+                    err = stderr.decode(_SYS_ENCODING, errors="replace")[:200]
                     logger.warning("ARP 防护: ip addr 切换 IP 失败: %s", err)
                     return False
                 # 网关路由
@@ -2411,7 +2525,7 @@ class ARPProtection:
                     # 等待 DHCP 获取地址
                     await asyncio.sleep(3)
                 else:
-                    err = stderr.decode("utf-8", errors="replace")[:200]
+                    err = stderr.decode(_SYS_ENCODING, errors="replace")[:200]
                     logger.error("ARP 防护: DHCP 切换失败 (code=%d): %s",
                                  proc.returncode, err or "(空)")
             except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
@@ -2630,7 +2744,7 @@ class ARPProtection:
                 stderr=asyncio.subprocess.DEVNULL,
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-            text = stdout.decode("utf-8", errors="replace")
+            text = stdout.decode(_SYS_ENCODING, errors="replace")
             logger.info("ARP 防护: netsh show interfaces 原始输出:\n%s", text)
 
             interfaces = []
@@ -2703,7 +2817,7 @@ class ARPProtection:
                 stderr=asyncio.subprocess.DEVNULL,
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-            text = stdout.decode("utf-8", errors="replace")
+            text = stdout.decode(_SYS_ENCODING, errors="replace")
         except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
             logger.debug("ARP 防护: netsh show config 失败: %s", e)
             return None
@@ -2729,7 +2843,7 @@ class ARPProtection:
                 stderr=asyncio.subprocess.DEVNULL,
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-            text = stdout.decode("utf-8", errors="replace")
+            text = stdout.decode(_SYS_ENCODING, errors="replace")
         except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
             logger.debug("ARP 防护: netsh show address 失败: %s", e)
             return None
@@ -2824,8 +2938,8 @@ class ARPProtection:
                     logger.info("ARP 防护: ✓ 静态 ARP 已绑定 %s (%s → %s)",
                                  gw_ip, iface, gw_mac)
                     return True
-                err_text = stderr.decode("utf-8", errors="replace").strip()
-                out_text = stdout.decode("utf-8", errors="replace").strip()
+                err_text = stderr.decode(_SYS_ENCODING, errors="replace").strip()
+                out_text = stdout.decode(_SYS_ENCODING, errors="replace").strip()
                 detail = err_text or out_text or "(空 — 可能需要管理员权限)"
                 logger.warning("ARP 防护: netsh 命名参数格式失败: %s", detail)
 
@@ -2850,7 +2964,7 @@ class ARPProtection:
                         if netsh_name and netsh_name.upper() != iface.upper():
                             self._interface_name = netsh_name
                         return True
-                    err2 = serr2.decode("utf-8", errors="replace").strip() or sout2.decode("utf-8", errors="replace").strip() or "(空)"
+                    err2 = serr2.decode(_SYS_ENCODING, errors="replace").strip() or sout2.decode(_SYS_ENCODING, errors="replace").strip() or "(空)"
                     logger.warning("ARP 防护: netsh 索引也失败: %s", err2)
 
                     # 用 netsh 的名称重试
@@ -2872,7 +2986,7 @@ class ARPProtection:
                     logger.info("ARP 防护: ✓ 静态 ARP 已绑定(位置参数) %s (%s → %s)",
                                  gw_ip, self._interface_name, gw_mac)
                     return True
-                err3 = serr3.decode("utf-8", errors="replace").strip() or sout3.decode("utf-8", errors="replace").strip() or "(空)"
+                err3 = serr3.decode(_SYS_ENCODING, errors="replace").strip() or sout3.decode(_SYS_ENCODING, errors="replace").strip() or "(空)"
                 logger.warning("ARP 防护: netsh 位置参数也失败: %s", err3)
                 return False
             except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
@@ -2896,7 +3010,7 @@ class ARPProtection:
                     logger.info("ARP 防护: ✓ 静态 ARP 已绑定 %s (%s → %s)",
                                  gw_ip, iface, gw_mac)
                     return True
-                err_text = stderr.decode("utf-8", errors="replace").strip()
+                err_text = stderr.decode(_SYS_ENCODING, errors="replace").strip()
                 logger.warning("ARP 防护: ip neigh replace 失败: %s",
                                 err_text or "(空)")
                 return False
@@ -2924,7 +3038,7 @@ class ARPProtection:
                     stderr=asyncio.subprocess.DEVNULL,
                 )
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-                text = stdout.decode("utf-8", errors="replace")
+                text = stdout.decode(_SYS_ENCODING, errors="replace")
                 for line in text.splitlines():
                     line = line.strip()
                     if not line:
@@ -2960,12 +3074,65 @@ class ARPProtection:
                     stderr=asyncio.subprocess.DEVNULL,
                 )
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-                mac = stdout.decode("utf-8", errors="replace").strip()
+                mac = stdout.decode(_SYS_ENCODING, errors="replace").strip()
                 if mac and len(mac.replace(":", "")) == 12:
                     return mac
         except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
             logger.debug("ARP 防护: 获取本地 MAC 失败: %s", e)
         return None
+
+    @staticmethod
+    async def _fetch_all_local_macs() -> set:
+        """
+        收集本机所有网络接口的 MAC 地址。
+        用于识别攻击者是否冒用本机 MAC 进行 ARP 投毒，防止反制误伤本地程序。
+
+        Returns:
+            所有本地 MAC 的集合（冒号大写格式，如 {'AA:BB:CC:DD:EE:FF', ...}）
+        """
+        macs: set = set()
+        try:
+            if sys.platform == "win32":
+                proc = await asyncio.create_subprocess_exec(
+                    "getmac", "/FO", "CSV", "/NH",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+                for line in stdout.decode(_SYS_ENCODING, errors="replace").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    inner = line.strip('"')
+                    parts = inner.split('","')
+                    if len(parts) >= 2:
+                        mac = parts[1].strip()
+                        if mac and len(mac.replace("-", "")) == 12:
+                            macs.add(mac.replace("-", ":").upper())
+            else:
+                proc = await asyncio.create_subprocess_exec(
+                    "ls", "/sys/class/net",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+                interfaces = stdout.decode(_SYS_ENCODING, errors="replace").split()
+                for iface in interfaces:
+                    try:
+                        proc2 = await asyncio.create_subprocess_exec(
+                            "cat", f"/sys/class/net/{iface}/address",
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.DEVNULL,
+                        )
+                        out2, _ = await asyncio.wait_for(proc2.communicate(), timeout=3)
+                        mac = out2.decode(_SYS_ENCODING, errors="replace").strip()
+                        if mac and len(mac.replace(":", "")) == 12:
+                            macs.add(mac.upper())
+                    except Exception:
+                        continue
+        except Exception as e:
+            logger.debug("ARP 防护: 获取所有本地 MAC 失败: %s", e)
+        return macs
 
     @staticmethod
     async def _fetch_local_ips(interface_name: str) -> set:
@@ -2984,7 +3151,7 @@ class ARPProtection:
                     stderr=asyncio.subprocess.DEVNULL,
                 )
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-                text = stdout.decode("utf-8", errors="replace")
+                text = stdout.decode(_SYS_ENCODING, errors="replace")
                 in_adapter = False
                 for line in text.splitlines():
                     s = line.strip()
@@ -3011,7 +3178,7 @@ class ARPProtection:
                     stderr=asyncio.subprocess.DEVNULL,
                 )
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-                for line in stdout.decode("utf-8", errors="replace").splitlines():
+                for line in stdout.decode(_SYS_ENCODING, errors="replace").splitlines():
                     m = re.search(r'inet\s+(\d+\.\d+\.\d+\.\d+)', line)
                     if m:
                         ips.add(m.group(1))
@@ -3264,7 +3431,7 @@ class ARPProtection:
             )
             stdout_bytes, _ = await asyncio.wait_for(
                 proc.communicate(), timeout=(timeout_ms / 1000) + 5)
-            stdout_text = stdout_bytes.decode("utf-8", errors="replace")
+            stdout_text = stdout_bytes.decode(_SYS_ENCODING, errors="replace")
             lines = stdout_text.splitlines()
 
             # ping.exe exit code: 0=success, 1=unreachable/timeout
@@ -3453,6 +3620,7 @@ class ARPProtection:
             "manual_gateway_count": len(self._manual_gateways),
             "local_ipv4": self._local_ipv4,
             "local_mac": self._local_mac,
+            "local_macs": list(self._local_macs),
             "subnet_mask": self._subnet_mask,
             "broadcast": self._get_broadcast_address(),
             "manual_ip": bool(self._manual_gateway_ip),

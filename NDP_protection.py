@@ -154,8 +154,9 @@ class NDPProtection:
         self._ndp_attack_stats: dict = {}
         self._ndp_sender_queue: asyncio.Queue = asyncio.Queue()
         self._ndp_sender_ready: bool = False
-        self._ndp_counterstrike_cooldown: float = 0.0
         self._ndp_ip_migrated: bool = True              # 全局NDP是否已标记迁移（永久禁用IP迁移，仅用反制）
+        self._local_macs: set = set()              # 本机所有网络接口的 MAC 地址（防自伤反制）
+        self._local_macs_loaded: bool = False      # 本地 MAC 是否已加载
 
         # T5 NUD 追踪
         self._nud_tracker: Dict[str, list] = {}
@@ -285,6 +286,59 @@ class NDPProtection:
             except LookupError:
                 continue
         return data.decode('utf-8', errors='replace')
+
+    @staticmethod
+    async def _fetch_all_local_macs() -> set:
+        """
+        收集本机所有网络接口的 MAC 地址。
+        用于识别攻击者是否冒用本机 MAC 进行 NDP 欺骗，防止反制误伤本地程序。
+
+        Returns:
+            所有本地 MAC 的集合（冒号大写格式，如 {'AA:BB:CC:DD:EE:FF', ...}）
+        """
+        macs: set = set()
+        try:
+            if sys.platform == "win32":
+                proc = await asyncio.create_subprocess_exec(
+                    "getmac", "/FO", "CSV", "/NH",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+                for line in stdout.decode(locale.getpreferredencoding(False), errors="replace").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    inner = line.strip('"')
+                    parts = inner.split('","')
+                    if len(parts) >= 2:
+                        mac = parts[1].strip()
+                        if mac and len(mac.replace("-", "")) == 12:
+                            macs.add(mac.replace("-", ":").upper())
+            else:
+                proc = await asyncio.create_subprocess_exec(
+                    "ls", "/sys/class/net",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+                interfaces = stdout.decode("utf-8", errors="replace").split()
+                for iface in interfaces:
+                    try:
+                        proc2 = await asyncio.create_subprocess_exec(
+                            "cat", f"/sys/class/net/{iface}/address",
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.DEVNULL,
+                        )
+                        out2, _ = await asyncio.wait_for(proc2.communicate(), timeout=3)
+                        mac = out2.decode("utf-8", errors="replace").strip()
+                        if mac and len(mac.replace(":", "")) == 12:
+                            macs.add(mac.upper())
+                    except Exception:
+                        continue
+        except Exception as e:
+            logger.debug("NDP 防护: 获取所有本地 MAC 失败: %s", e)
+        return macs
 
     @staticmethod
     def _mac_normalize(mac: str) -> str:
@@ -437,6 +491,7 @@ class NDPProtection:
         self._na_burst_done.set()
         self._detect_done_event.set()
         self._poison_detected.set()
+        self._run_dhcpv6_check.set()
         try:
             self._ndp_sender_queue.put_nowait(None)
         except Exception:
@@ -559,11 +614,17 @@ class NDPProtection:
         if not self._scapy_available:
             await asyncio.Event().wait()
             return
+        # 收集本机所有 MAC 地址（用于检测本地 MAC 冒用攻击+防自伤）
+        if not self._local_macs_loaded:
+            self._local_macs = await NDPProtection._fetch_all_local_macs()
+            self._local_macs_loaded = True
         loop = asyncio.get_event_loop()
 
         def _sniff():
-            sniff(
-                count=0, timeout=None,
+            while self._ndp_running:
+                sniff(
+                    count=0, timeout=5,
+                    stop_filter=lambda pkt: not self._ndp_running,
                 lfilter=lambda p: (
                     p.haslayer(Ether) and p.haslayer(IPv6) and (
                         p.haslayer(ICMPv6ND_NA) or
@@ -759,6 +820,32 @@ class NDPProtection:
                 self._loop.call_soon_threadsafe(
                     lambda: asyncio.create_task(self._on_poison_detected(attacker_mac=src_mac, attacker_ip=src_ip)))
                 break
+
+        # ==================== 本地 MAC 冒用攻击 ====================
+        if self._local_macs and any(self._mac_normalize(src_mac) == self._mac_normalize(m) for m in self._local_macs)                 and src_ip not in all_local_ips and src_mac != "000000000000":
+            self._threat_events.append({
+                "type": "local_mac_spoof", "time": time.time(),
+                "attacker_mac": src_mac, "src_ip": src_ip,
+            })
+            logger.warning("NDP 嗅探: 本地 MAC 冒用攻击！攻击者冒用本机 MAC %s 以 %s 身份发送 NDP", src_mac, src_ip)
+            _now_lm = time.time()
+            _stats_lm = self._ndp_attack_stats.get(src_mac, {})
+            _rate_lm = _stats_lm.get("count", 0)
+            if _rate_lm > 200:
+                _debounce_lm = 0.0
+            elif _rate_lm > 100:
+                _debounce_lm = 0.1
+            elif _rate_lm > 50:
+                _debounce_lm = 0.3
+            elif _rate_lm > 10:
+                _debounce_lm = 1.0
+            else:
+                _debounce_lm = 3.0
+            _last_time_lm = _stats_lm.get("last_attack", 0)
+            if _now_lm - _last_time_lm >= _debounce_lm:
+                self._poison_detected.set()
+                self._loop.call_soon_threadsafe(
+                    lambda: asyncio.create_task(self._on_poison_detected(attacker_mac=src_mac, attacker_ip=src_ip)))
 
     def has_recent_attacks(self, seconds: float = 5.0) -> bool:
         """检查指定秒数内是否有任何 NDP 攻击被检测到。
@@ -1426,6 +1513,29 @@ class NDPProtection:
             logger.warning("NDP 反制 %s: %s %d次/60s -> %d轮NA @%.0fms",
                            log_tag, attacker_mac or "?", attack_rate, na_rounds, inter*1000)
 
+        # 防自伤检测：如果 attacker_mac 属于本机接口的 MAC，跳过定向反制
+        # （攻击者冒用本机 MAC 陷害本地程序，定向反制会伤及自身）
+        is_local_mac = attacker_mac and self._local_macs and             any(self._mac_normalize(attacker_mac) == self._mac_normalize(m) for m in self._local_macs)
+        if is_local_mac:
+            logger.warning("NDP 反制: 攻击者冒用本机 MAC %s，跳过定向反制（防自伤），仅用广播 NA 修复", attacker_mac)
+            # 广播 NA 按攻击强度等比放大
+            for iface in self.interfaces:
+                local_ip = iface.ipv6_global or iface.ipv6_ll
+                local_mac_real = iface.mac
+                if local_ip and local_mac_real:
+                    vlan_id = self._manual_gateway_vlan
+                    broadcast_rounds = max(na_rounds // 2, 1)
+                    try:
+                        self._ndp_sender_queue.put_nowait(
+                            ("ff:ff:ff:ff:ff:ff", local_ip, local_mac_real, local_ip, broadcast_rounds, inter, vlan_id)
+                        )
+                    except Exception:
+                        pass
+                    break
+            # 立即尝试静态 NDP 绑定保护网关
+            await self.protect_ndp_entry()
+            return
+
         # 定向反制：单播 NA 到攻击者网卡，毒化其邻居缓存
         if attacker_mac and self._ndp_sender_ready:
             # 收集本机 IPv6 和 MAC 信息
@@ -1442,10 +1552,10 @@ class NDPProtection:
                         )
                     except Exception:
                         pass
-                    # 正确 NA 广播（固定 1 轮，仅恢复路由器 NDP 表；定向反制保持原量）
+                    # 正确 NA 广播按攻击强度等比放大（定向反制保持原量）
                     try:
                         self._ndp_sender_queue.put_nowait(
-                            ("ff:ff:ff:ff:ff:ff", local_ip, local_mac_real, local_ip, 1, inter, vlan_id)
+                            ("ff:ff:ff:ff:ff:ff", local_ip, local_mac_real, local_ip, max(na_rounds // 2, 1), inter, vlan_id)
                         )
                     except Exception:
                         pass
@@ -1658,6 +1768,7 @@ class NDPProtection:
                 return proc.returncode == 0
             except Exception:
                 return False
+
     @property
     def stats(self) -> dict:
         return {
@@ -1667,6 +1778,7 @@ class NDPProtection:
             "ipv6_addresses": self.all_local_ipv6,
             "scapy_available": self._scapy_available,
             "threat_events": len(self._threat_events),
+            "local_macs": list(self._local_macs),
             "last_fix_time": self._last_fix_time,
             "trusted_ra_sources": len(self._trusted_ra_sources),
             "suspicious_ra_sources": len(self._suspicious_ra_sources),
