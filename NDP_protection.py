@@ -31,13 +31,16 @@ import os
 import re
 import sys
 import time
+import struct
 import asyncio
 import logging
+import random
 import locale
 from typing import Optional, List, Tuple, Dict, Callable, Any
 from collections import defaultdict
 from dataclasses import dataclass, field
 
+import socket
 
 logger = logging.getLogger("dns-proxy.ndp")
 
@@ -45,16 +48,28 @@ logger = logging.getLogger("dns-proxy.ndp")
 
 _HAS_SCAPY = False
 try:
-    from scapy.all import (
-        Ether, IPv6, ICMPv6ND_NA, ICMPv6NDOptDstLLAddr,
-        ICMPv6ND_NS, ICMPv6NDOptSrcLLAddr,
-        ICMPv6ND_RA, ICMPv6NDOptPrefixInformation,
-        ICMPv6ND_RS,
-        ICMPv6NDOptRedirectedHdr, ICMPv6Error,
-        Dot1Q, sniff, sendp,
-    )
+    import scapy.all as scapy_module
+    Ether = scapy_module.Ether
+    IPv6 = scapy_module.IPv6
+    ICMPv6ND_NA = scapy_module.ICMPv6ND_NA
+    ICMPv6NDOptDstLLAddr = scapy_module.ICMPv6NDOptDstLLAddr
+    ICMPv6ND_NS = scapy_module.ICMPv6ND_NS
+    ICMPv6NDOptSrcLLAddr = scapy_module.ICMPv6NDOptSrcLLAddr
+    ICMPv6ND_RA = scapy_module.ICMPv6ND_RA
+    ICMPv6ND_RS = scapy_module.ICMPv6ND_RS
+    ICMPv6NDOptRedirectedHdr = scapy_module.ICMPv6NDOptRedirectedHdr
+    Dot1Q = scapy_module.Dot1Q
+    sniff = scapy_module.sniff
+    sendp = scapy_module.sendp
+    # 兼容不同 scapy 版本的符号名
+    ICMPv6NDOptPrefixInformation = getattr(scapy_module, 'ICMPv6NDOptPrefixInformation',
+                                         getattr(scapy_module, 'ICMPv6NDOptPrefixInfo', None))
+    try:
+        from scapy.layers.inet6 import _ICMPv6Error as ICMPv6Error
+    except Exception:
+        ICMPv6Error = None
     _HAS_SCAPY = True
-except ImportError:
+except Exception:
     pass
 
 
@@ -139,12 +154,14 @@ class NDPProtection:
         self._ndp_attack_stats: dict = {}
         self._ndp_sender_queue: asyncio.Queue = asyncio.Queue()
         self._ndp_sender_ready: bool = False
+        self._ndp_counterstrike_cooldown: float = 0.0
         self._ndp_ip_migrated: bool = True              # 全局NDP是否已标记迁移（永久禁用IP迁移，仅用反制）
 
         # T5 NUD 追踪
         self._nud_tracker: Dict[str, list] = {}
 
         # 基线学习
+        self._baseline_learned: bool = False
         self._baseline_mac_per_gw: Dict[str, str] = {}
         self._baseline_proposed: Dict[str, str] = {}
         self._baseline_proposed_time: Dict[str, float] = {}
@@ -269,6 +286,13 @@ class NDPProtection:
                 continue
         return data.decode('utf-8', errors='replace')
 
+    @staticmethod
+    def _mac_normalize(mac: str) -> str:
+        """去掉 MAC 中所有分隔符（:-）后统一大写，用于可靠比较不同来源的 MAC"""
+        if not mac:
+            return ""
+        return re.sub(r'[:-]', '', mac).upper()
+
     # ======================== 生命周期 ========================
 
 
@@ -294,15 +318,17 @@ class NDPProtection:
         """
         try:
             if sys.platform == "win32":
-                cmd = ["ping", "-6", "-n", "1", "-w", str(int(timeout_sec * 1000))]
+                proc = await asyncio.create_subprocess_exec(
+                    "ping", "-6", "-n", "1", "-w", str(int(timeout_sec * 1000)), target,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
             else:
-                cmd = ["ping", "-6", "-c", "1", "-W", str(int(timeout_sec))]
-            cmd.append(target)
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
+                proc = await asyncio.create_subprocess_exec(
+                    "ping", "-6", "-c", "1", "-W", str(max(1, int(timeout_sec))), target,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
             stdout_bytes, _ = await asyncio.wait_for(
                 proc.communicate(), timeout=timeout_sec + 2)
             stdout_text = stdout_bytes.decode("utf-8", errors="replace")
@@ -395,6 +421,7 @@ class NDPProtection:
             self._enabled = False
             return
         self._running = True
+        self._loop = asyncio.get_event_loop()
         self._check_task = asyncio.create_task(self._periodic_check_loop())
         await self._start_workers()
         logger.info("NDP 防护: 已启动 (接口=%d, 网关=%d, scapy=%s, workers=%d)",
@@ -557,7 +584,7 @@ class NDPProtection:
     def _on_ndp_packet(self, pkt):
         if not pkt.haslayer(Ether) or not pkt.haslayer(IPv6):
             return
-        src_mac = pkt[Ether].src.upper()
+        src_mac = self._mac_normalize(pkt[Ether].src)
         src_ip = str(pkt[IPv6].src)
         all_gw_ips = {ip for ip, _, _ in self.gateway_pairs if ip}
         all_local_ips = set(self.all_local_ipv6)
@@ -606,7 +633,7 @@ class NDPProtection:
 
                 # --- RA 源自动学习（替代 max_ra_routers）---
                 # 从手动配置的网关 MAC 或已确认的接口网关 MAC 发来的 RA = 信任
-                known_gw_macs = {mac.replace("-", ":").upper() for _, mac, _ in self.gateway_pairs if mac}
+                known_gw_macs = {self._mac_normalize(mac) for _, mac, _ in self.gateway_pairs if mac}
                 known_baseline_macs = set(self._baseline_mac_per_gw.values())
                 all_trusted = known_gw_macs | known_baseline_macs | self._trusted_ra_sources
 
@@ -657,8 +684,9 @@ class NDPProtection:
                         self._baseline_proposed_time[gw_ip] = time.time()
                     elif self._baseline_proposed[gw_ip] == src_mac:
                         elapsed = time.time() - self._baseline_proposed_time.get(gw_ip, 0)
-                        if elapsed > self._baseline_learn_time and gw_ip not in self._baseline_mac_per_gw:
+                        if elapsed > self._baseline_learn_time and not self._baseline_learned:
                             self._baseline_mac_per_gw[gw_ip] = src_mac
+                            self._baseline_learned = True
                             logger.info("NDP 防护: 基线学习完成 [%s] -> MAC=%s", gw_ip, src_mac)
                     else:
                         self._baseline_proposed[gw_ip] = src_mac
@@ -697,7 +725,7 @@ class NDPProtection:
                         break
                     if not self._poison_detected.is_set():
                         self._poison_detected.set()
-                        asyncio.get_event_loop().call_soon_threadsafe(
+                        self._loop.call_soon_threadsafe(
                             lambda: asyncio.create_task(self._on_poison_detected(attacker_mac=src_mac, attacker_ip=src_ip)))
                     break
 
@@ -705,7 +733,7 @@ class NDPProtection:
         for local_ip in all_local_ips:
             if local_ip and (src_ip == local_ip or (
                 pkt.haslayer(ICMPv6ND_NA) and str(pkt[ICMPv6ND_NA].target) == local_ip
-            )) and self._mac_normalize(src_mac) != self._mac_normalize(self.local_mac or ""):
+            )) and self._mac_normalize(src_mac) != self._mac_normalize(self.local_mac):
                 self._threat_events.append({
                     "type": "ip_conflict", "time": time.time(),
                     "ip": local_ip, "attacker_mac": src_mac,
@@ -728,7 +756,7 @@ class NDPProtection:
                 if _now_ipc - _last_time_ipc < _debounce_ipc:
                     break
                 self._poison_detected.set()
-                asyncio.get_event_loop().call_soon_threadsafe(
+                self._loop.call_soon_threadsafe(
                     lambda: asyncio.create_task(self._on_poison_detected(attacker_mac=src_mac, attacker_ip=src_ip)))
                 break
 
@@ -1016,7 +1044,7 @@ class NDPProtection:
                         iface.mac = mac
             if iface.ipv6_ll or iface.ipv6_global:
                 for gw, idx in default_routes:
-                    if not any(g == gw for g, _, _ in iface.gateways):
+                    if not any(g == gw for g, _ in iface.gateways):
                         iface.gateways.append((gw, "", ""))
                 self.interfaces.append(iface)
         await self._resolve_all_gateway_macs()
@@ -1224,13 +1252,6 @@ class NDPProtection:
         return results
 
     @staticmethod
-    def _mac_normalize(mac: str) -> str:
-        """去掉 MAC 中所有分隔符（:-）后统一大写，用于可靠比较不同来源的 MAC"""
-        if not mac:
-            return ""
-        return re.sub(r'[:-]', '', mac).upper()
-
-    @staticmethod
     async def _run_dict(task_dict: dict) -> dict:
         keys = list(task_dict.keys())
         coros = [task_dict[k] for k in keys]
@@ -1318,7 +1339,7 @@ class NDPProtection:
             logger.debug("NDP 防护: sniff 失败: %s", e)
             return {"t2_ns": [], "t3_ra": [], "t4_dad": [], "t6_redirect": []}
 
-        known_gw_macs = {mac.replace("-", ":").upper() for _, mac, _ in self.gateway_pairs if mac}
+        known_gw_macs = {self._mac_normalize(mac) for _, mac, _ in self.gateway_pairs if mac}
         ra_sources = {}
         ns_targets = defaultdict(int)
         dad_targets = defaultdict(int)
@@ -1326,7 +1347,7 @@ class NDPProtection:
         suspicious_ns = []
 
         for pkt in pkts:
-            src_mac = pkt[Ether].src.upper()
+            src_mac = self._mac_normalize(pkt[Ether].src)
             src_ip = str(pkt[IPv6].src) if pkt.haslayer(IPv6) else "?"
             if pkt.haslayer(ICMPv6ND_RA):
                 prefix = ""
@@ -1415,13 +1436,19 @@ class NDPProtection:
                     # 网关 IPv6 -> 00:00:00:00:00:00 毒化包（打残攻击者）
                     null_mac = "00:00:00:00:00:00"
                     vlan_id = self._manual_gateway_vlan
-                    self._ndp_sender_queue.put_nowait(
-                        (attacker_mac, local_ip, null_mac, attacker_ip or self.gateway_ipv6 or local_ip, na_rounds, inter, vlan_id)
-                    )
+                    try:
+                        self._ndp_sender_queue.put_nowait(
+                            (attacker_mac, local_ip, null_mac, attacker_ip or self.gateway_ipv6 or local_ip, na_rounds, inter, vlan_id)
+                        )
+                    except Exception:
+                        pass
                     # 正确 NA 广播（固定 1 轮，仅恢复路由器 NDP 表；定向反制保持原量）
-                    self._ndp_sender_queue.put_nowait(
-                        ("ff:ff:ff:ff:ff:ff", local_ip, local_mac_real, local_ip, 1, inter, vlan_id)
-                    )
+                    try:
+                        self._ndp_sender_queue.put_nowait(
+                            ("ff:ff:ff:ff:ff:ff", local_ip, local_mac_real, local_ip, 1, inter, vlan_id)
+                        )
+                    except Exception:
+                        pass
                     break
 
         # 回退：如果 sender 就绪就用队列，否则走原广播逻辑
@@ -1465,7 +1492,7 @@ class NDPProtection:
                 eth = Ether(dst=dst_mac, src=local_mac)
                 na = ICMPv6ND_NA(R=0, S=0, O=1, target=target_ip)
                 lla = ICMPv6NDOptDstLLAddr(lladdr=local_mac)
-                ipv6 = IPv6(src=local_ip, dst="ff02::1", hlim=255)
+                ipv6 = IPv6(src=local_ip, dst=target_ip if dst_mac != "ff:ff:ff:ff:ff:ff" else "ff02::1", hlim=255)
                 pkt = eth / ipv6 / na / lla
                 # VLAN 802.1Q tag when vlan_id is set and not VXLAN
                 if vlan_id and not self._vxlan_enabled:
@@ -1475,9 +1502,13 @@ class NDPProtection:
                         pass
                 elif vlan_id and self._vxlan_enabled:
                     try:
-                        from scapy.all import VXLAN, IP, UDP
                         inner_pkt = eth / ipv6 / na / lla
-                        pkt = Ether(dst=dst_mac, src=local_mac) / IP(dst=dst_mac, src=local_ip) / UDP(sport=4789, dport=4789) / VXLAN(vni=int(vlan_id)) / inner_pkt
+                        # VXLAN外层使用IPv6封装（NDP为IPv6协议族）
+                        pkt = (Ether(dst=dst_mac, src=local_mac)
+                               / scapy_module.IPv6(src=local_ip, dst=target_ip, hlim=64)
+                               / scapy_module.UDP(sport=4789, dport=4789)
+                               / scapy_module.VXLAN(vni=int(vlan_id))
+                               / inner_pkt)
                     except Exception:
                         pass
                 for _ in range(count):
@@ -1526,28 +1557,52 @@ class NDPProtection:
     async def _send_na_system_all(self) -> bool:
         if not self.gateway_ipv6:
             return False
-        # 优先设置静态 NDP 绑定保护本机邻居缓存
-        try:
-            await self.protect_ndp_entry()
-        except Exception:
-            pass
-        # ping 验证连通性
         success = False
         try:
             if sys.platform == "win32":
-                cmd = ["ping", "-6", "-n", "10", "-w", str(int(self._ping_interval * 1000))]
+                proc = await asyncio.create_subprocess_exec(
+                    "ping", "-6", "-n", "10", "-w", str(int(self._ping_interval * 1000)),
+                    self.gateway_ipv6,
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                )
             else:
-                cmd = ["ping", "-6", "-c", "10", "-W", str(max(1, int(self._ping_interval)))]
-            cmd.append(self.gateway_ipv6)
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-            )
+                proc = await asyncio.create_subprocess_exec(
+                    "ping", "-6", "-c", "10", "-W", str(max(1, int(self._ping_interval))),
+                    self.gateway_ipv6,
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                )
             await asyncio.wait_for(proc.wait(), timeout=15)
             success = proc.returncode == 0
         except Exception:
             pass
         return success
+
+    async def _send_rs(self):
+        if not self._scapy_available:
+            return
+        loop = asyncio.get_event_loop()
+
+        def _send(iface: InterfaceInfo):
+            local = iface.ipv6_ll or iface.ipv6_global
+            if not local or not iface.mac:
+                return
+            try:
+                eth = Ether(dst="33:33:00:00:00:02", src=iface.mac)
+                rs = ICMPv6ND_RS()
+                lla = ICMPv6NDOptSrcLLAddr(lladdr=iface.mac)
+                ipv6 = IPv6(src=local, dst="ff02::2", hlim=255)
+                sendp(eth / ipv6 / rs / lla, iface=iface.name, verbose=False)
+            except Exception:
+                pass
+
+        try:
+            for iface in self.interfaces:
+                if iface.ipv6_ll or iface.ipv6_global:
+                    await loop.run_in_executor(None, _send, iface)
+            logger.debug("NDP 防护: RS 已在 %d 个接口发送",
+                         sum(1 for i in self.interfaces if i.ipv6_ll or i.ipv6_global))
+        except Exception:
+            pass
 
     async def protect_ndp_entry(self) -> bool:
         success = True
@@ -1617,7 +1672,7 @@ class NDPProtection:
             "suspicious_ra_sources": len(self._suspicious_ra_sources),
             "interface_details": [{
                 "name": iface.name, "mac": iface.mac,
-                "ipv6_globals": iface.ipv6_globals, "ipv6_global": iface.ipv6_global, "ipv6_ll": iface.ipv6_ll,
+                "ipv6_global": iface.ipv6_global, "ipv6_globals": iface.ipv6_globals, "ipv6_ll": iface.ipv6_ll,
                 "gateways": iface.gateways,
             } for iface in self.interfaces],
         }
