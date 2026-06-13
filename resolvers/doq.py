@@ -112,7 +112,7 @@ if HAS_AIOQUIC:
             if self._closed:
                 return
             try:
-                now = time.time()
+                now = time.monotonic()
                 self._quic.receive_datagram(data, addr, now=now)
                 self._process_quic_events(now)
                 self._flush_send(now)
@@ -121,7 +121,11 @@ if HAS_AIOQUIC:
 
         def _process_quic_events(self, now: float):
             """处理 QUIC 事件并分发给对应 stream 的 Future"""
-            for event in self._quic.next_send_events(now=now):
+            self._quic.handle_timer(now)
+            while True:
+                event = self._quic.next_event()
+                if event is None:
+                    break
                 try:
                     if isinstance(event, HandshakeCompleted):
                         self._connected = True
@@ -131,6 +135,9 @@ if HAS_AIOQUIC:
                                      event.early_data_accepted)
 
                     elif isinstance(event, StreamDataReceived):
+                        # 如果 stream 已被取消（不在 _stream_futures 中），直接丢弃延迟数据
+                        if event.stream_id not in self._stream_futures:
+                            continue
                         buf = self._recv_buffers.get(event.stream_id)
                         if buf is None:
                             buf = bytearray()
@@ -185,7 +192,12 @@ if HAS_AIOQUIC:
         def _flush_send(self, now: float):
             """发送 QUIC 缓冲的数据报"""
             if self._transport and not self._transport.is_closing():
-                for data, addr in self._quic.send_flow_control_offered(now=now):
+                try:
+                    datagrams = self._quic.datagrams_to_send(now=now)
+                except Exception as e:
+                    logger.debug("DoQ 解析器获取待发送数据报异常: %s", e)
+                    return
+                for data, addr in datagrams:
                     try:
                         self._transport.sendto(data, addr)
                     except Exception as e:
@@ -204,11 +216,11 @@ if HAS_AIOQUIC:
             frame = struct.pack("!H", len(fixed)) + fixed
 
             stream_id = self._quic.get_next_available_stream_id()
-            future = asyncio.get_event_loop().create_future()
+            future = asyncio.get_running_loop().create_future()
             self._stream_futures[stream_id] = future
 
             self._quic.send_stream_data(stream_id, frame, end_stream=True)
-            self._flush_send(time.time())
+            self._flush_send(time.monotonic())
 
             try:
                 return await asyncio.wait_for(future, timeout=10.0)
@@ -233,14 +245,17 @@ if HAS_AIOQUIC:
             self._closed = True
             try:
                 self._quic.close()
-                self._flush_send(time.time())
             except Exception as e:
-                logger.debug("DoQ 解析器关闭异常: %s", e)
+                logger.debug("DoQ 解析器关闭 QUIC 异常: %s", e)
+            try:
+                self._flush_send(time.monotonic())
+            except Exception as e:
+                logger.debug("DoQ 解析器关闭刷新异常: %s", e)
             self._close_transport()
 
         @property
         def is_closed(self) -> bool:
-            return self._closed or self._quic.is_closed()
+            return self._closed
 
     class _QuicConnectionHandle:
         """
@@ -261,7 +276,7 @@ if HAS_AIOQUIC:
             self._last_used = 0.0
             self._cleanup_task: Optional[asyncio.Task] = None
             self._closed = False
-            self._created_at = time.time()
+            self._created_at = time.monotonic()
 
         async def connect(self):
             """建立 QUIC 连接（等待握手完成或超时）"""
@@ -272,7 +287,7 @@ if HAS_AIOQUIC:
             )
             protocol = _PooledQuicProtocol(quic)
 
-            connected_future = asyncio.get_event_loop().create_future()
+            connected_future = asyncio.get_running_loop().create_future()
             protocol.set_connected_future(connected_future)
 
             loop = asyncio.get_running_loop()
@@ -287,7 +302,7 @@ if HAS_AIOQUIC:
                 raise
 
             self._protocol = protocol
-            self._last_used = time.time()
+            self._last_used = time.monotonic()
 
             # 等待握手完成（超时则关闭连接）
             try:
@@ -319,7 +334,7 @@ if HAS_AIOQUIC:
                     try:
                         if self._protocol is None or self._protocol.is_closed:
                             break
-                        now = time.time()
+                        now = time.monotonic()
                         self._protocol._process_quic_events(now)
                         self._protocol._flush_send(now)
                         if now - self._created_at > 300.0:
@@ -348,7 +363,7 @@ if HAS_AIOQUIC:
                 raise ConnectionError("连接不可用")
 
             # QUIC 原生支持多流复用，多个 send_query 可并发
-            self._last_used = time.time()
+            self._last_used = time.monotonic()
             try:
                 return await self._protocol.send_query(query_bytes)
             except asyncio.CancelledError:
@@ -432,11 +447,12 @@ if HAS_AIOQUIC:
 
                 # 检查连接数上限，超出则驱逐最久未用的
                 if len(self._handles) >= self._max_handles:
-                    oldest_target = min(
-                        self._handles,
-                        key=lambda t: self._handles[t]._last_used
-                    )
-                    oldest = self._handles.pop(oldest_target)
+                    async with self._lock:
+                        oldest_target = min(
+                            self._handles,
+                            key=lambda t: self._handles[t]._last_used
+                        )
+                        oldest = self._handles.pop(oldest_target)
                     await oldest.close()
 
                 # 创建新连接
@@ -450,12 +466,12 @@ if HAS_AIOQUIC:
                     )
                     async with self._lock:
                         old = self._handles.get(target)
-                        if old:
-                            try:
-                                await old.close()
-                            except Exception:
-                                pass
                         self._handles[target] = handle
+                    if old:
+                        try:
+                            await old.close()
+                        except Exception:
+                            pass
                     return handle
                 except (ConnectionError, asyncio.TimeoutError, OSError) as e:
                     if handle:
@@ -508,13 +524,14 @@ if HAS_AIOQUIC:
             """关闭所有连接"""
             self._closed = True
             async with self._lock:
-                for target, handle in list(self._handles.items()):
-                    await handle.close()
+                to_close = list(self._handles.values())
                 self._handles.clear()
+            for handle in to_close:
+                await handle.close()
 
         async def close_idle(self):
             """仅关闭空闲或已死亡的连接，保留活跃连接。"""
-            now = time.time()
+            now = time.monotonic()
             async with self._lock:
                 dead_targets = [
                     (t, h) for t, h in list(self._handles.items())
@@ -603,7 +620,7 @@ if HAS_AIOQUIC:
             config.max_data = 10_000_000
             config.max_stream_data = 1_000_000
             # 空闲超时设为 60 秒（避免因 _ATTEMPT_TIMEOUT 过短导致连接频繁断开）
-            # 实际空闲清理由 _QuicConnectionHandle._keepalive_loop 的 _IDLE_KEEPALIVE(30s) 控制
+            # 实际空闲清理由 _QuicConnectionHandle._keepalive_loop 的 _IDLE_KEEPALIVE(15s) 控制
             config.idle_timeout = 60.0
             # 0-RTT 会话恢复：复用上次的 session ticket
             if self._session_ticket is not None:
