@@ -110,6 +110,11 @@ class _TlsConnectionPool:
         for conn in to_close:
             await conn.close()
 
+    async def close_idle(self):
+        """Close only idle connections, keep active ones."""
+        await self._evict_stale()
+
+
     def _get_pool(self, target: str) -> OrderedDict:
         """获取或创建某个目标的空闲连接池"""
         if target not in self._idle_pool:
@@ -121,12 +126,13 @@ class _TlsConnectionPool:
         从池中借出一条 TLS 连接。
         优先返回空闲连接，无空闲则创建新连接（不超过 max_pool_size）。
         """
+        dead_conn = None
+        evict_conn = None
         async with self._lock:
             pool = self._get_pool(target)
             if pool:
                 # LRU: 弹出最久未用的
                 cid, conn = pool.popitem(last=False)
-                self._total_conns -= 1
                 if not pool:
                     self._idle_pool.pop(target, None)
                 # 检查连接是否还存活
@@ -134,7 +140,8 @@ class _TlsConnectionPool:
                     return conn
                 else:
                     # 死连接，丢弃
-                    await conn.close()
+                    # close 在锁外执行
+                    dead_conn = conn
                     # 继续往下创建新连接
 
             # 检查是否已达上限
@@ -147,7 +154,14 @@ class _TlsConnectionPool:
                     self._total_conns -= 1
                     if not evict_pool:
                         self._idle_pool.pop(target_evict)
-                    await evict_conn.close()
+
+        # 在锁外执行 close（避免阻塞）
+        if evict_conn is not None:
+            await evict_conn.close()
+        if dead_conn is not None:
+            await dead_conn.close()
+            async with self._lock:
+                self._total_conns = max(0, self._total_conns - 1)
 
         # 创建新连接（锁外）
         reader, writer = await asyncio.wait_for(
@@ -177,7 +191,8 @@ class _TlsConnectionPool:
             # 用单调递增 id 作为 key
             cid = id(conn)
             pool[cid] = conn
-            self._total_conns += 1
+
+    
 
     async def discard(self, conn: _TlsConnection):
         """丢弃一条失效连接（不归还池）"""
@@ -211,7 +226,6 @@ class _TlsConnectionPool:
 class DoTResolver(BaseResolver):
     """DoT 上游解析器（支持连接池复用 + bootstrap IP 直连 + 双栈）"""
 
-    # 检测当前 Python/OpenSSL 是否支持 ECHClientConfig API
     _HAS_ECH = hasattr(ssl, 'ECHClientConfig')
 
     def __init__(self, host: str, port: int = 853, timeout: float = 5.0,
@@ -228,7 +242,6 @@ class DoTResolver(BaseResolver):
         self._ca_path = ca_path
         self._connection_pool_size = max(1, connection_pool_size)
         self._ssl_context = self._create_ssl_context()
-        # 连接池：每 DoTResolver 一个池（懒惰初始化）
         self._pool: Optional[_TlsConnectionPool] = None
         self._pool_created = False
 
@@ -254,17 +267,10 @@ class DoTResolver(BaseResolver):
         return self._pool
 
     def _create_ssl_context(self) -> ssl.SSLContext:
-        """创建 SSL 上下文（CA 证书验证 + 自定义 CA + ECH 配置）
-
-        安全策略：
-        - 如果配置了 ca_path: 创建空 SSL 上下文，**只信任自定义 CA**，完全排除系统默认 CA
-          防御系统 CA 已被入侵的 MITM 场景
-        - 如果未配置 ca_path: 使用系统默认 CA
-        """
+        """创建 SSL 上下文（CA 证书验证 + 自定义 CA + ECH 配置）"""
         ciphers = "HIGH:!aNULL:!kRSA:!PSK:!SRP:!MD5:!RC4"
 
         if self._ca_path:
-            # 自定义 CA 模式：创建空上下文，只加载自定义 CA
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             ctx.check_hostname = True
             ctx.verify_mode = ssl.CERT_REQUIRED
@@ -284,7 +290,6 @@ class DoTResolver(BaseResolver):
             ctx.verify_mode = ssl.CERT_REQUIRED
             ctx.set_ciphers(ciphers)
 
-        # 真正的 ECH：通过 HTTPS 记录获取的 ECHConfigList 配置到 SSL 上下文
         if self._ech_enabled and self._HAS_ECH and self._ech_config:
             try:
                 ech_obj = ssl.ECHClientConfig(self._ech_config)
@@ -293,17 +298,13 @@ class DoTResolver(BaseResolver):
                              self.host, len(self._ech_config))
             except Exception as e:
                 logger.warning("DoT %s: ECH 配置失败: %s", self.host, e)
-
         return ctx
 
     async def resolve(self, query_bytes: bytes) -> Optional[bytes]:
         """
         通过 TLS 加密连接解析 DNS（先 hostname 直连，再 fallback bootstrap IP）。
         使用连接池复用 TLS 连接，避免每查询新建/销毁 TLS 连接。
-
-        单栈兼容：如果系统没有 IPv6 栈，连接 IPv6 bootstrap 地址会超时失败并自动 fallback。
         """
-        # 构建连接目标列表：hostname 优先，bootstrap IP 作为 fallback
         connect_targets = [self.host]
         if self._connect_ips:
             for ip in self._connect_ips:
@@ -317,15 +318,11 @@ class DoTResolver(BaseResolver):
             conn: Optional[_TlsConnection] = None
             for target in connect_targets:
                 try:
-                    # 从连接池获取一条 TLS 连接
                     conn = await pool.acquire(target)
-
-                    # DoT 使用 2 字节长度前缀
                     msg_len = len(query_bytes)
                     conn.writer.write(msg_len.to_bytes(2, "big") + query_bytes)
                     await asyncio.wait_for(conn.writer.drain(), timeout=self.timeout)
 
-                    # 读取响应长度
                     raw_len = await asyncio.wait_for(
                         conn.reader.readexactly(2), timeout=self.timeout
                     )
@@ -336,12 +333,10 @@ class DoTResolver(BaseResolver):
                         conn = None
                         raise ConnectionError(f"无效的响应长度: {resp_len}")
 
-                    # 读取响应内容
                     response_data = await asyncio.wait_for(
                         conn.reader.readexactly(resp_len), timeout=self.timeout
                     )
 
-                    # 成功：归还连接到池
                     await pool.release(conn)
                     conn = None
                     return response_data
@@ -349,7 +344,6 @@ class DoTResolver(BaseResolver):
                 except (asyncio.TimeoutError, ConnectionError, OSError,
                         ssl.SSLError, asyncio.IncompleteReadError) as e:
                     last_error = e
-                    # 连接失效，丢弃
                     if conn is not None:
                         await pool.discard(conn)
                         conn = None
@@ -365,12 +359,10 @@ class DoTResolver(BaseResolver):
                     logger.debug("DoT %s (%s) 未知错误: %s", self.host, target, e)
                     continue
                 finally:
-                    # 如果 conn 不为 None 说明出了异常但没被 except 处理
                     if conn is not None:
                         await pool.discard(conn)
                         conn = None
 
-            # 所有地址都失败
             if isinstance(last_error, asyncio.TimeoutError):
                 logger.debug("DoT %s:%d 超时 (timeout=%s)", self.host, self.port, self.timeout)
             elif isinstance(last_error, ConnectionError):
@@ -396,3 +388,9 @@ class DoTResolver(BaseResolver):
         """
         await self.close()
         logger.debug("DoT %s: TLS 连接池已重置", self.host)
+
+    async def close_idle(self):
+        """Close only idle connections, keep active ones."""
+        if self._pool:
+            await self._pool.close_idle()
+            logger.debug("DoT %s: 空闲 TLS 连接已关闭", self.host)

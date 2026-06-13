@@ -61,6 +61,32 @@ class _MultiHostResolver:
         pass
 
 
+class _StaticHostResolver:
+    """Static DNS resolver for a single hostname -> pre-resolved IPs."""
+    def __init__(self, hostname: str, ips: list):
+        self._hostname = hostname
+        self._ips = ips
+
+    async def resolve(self, host: str, port: int = 0, family: int = 0):
+        if host != self._hostname and host != host.split(':')[0]:
+            return []
+        results = []
+        for ip in self._ips:
+            try:
+                family_actual = socket.AF_INET6 if ":" in ip else socket.AF_INET
+                results.append({
+                    "hostname": host,
+                    "host": ip,
+                    "port": port,
+                    "family": family_actual,
+                    "proto": socket.IPPROTO_TCP,
+                    "flags": socket.AI_NUMERICHOST,
+                })
+            except Exception:
+                continue
+        return results
+
+
 class DoHResolver(BaseResolver):
     """DoH 上游解析器（RFC 8484 Wire Format POST）"""
 
@@ -105,11 +131,13 @@ class DoHResolver(BaseResolver):
           防御系统 CA 已被入侵的 MITM 场景
         - 如果未配置 ca_path: 使用系统默认 CA
         """
+        ciphers = "HIGH:!aNULL:!kRSA:!PSK:!SRP:!MD5:!RC4"
         if self._ca_path:
             # 自定义 CA 模式：创建空上下文，只加载自定义 CA
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             ctx.check_hostname = True
             ctx.verify_mode = ssl.CERT_REQUIRED
+            ctx.set_ciphers(ciphers)
             try:
                 ctx.load_verify_locations(self._ca_path)
                 logger.info("DoH %s: 使用自定义 CA 证书（系统默认 CA 已禁用）", self.url)
@@ -123,6 +151,7 @@ class DoHResolver(BaseResolver):
             ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
             ctx.check_hostname = True
             ctx.verify_mode = ssl.CERT_REQUIRED
+            ctx.set_ciphers(ciphers)
 
         if self._ech_enabled and self._ech_config and self._HAS_ECH:
             try:
@@ -180,8 +209,8 @@ class DoHResolver(BaseResolver):
             try:
                 session = self._get_session()
                 headers = {"Content-Type": "application/dns-message"}
-                # 共享 session 模式下，per-request 传入 SSL context
-                ssl_ctx = None if self._shared_session else self._ssl_context
+                # 共享 session 模式下，per-request 传入 SSL context；自有 session connector 已自带
+                ssl_ctx = self._ssl_context if self._shared_session else None
                 async with session.post(
                     self.url, data=query_bytes, headers=headers,
                     ssl=ssl_ctx,
@@ -219,3 +248,9 @@ class DoHResolver(BaseResolver):
         """
         await self.close()
         logger.debug("DoH %s: 持久连接已重置", self.url)
+
+    async def close_idle(self):
+        """关闭自有 session（aiohttp 无"仅关空闲"API，等价于全量重置）。
+        共享 session 模式不受影响，由全局 session 管理连接生命周期。"""
+        if self._own_session and not self._own_session.closed:
+            await self.close()
