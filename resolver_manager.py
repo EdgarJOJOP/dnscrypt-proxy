@@ -146,6 +146,8 @@ class ResolverManager:
         # 启动缓冲：程序启动后前 3 秒内上游失败时等待再试，不触发重试风暴
         self._start_time = 0.0
         self._startup_buffer = 3.0
+        # 波次查询失败统计（供 _parallel_resolve_once 汇总日志使用）
+        self._failure_stats = {}
         # 重试互斥锁：只有一个并发请求执行重试，其余直接返回 SERVFAIL
         self._retry_lock = asyncio.Lock()
         self._retry_version = 0  # 每次重试递增，避免锁排队请求重复重试
@@ -220,7 +222,7 @@ class ResolverManager:
         # 5. 将 connection_pool_size 注入 DoQ 全局并发限制
         from resolvers.doq import set_doq_global_concurrency
         set_doq_global_concurrency(self.config.connection_pool_size)
-        # 5b. 启动定期空闲连接清理（每 30 秒）
+        # 5b. 启动定期空闲连接清理（每 120 秒）
         self._cleanup_idle_task = asyncio.create_task(self._periodic_idle_cleanup())
 
         self._bootstrap_ready.set()
@@ -420,7 +422,7 @@ class ResolverManager:
             ttl_dns_cache=300,
             force_close=False,
             resolver=self._shared_doh_resolver if any(self._bootstrap_cache.values()) else None,
-            # 不在这里设 ssl，per-request 传入
+            # 不在这里设 ssl，由 doh.py 的 resolve() 在每个请求中传入 ssl=self._ssl_context
         )
         self._shared_doh_session = aiohttp.ClientSession(
             connector=connector,
@@ -663,23 +665,32 @@ class ResolverManager:
                 await server.resolver.reset_connections()
             except Exception as e:
                 logger.debug("解析管理器重置 bootstrap 连接异常: %s", e)
-        # 清除 bootstrap 缓存
+        # 保存旧缓存作为后备，然后清除（刷新成功后会重新填充）
+        _old_cache = dict(self._bootstrap_cache)
         self._bootstrap_cache.clear()
         # 重新启用 + 恢复模式
         self.reenable_all()
         self.enter_recovery_mode()
-        # 异步刷新 bootstrap IP（非阻塞，失败不影响恢复）
-        asyncio.create_task(self._async_refresh_bootstrap())
+        # 异步刷新 bootstrap IP（非阻塞，失败则恢复旧缓存）
+        asyncio.create_task(self._async_refresh_bootstrap(_old_cache))
         enabled = sum(1 for s in self._upstream_servers if s.enabled)
         logger.info("自动恢复完成: %d 个上游已启用", enabled)
 
-    async def _async_refresh_bootstrap(self):
-        """异步刷新所有上游域名的 bootstrap IP（自动恢复时调用）"""
+    async def _async_refresh_bootstrap(self, old_cache=None):
+        """异步刷新所有上游域名的 bootstrap IP（自动恢复时调用）
+        Args:
+            old_cache: 旧缓存快照，刷新失败时恢复为后备
+        """
         try:
             await asyncio.sleep(0.5)  # 稍等片刻再刷新
             await self.refresh_all_upstream_ips()
         except Exception as e:
             logger.debug("自动恢复后刷新 bootstrap IP 失败: %s", e)
+            if old_cache:
+                # 刷新失败，恢复旧缓存避免无缓存可用
+                for hostname, ips in old_cache.items():
+                    if hostname not in self._bootstrap_cache:
+                        self._bootstrap_cache[hostname] = ips
 
     def set_network_down(self, down: bool = True):
         """设置网络断开标志。网络断开时上游查询直接跳过，不打印任何警告。"""
@@ -736,6 +747,8 @@ class ResolverManager:
                 return result
 
         # === 集群故障冷却 ===
+        # 更新时间戳，因为启动缓冲可能已经睡了几秒
+        now = asyncio.get_event_loop().time()
         if self._last_all_failed_time > 0:
             elapsed = now - self._last_all_failed_time
             if elapsed < self._all_failed_cooldown:
@@ -809,7 +822,6 @@ class ResolverManager:
             return None
 
         async def query_one(server: UpstreamServer) -> Optional[tuple]:
-            t0 = asyncio.get_event_loop().time()
             try:
                 result, elapsed = await server.resolver.resolve_with_stats(
                     query_bytes
@@ -820,6 +832,7 @@ class ResolverManager:
                     return (result, elapsed, server)
                 if not self._recovery_mode:
                     server.record_failure()
+                    self._failure_stats["返回空"] = self._failure_stats.get("返回空", 0) + 1
                 else:
                     logger.debug("上游 %s 返回空（恢复模式，不计失败）", server.name)
                 return None
@@ -828,6 +841,10 @@ class ResolverManager:
             except Exception as e:
                 if not self._recovery_mode:
                     server.record_failure()
+                    logger.warning("上游 %s 查询失败: %s [%s]",
+                                   server.name, e, type(e).__name__)
+                    err_type = type(e).__name__
+                    self._failure_stats[err_type] = self._failure_stats.get(err_type, 0) + 1
                 else:
                     logger.debug("上游 %s 异常（恢复模式）: %s", server.name, e)
                 return None
@@ -856,7 +873,8 @@ class ResolverManager:
 
         for task in remaining:
             task.cancel()
-        # await 被取消的 task 使 CancelledError 在 DoQ 内部传播，触发连接清理
+        # 取消未完成的任务；CancelledError 在 query_one 中被捕获返回 None，
+        # 不会传播到 DoQ 内部。连接清理由各 resolver 的 close/reset 负责。
         if remaining:
             await asyncio.gather(*remaining, return_exceptions=True)
 
@@ -906,7 +924,12 @@ class ResolverManager:
                 self._last_fast_server_obj = result[2]
                 return result[0]
 
-        logger.warning("并行查询: 全部 %d 个上游均失败", len(enabled))
+        if self._failure_stats:
+            summary = ", ".join(f"{k}×{v}" for k, v in sorted(self._failure_stats.items()))
+            logger.warning("并行查询: 全部 %d 个上游均失败 — %s", len(enabled), summary)
+            self._failure_stats.clear()
+        else:
+            logger.warning("并行查询: 全部 %d 个上游均失败", len(enabled))
         return None
 
     async def _background_consistency_check(
@@ -951,7 +974,7 @@ class ResolverManager:
                 pass
 
     async def _periodic_idle_cleanup(self):
-        """定期清理空闲连接（每 30 秒），防止 UDP/TCP 连接积压。"""
+        """定期清理空闲连接（每 120 秒），防止 UDP/TCP 连接积压。"""
         while True:
             try:
                 await asyncio.sleep(120)
