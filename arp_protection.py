@@ -23,6 +23,9 @@ logger = logging.getLogger("dns-proxy.arp")
 _SYS_ENCODING = locale.getpreferredencoding()
 
 # ARP 嗅探：scapy 跨平台抓包（可选，需 libpcap/Npcap 驱动支持）
+# Suppress Scapy socket BPF filter warnings on Windows
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, message=".*Socket.*failed.*")
 _SCAPY_AVAILABLE = False
 try:
     import scapy.all as scapy
@@ -650,14 +653,11 @@ class ARPProtection:
         while i + 2 < n:
             groups.append((parts[i], parts[i+1], parts[i+2]))
             i += 3
-        # 处理尾部不足 3 个的情况
+        # 尾部不足 3 个：不处理遗留元素（格式错误，期望完整 3 元素组）
         if i < n:
-            ip = parts[i] if i < n else ""
-            mac = parts[i+1] if i + 1 < n else ""
-            vlan = parts[i+2] if i + 2 < n else ""
-            groups.append((ip, mac, vlan))
+            logger.warning('ARP 防护: gateway 配置尾部 ' + str(n - i) + ' 个多余元素被忽略 (格式应为 IP,MAC,VLAN 交替)')
         return groups
-
+        
     @property
     def enabled(self) -> bool:
         return self._enabled
@@ -763,7 +763,7 @@ class ARPProtection:
                     logger.info("ARP 防护: VLAN 子接口 %s 已创建", vlan_iface)
                     return True
                 # 非零返回通常表示子接口已存在，不视为错误
-                logger.debug("ARP 防护: VLAN 子接口 %s 创建返回 %d（可能已存在）", vlan_iface, proc.returncode)
+                logger.warning("ARP 防护: VLAN 子接口 %s 创建返回 %d（可能已存在或命令不被支持）", vlan_iface, proc.returncode)
                 return True
             except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
                 logger.debug("ARP 防护: VLAN 子接口创建失败 %s", e)
@@ -782,7 +782,7 @@ class ARPProtection:
                 if proc.returncode == 0:
                     logger.info("ARP 防护: VLAN 子接口 %s 已创建", vlan_iface)
                     return True
-                logger.debug("ARP 防护: VLAN 子接口 %s 创建返回 %d（可能已存在）", vlan_iface, proc.returncode)
+                logger.warning("ARP 防护: VLAN 子接口 %s 创建返回 %d（可能已存在或命令不被支持）", vlan_iface, proc.returncode)
                 return True
             except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
                 logger.debug("ARP 防护: VLAN 子接口创建失败 %s", e)
@@ -1239,7 +1239,7 @@ class ARPProtection:
         """去掉 MAC 中所有分隔符（:-. ）后统一大写，用于可靠比较不同来源的 MAC"""
         if not mac:
             return ""
-        return re.sub(r'[:-]', '', mac).upper()
+        return re.sub(r'[-:.\s]', '', mac).upper()
 
     @staticmethod
     async def _arp_get_mac_linux(ip: str) -> Optional[str]:
@@ -1592,10 +1592,20 @@ class ARPProtection:
         new_host = host + offset
 
         if new_host >= host_max or new_host <= 0:
-            # 正向偏移溢出（如 .254 + 50），改尝试反向偏移
+            # 正向溢出，尝试反向
             new_host = host - offset
             if new_host <= 0 or new_host >= host_max:
-                return None  # 无法找到安全地址
+                # 双向均溢出，退化为最小偏移
+                if host > 1:
+                    new_host = host - 1
+                elif host < host_max - 1:
+                    new_host = host + 1
+                else:
+                    return None
+
+        # 确保结果不是网络地址或广播地址
+        if new_host >= host_max or new_host <= 0:
+            return None
 
         new_ip_int = network | new_host
         return ".".join(str((new_ip_int >> (8 * (3 - i))) & 0xFF) for i in range(4))
@@ -2373,7 +2383,6 @@ class ARPProtection:
 
         # 定向反制：使用攻击者真实 MAC 单播射它，误导其网络栈中断
         # 不再区分 GARP/ARP 攻击（GARP 攻击 attacker_ip=网关，但 attacker_mac 是攻击者真实的）
-        is_local = attacker_ip and self._local_ipv4 and attacker_ip == self._local_ipv4
         # 防自伤检测：如果 attacker_mac 属于本机接口的 MAC，跳过定向反制
         # （攻击者冒用本机 MAC 陷害本地程序，定向反制会伤及自身）
         is_local_mac = attacker_mac and self._local_macs and             any(self._mac_normalize(attacker_mac) == self._mac_normalize(m) for m in self._local_macs)
@@ -2385,7 +2394,7 @@ class ARPProtection:
             if self.gateway_mac:
                 await self._protect_gateway_arp()
             return
-        if attacker_mac and not is_local:
+        if attacker_mac:
             poison_mac = "FF:FF:FF:FF:FF:FE" if (self._counterstrike_count % 2 == 0) else "00:00:00:00:00:00"
             if _SCAPY_AVAILABLE and self._scapy_sender_ready:
                 # 通过常驻 sender 队列发送（一次性导入 scapy，不重复创建）
@@ -3524,10 +3533,9 @@ class ARPProtection:
 
             sock.sendto(pkt, (ip, 0))
 
-            # 等回复
-            sock.settimeout(timeout_ms / 1000.0)
-            sock.setblocking(True)
-            resp, addr = sock.recvfrom(4096)
+            # 异步等待回复，不阻塞事件循环
+            loop = asyncio.get_event_loop()
+            resp, addr = await asyncio.wait_for(loop.sock_recv(sock, 4096), timeout=timeout_ms/1000.0)
             # addr = (source_ip, port) — port is 0 for raw sockets
 
             # 解析 IP 头 + ICMP 载荷
@@ -3549,7 +3557,7 @@ class ARPProtection:
             return {"reachable": reachable, "icmp_type": icmp_type, "icmp_code": icmp_code,
                     "from_ip": src_ip, "saw_reply": True}
 
-        except socket.timeout:
+        except (asyncio.TimeoutError, socket.timeout):
             return {"reachable": False, "icmp_type": None, "icmp_code": None,
                     "from_ip": None, "saw_reply": False}
         except PermissionError:

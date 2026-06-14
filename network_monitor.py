@@ -1,4 +1,4 @@
-"""
+﻿"""
 网络连通性监控器
 - 定期 ping/探测网络连通性（IPv4 + IPv6 双栈）
 - 检测网络中断/恢复，自动重新启用上游服务器
@@ -288,6 +288,8 @@ class NetworkMonitor:
                             self._arp_network_down = False
                             self._ndp_network_down = False
                             self.resolver_manager.set_network_down(False)
+                            self.resolver_manager.enter_recovery_mode()
+                            self.resolver_manager.reenable_all()
                         else:
                             # ARP/NDP 安静期：触发完整恢复
                             self._run_recover.set()
@@ -800,6 +802,7 @@ class NetworkMonitor:
             self._last_recovery_time = asyncio.get_event_loop().time()
             self._arp_network_down = False
             self._ndp_network_down = False
+            self.resolver_manager.set_network_down(False)
 
             # 重新统计可用上游
             enabled = sum(1 for s in self.resolver_manager._upstream_servers if s.enabled)
@@ -836,6 +839,8 @@ class NetworkMonitor:
                 self._arp_network_down = False
                 self._ndp_network_down = False
                 self.resolver_manager.set_network_down(False)
+                self.resolver_manager.enter_recovery_mode()
+                self.resolver_manager.reenable_all()
                 self._recovery_in_progress = False
                 continue
 

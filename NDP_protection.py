@@ -46,6 +46,9 @@ logger = logging.getLogger("dns-proxy.ndp")
 
 # ======================== scapy 可选引入 ========================
 
+# Suppress Scapy socket BPF filter warnings on Windows
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, message=".*Socket.*failed.*")
 _HAS_SCAPY = False
 try:
     import scapy.all as scapy_module
@@ -266,10 +269,7 @@ class NDPProtection:
             groups.append((parts[i], parts[i+1], parts[i+2]))
             i += 3
         if i < n:
-            ip = parts[i] if i < n else ""
-            mac = parts[i+1] if i + 1 < n else ""
-            vlan = parts[i+2] if i + 2 < n else ""
-            groups.append((ip, mac, vlan))
+            logger.warning('NDP 防护: gateway_ipv6 配置尾部 ' + str(n - i) + ' 个多余元素被忽略 (格式应为 IPv6,MAC,VLAN_ID 交替)')
         return groups
 
     @staticmethod
@@ -1032,7 +1032,7 @@ class NDPProtection:
                 if proc.returncode == 0:
                     logger.info("NDP 防护: VLAN 子接口 %s 已创建", vlan_iface)
                 else:
-                    logger.debug("NDP 防护: VLAN 子接口 %s 创建返回 %d（可能已存在）", vlan_iface, proc.returncode)
+                    logger.warning("NDP 防护: VLAN 子接口 %s 创建返回 %d（可能已存在或命令不被支持）", vlan_iface, proc.returncode)
                 return True
             except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
                 logger.debug("NDP 防护: VLAN 子接口创建失败 %s", e)
@@ -1050,7 +1050,7 @@ class NDPProtection:
                 if proc.returncode == 0:
                     logger.info("NDP 防护: VLAN 子接口 %s 已创建", vlan_iface)
                 else:
-                    logger.debug("NDP 防护: VLAN 子接口 %s 创建返回 %d（可能已存在）", vlan_iface, proc.returncode)
+                    logger.warning("NDP 防护: VLAN 子接口 %s 创建返回 %d（可能已存在或命令不被支持）", vlan_iface, proc.returncode)
                 return True
             except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
                 logger.debug("NDP 防护: VLAN 子接口创建失败 %s", e)
