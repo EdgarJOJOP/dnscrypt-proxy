@@ -170,15 +170,15 @@ tls:
   #   1. Base64 编码的 ECHConfigList（静态配置）
   #      "dns.alidns.com": "AFj+DQAAAC..."
   #   2. DNS 查询 URL（自动查询此上游的 HTTPS 记录）
-  #      "dns.cloudflare.com": "https://1.1.1.1/dns-query"
+  #      "dns.cloudflare.com": "https://dns.alidns.com/dns-query"
   #   3. hostname+DNS 查询（查询指定 hostname 的 HTTPS 记录）
-  #      "dns.cloudflare.com": "cloudflare-ech.com+https://1.1.1.1/dns-query"
+  #      "dns.cloudflare.com": "cloudflare-ech.com+https://cloudflare-ech.com/dns-query"
   # ============================================================
   ech:
     # Cloudflare DNS 的 ECH 配置：查询 cloudflare-ech.com 的 HTTPS 记录
-    dns.cloudflare.com: cloudflare-ech.com+https://1.1.1.1/dns-query
+    dns.cloudflare.com: cloudflare-ech.com+https://cloudflare-ech.com/dns-query
     1dot1dot1dot1.cloudflare-dns.com: 
-      cloudflare-ech.com+https://1.1.1.1/dns-query
+      cloudflare-ech.com+https://cloudflare-ech.com/dns-query
 
 # ============================================================
 # 网络连通性监控（自动恢复上游服务器连接）
