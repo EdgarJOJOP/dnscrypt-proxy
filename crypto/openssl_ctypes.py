@@ -32,6 +32,19 @@ SSL_VERIFY_PEER = 1
 SSL_VERIFY_FAIL_IF_NO_PEER_CERT = 2
 SSL_VERIFY_CLIENT_ONCE = 4
 
+# TLS protocol version options (SSL_OP_BIT(n) = 1 << n)
+SSL_OP_NO_SSLv3 = 1 << 25       # 0x02000000
+SSL_OP_NO_TLSv1 = 1 << 26       # 0x04000000
+SSL_OP_NO_TLSv1_2 = 1 << 27     # 0x08000000
+SSL_OP_NO_TLSv1_1 = 1 << 28     # 0x10000000
+
+# ECH handshake status (from OpenSSL 4.0 ech.h)
+SSL_ECH_STATUS_SUCCESS = 1          # ECH negotiated successfully
+SSL_ECH_STATUS_GREASE = 2           # ECH GREASE only
+SSL_ECH_STATUS_GREASE_ECH = 3       # GREASEd and got ECH in return
+SSL_ECH_STATUS_FAILED = 0           # Some internal or protocol error
+SSL_ECH_STATUS_NOT_TRIED = -101     # ECH was not attempted
+
 
 class OpenSSL4Wrapper:
     """
@@ -163,6 +176,10 @@ class OpenSSL4Wrapper:
         # void SSL_CTX_set_verify(SSL_CTX *ctx, int mode, void *callback)
         S.SSL_CTX_set_verify.restype = None
         S.SSL_CTX_set_verify.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+
+        # uint64 SSL_CTX_set_options(SSL_CTX *ctx, uint64 options)
+        S.SSL_CTX_set_options.restype = ctypes.c_uint64
+        S.SSL_CTX_set_options.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
 
         # int SSL_CTX_set_ciphersuites(SSL_CTX *ctx, const char *str)
         S.SSL_CTX_set_ciphersuites.restype = ctypes.c_int
@@ -374,14 +391,19 @@ class OpenSSL4Wrapper:
             # 在 Windows 上没有默认 CA 路径，需要 certifi
             logger.warning("未指定 CA 文件，证书验证可能失败")
 
-        # 设置密码套件
-        if ciphers:
-            ciphers_bytes = ciphers.encode("utf-8")
-            ciphers_buf = ctypes.create_string_buffer(ciphers_bytes)
-            ret = self._libssl.SSL_CTX_set_cipher_list(ctx, ciphers_buf)
-            if ret != 1:
-                logger.debug("SSL_CTX_set_cipher_list 失败")
+        # 强制 TLS 1.3 only：禁用 SSLv3 / TLSv1 / TLSv1.1 / TLSv1.2
+        no_mask = SSL_OP_NO_SSLv3 | SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1 | SSL_OP_NO_TLSv1_2
+        self._libssl.SSL_CTX_set_options(ctx, no_mask)
 
+        # 仅设置 TLS 1.3 密码套件（RFC 8446 标准套件）
+        tls13_ciphers = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256"
+        ciphers_bytes = tls13_ciphers.encode("utf-8")
+        ciphers_buf = ctypes.create_string_buffer(ciphers_bytes)
+        ret = self._libssl.SSL_CTX_set_ciphersuites(ctx, ciphers_buf)
+        if ret != 1:
+            logger.warning("SSL_CTX_set_ciphersuites 失败（TLS 1.3 密码套件）")
+
+        # 不再设置 TLS 1.2 及以下的密码套件（已禁用）
         return ctx
 
     def _new_ssl(self, ctx: int, server_hostname: str) -> int:
@@ -546,6 +568,25 @@ class OpenSSL4Wrapper:
             writer.close()
             raise
 
+        # 7. 验证 ECH 握手状态：确认服务器接受了 ECH
+        if ech_config and self._has_ech:
+            ech_status = ctypes.c_int(0)
+            ret = self._libssl.SSL_get_ech_status(ssl, ctypes.byref(ech_status))
+            if ret == 1:
+                status_val = ech_status.value
+                if status_val == SSL_ECH_STATUS_SUCCESS:
+                    logger.debug("ECH 握手成功: %s", server_hostname)
+                elif status_val == SSL_ECH_STATUS_GREASE_ECH:
+                    logger.debug("ECH GREASE 成功，服务器返回了 ECH: %s", server_hostname)
+                elif status_val == SSL_ECH_STATUS_GREASE:
+                    logger.debug("ECH GREASE 模式（仅客户端发送 GREASE）: %s", server_hostname)
+                elif status_val == SSL_ECH_STATUS_FAILED:
+                    raise ConnectionError(f"ECH 握手被服务器拒绝: {server_hostname}")
+                else:
+                    logger.warning("ECH 握手状态异常 (code=%d): %s", status_val, server_hostname)
+            else:
+                logger.warning("SSL_get_ech_status 调用失败: %s", server_hostname)
+
         # SSL 对象拥有 BIO 的所有权（SSL_free 会自动释放 BIO）
         # 但我们需要释放 SSL_CTX
         # 注意：SSL_free 不会释放 SSL_CTX
@@ -567,7 +608,11 @@ class OpenSSL4Wrapper:
     ) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter, int, int, int, int]:
         """
         建立普通 TLS 连接（无 ECH），用于诊断对比。
+        注意：OpenSSL 4.0 已移除 SSL_set_tlsext_host_name，此方法可能无法正确设置 SNI。
+        ECH 连接请使用 connect_ech()。
         """
+        import warnings
+        warnings.warn("connect_tls 已弃用，请使用 connect_ech", DeprecationWarning, stacklevel=2)
         connect_addr = connect_ip or host
         try:
             reader, writer = await asyncio.wait_for(
