@@ -93,7 +93,8 @@ win记得安装360杀毒(https://sd.360.cn/ )比360安全管家管用。
 linux上就简单了。。。。。。。
 
 # 3. 开启全链路加密最后一块拼图ECH(可选)
-我目前查询连cloudflare的加密dns都不支持ech，如果要用需要自行搭建加密dns反代nginx或者caddy开启ech就能验证代码是否工作正常。
+
+目前cloudflare的加密dns都支持ech，查询网站或加密dns是否支持ech扩展网站(https://doh-ech-check.foreverlink.love/ ),也可以自行搭建加密dns反代nginx或者caddy开启ech就能正常使用ech加密。
 使用和写法全部在config.yaml文件里，默认是关闭的。
 
 # 4. 运行
