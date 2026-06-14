@@ -141,11 +141,25 @@ class ECHDoHResolver(BaseResolver):
                         if "illegal parameter" in err_msg:
                             logger.warning("ECHDoH %s: ECH 被服务器拒绝，"
                                            "回退到 Python SSL（无 ECH）", self.url)
-                            # Python 内置 ssl 模块在 Windows 上使用系统证书存储，
-                            # 不需要手动指定 CA 路径
-                            py_ctx = py_ssl.create_default_context()
-                            connect_addr = connect_ip or self._hostname \
-                                if target != self._hostname else self._hostname
+                            # Python SSL fallback：优先使用自定义 CA（如果有），否则系统默认
+                            if self._ca_path:
+                                py_ctx = py_ssl.SSLContext(py_ssl.PROTOCOL_TLS_CLIENT)
+                                py_ctx.check_hostname = True
+                                py_ctx.verify_mode = py_ssl.CERT_REQUIRED
+                                try:
+                                    py_ctx.load_verify_locations(self._ca_path)
+                                except Exception as ca_e:
+                                    logger.warning("ECHDoH %s: 加载自定义 CA 失败: %s，"
+                                                   "使用系统默认 CA", self.url, ca_e)
+                                    py_ctx = py_ssl.create_default_context()
+                            else:
+                                py_ctx = py_ssl.create_default_context()
+                            py_ctx.minimum_version = py_ssl.TLSVersion.TLSv1_3
+                            py_ctx.maximum_version = py_ssl.TLSVersion.TLSv1_3
+                            py_ctx.set_ciphers(
+                                "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:"
+                                "TLS_CHACHA20_POLY1305_SHA256"
+                            )
                             target_ip = target if target != self._hostname else None
                             fallback_ip = target_ip or self._hostname
                             try:
@@ -297,6 +311,12 @@ class ECHDoHResolver(BaseResolver):
                             content_length = int(line.split(b":")[1].strip())
                         except (ValueError, IndexError):
                             pass
+                    # 检查 Content-Type
+                    if line.lower().startswith(b"content-type:"):
+                        ct = line.split(b":", 1)[1].strip()
+                        if b"application/dns-message" not in ct.lower():
+                            logger.warning("ECHDoH %s 响应 Content-Type 非 dns-message: %s",
+                                           self.url, ct.decode(errors="replace"))
                     # 检查状态码
                     if line.startswith(b"HTTP/"):
                         if b"200" not in line:
@@ -304,11 +324,13 @@ class ECHDoHResolver(BaseResolver):
                                          self.url, line.decode(errors="replace"))
                             return None
 
-                # 如果 content-length 已知，等够数据
-                if content_length is not None:
-                    if len(body_part) >= content_length:
-                        return response
 
+            # 如果 content-length 已知，等够数据
+            # 每次迭代都检查，避免跨 chunk 时无法返回
+            if content_length is not None:
+                _, _, current_body = response.partition(b"\r\n\r\n")
+                if len(current_body) >= content_length:
+                    return response
             # 如果 content-length 未知，等到连接关闭
             if content_length is None and response.endswith(b"\r\n\r\n"):
                 # 没有 Content-Length，继续读直到连接关闭

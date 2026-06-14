@@ -79,7 +79,8 @@ class PlainDNSResolver(BaseResolver):
                 sock = self._get_socket()
                 loop = asyncio.get_running_loop()
                 # 发送
-                await loop.sock_sendto(sock, query_bytes, (self.address, 53))
+                addr = (self.address, 53, 0, 0) if self._is_v6 else (self.address, 53)
+                await loop.sock_sendto(sock, query_bytes, addr)
                 # 接收（带超时）
                 try:
                     data, _ = await asyncio.wait_for(

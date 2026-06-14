@@ -139,10 +139,10 @@ class _TlsConnectionPool:
                 if not conn.closed and not conn.writer.is_closing():
                     return conn
                 else:
-                    # 死连接，丢弃
-                    # close 在锁外执行
+                    # 死连接，丢弃（在锁内递减计数，避免计数漂移）
+                    self._total_conns -= 1
                     dead_conn = conn
-                    # 继续往下创建新连接
+                    # close 在锁外执行；继续往下创建新连接
 
             # 检查是否已达上限
             if self._total_conns >= self._max_pool_size:
@@ -160,8 +160,6 @@ class _TlsConnectionPool:
             await evict_conn.close()
         if dead_conn is not None:
             await dead_conn.close()
-            async with self._lock:
-                self._total_conns = max(0, self._total_conns - 1)
 
         # 创建新连接（锁外）
         reader, writer = await asyncio.wait_for(
@@ -298,6 +296,15 @@ class DoTResolver(BaseResolver):
                              self.host, len(self._ech_config))
             except Exception as e:
                 logger.warning("DoT %s: ECH 配置失败: %s", self.host, e)
+
+        # 当 ECH 启用时，强制 TLS 1.3 only（RFC 8446 标准套件）
+        if self._ech_enabled:
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+            ctx.maximum_version = ssl.TLSVersion.TLSv1_3
+            ctx.set_ciphers(
+                "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256"
+            )
+
         return ctx
 
     async def resolve(self, query_bytes: bytes) -> Optional[bytes]:

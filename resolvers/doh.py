@@ -161,6 +161,15 @@ class DoHResolver(BaseResolver):
                              self.url, len(self._ech_config))
             except Exception as e:
                 logger.warning("DoH %s: ECH 配置失败: %s", self.url, e)
+
+        # 当 ECH 启用时，强制 TLS 1.3 only（RFC 8446 标准套件）
+        if self._ech_enabled:
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+            ctx.maximum_version = ssl.TLSVersion.TLSv1_3
+            ctx.set_ciphers(
+                "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256"
+            )
+
         return ctx
 
     def _get_hostname(self) -> str:

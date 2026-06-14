@@ -13,6 +13,7 @@ ECH-enabled DoT 解析器
 
 import asyncio
 import logging
+import ssl as py_ssl
 from typing import Optional
 
 from resolvers.base import BaseResolver
@@ -95,54 +96,86 @@ class ECHDoTResolver(BaseResolver):
                         return None
 
                     # 1. 建立 ECH TLS 连接（使用 target 直连，绕过系统 DNS）
-                    reader, writer, ssl_ptr, ctx_ptr, bio_in, bio_out = \
-                        await self._openssl.connect_ech(
-                            host=self.host,
-                            port=self.port,
-                            server_hostname=self.host,
-                            ech_config=ech_config,
-                            ca_path=self._ca_path,
-                            ciphers=self._ciphers,
-                            timeout=self.timeout,
-                            connect_ip=target if target != self.host else None,
-                        )
+                    try:
+                        reader, writer, ssl_ptr, ctx_ptr, bio_in, bio_out = \
+                            await self._openssl.connect_ech(
+                                host=self.host,
+                                port=self.port,
+                                server_hostname=self.host,
+                                ech_config=ech_config,
+                                ca_path=self._ca_path,
+                                ciphers=self._ciphers,
+                                timeout=self.timeout,
+                                connect_ip=target if target != self.host else None,
+                            )
+                    except ConnectionError as e:
+                        err_msg = str(e)
+                        if "illegal parameter" in err_msg or "ECH" in err_msg:
+                            logger.warning("ECHDoT %s: ECH \u88ab\u670d\u52a1\u5668\u62d2\u7edd\uff0c"
+                                           "\u56de\u9000\u5230 Python SSL\uff08\u65e0 ECH\uff09", self.host)
+                            if self._ca_path:
+                                py_ctx = py_ssl.SSLContext(py_ssl.PROTOCOL_TLS_CLIENT)
+                                py_ctx.check_hostname = True
+                                py_ctx.verify_mode = py_ssl.CERT_REQUIRED
+                                try:
+                                    py_ctx.load_verify_locations(self._ca_path)
+                                except Exception as ca_e:
+                                    logger.warning("ECHDoT %s: \u52a0\u8f7d\u81ea\u5b9a\u4e49 CA \u5931\u8d25: %s\uff0c"
+                                                   "\u4f7f\u7528\u7cfb\u7edf\u9ed8\u8ba4 CA", self.host, ca_e)
+                                    py_ctx = py_ssl.create_default_context()
+                            else:
+                                py_ctx = py_ssl.create_default_context()
+                            py_ctx.minimum_version = py_ssl.TLSVersion.TLSv1_3
+                            py_ctx.maximum_version = py_ssl.TLSVersion.TLSv1_3
+                            py_ctx.set_ciphers(
+                                "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:"
+                                "TLS_CHACHA20_POLY1305_SHA256"
+                            )
+                            target_ip = target if target != self.host else None
+                            fallback_ip = target_ip or self.host
+                            try:
+                                reader, writer = await asyncio.wait_for(
+                                    asyncio.open_connection(
+                                        fallback_ip, self.port,
+                                        ssl=py_ctx,
+                                        server_hostname=self.host,
+                                    ),
+                                    timeout=self.timeout,
+                                )
+                            except OSError as conn_e:
+                                logger.debug("ECHDoT %s: Python SSL \u8fde\u63a5\u5931\u8d25: %s",
+                                             self.host, conn_e)
+                                raise ConnectionError(str(conn_e))
+                            msg_len = len(query_bytes)
+                            query_frame = msg_len.to_bytes(2, "big") + query_bytes
+                            writer.write(query_frame)
+                            await writer.drain()
+                            try:
+                                raw_len = await asyncio.wait_for(
+                                    reader.readexactly(2), timeout=self.timeout
+                                )
+                            except (asyncio.IncompleteReadError, asyncio.TimeoutError) as re_e:
+                                logger.debug("ECHDoT %s: Python SSL \u8bfb\u53d6\u957f\u5ea6\u524d\u7f00\u5931\u8d25: %s",
+                                             self.host, re_e)
+                                raise ConnectionError(str(re_e))
+                            resp_len = int.from_bytes(raw_len, "big")
+                            if resp_len <= 0 or resp_len > 65535:
+                                logger.debug("ECHDoT %s: Python SSL \u65e0\u6548\u54cd\u5e94\u957f\u5ea6 %d",
+                                             self.host, resp_len)
+                                raise ConnectionError(f"\u65e0\u6548\u54cd\u5e94\u957f\u5ea6: {resp_len}")
+                            try:
+                                response_data = await asyncio.wait_for(
+                                    reader.readexactly(resp_len), timeout=self.timeout
+                                )
+                            except (asyncio.IncompleteReadError, asyncio.TimeoutError) as re_e:
+                                logger.debug("ECHDoT %s: Python SSL \u8bfb\u53d6 DNS \u54cd\u5e94\u5931\u8d25: %s",
+                                             self.host, re_e)
+                                raise ConnectionError(str(re_e))
+                            logger.info("ECHDoT %s:%d \u67e5\u8be2\u6210\u529f (Python SSL)", self.host, self.port)
+                            return response_data[:resp_len]
+                        else:
+                            raise
 
-                    # 2. DoT 使用 2 字节长度前缀 + DNS 消息
-                    msg_len = len(query_bytes)
-                    query_frame = msg_len.to_bytes(2, "big") + query_bytes
-
-                    # 3. 发送
-                    offset = 0
-                    while offset < len(query_frame):
-                        chunk = query_frame[offset:offset + 16384]
-                        await self._openssl.ech_write(
-                            ssl_ptr, bio_out, writer, chunk
-                        )
-                        offset += len(chunk)
-
-                    # 4. 读取响应长度前缀 (2 字节)
-                    raw_len = await self._read_exactly(
-                        ssl_ptr, bio_in, bio_out, reader, writer, 2
-                    )
-                    if raw_len is None or len(raw_len) < 2:
-                        logger.debug("ECHDoT %s (%s) 响应长度前缀读取失败，切换到下一地址", self.host, target)
-                        continue
-
-                    resp_len = int.from_bytes(raw_len[:2], "big")
-                    if resp_len <= 0 or resp_len > 65535:
-                        logger.debug("ECHDoT %s (%s) 无效响应长度 %d，切换到下一地址", self.host, target, resp_len)
-                        continue
-
-                    # 5. 读取 DNS 响应
-                    response_data = await self._read_exactly(
-                        ssl_ptr, bio_in, bio_out, reader, writer, resp_len
-                    )
-                    if response_data is None:
-                        logger.debug("ECHDoT %s (%s) DNS 响应读取失败，切换到下一地址", self.host, target)
-                        continue
-
-                    logger.info("ECHDoT %s:%d 查询成功 (ECH)", self.host, self.port)
-                    return response_data[:resp_len]
 
                 except asyncio.TimeoutError as e:
                     last_error = e
