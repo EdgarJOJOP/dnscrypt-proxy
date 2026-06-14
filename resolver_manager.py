@@ -155,6 +155,7 @@ class ResolverManager:
         self._network_down = False
         self._network_down_reported = False  # 避免重复日志
         self._ech_fetchers: Dict[str, ECHConfigFetcher] = {}  # hostname -> ECHConfigFetcher
+        self._ech_warmup_failed: set = set()  # hostnames whose ECH warmup all failed
         self._openssl4_wrapper = None  # OpenSSL 4.0 wrapper（ECH；如不可用则为 None）
         # 全局共享的 aiohttp.ClientSession（所有 DoH 上游共用，消除多个连接池）
         self._shared_doh_session: Optional[aiohttp.ClientSession] = None
@@ -384,19 +385,39 @@ class ResolverManager:
 
             # 立即尝试获取一次（预热缓存）
             if fetcher.enabled:
-                try:
-                    config = await asyncio.wait_for(fetcher.get_config(), timeout=8.0)
-                    if config:
-                        logger.info("  %s: ECH 预热成功 (%d bytes)", hostname, len(config))
-                    else:
-                        logger.debug("  %s: ECH 预热返回空", hostname)
-                except asyncio.TimeoutError:
-                    logger.debug("  %s: ECH 预热超时（后台继续重试）", hostname)
-                except Exception as e:
-                    logger.debug("  %s: ECH 预热异常: %s（后台继续重试）", hostname, e)
+                warmed_up = False
+                for attempt in range(3):  # 最多 3 次（首次 + 2 次重试）
+                    try:
+                        config = await asyncio.wait_for(fetcher.get_config(), timeout=8.0)
+                        if config:
+                            if attempt > 0:
+                                logger.info("  %s: ECH 预热成功 (%d bytes, 第%d次重试)",
+                                             hostname, len(config), attempt + 1)
+                            else:
+                                logger.info("  %s: ECH 预热成功 (%d bytes)", hostname, len(config))
+                            warmed_up = True
+                            break
+                        else:
+                            logger.debug("  %s: ECH 预热返回空 (第%d次)", hostname, attempt + 1)
+                    except asyncio.TimeoutError:
+                        logger.debug("  %s: ECH 预热超时 (第%d次，%s)", hostname, attempt + 1,
+                                     "继续重试" if attempt < 2 else "放弃")
+                    except Exception as e:
+                        logger.debug("  %s: ECH 预热异常: %s (第%d次，%s)", hostname, e, attempt + 1,
+                                     "继续重试" if attempt < 2 else "放弃")
+                    if not warmed_up and attempt < 2:
+                        await asyncio.sleep(1.0)  # 重试间隔
+                if not warmed_up:
+                    self._ech_warmup_failed.add(hostname)
+                    last_err = fetcher._last_error or "未知"
+                    logger.warning("  %s: ECH 预热失败（%s），将使用普通 TLS 连接此上游",
+                                   hostname, last_err)
 
         enabled_count = sum(1 for f in self._ech_fetchers.values() if f.enabled)
-        logger.info("ECH 获取器初始化完成: %d/%d 个上游", enabled_count, len(self._ech_fetchers))
+        valid_count = sum(1 for f in self._ech_fetchers.values() if f.has_valid_config)
+        failed_count = len(self._ech_warmup_failed)
+        logger.info("ECH 获取器初始化完成: %d/%d 个上游启用, %d 有效, %d 预热失败",
+                     enabled_count, len(self._ech_fetchers), valid_count, failed_count)
 
     async def _init_shared_doh_session(self):
         """
@@ -467,7 +488,13 @@ class ResolverManager:
             hostname = url.replace("https://", "").split("/")[0].split(":")[0]
             cached_ips = self._bootstrap_cache.get(hostname, [])
             ech_fetcher = self._ech_fetchers.get(hostname) if ech_enabled else None
-            has_ech = openssl4_available and ech_fetcher is not None and ech_fetcher.enabled
+            # 真正的 ECH 需要：fetcher 存在且有过成功的预热（has_valid_config）且未标记失败
+            has_ech = (
+                openssl4_available
+                and ech_fetcher is not None
+                and ech_fetcher.has_valid_config
+                and hostname not in self._ech_warmup_failed
+            )
 
             if has_ech:
                 resolver = ECHDoHResolver(
@@ -504,7 +531,13 @@ class ResolverManager:
             p = int(parts[1]) if len(parts) > 1 else 853
             cached_ips = self._bootstrap_cache.get(h, [])
             ech_fetcher = self._ech_fetchers.get(h) if ech_enabled else None
-            has_ech = openssl4_available and ech_fetcher is not None and ech_fetcher.enabled
+            # 真正的 ECH 需要：fetcher 存在且有过成功的预热（has_valid_config）且未标记失败
+            has_ech = (
+                openssl4_available
+                and ech_fetcher is not None
+                and ech_fetcher.has_valid_config
+                and h not in self._ech_warmup_failed
+            )
 
             if has_ech:
                 resolver = ECHDoTResolver(
@@ -1012,6 +1045,25 @@ class ResolverManager:
         )
         success_count = sum(1 for r in results if isinstance(r, list) and r)
         logger.info("批量刷新 bootstrap IP: %d/%d 成功", success_count, len(all_hostnames))
+
+        # 重新尝试 ECH 预热（清理 _ech_warmup_failed 中可能已恢复的主机）
+        if self._ech_warmup_failed:
+            retried = set(self._ech_warmup_failed)
+            for hostname in retried:
+                fetcher = self._ech_fetchers.get(hostname)
+                if fetcher and fetcher.enabled and not fetcher.has_valid_config:
+                    try:
+                        config = await asyncio.wait_for(fetcher.force_refresh(), timeout=8.0)
+                        if config:
+                            self._ech_warmup_failed.discard(hostname)
+                            logger.info("  %s: ECH 刷新成功，已从预热失败列表中移除", hostname)
+                        else:
+                            logger.debug("  %s: ECH 刷新仍无配置，保留在预热失败列表", hostname)
+                    except asyncio.TimeoutError:
+                        logger.debug("  %s: ECH 刷新超时，保留在预热失败列表", hostname)
+                    except Exception as e:
+                        logger.debug("  %s: ECH 刷新异常: %s", hostname, e)
+
         return success_count
 
     def get_bootstrap_addresses(self) -> List[str]:
