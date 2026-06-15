@@ -117,6 +117,7 @@ class NetworkMonitor:
         # 缓存上次探测结果（避免每轮都重复分析）
         self._last_wan_probe_result: dict = None
         self._last_wan_probe_time: float = 0.0
+        self._last_wan_probe_time_v6: float = 0.0  # IPv6 WAN 探测独立限速
         # 外网 ping 的轮换索引（用于 WAN 探测）
         self._wan_probe_index = 0
         self._wan_probe_index_v6 = 0  # IPv6 WAN 探测独立索引
@@ -206,9 +207,10 @@ class NetworkMonitor:
                 ndp_gw_ok = True
                 if ndp_gw:
                     ndp_gw_ok = await self._ndp_protection._ping_ipv6(ndp_gw)
-                self._ndp_gw_results.append(ndp_gw_ok)
+                    self._ndp_gw_results.append(ndp_gw_ok)
 
                 # 外网探测：按 external_interval 间隔执行，不每轮都 ping
+                ext_just_checked = False
                 ext_ok = True
                 if self._ping_targets_v4:
                     now = asyncio.get_event_loop().time()
@@ -217,13 +219,15 @@ class NetworkMonitor:
                         idx = self._ext_ping_index % len(self._ping_targets_v4)
                         self._ext_ping_index += 1
                         ext_ok = await self._ping(self._ping_targets_v4[idx])
-                self._ext_results.append(ext_ok)
+                        # 只有真实外网 ping 后才更新滑动窗口，避免默认 True 值污染
+                        self._ext_results.append(ext_ok)
+                        ext_just_checked = True
 
                 # ========== WAN 断连快速检测（Dest Unreachable） ==========
                 # 当光猫运行但光纤断开时，光猫会对外网 ping 回复 ICMP type=3
                 # (Destination Unreachable)。收到来自网关的 Dest Unreachable
                 # 立即判定为 WAN 断连，跳过滑动窗口等待。
-                if not ext_ok and not self._arp_network_down:
+                if not ext_ok and ext_just_checked and not self._arp_network_down:
                     now = asyncio.get_event_loop().time()
                     if now - self._last_wan_probe_time >= 1.0:
                         await self._check_wan_unreachable()
@@ -231,7 +235,7 @@ class NetworkMonitor:
                 # ========== IPv6 WAN 断开快速检测 ==========
                 if not ext_ok and not self._ndp_network_down and ndp_gw is not None:
                     now = asyncio.get_event_loop().time()
-                    if now - self._last_wan_probe_time >= 1.0:
+                    if now - self._last_wan_probe_time_v6 >= 1.0:
                         await self._check_wan_unreachable_v6(ndp_gw)
 
                 # ========== 1.5 ARP 投毒检测（反制已在 _on_arp_attack 中并行执行，不暂停 DNS） ==========
@@ -292,11 +296,18 @@ class NetworkMonitor:
                             self.resolver_manager.reenable_all()
                         else:
                             # ARP/NDP 安静期：触发完整恢复
+                            # 同时直接清除标志作为兜底，防止 recovery worker 异常后主循环卡死
+                            self._arp_network_down = False
+                            self._ndp_network_down = False
+                            self.resolver_manager.set_network_down(False)
                             self._run_recover.set()
                     # 取消还在运行的 ARP 防护任务
                     if self._arp_task and not self._arp_task.done():
                         self._arp_task.cancel()
                         self._arp_task = None
+                    if self._ndp_task and not self._ndp_task.done():
+                        self._ndp_task.cancel()
+                        self._ndp_task = None
                     self._consecutive_network_down = 0
 
                 elif diagnosis == "network_down":
@@ -320,6 +331,7 @@ class NetworkMonitor:
 
                 elif diagnosis == "arp_issue":
                     # 部分丢包 → 需要 ARP 防护
+                    self._consecutive_network_down = 0
                     # Bug #3: 如果 _arp_network_down 已由 WAN 断开检测触发，ARP 修复无效，直接跳过
                     if self._arp_network_down:
                         logger.debug("ARP 防护: WAN 已断开，跳过 ARP 修复")
@@ -331,14 +343,31 @@ class NetworkMonitor:
                             self._arp_task = asyncio.create_task(
                                 self._run_arp_defense(gw_ip, lambda: self._is_recovered())
                             )
+
+                    # NDP defense for IPv6 (parallel to IPv4 ARP)
+                    if self._ndp_protection.enabled:
+                        if not self._ndp_task or self._ndp_task.done():
+                            ndp_gw = self._ndp_protection.gateway_ipv6
+                            if ndp_gw:
+                                logger.warning("NDP 防护: IPv6 网关丢包，启动后台 NDP 修复")
+                                self._ndp_task = asyncio.create_task(
+                                    self._run_ndp_defense(ndp_gw, lambda: self._is_recovered())
+                                )
+                else:
+                    # normal - reset network_down counter
+                    self._consecutive_network_down = 0
                 # ========== 4. 外网降级跟踪（全量 check 每 15s 做一次，非每轮） ==========
                 # 这里简化：降级状态仅用于触发全量 recover
-                if not ext_ok and not self._arp_network_down:
+                if not ext_ok and ext_just_checked and not self._arp_network_down:
                     self._consecutive_failures += 1
                     self._recovery_successes = 0
                     if not self._degraded \
                             and self._consecutive_failures >= self._failure_threshold:
                         self._degraded = True
+                        # 连续多次外网失败，直接抑制 DNS 查询
+                        self._arp_network_down = True
+                        self._ndp_network_down = True
+                        self.resolver_manager.set_network_down(True)
                 elif ext_ok and self._degraded:
                     self._recovery_successes += 1
                     if self._recovery_successes >= self._recovery_check_count:
@@ -346,8 +375,7 @@ class NetworkMonitor:
                         self._consecutive_failures = 0
                         self._recovery_successes = 0
                         if not self._recovery_in_progress:
-                            self._recovery_in_progress = True
-                            asyncio.create_task(self._recover())
+                            self._run_recover.set()
                 elif ext_ok:
                     self._consecutive_failures = 0
                     self._recovery_successes = 0
@@ -481,9 +509,24 @@ class NetworkMonitor:
         gw_fails = gw_len - sum(gw_results)
         gw_loss = int(gw_fails / gw_len * 100)
 
+        # IPv4 网关高丢包时，回退到 IPv6 网关检测
+        if gw_loss >= 50 and self._arp_protection.gateway_ip is not None                 and self._ndp_protection.gateway_ipv6:
+            ndp_len = len(self._ndp_gw_results)
+            if ndp_len >= 2:
+                ndp_fails = ndp_len - sum(self._ndp_gw_results)
+                ndp_loss = int(ndp_fails / ndp_len * 100)
+                # IPv6 正常说明网关本身可达，问题在 IPv4 层
+                if ndp_loss < 50:
+                    gw_loss = ndp_loss
+                    gw_results = self._ndp_gw_results
+
         ext_len = len(self._ext_results)
-        ext_fails = ext_len - sum(self._ext_results) if ext_len > 0 else 0
-        ext_loss = int(ext_fails / max(ext_len, 1) * 100) if ext_len > 0 else 100
+        if ext_len < 2:
+            # 窗口未填满，不做外网判断（仅用网关判断）
+            ext_loss = 0
+        else:
+            ext_fails = ext_len - sum(self._ext_results)
+            ext_loss = int(ext_fails / ext_len * 100)
 
         # Bug #2 fix: 网关正常但外网全丢——可能是 ONT 静默丢包（不发 Dest Unreachable）
         if gw_loss < 20 and ext_loss == 100:
@@ -880,3 +923,9 @@ class NetworkMonitor:
                 raise
             except Exception as e:
                 logger.error("后台恢复异常: %s", e, exc_info=True)
+                # 异常时也要放行 DNS，防止主循环卡死
+                self._arp_network_down = False
+                self._ndp_network_down = False
+                self.resolver_manager.set_network_down(False)
+            finally:
+                self._recovery_in_progress = False
