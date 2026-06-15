@@ -385,12 +385,8 @@ class ECHConfigFetcher:
                 ctx = ssl.create_default_context()
                 ctx.check_hostname = True
                 ctx.verify_mode = ssl.CERT_REQUIRED
-                ctx.minimum_version = ssl.TLSVersion.TLSv1_3
-                ctx.maximum_version = ssl.TLSVersion.TLSv1_3
-                ctx.set_ciphers(
-                    "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:"
-                    "TLS_CHACHA20_POLY1305_SHA256"
-                )
+                # 公共 DoH 解析器（如 dns.alidns.com）可能不支持 TLS 1.3，
+                # 此处使用默认 TLS 版本协商（TLS 1.2-1.3）
 
                 reader, writer = await asyncio.wait_for(
                     asyncio.open_connection(ip, ep_port, ssl=ctx,
