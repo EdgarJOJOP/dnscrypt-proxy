@@ -233,7 +233,7 @@ class NetworkMonitor:
                         await self._check_wan_unreachable()
 
                 # ========== IPv6 WAN 断开快速检测 ==========
-                if not ext_ok and not self._ndp_network_down and ndp_gw is not None:
+                if not ext_ok and ext_just_checked and not self._ndp_network_down and ndp_gw is not None:
                     now = asyncio.get_event_loop().time()
                     if now - self._last_wan_probe_time_v6 >= 1.0:
                         await self._check_wan_unreachable_v6(ndp_gw)
@@ -368,7 +368,7 @@ class NetworkMonitor:
                         self._arp_network_down = True
                         self._ndp_network_down = True
                         self.resolver_manager.set_network_down(True)
-                elif ext_ok and self._degraded:
+                elif ext_ok and ext_just_checked and self._degraded:
                     self._recovery_successes += 1
                     if self._recovery_successes >= self._recovery_check_count:
                         self._degraded = False
@@ -376,7 +376,7 @@ class NetworkMonitor:
                         self._recovery_successes = 0
                         if not self._recovery_in_progress:
                             self._run_recover.set()
-                elif ext_ok:
+                elif ext_ok and ext_just_checked:
                     self._consecutive_failures = 0
                     self._recovery_successes = 0
 
@@ -465,10 +465,10 @@ class NetworkMonitor:
             )
         except Exception as e:
             logger.debug("WAN 断连检测 (IPv6) 异常: %s", e)
-            self._last_wan_probe_time = asyncio.get_event_loop().time()
+            self._last_wan_probe_time_v6 = asyncio.get_event_loop().time()
             return
 
-        self._last_wan_probe_time = asyncio.get_event_loop().time()
+        self._last_wan_probe_time_v6 = asyncio.get_event_loop().time()
         if result.get("wan_dead"):
             logger.warning("WAN 断连检测 (IPv6): 网关 %s 对 %s 回复 ICMPv6 "
                            "Destination Unreachable (code=%s)，光纤可能已断开",
@@ -478,7 +478,7 @@ class NetworkMonitor:
             self._ext_results.clear()
             for _ in range(self._ext_results.maxlen):
                 self._ext_results.append(False)
-            self._wan_dead_confirmed_at = self._last_wan_probe_time
+            self._wan_dead_confirmed_at = self._last_wan_probe_time_v6
             self._arp_network_down = True
             self._ndp_network_down = True
             self.resolver_manager.set_network_down(True)
@@ -725,6 +725,8 @@ class NetworkMonitor:
         """
         使用系统 ping 命令检测连通性
         跨平台支持 Windows / Linux
+        ICMP 失败时自动尝试 TCP 连接兜底（端口 80/443），
+        防止因 Windows 上 scapy 原始套接字拦截 ping.exe 的 ICMP 回复导致的误判。
         """
         is_ipv6 = ":" in target
         if sys.platform == "win32":
@@ -743,9 +745,27 @@ class NetworkMonitor:
                 stderr=asyncio.subprocess.DEVNULL,
             )
             await asyncio.wait_for(proc.wait(), timeout=self._ping_timeout + 2)
-            return proc.returncode == 0
+            if proc.returncode == 0:
+                return True
         except (asyncio.TimeoutError, FileNotFoundError, OSError):
-            return False
+            pass
+
+        # ICMP 失败时尝试 TCP 连接兜底（端口 443/80）
+        # Windows 上 scapy 的 L2pcapListenSocket 可能会拦截 ping.exe 的 ICMP Echo Reply，
+        # 导致 ping.exe 超时返回非零退出码。TCP 兜底不受 scapy 原始套接字影响。
+        if not is_ipv6:
+            for port in (443, 80):
+                try:
+                    _, writer = await asyncio.wait_for(
+                        asyncio.open_connection(target, port),
+                        timeout=min(self._ping_timeout + 2, 5.0),
+                    )
+                    writer.close()
+                    await writer.wait_closed()
+                    return True
+                except (asyncio.TimeoutError, OSError, ConnectionError):
+                    continue
+        return False
 
     async def _dns_probe_check(self) -> bool:
         """

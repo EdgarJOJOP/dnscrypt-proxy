@@ -3222,8 +3222,8 @@ class ARPProtection:
         return await ARPProtection._ping_icmp(gw_ip, timeout_ms=timeout_ms)
 
     async def _ping_gateway_fast(self, gw_ip: str) -> bool:
-        """ping 网关（使用 ping_interval 超时，用于 GARP 爆发场景的快速验证，不启用 TCP 兜底）"""
-        timeout_ms = int(self._ping_interval * 1000)
+        """ping 网关（快速验证，至少 500ms 超时，用于 GARP 爆发场景后的快速验证，不启用 TCP 兜底）"""
+        timeout_ms = max(int(self._ping_interval * 1000), 500)
         return await ARPProtection._ping_icmp(gw_ip, timeout_ms=timeout_ms, use_tcp_fallback=False)
 
     @staticmethod
