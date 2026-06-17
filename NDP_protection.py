@@ -109,6 +109,8 @@ class NDPProtection:
         self._nud_window = self._nud_window_ms / 1000.0
         self._nud_threshold = cfg.get("nud_threshold", 3)
         self._baseline_learn_ms = int(cfg.get("baseline_learn_ms", 3000))
+        # \u7f51\u53e3\u540d\u79f0->\u7d22\u5f15\u7f13\u5b58\uff0c\u7528\u4e8e\u9759\u6001 NDP \u7ed1\u5b9a
+        self._iface_name_to_idx: Dict[str, int] = {}
         self._baseline_learn_time = self._baseline_learn_ms / 1000.0
         self._send_ns_probe = cfg.get("send_ns_probe", True)
 
@@ -518,6 +520,14 @@ class NDPProtection:
                 await asyncio.sleep(30)
                 if not self._running:
                     break
+                
+                # 无 scapy 兜底：每 30 秒检查基线是否已学习
+                if not self._scapy_available and not self._baseline_learned:
+                    had_macs = any(True for iface in self.interfaces
+                                   for _, mac, _ in iface.gateways if mac)
+                    if not had_macs:
+                        await self._resolve_all_gateway_macs()
+                    await self.protect_ndp_entry()
                 self._run_dhcpv6_check.set()
                 results = await self.run_all_checks()
                 if self._send_ns_probe:
@@ -745,10 +755,17 @@ class NDPProtection:
                         self._baseline_proposed_time[gw_ip] = time.time()
                     elif self._baseline_proposed[gw_ip] == src_mac:
                         elapsed = time.time() - self._baseline_proposed_time.get(gw_ip, 0)
-                        if elapsed > self._baseline_learn_time and not self._baseline_learned:
+                        if elapsed > self._baseline_learn_time:
                             self._baseline_mac_per_gw[gw_ip] = src_mac
                             self._baseline_learned = True
                             logger.info("NDP 防护: 基线学习完成 [%s] -> MAC=%s", gw_ip, src_mac)
+                            # 更新网关 MAC 为基线 MAC，用于 Static NDP 绑定
+                            for _iface in self.interfaces:
+                                _iface.gateways = [
+                                    (_gw, self._baseline_mac_per_gw.get(_gw, _mac), _vlan)
+                                    for _gw, _mac, _vlan in _iface.gateways
+                                ]
+                            asyncio.get_event_loop().create_task(self.protect_ndp_entry())
                     else:
                         self._baseline_proposed[gw_ip] = src_mac
                         self._baseline_proposed_time[gw_ip] = time.time()
@@ -1015,6 +1032,14 @@ class NDPProtection:
                     break
 
 
+        # 立即用已探测的 MAC 做静态 NDP 绑定（后续基线学习完成后再覆盖）
+        if self.interfaces:
+            for iface in self.interfaces:
+                for _, gw_mac, _ in iface.gateways:
+                    if gw_mac:
+                        await self.protect_ndp_entry()
+                        break
+                break
     async def _ensure_vlan_interface(self, iface_name: str, vlan_id: str) -> bool:
         """确保 VLAN 子接口存在（vlan_id 非空且非 VXLAN 时自动创建）"""
         if not vlan_id or self._vxlan_enabled or not iface_name:
@@ -1098,7 +1123,12 @@ class NDPProtection:
         except Exception as e:
             logger.debug("NDP 防护: ipconfig 失败: %s", e)
             return
-        raw_sections = re.split(r'\n\s*\n', text)
+        raw_sections = re.split(
+                r'(?=^(?:以太网适配器 |Ethernet adapter |无线局域网适配器 |Wireless LAN adapter |WLAN 适配器 |WLAN adapter |本地连接|Local Area Connection))',
+                text, flags=re.MULTILINE
+            )
+        if raw_sections and not raw_sections[0].strip():
+            raw_sections = raw_sections[1:]
         for section in raw_sections:
             lines = section.strip().splitlines()
             if not lines:
@@ -1733,6 +1763,27 @@ class NDPProtection:
                     success = False
         return success
 
+    async def _resolve_iface_idx(self, iface_name: str) -> int:
+        """\u901a\u8fc7 netsh interface ipv6 show interfaces \u83b7\u53d6\u7f51\u53e3\u7d22\u5f15\uff0c\u7f13\u5b58\u81ea _iface_name_to_idx"""
+        if iface_name in self._iface_name_to_idx:
+            return self._iface_name_to_idx[iface_name]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "netsh", "interface", "ipv6", "show", "interfaces",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+            text = self._decode_win_output(stdout)
+            for line in text.splitlines():
+                parts = line.strip().split()
+                if len(parts) >= 5 and parts[0].isdigit():
+                    idx = int(parts[0])
+                    name = " ".join(parts[4:])
+                    self._iface_name_to_idx[name] = idx
+            return self._iface_name_to_idx.get(iface_name, 0)
+        except Exception:
+            return 0
+
     async def _protect_entry(self, iface: str, gw: str, mac: str, vlan_id: str = "") -> bool:
         if sys.platform == "win32":
             try:
@@ -1741,16 +1792,34 @@ class NDPProtection:
                 iface_name = iface or "以太网"
                 if vlan_id and not self._vxlan_enabled:
                     iface_name = f"{iface_name}.{vlan_id}"
-                proc = await asyncio.create_subprocess_exec(
-                    "netsh", "interface", "ipv6", "set", "neighbors",
-                    f"name={iface_name}", f"address={gw.split(chr(37))[0]}", f"neighbor={mac_fmt}",
-                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-                )
-                await asyncio.wait_for(proc.wait(), timeout=10)
+                # 尝试用接口索引优先（避免 name= 编码问题）
+                iface_idx = await self._resolve_iface_idx(iface_name)
+                if iface_idx > 0:
+                    proc = await asyncio.create_subprocess_exec(
+                        "netsh", "interface", "ipv6", "set", "neighbors",
+                        str(iface_idx), gw.split(chr(37))[0], mac_fmt,
+                        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+                    )
+                else:
+                    proc = await asyncio.create_subprocess_exec(
+                        "netsh", "interface", "ipv6", "set", "neighbors",
+                        f"name={iface_name}", f"address={gw.split(chr(37))[0]}", f"neighbor={mac_fmt}",
+                        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+                    )
+                try:
+                    _, serr = await asyncio.wait_for(proc.communicate(), timeout=10)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+                    logger.warning("NDP 防护: 静态 NDP 绑定超时 %s -> %s", gw, mac)
+                    return False
                 if proc.returncode == 0:
                     iface_log = iface_name if vlan_id else iface
                     logger.info("NDP 防护: 静态 NDP %s -> %s (%s)", gw, mac, iface_log)
                     return True
+                err_text = serr.decode("utf-8", errors="replace").strip() if serr else ""
+                logger.warning("NDP 防护: 静态 NDP 绑定失败 %s -> %s (code=%d, err=%s)",
+                              gw, mac, proc.returncode, err_text or "(无错误输出)")
                 return False
             except Exception:
                 return False
