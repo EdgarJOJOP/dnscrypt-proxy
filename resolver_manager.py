@@ -725,15 +725,15 @@ class ResolverManager:
                     if hostname not in self._bootstrap_cache:
                         self._bootstrap_cache[hostname] = ips
 
-    def set_network_down(self, down: bool = True):
+    def set_network_down(self, down: bool = True, detail: str = ""):
         """设置网络断开标志。网络断开时上游查询直接跳过，不打印任何警告。"""
         if down and not self._network_down_reported:
             self._network_down = True
             self._network_down_reported = True
-            logger.warning("网络已断开，暂停上游加密 DNS 查询")
+            logger.warning("网络已断开，暂停上游加密 DNS 查询" + (" [" + detail + "]" if detail else ""))
         elif not down:
             if self._network_down:
-                logger.info("网络已恢复，恢复上游加密 DNS 查询")
+                logger.info("网络已恢复，恢复上游加密 DNS 查询" + (" [" + detail + "]" if detail else ""))
             self._network_down = False
             self._network_down_reported = False
 

@@ -110,6 +110,7 @@ def test_rule_parsing():
         ("||example.com^$permissions=autoplay=()", [], ["example.com"]),
         ("||example.com^$referrerpolicy=unsafe-url", [], ["example.com"]),
         ("||example.com^$removeparam,important", ["example.com"], []),  # important 覆盖限制
+        ("||mcdn.bilivideo.cn^", ["mcdn.bilivideo.cn"], ["other.com"]),
     ]
 
     for rule_text, should_match, should_not_match in test_cases:
@@ -263,6 +264,302 @@ shandian.biz##.ad-banner
     print(f"  OK Title: {engine.title}")
 
 
+
+# ===== Test 5: 规则优先级 =====
+def test_rule_priority():
+    """测试 AdGuard 规则优先级：$important > 白名单 > 普通拦截"""
+    print()
+    print("=" * 60)
+    print("5. 测试规则优先级")
+    print("=" * 60)
+    from filter_engine import FilterEngine
+
+    ok = total = 0
+
+    # 5.1 白名单覆盖普通拦截
+    e1 = FilterEngine()
+    e1.load_rules_from_text("||ads.com^\n@@||ads.com^", source="prio1")
+    blocked, _ = e1.check_domain("ads.com")
+    total += 1
+    if not blocked:
+        ok += 1; print("  OK [5.1] 白名单覆盖普通拦截: ads.com 放行")
+    else:
+        print("  xx [5.1] 白名单应覆盖普通拦截")
+
+    # 5.2 重要规则覆盖白名单
+    e2 = FilterEngine()
+    e2.load_rules_from_text("||ads.com^$important\n@@||ads.com^", source="prio2")
+    blocked, _ = e2.check_domain("ads.com")
+    total += 1
+    if blocked:
+        ok += 1; print("  OK [5.2] 重要规则覆盖白名单: ads.com 被拦截")
+    else:
+        print("  xx [5.2] 重要规则应覆盖白名单")
+
+    # 5.3 子域名白名单精确匹配
+    e3 = FilterEngine()
+    e3.load_rules_from_text("||example.com^\n@@||sub.example.com^", source="prio3")
+    checks = [("sub.example.com", False), ("example.com", True)]
+    for d, expect in checks:
+        blocked, _ = e3.check_domain(d)
+        total += 1
+        if blocked == expect:
+            ok += 1
+        else:
+            print(f"  xx [5.3] {d}: 期望{"拦截" if expect else "放行"}")
+    if ok == total - len(checks) + ok:
+        print("  OK [5.3] 子域名白名单精确匹配")
+
+    # 5.4 混合多规则
+    e4 = FilterEngine()
+    e4.load_rules_from_text(
+        "||blocked.com^\n"
+        "@@||allowed.com^\n"
+        "||also-blocked.com^\n"
+        "||important.com^$important\n"
+        "@@||important.com^",
+        source="prio4"
+    )
+    checks = [("blocked.com", True), ("allowed.com", False),
+              ("also-blocked.com", True), ("important.com", True)]
+    for d, expect in checks:
+        blocked, _ = e4.check_domain(d)
+        total += 1
+        if blocked == expect:
+            ok += 1
+        else:
+            print(f"  xx [5.4] {d}: 期望{"拦截" if expect else "放行"}")
+    if ok == total - 4 + ok:
+        print("  OK [5.4] 混合多规则优先级正确")
+
+    print(f"  => 优先级测试: {ok}/{total} 通过")
+
+
+# ===== Test 6: $badfilter =====
+def test_badfilter():
+    """测试 $badfilter 修饰符"""
+    print()
+    print("=" * 60)
+    print("6. 测试 $badfilter 修饰符")
+    print("=" * 60)
+    from filter_engine import FilterEngine
+
+    ok = total = 0
+
+    # 6.1 badfilter 禁用同一文件规则
+    e1 = FilterEngine()
+    e1.load_rules_from_text("||ads.com^\n||ads.com^$badfilter", source="bf1")
+    total += 1
+    blocked, _ = e1.check_domain("ads.com")
+    if not blocked:
+        ok += 1; print("  OK [6.1] badfilter 禁用 ||ads.com^")
+    else:
+        print("  xx [6.1] badfilter 未生效")
+
+    # 6.2 badfilter 规则自身不被索引
+    total += 1
+    if e1.stats['total_rules'] == 0:
+        ok += 1; print("  OK [6.2] badfilter 规则自身未进入索引")
+    else:
+        print(f"  xx [6.2] 仍有 {e1.stats['total_rules']} 条规则")
+
+    # 6.3 badfilter 禁用例外规则
+    e2 = FilterEngine()
+    e2.load_rules_from_text("||ads.com^\n@@||ads.com^$badfilter", source="bf2")
+    total += 1
+    blocked, _ = e2.check_domain("ads.com")
+    if blocked:
+        ok += 1; print("  OK [6.3] badfilter 禁用例外: ads.com 被拦截")
+    else:
+        print("  xx [6.3] badfilter 应禁用例外规则")
+
+    # 6.4 badfilter 精确禁用，不影响其他
+    e3 = FilterEngine()
+    e3.load_rules_from_text(
+        "||blocked.com^\n||ads.com^\n||ads.com^$badfilter\n||also-blocked.com^",
+        source="bf3"
+    )
+    for d, expect in [("blocked.com", True), ("ads.com", False), ("also-blocked.com", True)]:
+        total += 1
+        blocked, _ = e3.check_domain(d)
+        if blocked == expect:
+            ok += 1
+        else:
+            print(f"  xx [6.4] {d}: 期望{"拦截" if expect else "放行"}")
+
+    print(f"  => badfilter 测试: {ok}/{total} 通过")
+
+
+# ===== Test 7: $dnsrewrite =====
+def test_dnsrewrite():
+    """测试 $dnsrewrite 修饰符"""
+    print()
+    print("=" * 60)
+    print("7. 测试 $dnsrewrite 修饰符")
+    print("=" * 60)
+    from filter_engine import FilterRule, FilterEngine
+
+    ok = total = 0
+
+    # 7.1 解析格式
+    cases = [
+        ("||t.com^$dnsrewrite", "noerror", None),
+        ("||t.com^$dnsrewrite=1.2.3.4", "dnsrewrite", "A:1.2.3.4"),
+        ("||t.com^$dnsrewrite=::1", "dnsrewrite", "AAAA:::1"),
+        ("||t.com^$dnsrewrite=host:my.d", "dnsrewrite", "CNAME:my.d"),
+        ("||t.com^$dnsrewrite=REFUSED", "dnsrewrite", "rc:REFUSED"),
+        ("||t.com^$dnsrewrite=NOERROR;A;5.6.7.8", "dnsrewrite", "A:5.6.7.8"),
+    ]
+    for rule_text, exp_action, exp_detail in cases:
+        rule = FilterRule(rule_text)
+        total += 1
+        if rule._skip or rule.dnsrewrite is None:
+            print(f"  xx [7.1] 解析失败: {rule_text[:40]}")
+        elif rule.dnsrewrite.get('action') == exp_action:
+            ok += 1
+        else:
+            print(f"  xx [7.1] {rule_text[:40]}: action={rule.dnsrewrite.get('action')}, 期望={exp_action}")
+
+    # 7.2 集成: check_domain + get_last_dnsrewrite
+    e1 = FilterEngine()
+    e1.load_rules_from_text("||rewrite.com^$dnsrewrite=10.0.0.1", source="dr1")
+    total += 1
+    blocked, reason = e1.check_domain("rewrite.com")
+    d = e1.get_last_dnsrewrite()
+    if blocked and reason == "dnsrewrite" and d and d.get('value') == '10.0.0.1':
+        ok += 1; print("  OK [7.2] dnsrewrite 集成: blocked + reason + data 正确")
+    else:
+        print(f"  xx [7.2] 集成错误: blocked={blocked}, reason={reason}, data={d}")
+
+    # 7.3 白名单可覆盖 dnsrewrite
+    e2 = FilterEngine()
+    e2.load_rules_from_text("||r.com^$dnsrewrite=10.0.0.1\n@@||r.com^", source="dr2")
+    total += 1
+    blocked, _ = e2.check_domain("r.com")
+    if not blocked:
+        ok += 1; print("  OK [7.3] 白名单覆盖 dnsrewrite")
+    else:
+        print("  xx [7.3] 白名单应覆盖 dnsrewrite")
+
+    print(f"  => dnsrewrite 测试: {ok}/{total} 通过")
+
+
+# ===== Test 8: 原子重载 =====
+def test_atomic_reload():
+    """测试原子重载"""
+    print()
+    print("=" * 60)
+    print("8. 测试原子重载")
+    print("=" * 60)
+    from filter_engine import FilterEngine
+    import tempfile, os
+
+    ok = total = 0
+
+    # 8.1 reload 基本功能
+    e1 = FilterEngine()
+    e1.load_rules_from_text("||old.com^", source="old")
+    f1 = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8')
+    f1.write("||new.com^\n")
+    f1.close()
+    f2 = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8')
+    f2.write("! empty\n")
+    f2.close()
+
+    try:
+        e1.reload([f1.name])
+        total += 2
+        ok_new = e1.check_domain("new.com")[0]
+        ok_old = not e1.check_domain("old.com")[0]
+        if ok_new: ok += 1
+        if ok_old: ok += 1
+
+        # 8.2 空文件不替换旧规则
+        e1.reload([f2.name])
+        total += 1
+        if e1.check_domain("new.com")[0]:
+            ok += 1
+    finally:
+        os.unlink(f1.name)
+        os.unlink(f2.name)
+
+    print(f"  => 原子重载测试: {ok}/{total} 通过")
+
+
+# ===== Test 9: 边界条件 =====
+def test_boundary():
+    """测试边界条件：FQDN、大小写、限制修饰符跳过"""
+    print()
+    print("=" * 60)
+    print("9. 测试边界条件")
+    print("=" * 60)
+    from filter_engine import FilterEngine
+
+    ok = total = 0
+
+    # 9.1 FQDN 尾点
+    e1 = FilterEngine()
+    e1.load_rules_from_text("||example.net^\n0.0.0.0 tracker.net", source="b1")
+    for d, exp in [("example.net", True), ("example.net.", True),
+                   ("tracker.net", True), ("tracker.net.", True)]:
+        total += 1
+        if e1.check_domain(d)[0] == exp:
+            ok += 1
+        else:
+            print(f"  xx [9.1] FQDN: {d}")
+    if ok >= total - 4 + 4:
+        print("  OK [9.1] FQDN 尾点匹配正确")
+
+    # 9.2 大小写不敏感
+    e2 = FilterEngine()
+    e2.load_rules_from_text("||Example.COM^", source="b2")
+    for d in ["example.com", "EXAMPLE.COM", "Example.Com"]:
+        total += 1
+        if e2.check_domain(d)[0]:
+            ok += 1
+        else:
+            print(f"  xx [9.2] 大小写: {d}")
+    if ok >= total - 3 + 3:
+        print("  OK [9.2] 大小写不敏感")
+
+    # 9.3 白名单大小写不敏感
+    e3 = FilterEngine()
+    e3.load_rules_from_text("||Blocked.COM^\n@@||blocked.com^", source="b3")
+    for d in ["BLOCKED.COM", "blocked.com"]:
+        total += 1
+        if not e3.check_domain(d)[0]:
+            ok += 1
+        else:
+            print(f"  xx [9.3] 白名单大小写: {d}")
+
+    # 9.4 $domain 限制规则应跳过
+    e4 = FilterEngine()
+    e4.load_rules_from_text("||skip.com^$domain=somewhere.com\n||normal.com^", source="b4")
+    total += 2
+    if not e4.check_domain("skip.com")[0]: ok += 1
+    else: print("  xx [9.4] $domain 限制规则未跳过")
+    if e4.check_domain("normal.com")[0]: ok += 1
+    else: print("  xx [9.4] 普通规则被误跳过")
+
+    # 9.5 $app / $client 限制规则应跳过
+    e5 = FilterEngine()
+    e5.load_rules_from_text(
+        "||skip-app.com^$app=X\n||skip-client.com^$client=1.2.3.4\n||ok.com^",
+        source="b5"
+    )
+    total += 3
+    if not e5.check_domain("skip-app.com")[0]: ok += 1
+    else: print("  xx [9.5] $app 限制未跳过")
+    if not e5.check_domain("skip-client.com")[0]: ok += 1
+    else: print("  xx [9.5] $client 限制未跳过")
+    if e5.check_domain("ok.com")[0]: ok += 1
+    else: print("  xx [9.5] 普通规则被误跳过")
+
+    print(f"  => 边界条件测试: {ok}/{total} 通过")
+
+
+# ===== 更新 main 入口 =====
+
 if __name__ == "__main__":
     test_parser()
     test_rule_parsing()
@@ -275,3 +572,8 @@ if __name__ == "__main__":
         print("3. 跳过 all.txt 文件加载测试（使用 --all 参数启用）")
         print("=" * 60)
     test_parser_in_engine()
+    test_rule_priority()
+    test_badfilter()
+    test_dnsrewrite()
+    test_atomic_reload()
+    test_boundary()

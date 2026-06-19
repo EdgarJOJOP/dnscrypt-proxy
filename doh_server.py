@@ -267,15 +267,20 @@ class DoHServer:
                     return result
 
             # 1. 检查域名过滤
+            cache_key = (question.name, question.rdtype, question.rdclass)
             if self.config.filter_enabled:
                 blocked, reason = self.filter_engine.check_domain(qname)
                 if blocked:
                     result["Status"] = 3  # NXDOMAIN
                     result["Comment"] = f"被过滤规则拦截: {reason}"
+                    # 缓存拦截结果到 DNS 响应缓存，防止上游正向应答重复生效
+                    if self.config.cache_enabled:
+                        response = dns.message.make_response(query)
+                        response.set_rcode(dns.rcode.NXDOMAIN)
+                        await self.cache.set(cache_key, response)
                     return result
 
             # 2. 缓存检查
-            cache_key = (question.name, question.rdtype, question.rdclass)
             if self.config.cache_enabled:
                 cached = await self.cache.get(cache_key)
                 if cached is not None:

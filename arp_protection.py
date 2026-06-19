@@ -25,7 +25,9 @@ _SYS_ENCODING = locale.getpreferredencoding()
 # ARP 嗅探：scapy 跨平台抓包（可选，需 libpcap/Npcap 驱动支持）
 # Suppress Scapy socket BPF filter warnings on Windows
 import warnings
+import logging
 warnings.filterwarnings("ignore", category=UserWarning, message=".*Socket.*failed.*")
+logging.getLogger("scapy").setLevel(logging.ERROR)
 _SCAPY_AVAILABLE = False
 try:
     import scapy.all as scapy

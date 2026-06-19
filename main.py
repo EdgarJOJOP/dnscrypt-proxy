@@ -25,6 +25,7 @@ import gc
 import asyncio
 import signal
 import logging
+import time
 from pathlib import Path
 from typing import Optional, List
 
@@ -55,6 +56,9 @@ from network_monitor import NetworkMonitor
 from dnssec import DNSSECValidator, DNSSECQueryWrapper
 from consistency_verifier import ResponseConsistencyVerifier
 from anomaly_detector import AnomalyDetector
+from ntp_sync import (check_system_time_vs_ntp, check_system_time_vs_ntp_async,
+                       DEVIATION_THRESHOLD, DRIFT_SAMPLE_INTERVAL, RLS_LAMBDA,
+                       RLS_MIN_SAMPLES, MAX_JUMP, DriftEstimator, apply_drift_compensation)
 
 # ======================== 日志配置 ========================
 LOG_FORMAT = "[%(asctime)s] %(levelname)s [%(name)s] %(message)s"
@@ -122,6 +126,8 @@ class DNSProxyApp:
         self._cache_cleanup_task: Optional[asyncio.Task] = None
         self._filter_reload_task: Optional[asyncio.Task] = None  # 跟踪后台过滤规则重载
         self._filter_reload_gen = 0  # 递增 generation，防止过期重载覆盖
+        self._ntp_freeze_event: asyncio.Event = asyncio.Event()  # NTP 冻结事件，set=暂停
+        self._ntp_calibrate_task: Optional[asyncio.Task] = None  # NTP 定时校准
         self._running = False
         self.network_monitor: Optional[NetworkMonitor] = None  # 网络连通性监控
 
@@ -174,8 +180,24 @@ class DNSProxyApp:
                      self.config.dnssec_mode)
 
         # 3. 过滤器
+        # 2.5. NTP 校时
+        logger.info("[2.5/11] 校验系统时间（NTP）...")
+        try:
+            ntp_ok, ntp_offset = check_system_time_vs_ntp(min_delay=True)
+            if ntp_ok:
+                logger.info("  NTP 校时完成，偏差=%.2f 秒", ntp_offset)
+            else:
+                logger.warning("  NTP 校时失败，将使用当前系统时间")
+        except Exception as e:
+            logger.error("  NTP 校时异常: %s", e)
+
+        # 3. 过滤器
         logger.info("[3/11] 初始化域名过滤引擎...")
-        self.filter_engine = FilterEngine()
+        self.filter_engine = FilterEngine(
+            cache_ttl_blocked=self.config.cache_default_ttl,
+            cache_ttl_allowed=self.config.cache_negative_ttl,
+            cache_maxsize=self.config.cache_max_size,
+        )
         # 加载自定义 hosts 映射
         self.filter_engine.load_custom_hosts(self.config.hosts_config)
         if self.config.filter_enabled:
@@ -235,6 +257,13 @@ class DNSProxyApp:
 
         # 5. 并行解析管理器（带 DNSSEC）
         logger.info("[5/11] 初始化并行解析管理器...")
+        # 确保过滤规则已加载完毕，避免 bootstrap DNS 在规则未就绪时查询
+        if self._filter_reload_task is not None:
+            try:
+                await self._filter_reload_task
+            except Exception as e:
+                logger.debug("等待过滤规则加载异常: %s", e)
+            self._filter_reload_task = None
         self.resolver_manager = ResolverManager(self.config, dnssec_wrapper=self._dnssec_wrapper,
                                                  consistency_verifier=self._consistency_verifier,
                                                  anomaly_detector=self._anomaly_detector)
@@ -357,8 +386,7 @@ class DNSProxyApp:
             logger.info("  拦截索引域名: %d, 白名单域名: %d",
                          self.filter_engine.stats["block_index_domains"],
                          self.filter_engine.stats["allow_index_domains"])
-
-            # ========== 规则加载完毕后：扫描 DNS 缓存，覆写已缓存拦截域名的 IP ==========
+            # 规则加载完毕后扫描 DNS 缓存，覆写已缓存拦截域名的 IP
             await self._sweep_cache_after_filter_load()
 
         except asyncio.CancelledError:
@@ -370,71 +398,65 @@ class DNSProxyApp:
 
     async def _sweep_cache_after_filter_load(self):
         """
-        过滤规则加载完毕后，扫描 DNS 缓存中的域名。
+        过滤规则加载完毕后，并行扫描 DNS 缓存中的域名。
         如果有域名匹配新的拦截规则，将其 IP 覆写为 0.0.0.0（A记录）或 ::（AAAA记录）。
-        这解决了"启动时规则未加载完 → 域名已被解析并缓存 → 规则加载后旧 IP 仍有效"的问题。
+        使用 asyncio.gather + Semaphore 并行处理，避免阻塞事件循环。
         """
         if not self.cache or not self.config.cache_enabled or not self.config.filter_enabled:
             return
 
         logger = logging.getLogger("dns-proxy.app")
-        logger.info("开始扫描 DNS 缓存，检查是否有域名应被新规则拦截...")
-
-        # 获取当前缓存的所有 key
         cache_keys = await self.cache.get_all_keys()
-        swept_count = 0
-        changed_count = 0
+        if not cache_keys:
+            return
 
-        for cache_key in cache_keys:
-            qname, qtype, qclass = cache_key
-            domain = str(qname).rstrip(".")
-            # 检查是否匹配过滤规则
-            blocked, _ = self.filter_engine.check_domain(domain)
-            if blocked:
-                # 获取当前缓存的响应
+        logger.info("开始并行扫描 DNS 缓存 (%d 条)...", len(cache_keys))
+
+        sem = asyncio.Semaphore(200)  # 最多 200 个并发任务
+
+        async def _sweep_one(cache_key) -> bool:
+            """处理单条缓存条目，返回 True=已覆写"""
+            async with sem:
+                qname, qtype, qclass = cache_key
+                domain = str(qname).rstrip(".")
+                blocked, _ = self.filter_engine.check_domain(domain)
+                if not blocked:
+                    return False
                 cached_response = await self.cache.peek(cache_key)
                 if cached_response is None:
-                    continue
-                # 检查当前缓存的 IP 是否已经是 0.0.0.0 或 ::
-                already_blocked = False
+                    return False
+                # 跳过已是 0.0.0.0 / :: 的条目
                 for rrset in cached_response.answer:
                     for rd in rrset:
-                        if rd.rdtype == dns.rdatatype.A:
-                            if str(rd.address) == "0.0.0.0":  # nosec B104 - checking blocked IP in cache
-                                already_blocked = True
-                        elif rd.rdtype == dns.rdatatype.AAAA:
-                            if str(rd.address) == "::":
-                                already_blocked = True
-                if already_blocked:
-                    continue
-                # 覆写为拦截 IP
-                # 注意：make_response() 需要 query 报文，cache 中存的是 response，需构造 query
+                        if rd.rdtype == dns.rdatatype.A and str(rd.address) == "0.0.0.0":
+                            return False
+                        if rd.rdtype == dns.rdatatype.AAAA and str(rd.address) == "::":
+                            return False
+                # 构造拦截响应
                 q_msg = dns.message.make_query(qname, qtype, qclass)
-                new_response = dns.message.make_response(q_msg)
-                new_response.answer.clear()
+                new_resp = dns.message.make_response(q_msg)
+                new_resp.answer.clear()
                 if qtype == dns.rdatatype.A:
-                    new_response.answer.append(
-                        dns.rrset.RRset(qname, qclass, dns.rdatatype.A)
+                    new_resp.answer.append(dns.rrset.RRset(qname, qclass, dns.rdatatype.A))
+                    new_resp.answer[0].add(
+                        dns.rdtypes.IN.A.A(dns.rdataclass.IN, dns.rdatatype.A, "0.0.0.0"), ttl=3600
                     )
-                    new_response.answer[0].add(
-                        dns.rdtypes.IN.A.A(dns.rdataclass.IN, dns.rdatatype.A, "0.0.0.0"), ttl=3600  # nosec B104 - blocked A record
-                    )
-                    new_response.set_rcode(dns.rcode.NOERROR)
+                    new_resp.set_rcode(dns.rcode.NOERROR)
                 elif qtype == dns.rdatatype.AAAA:
-                    new_response.answer.append(
-                        dns.rrset.RRset(qname, qclass, dns.rdatatype.AAAA)
-                    )
-                    new_response.answer[0].add(
+                    new_resp.answer.append(dns.rrset.RRset(qname, qclass, dns.rdatatype.AAAA))
+                    new_resp.answer[0].add(
                         dns.rdtypes.IN.AAAA.AAAA(dns.rdataclass.IN, dns.rdatatype.AAAA, "::"), ttl=3600
                     )
-                    new_response.set_rcode(dns.rcode.NOERROR)
+                    new_resp.set_rcode(dns.rcode.NOERROR)
                 else:
-                    new_response.set_rcode(dns.rcode.NXDOMAIN)
-                await self.cache.set(cache_key, new_response)
-                changed_count += 1
-            swept_count += 1
+                    new_resp.set_rcode(dns.rcode.NXDOMAIN)
+                is_neg = new_resp.rcode() == dns.rcode.NXDOMAIN
+                await self.cache.set(cache_key, new_resp, is_negative=is_neg)
+                return True
 
-        logger.info("缓存扫描完成: 检查 %d 条, 覆写 %d 条为拦截 IP", swept_count, changed_count)
+        results = await asyncio.gather(*[_sweep_one(k) for k in cache_keys])
+        changed = sum(1 for r in results if r)
+        logger.info("缓存并行扫描完成: %d 条, 覆写 %d 条", len(cache_keys), changed)
 
     @staticmethod
     def _get_memory_mb() -> float:
@@ -547,10 +569,47 @@ class DNSProxyApp:
             except Exception as e:
                 logging.getLogger("dns-proxy.app").debug("缓存清理循环异常: %s", e)
 
+    async def _ntp_calibrate_loop(self):
+        """定期 NTP 校时循环（异步并行 + 可冻结）
+        每周期: 最小延迟筛选 + RLS 在线更新 (lambda=0.98) + 跳变保护 (MAX_JUMP=1.0)
+        冻结: _ntp_freeze_event.set() 时暂停，clear() 时恢复（由 optimizer 触发）"""
+        logger = logging.getLogger("dns-proxy.app")
+        estimator = DriftEstimator(lam=RLS_LAMBDA)
+        applied = False
+        while self._running:
+            try:
+                await asyncio.sleep(DRIFT_SAMPLE_INTERVAL)
+                # 异步 NTP 校时（线程池+并行查询），支持冻结
+                ntp_ok, ntp_offset = await check_system_time_vs_ntp_async(
+                    freeze_event=self._ntp_freeze_event, min_delay=True)
+                if not ntp_ok:
+                    continue
+                drift_ppm, offset_smoothed = estimator.update(time.time(), ntp_offset)
+                if estimator.sample_count < RLS_MIN_SAMPLES:
+                    logger.info("  NTP 漂移估算: 采样 %d/%d, 当前偏差=%.2f 秒",
+                                estimator.sample_count, RLS_MIN_SAMPLES, ntp_offset)
+                    continue
+                if not applied:
+                    applied = True
+                    logger.info("  NTP 频率漂移: %.2f PPM, 平滑偏差=%.2f 秒 (RLS lam=%.2f)",
+                                drift_ppm, offset_smoothed, RLS_LAMBDA)
+                    apply_drift_compensation(drift_ppm)
+                else:
+                    logger.debug("  NTP 漂移: %.2f PPM, 原始=%.2f 秒, 平滑=%.2f 秒",
+                                 drift_ppm, ntp_offset, offset_smoothed)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug("NTP 定时校准异常: %s", e)
+
     async def start(self):
         """启动所有服务"""
         logger = logging.getLogger("dns-proxy.app")
         self._running = True
+
+        # 等待远程规则加载完成后再启动服务器，防止查询涌入时规则还未就绪
+        if self._filter_reload_task is not None:
+            await self._filter_reload_task
 
         # 启动 DoH 服务器（IPv4 + IPv6）
         await self.doh_server.start()
@@ -584,11 +643,18 @@ class DNSProxyApp:
         # 启动后台任务
         self._config_reload_task = asyncio.create_task(self._config_reload_loop())
         self._cache_cleanup_task = asyncio.create_task(self._cache_cleanup_loop())
+        self._ntp_calibrate_task = asyncio.create_task(self._ntp_calibrate_loop())
+        logger.info("  - NTP 定时校准: 每 %d 秒", DRIFT_SAMPLE_INTERVAL)
 
         # 启动过滤规则定时更新（如果配置了远程 URL）
         if self.config.filter_update_interval > 0 and self.config.filter_rules_urls:
             rule_files = self.config.filter_rules_files
             full_paths = [str(PROJECT_ROOT / f) for f in rule_files]
+            # 注册更新回调：定时更新规则后自动扫描 DNS 缓存
+            async def _on_filter_update(rules_count):
+                await self._sweep_cache_after_filter_load()
+            self.filter_engine.on_update(lambda count: asyncio.create_task(_on_filter_update(count)))
+
             await self.filter_engine.start_auto_update(
                 interval_hours=self.config.filter_update_interval,
                 urls=self.config.filter_rules_urls,
@@ -596,12 +662,9 @@ class DNSProxyApp:
             )
             logger.info("  - 规则自动更新: 每 %d 小时（完整替换模式）", self.config.filter_update_interval)
 
-        # 等待后台过滤规则加载完成，确保摘要中的规则数准确
-        if self._filter_reload_task is not None:
-            try:
-                await self._filter_reload_task
-            except Exception as e:
-                logger.debug("过滤规则加载任务异常: %s", e)
+        # 规则加载完毕后：扫描 DNS 缓存，覆写已缓存拦截域名的 IP
+        # 此时服务器已启动、DNS 缓存已有条目、规则也已就绪，扫描能真正生效
+        await self._sweep_cache_after_filter_load()
 
         logger.info("所有服务已启动！")
         # 启动后再次 GC
@@ -648,7 +711,7 @@ class DNSProxyApp:
 
         # 取消后台任务
         for task in [self._config_reload_task, self._cache_cleanup_task,
-                     self._filter_reload_task]:
+                     self._ntp_calibrate_task, self._filter_reload_task]:
             if task:
                 task.cancel()
                 try:

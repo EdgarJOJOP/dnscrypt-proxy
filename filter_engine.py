@@ -212,7 +212,8 @@ class AdGuardRuleParser:
 class FilterRule:
     """单条过滤规则（编译后的匹配规则）"""
 
-    __slots__ = ("pattern", "is_exception", "is_important", "is_regex", "raw", "_skip")
+    __slots__ = ("pattern", "is_exception", "is_important", "is_regex", "raw", "_skip",
+                 "is_badfilter", "dnsrewrite")
 
     def __init__(self, rule_text: str):
         self.raw = rule_text
@@ -221,6 +222,8 @@ class FilterRule:
         self.is_regex = False
         self.pattern = rule_text
         self._skip = False
+        self.is_badfilter = False
+        self.dnsrewrite = None
 
         self._parse()
 
@@ -250,7 +253,7 @@ class FilterRule:
         # 杂项
         'popunder', 'network', 'hls', 'jsonprune', 'cookie',
         # 其他
-        'noop', 'reason',
+        'noop', 'reason', 'stealth', 'mp4',
     }
 
     # 例外规则上 DNS 级别无法评估的修饰符集合
@@ -259,7 +262,7 @@ class FilterRule:
     _EXCEPTION_RESTRICTIVE_MODIFIERS = frozenset({
         # 条件修饰符（需要页面域名/请求来源上下文）
         'domain', 'third-party', 'strict-third-party', 'strict-first-party',
-        'denyallow', 'app', 'method', 'to', 'header', 'client', 'ctag',
+        'denyallow', 'app', 'method', 'to', 'header', 'client', 'ctag', 'dnstype',
         # Content-type（需要请求类型信息）
         'script', 'image', 'stylesheet', 'object', 'xmlhttprequest',
         'subdocument', 'font', 'media', 'popup', 'document',
@@ -275,7 +278,7 @@ class FilterRule:
         'elemhide', 'generichide', 'specifichide', 'jsinject',
         'urlblock', 'content', 'extension', 'genericblock',
         # 杂项限制修饰符
-        'popunder', 'network', 'hls', 'jsonprune', 'cookie',
+        'popunder', 'network', 'hls', 'jsonprune', 'cookie', 'stealth',
     })
 
     # 拦截规则上 DNS 级别无法评估的范围限制修饰符集合
@@ -365,7 +368,10 @@ class FilterRule:
             if ch == '*':
                 # 匹配除点号外的任意字符（不跨域名段）
                 parts.append('[^.]*')
-            elif ch in '.^$+{}[]\\()|':
+            elif ch == '^':
+                # 分隔符：匹配非字母数字_-.% 的字符，或字符串结尾
+                parts.append('(?:[^a-zA-Z0-9_\\-.%]|\\Z)')
+            elif ch in '.$+{}[]\\()|':
                 parts.append('\\' + ch)
             else:
                 parts.append(ch)
@@ -428,6 +434,18 @@ class FilterRule:
             for mod in modifiers_str.split(','):
                 if mod.strip() == 'important':
                     self.is_important = True
+                    break
+
+            # 检测 badfilter 修饰符 — $badfilter 规则禁用其他具有相同 pattern 的规则
+            for mod in modifiers_str.split(','):
+                if mod.strip() == 'badfilter':
+                    self.is_badfilter = True
+                    break
+
+            # 检测 dnsrewrite 修饰符
+            for mod in modifiers_str.split(','):
+                if mod.strip().startswith('dnsrewrite'):
+                    self._parse_dnsrewrite(mod.strip())
                     break
 
             # 例外规则带有限制性修饰符（如 $domain=xxx、$third-party、$script 等）
@@ -604,6 +622,90 @@ class FilterRule:
         else:
             self._skip = True
 
+    def _parse_dnsrewrite(self, mod: str):
+        """
+        解析 $dnsrewrite 修饰符的值
+
+        AdGuard 支持以下格式:
+          $dnsrewrite              - 返回 NOERROR（空应答）
+          $dnsrewrite=1.2.3.4      - 返回 A 记录
+          $dnsrewrite=::1          - 返回 AAAA 记录
+          $dnsrewrite=host:name    - 返回 CNAME
+          $dnsrewrite=REFUSED      - 自定义 DNS 返回码
+          $dnsrewrite=NOERROR;A;1.2.3.4  - 完整自定义应答
+        """
+        if '=' not in mod:
+            # 纯 $dnsrewrite（无值）→ NOERROR 空应答
+            self.dnsrewrite = {'action': 'noerror'}
+            return
+
+        value = mod.split('=', 1)[1].strip()
+        if not value:
+            self.dnsrewrite = {'action': 'noerror'}
+            return
+
+        # 结构化语法: RC;QT;VAL
+        if ';' in value:
+            parts = value.split(';', 2)
+            rc = parts[0].strip().upper() if parts[0] else 'NOERROR'
+            qt = parts[1].strip().upper() if len(parts) > 1 and parts[1] else ''
+            val = parts[2].strip() if len(parts) > 2 and parts[2] else ''
+            self.dnsrewrite = {
+                'action': 'dnsrewrite',
+                'rcode': rc,
+                'qtype': qt,
+                'value': val,
+            }
+            return
+
+        # host: 前缀 → CNAME 重写
+        if value.startswith('host:'):
+            self.dnsrewrite = {
+                'action': 'dnsrewrite',
+                'rcode': 'NOERROR',
+                'qtype': 'CNAME',
+                'value': value[5:],
+            }
+            return
+
+        # 简单 IP 地址
+        if ':' in value:
+            # IPv6
+            self.dnsrewrite = {
+                'action': 'dnsrewrite',
+                'rcode': 'NOERROR',
+                'qtype': 'AAAA',
+                'value': value,
+            }
+            return
+
+        # 检查是否为 DNS 返回码（REFUSED, SERVFAIL 等大写单词）
+        if value.upper() in ('NOERROR', 'FORMERR', 'SERVFAIL', 'NXDOMAIN',
+                              'NOTIMP', 'REFUSED'):
+            self.dnsrewrite = {
+                'action': 'dnsrewrite',
+                'rcode': value.upper(),
+                'qtype': '',
+                'value': '',
+            }
+            return
+
+        # 默认视为 IPv4 地址
+        import re as _re
+        ipv4_match = _re.match(r'^\d{1,3}(?:\.\d{1,3}){3}$', value)
+        if ipv4_match:
+            self.dnsrewrite = {
+                'action': 'dnsrewrite',
+                'rcode': 'NOERROR',
+                'qtype': 'A',
+                'value': value,
+            }
+            return
+
+        # 未知格式，记录日志并按 noerror 处理
+        logger.debug("无法识别的 $dnsrewrite 值: %s (规则: %s)", value, self.raw[:80])
+        self.dnsrewrite = {'action': 'noerror'}
+
     def matches(self, domain: str) -> bool:
         """检查域名是否匹配此规则"""
         try:
@@ -704,7 +806,17 @@ class FilterEngine:
     - 自定义 hosts 映射 — 类似 Windows hosts 文件，可自定义域名指向 IP
     """
 
-    def __init__(self, cache_dir: Optional[str] = None):
+    def __init__(self, cache_dir: Optional[str] = None,
+                 cache_ttl_blocked: int = 300,
+                 cache_ttl_allowed: int = 60,
+                 cache_maxsize: int = 100000):
+        """
+        Args:
+            cache_dir: 缓存目录（未使用，保留兼容）
+            cache_ttl_blocked: 已拦截域名的过滤缓存 TTL（秒），默认 300
+            cache_ttl_allowed: 放行域名的过滤缓存 TTL（秒），默认 60
+            cache_maxsize: 过滤缓存最大条目数，默认 100000
+        """
         # 黑名单索引（Go: filteringEngine）
         self._block_index = DomainIndex()
         # 白名单索引（Go: filteringEngineAllow）
@@ -722,8 +834,10 @@ class FilterEngine:
         # 格式: {domain: (blocked, reason, timestamp, priority)}
         # priority=True 的条目（自定义 hosts）永不淘汰
         self._filter_cache: Dict[str, Tuple[bool, str, float, bool]] = {}
-        self._filter_cache_timeout: float = 5.0
-        self._filter_cache_maxsize: int = 100000  # 过滤缓存最大条目数，防止无界增长
+        self._cache_ttl_blocked: int = cache_ttl_blocked
+        self._cache_ttl_allowed: int = cache_ttl_allowed
+        self._cache_trim_pending: bool = False  # call_soon 防重复
+        self._filter_cache_maxsize: int = cache_maxsize
         self._update_callback: Optional[Callable] = None
         # 校验和缓存（类似 Go 的 checksum）
         self._file_checksums: dict = {}
@@ -746,16 +860,29 @@ class FilterEngine:
         self._custom_hosts_enabled = True
         # 内存压力下暂停过滤缓存写入（由优化器控制）
         self._cache_suspended = False
+        # 规则重载进行中标志：重载期间不缓存未拦截的中间结果，防止窗口期漏放
+        self._loading = False
         # 纯域名快速查找集合（无通配符/正则的规则）
         self._plain_domains: Set[str] = set()
+        # $badfilter 禁用 pattern 集合
+        self._badfilter_patterns: Set[str] = set()
+        # $dnsrewrite 匹配结果缓存
+        self._last_dnsrewrite: Optional[dict] = None
+        # ========== Atomic reload: pending state ==========
+        # Rule reload writes new rules to pending indices while active indices
+        # continue answering DNS queries. Atomically swap on success.
+        self._pending_block_index: Optional[DomainIndex] = None
+        self._pending_allow_index: Optional[DomainIndex] = None
+        self._pending_plain_domains: Optional[Set[str]] = None
+        self._pending_rule_count: int = 0
+        self._pending_loaded_files: List[str] = []
+        self._pending_loaded_urls: List[str] = []
 
     @property
     def title(self) -> str:
         return self._title
 
     # 过滤结果缓存 TTL（秒）
-    FILTER_CACHE_TTL = 5.0
-
     @staticmethod
     def _extract_index_domain(rule_text: str) -> Optional[str]:
         """
@@ -864,29 +991,77 @@ class FilterEngine:
 
     def _index_rule(self, rule: FilterRule, rule_text: str):
         """将单条规则加入对应的索引（不再维护冗余列表）"""
+        # 原子重载期间使用 pending 索引，旧索引保持活跃继续应答 DNS 查询
+        if self._pending_block_index is not None:
+            block_idx = self._pending_block_index
+            allow_idx = self._pending_allow_index
+            plain_domains = self._pending_plain_domains
+        else:
+            block_idx = self._block_index
+            allow_idx = self._allow_index
+            plain_domains = self._plain_domains
+
         if rule.is_exception:
             index_domain = self._extract_index_domain(rule_text)
-            self._allow_index.add_rule(rule, index_domain)
+            allow_idx.add_rule(rule, index_domain)
         elif rule.is_important:
-            # 重要规则也加入黑名单索引
             index_domain = self._extract_index_domain(rule_text)
-            self._block_index.add_rule(rule, index_domain)
+            block_idx.add_rule(rule, index_domain)
         else:
             index_domain = self._extract_index_domain(rule_text)
-            self._block_index.add_rule(rule, index_domain)
+            block_idx.add_rule(rule, index_domain)
 
-        # 为纯域名规则（无通配符/正则）添加快速 set-lookup
-        if not rule.is_regex and not rule._skip:
+        # 为纯域名拦截规则（无通配符/正则）添加快速 set-lookup
+        # 例外规则不加入 _plain_domains：该检查在白名单之后执行，
+        # 已由 allowlist 放行的域名不会再被这里拦截；
+        # _plain_domains 仅作为拦截快速路径，白名单不需要在此记录。
+        if not rule.is_exception and not rule.is_regex and not rule._skip:
             domain = rule_text.strip().lower().rstrip('^')
+            # 去除 || 和 *. 前缀，提取实际域名用于快速查找
+            if domain.startswith('||'):
+                domain = domain[2:]
+            if domain.startswith('*.'):
+                domain = domain[2:]
             # 仅当规则是普通域名（不含 * ? 等特殊字符）
             if domain and '.' in domain and '*' not in domain and '/' not in domain:
-                self._plain_domains.add(domain)
+                plain_domains.add(domain)
+
+    @staticmethod
+    def _extract_badfilter_target(rule_text: str) -> Optional[str]:
+        if '$' not in rule_text:
+            return None
+        pattern = rule_text.rsplit('$', 1)[0]
+        return pattern
+
+    def _is_rule_badfiltered(self, rule_text: str) -> bool:
+        if not self._badfilter_patterns:
+            return False
+        pattern = rule_text.split('$')[0] if '$' in rule_text else rule_text
+        return pattern in self._badfilter_patterns
 
     def _compile_rules(self, cleaned_text: str, source: str = "memory"):
         """
         编译清理后的规则文本为 FilterRule 对象并建立索引
+
+        两阶段加载：先收集 $badfilter 目标，再索引剩余规则。
         """
         count = 0
+        skip_count = 0
+
+        # 第一阶段：收集 $badfilter 目标 pattern
+        for line in cleaned_text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if '$' not in line:
+                continue
+            rule = FilterRule(line)
+            if rule.is_badfilter:
+                target = self._extract_badfilter_target(line)
+                if target:
+                    self._badfilter_patterns.add(target)
+
+        # 第二阶段：索引剩余规则，过滤被禁用的
         for line in cleaned_text.splitlines():
             line = line.strip()
             if not line:
@@ -896,17 +1071,42 @@ class FilterEngine:
             if rule._skip:
                 continue
 
+            if rule.is_badfilter:
+                skip_count += 1
+                continue
+
+            if self._is_rule_badfiltered(line):
+                skip_count += 1
+                continue
+
             self._index_rule(rule, line)
             count += 1
 
-        self._rule_count += count
-        logger.info(
-            "从 %s 索引了 %d 条规则 (总: %d, 拦截索引: %d 域名, 白名单: %d 域名)",
-            source, count,
-            self._rule_count,
-            self._block_index.domain_count,
-            self._allow_index.domain_count,
-        )
+        # 原子重载期间使用 pending 计数
+        if self._pending_block_index is not None:
+            self._pending_rule_count += count
+            total = self._pending_rule_count
+            block_domains = self._pending_block_index.domain_count
+            allow_domains = self._pending_allow_index.domain_count
+        else:
+            self._rule_count += count
+            total = self._rule_count
+            block_domains = self._block_index.domain_count
+            allow_domains = self._allow_index.domain_count
+
+        if skip_count:
+            logger.info(
+                "从 %s 索引了 %d 条规则 (%d 条被 badfilter 跳过), 总: %d, "
+                "拦截索引: %d 域名, 白名单: %d 域名",
+                source, count, skip_count,
+                total, block_domains, allow_domains,
+            )
+        else:
+            logger.info(
+                "从 %s 索引了 %d 条规则 (总: %d, 拦截索引: %d 域名, 白名单: %d 域名)",
+                source, count,
+                total, block_domains, allow_domains,
+            )
 
     def load_rules_from_text(self, text: str, source: str = "memory"):
         """
@@ -924,16 +1124,37 @@ class FilterEngine:
             return ParseResult()
 
     def load_rules_from_file(self, filepath: str) -> bool:
-        """从文件加载规则"""
+        """从文件加载规则（带 mtime+size checksum 缓存）"""
         path = Path(filepath)
         if not path.exists():
             logger.warning("规则文件不存在: %s", filepath)
             return False
 
+        # 检查 checksum 缓存：mtime + size 未变则跳过重解析
+        try:
+            stat = path.stat()
+            file_key = (stat.st_mtime, stat.st_size)
+            cached = self._file_checksums.get(filepath)
+            if cached == file_key:
+                logger.debug("Checksum 命中，跳过未变更文件: %s", filepath)
+                return True
+        except OSError:
+            pass
+
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
             parse_res = self.load_rules_from_text(text, source=filepath)
-            self._loaded_files.append(filepath)
+            if self._pending_block_index is not None:
+                self._pending_loaded_files.append(filepath)
+            else:
+                self._loaded_files.append(filepath)
+            # 更新 checksum 缓存
+            try:
+                stat = path.stat()
+                self._file_checksums[filepath] = (stat.st_mtime, stat.st_size)
+            except OSError:
+                pass
+            logger.debug("Checksum 缓存已更新: %s (rules=%d)", filepath, parse_res.rules_count)
             return parse_res.rules_count > 0
         except Exception as e:
             logger.error("读取规则文件 %s 失败: %s", filepath, e)
@@ -1038,6 +1259,13 @@ class FilterEngine:
                             rule = FilterRule(cleaned)
                             if rule._skip:
                                 continue
+                            if rule.is_badfilter:
+                                target = self._extract_badfilter_target(cleaned)
+                                if target:
+                                    self._badfilter_patterns.add(target)
+                                continue
+                            if self._is_rule_badfiltered(cleaned):
+                                continue
                             self._index_rule(rule, cleaned)
                             rule_count += 1
                             lines_processed += 1
@@ -1048,13 +1276,26 @@ class FilterEngine:
                         if cleaned:
                             rule = FilterRule(cleaned)
                             if not rule._skip:
-                                self._index_rule(rule, cleaned)
-                                rule_count += 1
-                                lines_processed += 1
+                                if rule.is_badfilter:
+                                    target = self._extract_badfilter_target(cleaned)
+                                    if target:
+                                        self._badfilter_patterns.add(target)
+                                elif self._is_rule_badfiltered(cleaned):
+                                    pass
+                                else:
+                                    self._index_rule(rule, cleaned)
+                                    rule_count += 1
+                                    lines_processed += 1
 
-                    self._rule_count += rule_count
-                    self._loaded_urls.append(url)
-                    logger.info("从 %s 流式加载了 %d 条规则 (总: %d)", url, rule_count, self._rule_count)
+                    if self._pending_block_index is not None:
+                        self._pending_rule_count += rule_count
+                        self._pending_loaded_urls.append(url)
+                        total = self._pending_rule_count
+                    else:
+                        self._rule_count += rule_count
+                        self._loaded_urls.append(url)
+                        total = self._rule_count
+                    logger.info("从 %s 流式加载了 %d 条规则 (总: %d)", url, rule_count, total)
                     return rule_count > 0
 
         except asyncio.TimeoutError:
@@ -1069,62 +1310,70 @@ class FilterEngine:
         异步重新加载所有规则（原子加载模式）。
 
         加载流程：
-        1. 保存旧规则状态
-        2. 创建新规则索引
-        3. 尝试加载本地文件 + 远程 URL
-        4. 如果加载结果为 0 条但旧状态有规则 → 恢复旧规则（URL 不可用场景）
-        5. 加载成功后清除 filter_cache
+        1. 保存旧规则状态（旧索引保持活跃应答 DNS 查询）
+        2. 创建 pending 索引（不触碰活跃索引）
+        3. 将新规则加载到 pending 索引
+        4. 加载成功则原子交换 pending → active；失败则丢弃 pending，保留旧状态
+        5. 清除 filter_cache（旧缓存基于旧规则集，已失效）
         """
-        # 保存旧状态
+        # 1. 保存旧状态
         saved_state = {
             'block_index': self._block_index,
             'allow_index': self._allow_index,
+            'plain_domains': self._plain_domains,
             'loaded_files': list(self._loaded_files),
             'loaded_urls': list(self._loaded_urls),
             'rule_count': self._rule_count,
         }
 
-        # 创建新空状态
-        self._block_index = DomainIndex()
-        self._allow_index = DomainIndex()
-        self._loaded_files = []
-        self._loaded_urls = []
-        self._rule_count = 0
-        self._filter_cache.clear()
+        # 2. 创建 pending 状态（不触碰活跃索引）
+        self._pending_block_index = DomainIndex()
+        self._pending_allow_index = DomainIndex()
+        self._pending_plain_domains = set()
+        self._pending_rule_count = 0
+        self._pending_loaded_files = []
+        self._pending_loaded_urls = []
+        self._loading = True
 
-        # 加载本地文件
-        for filepath in files:
-            self.load_rules_from_file(filepath)
+        # 3. 加载到 pending 状态
+        try:
+            for filepath in files:
+                self.load_rules_from_file(filepath)
 
-        # 加载远程 URL
-        if urls:
-            await asyncio.gather(
-                *[self.load_rules_from_url_async(url) for url in urls],
-                return_exceptions=True,
-            )
+            if urls:
+                await asyncio.gather(
+                    *[self.load_rules_from_url_async(url) for url in urls],
+                    return_exceptions=True,
+                )
 
-        # 原子恢复：如果没加载到任何规则但旧状态有规则 → 恢复旧规则
-        if self._rule_count == 0 and saved_state['rule_count'] > 0:
-            logger.error("规则加载失败（所有 %d 个远程 URL 均不可用），"
-                         "恢复上次的 %d 条规则 | 本地上次: %d 个文件",
-                         len(urls or []), saved_state['rule_count'],
-                         len(saved_state['loaded_files']))
-            self._block_index = saved_state['block_index']
-            self._allow_index = saved_state['allow_index']
-            self._loaded_files = saved_state['loaded_files']
-            self._loaded_urls = saved_state['loaded_urls']
-            self._rule_count = saved_state['rule_count']
-            # 恢复旧规则时不清除 filter_cache（保留有效的缓存结果）
-            return
+            # 4. 原子交换或恢复
+            if self._pending_rule_count == 0 and saved_state['rule_count'] > 0:
+                logger.error("规则加载失败（所有 %d 个远程 URL 均不可用），"
+                             "保留上次的 %d 条规则 | 本地上次: %d 个文件",
+                             len(urls or []), saved_state['rule_count'],
+                             len(saved_state['loaded_files']))
+            else:
+                # 原子交换：pending → active
+                self._block_index = self._pending_block_index
+                self._allow_index = self._pending_allow_index
+                self._plain_domains = self._pending_plain_domains
+                self._loaded_files = self._pending_loaded_files
+                self._loaded_urls = self._pending_loaded_urls
+                self._rule_count = self._pending_rule_count
+                # 清除 filter_cache：旧缓存基于旧规则集，可能不再正确
+                self._filter_cache.clear()
 
-        # 核心修复：规则全部加载完毕后再次清除 filter_cache
-        # 防止加载过程中被 DNS 查询写入的过期 (False, ...) 条目污染
-        # 如果不清除，_sweep_cache_after_filter_load 中的 check_domain 会返回
-        # 过期的 False 结果，导致缓存扫描无法将上游真实 IP 覆写为 0.0.0.0/::
-        self._filter_cache.clear()
+                logger.info("规则重载完成，共 %d 条规则 (本地: %d, 远程: %d)",
+                             self._rule_count, len(files), len(urls or []))
 
-        logger.info("规则重载完成，共 %d 条规则 (本地: %d, 远程: %d)",
-                     self._rule_count, len(files), len(urls or []))
+        finally:
+            # 5. 清理 pending 状态
+            self._pending_block_index = None
+            self._pending_allow_index = None
+            self._pending_plain_domains = None
+            self._pending_loaded_files = []
+            self._pending_loaded_urls = []
+            self._loading = False
 
         if self._update_callback:
             try:
@@ -1137,61 +1386,74 @@ class FilterEngine:
         重新加载所有规则（同步接口，用于测试）
         使用与 async_reload 相同的原子加载模式。
         """
-        # 保存旧状态
+        # 1. 保存旧状态
         saved_state = {
             'block_index': self._block_index,
             'allow_index': self._allow_index,
+            'plain_domains': self._plain_domains,
             'loaded_files': list(self._loaded_files),
             'loaded_urls': list(self._loaded_urls),
             'rule_count': self._rule_count,
         }
 
-        # 创建新空状态
-        self._block_index = DomainIndex()
-        self._allow_index = DomainIndex()
-        self._loaded_files = []
-        self._loaded_urls = []
-        self._rule_count = 0
-        self._filter_cache.clear()
+        # 2. 创建 pending 状态（不触碰活跃索引）
+        self._pending_block_index = DomainIndex()
+        self._pending_allow_index = DomainIndex()
+        self._pending_plain_domains = set()
+        self._pending_rule_count = 0
+        self._pending_loaded_files = []
+        self._pending_loaded_urls = []
+        self._loading = True
 
-        for filepath in files:
-            self.load_rules_from_file(filepath)
+        # 3. 加载到 pending 状态
+        try:
+            for filepath in files:
+                self.load_rules_from_file(filepath)
 
-        if urls:
-            for url in urls:
-                try:
-                    loop = asyncio.get_event_loop()
-                    if loop.is_running():
-                        logger.warning("规则 URL %s 无法同步加载（事件循环已运行）", url)
-                        continue
-                    from urllib.parse import urlparse as _urlparse
-                    parsed = _urlparse(url)
-                    if parsed.scheme not in ("http", "https"):
-                        raise ValueError(f"不允许的 URL 协议: {parsed.scheme}")
-                    import urllib.request
-                    resp = urllib.request.urlopen(url, timeout=120)  # nosec B310 - scheme validated above
-                    content = resp.read().decode("utf-8", errors="replace")
-                    self.load_rules_from_text(content, source=url)
-                    self._loaded_urls.append(url)
-                except Exception as e:
-                    logger.error("从 %s 加载规则失败: %s", url, e)
+            if urls:
+                for url in urls:
+                    try:
+                        loop = asyncio.get_event_loop()
+                        if loop.is_running():
+                            logger.warning("规则 URL %s 无法同步加载（事件循环已运行）", url)
+                            continue
+                        from urllib.parse import urlparse as _urlparse
+                        parsed = _urlparse(url)
+                        if parsed.scheme not in ("http", "https"):
+                            raise ValueError(f"不允许的 URL 协议: {parsed.scheme}")
+                        import urllib.request
+                        resp = urllib.request.urlopen(url, timeout=120)  # nosec B310 - scheme validated above
+                        content = resp.read().decode("utf-8", errors="replace")
+                        self.load_rules_from_text(content, source=url)
+                        self._pending_loaded_urls.append(url)
+                    except Exception as e:
+                        logger.error("从 %s 加载规则失败: %s", url, e)
 
-        # 原子恢复：如果没加载到任何规则但旧状态有规则 → 恢复旧规则
-        if self._rule_count == 0 and saved_state['rule_count'] > 0:
-            logger.error("同步规则加载失败，恢复上次的 %d 条规则",
-                         saved_state['rule_count'])
-            self._block_index = saved_state['block_index']
-            self._allow_index = saved_state['allow_index']
-            self._loaded_files = saved_state['loaded_files']
-            self._loaded_urls = saved_state['loaded_urls']
-            self._rule_count = saved_state['rule_count']
-            return
+            # 4. 原子交换或恢复
+            if self._pending_rule_count == 0 and saved_state['rule_count'] > 0:
+                logger.error("同步规则加载失败，保留上次的 %d 条规则",
+                             saved_state['rule_count'])
+            else:
+                # 原子交换：pending → active
+                self._block_index = self._pending_block_index
+                self._allow_index = self._pending_allow_index
+                self._plain_domains = self._pending_plain_domains
+                self._loaded_files = self._pending_loaded_files
+                self._loaded_urls = self._pending_loaded_urls
+                self._rule_count = self._pending_rule_count
+                self._filter_cache.clear()
 
-        # 同步 reload 同样需要在加载规则后清除 filter_cache
-        self._filter_cache.clear()
+                logger.info("规则重载完成，共 %d 条规则 (本地: %d, 远程: %d)",
+                             self._rule_count, len(files), len(urls or []))
 
-        logger.info("规则重载完成，共 %d 条规则 (本地: %d, 远程: %d)",
-                     self._rule_count, len(files), len(urls or []))
+        finally:
+            # 5. 清理 pending 状态
+            self._pending_block_index = None
+            self._pending_allow_index = None
+            self._pending_plain_domains = None
+            self._pending_loaded_files = []
+            self._pending_loaded_urls = []
+            self._loading = False
 
         if self._update_callback:
             try:
@@ -1220,26 +1482,25 @@ class FilterEngine:
             self._filter_cache[domain] = (True, "custom_hosts", now, True)
             return True, "custom_hosts"
 
-        # 0b. 快速纯域名 set 查找（跳过正则匹配的开销）
-        if domain in self._plain_domains:
-            reason = "plain_domain_block"
-            self._filter_cache[domain] = (True, reason, now, False)
-            self._trim_filter_cache()
-            return True, reason
-
         # 1. 检查统一过滤结果缓存
         cached = self._filter_cache.get(domain)
         if cached is not None:
             result, reason, ts, priority = cached
-            if priority or now - ts < self._filter_cache_timeout:
+            # blocked 结果永久有效（直到规则重载清空 _filter_cache）；
+            # allowed 结果使用 _cache_ttl_allowed 检查；priority 条目永不超时
+            if priority or result:
                 if result:
-                    logger.debug("FilterCache HIT(blocked): %s | %s", domain, reason[:60])
+                    logger.debug("FilterCache HIT(blocked): %s | %s (永久)", domain, reason[:60])
                 else:
-                    logger.log(logging.DEBUG-1, "FilterCache HIT(allow): %s", domain)
+                    logger.debug("FilterCache HIT(allow/priority): %s", domain)
                 return result, reason
-            # 非 priority 缓存过期，删除并重新匹配
+            # allowed 结果检查 TTL
+            if now - ts < self._cache_ttl_allowed:
+                logger.log(logging.DEBUG-1, "FilterCache HIT(allow): %s (ttl=%ds)", domain, self._cache_ttl_allowed)
+                return result, reason
+            # allowed 缓存过期，删除并重新匹配
             del self._filter_cache[domain]
-            logger.debug("FilterCache EXPIRED: %s (age=%.1fs)", domain, now - ts)
+            logger.debug("FilterCache EXPIRED(allow): %s (age=%.1fs)", domain, now - ts)
 
         # 2. 重要规则优先匹配（通过 block_index 中的 is_important 规则）
         #    重要规则与普通规则都在 block_index 中，但通过 FilterRule.is_important 区分
@@ -1250,10 +1511,17 @@ class FilterEngine:
         if block_match is not None:
             rule, method = block_match
             if rule.is_important:
+                if rule.dnsrewrite:
+                    self._last_dnsrewrite = rule.dnsrewrite
+                    reason = "dnsrewrite"
+                    if not self._cache_suspended:
+                        self._filter_cache[domain] = (True, reason, now, False)
+                    self._defer_trim()
+                    return True, reason
                 reason = f"重要规则拦截: {rule.raw}"
                 if not self._cache_suspended:
                     self._filter_cache[domain] = (True, reason, now, False)
-                self._trim_filter_cache()
+                self._defer_trim()
                 logger.debug("拦截(重要规则): %s | %s", domain, rule.raw[:60])
                 return True, reason
             # 保存普通规则匹配结果，避免后续重新查询
@@ -1263,26 +1531,45 @@ class FilterEngine:
         match = self._allow_index.match(domain)
         if match is not None:
             rule, method = match
-            if not self._cache_suspended:
+            if not self._cache_suspended and not self._loading:
                 self._filter_cache[domain] = (False, "", now, False)
             logger.debug("放行(白名单): %s | %s: %s", domain, method, rule.raw[:60])
             return False, ""
 
+        # 3b. 快速纯域名 set 查找（在白名单之后，防止绕过白名单）
+        if domain in self._plain_domains:
+            reason = "plain_domain_block"
+            if not self._cache_suspended:
+                self._filter_cache[domain] = (True, reason, now, False)
+            self._defer_trim()
+            return True, reason
+
         # 4. 使用步骤 2 保存的 block 匹配结果（如有）
         if block_rule_result is not None:
             rule, method = block_rule_result
-            reason = f"{method}: {rule.raw}"
+            if rule.dnsrewrite:
+                self._last_dnsrewrite = rule.dnsrewrite
+                reason = "dnsrewrite"
+            else:
+                reason = f"{method}: {rule.raw}"
             if not self._cache_suspended:
                 self._filter_cache[domain] = (True, reason, now, False)
-            self._trim_filter_cache()
+            self._defer_trim()
             logger.debug("拦截: %s | %s (%s)", domain, method, rule.raw[:80])
             return True, reason
 
         # 未匹配：缓存并放行
-        self._filter_cache[domain] = (False, "", now, False)
-        self._trim_filter_cache()
+        if not self._cache_suspended and not self._loading:
+            self._filter_cache[domain] = (False, "", now, False)
+        self._defer_trim()
         logger.log(logging.DEBUG-1, "放行(无匹配): %s (共 %d 条拦截规则)", domain, self._rule_count)
         return False, ""
+
+    def get_last_dnsrewrite(self) -> Optional[dict]:
+        """获取上一条匹配的 $dnsrewrite 规则数据（读取后清除）"""
+        result = self._last_dnsrewrite
+        self._last_dnsrewrite = None
+        return result
 
     # ======================== 自定义 hosts 管理 ========================
 
@@ -1368,6 +1655,20 @@ class FilterEngine:
                 self._filter_cache[k] = (True, "custom_hosts", time.monotonic(), True)
         logger.debug("过滤缓存已清除（保留 %d 条 priority 条目）", len(priority_keys))
 
+    def _defer_trim(self):
+        """延迟执行缓存裁剪，带防重复标志"""
+        if self._cache_trim_pending:
+            return
+        self._cache_trim_pending = True
+        asyncio.get_event_loop().call_soon(self._trim_cache_wrapper)
+
+    def _trim_cache_wrapper(self):
+        """call_soon 回调：执行裁剪并清除标志"""
+        try:
+            self._trim_filter_cache()
+        finally:
+            self._cache_trim_pending = False
+
     def _trim_filter_cache(self):
         """限制过滤缓存大小，跳过 priority 条目（自定义 hosts）"""
         if len(self._filter_cache) <= self._filter_cache_maxsize:
@@ -1410,13 +1711,13 @@ class FilterEngine:
             (k, v) for k, v in self._filter_cache.items()
             if len(v) >= 4 and v[3]
         ]
-        # 保留未过期的非 priority 条目
+        # 保留未过期的非 priority 条目 + 所有已拦截条目（永久有效，不淘汰）
         now = time.monotonic()
-        timeout = self._filter_cache_timeout
+        timeout = self._cache_ttl_allowed
         active_items = [
             (k, v) for k, v in self._filter_cache.items()
             if not (len(v) >= 4 and v[3])
-            and (len(v) >= 3 and now - v[2] < timeout)
+            and (len(v) >= 3 and (v[0] or now - v[2] < timeout))
         ]
         old_count = len(self._filter_cache)
         # 清空旧 dict
