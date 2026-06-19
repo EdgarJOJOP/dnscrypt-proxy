@@ -66,7 +66,7 @@ upstream:
     - 114.114.114.114
     - 119.29.29.29
     - 2400:3200::1
-    - 2400:da00::6666
+    - 2001:dc7:1000::1
   doh:
     - https://dns.alidns.com/dns-query
     - https://doh.pub/dns-query
