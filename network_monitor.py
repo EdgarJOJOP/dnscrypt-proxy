@@ -47,9 +47,9 @@ class NetworkMonitor:
         self._recovery_in_progress = False  # 恢复互斥锁（防止并发恢复）
 
         # 滑动窗口：记录最近 N 次 ping 结果
-        self._gw_results: collections.deque = collections.deque(maxlen=5)   # 网关 ping 结果窗口 (~4s)
-        self._ext_results: collections.deque = collections.deque(maxlen=3)  # 外网 ping 结果窗口 (~2.4s)
-        self._ext_results_v6: collections.deque = collections.deque(maxlen=3)
+        self._gw_results: collections.deque = collections.deque(maxlen=10)   # 网关 ping 结果窗口 (~4s)
+        self._ext_results: collections.deque = collections.deque(maxlen=10)  # 外网 ping 结果窗口 (~2.4s)
+        self._ext_results_v6: collections.deque = collections.deque(maxlen=10)
 
         # 网络断开标记：滑动窗口全丢包+外网不通时设置，
         # 跳过 ARP 防护直接抑制 DNS，恢复后重新启用
@@ -64,7 +64,7 @@ class NetworkMonitor:
         self._ndp_task: Optional[asyncio.Task] = None
         self._ndp_last_end_time: float = 0.0  # 上次 NDP 防护结束时间，用于防抖
         # IPv6 网关 ping 滑动窗口
-        self._ndp_gw_results: collections.deque = collections.deque(maxlen=5)
+        self._ndp_gw_results: collections.deque = collections.deque(maxlen=10)
 
         # 从配置读取
         nm = config.get_raw().get("network_monitor", {})
@@ -201,15 +201,22 @@ class NetworkMonitor:
 
                 # ========== 1. ping 网关 + ping 外网（每轮一次） ==========
                 gw_ok = True
-                if gw_ip:
-                    gw_ok = await self._arp_protection._ping_gateway(gw_ip)
-                self._gw_results.append(gw_ok)
-
-                # IPv6 网关 ping（NDP 防护用）
-                ndp_gw = self._ndp_protection.gateway_ipv6
                 ndp_gw_ok = True
+                if gw_ip and self._ndp_protection.gateway_ipv6:
+                    results = await asyncio.gather(
+                        self._arp_protection._ping_gateway(gw_ip),
+                        self._ndp_protection._ping_ipv6(self._ndp_protection.gateway_ipv6, timeout_ms=50),
+                        return_exceptions=True,
+                    )
+                    gw_ok = results[0] if not isinstance(results[0], Exception) else False
+                    ndp_gw_ok = results[1] if not isinstance(results[1], Exception) else False
+                elif gw_ip:
+                    gw_ok = await self._arp_protection._ping_gateway(gw_ip)
+                elif self._ndp_protection.gateway_ipv6:
+                    ndp_gw_ok = await self._ndp_protection._ping_ipv6(self._ndp_protection.gateway_ipv6, timeout_ms=50)
+                self._gw_results.append(gw_ok)
+                ndp_gw = self._ndp_protection.gateway_ipv6
                 if ndp_gw:
-                    ndp_gw_ok = await self._ndp_protection._ping_ipv6(ndp_gw)
                     self._ndp_gw_results.append(ndp_gw_ok)
 
                 # 外网探测：按 external_interval 间隔执行，不每轮都 ping
@@ -358,7 +365,7 @@ class NetworkMonitor:
                         else:
                             logger.debug("ARP v6 ext ok, skip DNS pause")
                         if not self._arp_task or self._arp_task.done():
-                            logger.warning("ARP 防护: IPv4 网关丢包 %d%%，启动后台 ARP 修复", loss_pct)
+                            logger.warning("ARP 防护: IPv4 网关丢包 %d%%，启动后台 ARP 修复" + " [v4gw=" + str(sum(self._gw_results)) + "/" + str(len(self._gw_results)) + " v6gw=" + str(sum(self._ndp_gw_results)) + "/" + str(len(self._ndp_gw_results)) + " v4ext=" + str(sum(self._ext_results)) + "/" + str(len(self._ext_results)) + " v6ext=" + str(sum(self._ext_results_v6)) + "/" + str(len(self._ext_results_v6)) + "]", loss_pct)
                             self._arp_task = asyncio.create_task(
                                 self._run_arp_defense(gw_ip, lambda: self._is_recovered())
                             )
@@ -774,7 +781,7 @@ class NetworkMonitor:
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            await asyncio.wait_for(proc.wait(), timeout=self._ping_timeout + 2)
+            await asyncio.wait_for(proc.wait(), timeout=self._ping_timeout + 1)
             if proc.returncode == 0:
                 return True
         except (asyncio.TimeoutError, FileNotFoundError, OSError):

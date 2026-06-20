@@ -94,6 +94,7 @@ def setup_logging(log_dir: str = "logs", max_log_size_mb: int = 100):
     logging.getLogger("aiohttp").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("quic").setLevel(logging.WARNING)  # 抑制 aioquic 大量连接日志
+    logging.getLogger("scapy").setLevel(logging.ERROR)  # yi zhi scapy L2 socket guan bi jing gao
 
     return root_logger
 

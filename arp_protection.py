@@ -25,9 +25,7 @@ _SYS_ENCODING = locale.getpreferredencoding()
 # ARP 嗅探：scapy 跨平台抓包（可选，需 libpcap/Npcap 驱动支持）
 # Suppress Scapy socket BPF filter warnings on Windows
 import warnings
-import logging
 warnings.filterwarnings("ignore", category=UserWarning, message=".*Socket.*failed.*")
-logging.getLogger("scapy").setLevel(logging.ERROR)
 _SCAPY_AVAILABLE = False
 try:
     import scapy.all as scapy
@@ -3343,7 +3341,10 @@ class ARPProtection:
             - diagnosis: "destination_unreachable" | "timeout" | "echo_reply" | "tcp_ok" | "tcp_fail"
         """
         if sys.platform == "win32":
-            result = await ARPProtection._ping_icmp_windows_detailed(ip, timeout_ms)
+            try:
+                result = await ARPProtection._ping_icmp_windows_native_detailed(ip, timeout_ms)
+            except (PermissionError, OSError):
+                result = await ARPProtection._ping_icmp_windows_detailed(ip, timeout_ms)
         else:
             result = await ARPProtection._ping_icmp_linux_detailed(ip, timeout_ms)
 
@@ -3559,6 +3560,75 @@ class ARPProtection:
         except (asyncio.TimeoutError, FileNotFoundError):
             return {"reachable": False, "icmp_type": None, "icmp_code": None,
                     "from_ip": None, "saw_reply": False, "stdout_lines": []}
+
+    @staticmethod
+    async def _ping_icmp_windows_native_detailed(ip: str, timeout_ms: int) -> dict:
+        """Windows raw socket ICMP with receive loop filtering stale/non-matching replies."""
+        import struct
+        cls = ARPProtection
+        deadline = asyncio.get_event_loop().time() + timeout_ms / 1000.0
+        try:
+            if cls._icmp_sock is None:
+                cls._icmp_sock = socket.socket(socket.AF_INET, socket.SOCK_RAW,
+                                               socket.IPPROTO_ICMP)
+                cls._icmp_sock.setblocking(False)
+            sock = cls._icmp_sock
+
+            pid = os.getpid() & 0xFFFF
+            seq = 1
+            data = struct.pack("!d", asyncio.get_event_loop().time()) + b"\x00" * 24
+
+            header = struct.pack("!BBHHH", 8, 0, 0, pid, seq)
+            pkt = header + data
+            chk = cls._icmp_checksum(pkt)
+            header = struct.pack("!BBHHH", 8, 0, chk, pid, seq)
+            pkt = header + data
+
+            sock.sendto(pkt, (ip, 0))
+
+            loop = asyncio.get_event_loop()
+            while True:
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    return {"reachable": False, "icmp_type": None, "icmp_code": None,
+                            "from_ip": None, "saw_reply": False}
+
+                resp, addr = await asyncio.wait_for(
+                    loop.sock_recv(sock, 4096), timeout=remaining)
+                src_ip = addr[0]
+
+                if len(resp) < 8:
+                    continue
+
+                icmp_type = resp[0]
+                icmp_code = resp[1]
+                resp_pid = struct.unpack("!H", resp[4:6])[0]
+                resp_seq = struct.unpack("!H", resp[6:8])[0]
+
+                if icmp_type != 0 or resp_pid != pid or resp_seq != seq:
+                    continue
+
+                reachable = (src_ip == ip)
+                return {"reachable": reachable, "icmp_type": icmp_type, "icmp_code": icmp_code,
+                        "from_ip": src_ip, "saw_reply": True}
+
+        except (asyncio.TimeoutError, socket.timeout):
+            return {"reachable": False, "icmp_type": None, "icmp_code": None,
+                    "from_ip": None, "saw_reply": False}
+        except PermissionError:
+            raise
+        except Exception:
+            return {"reachable": False, "icmp_type": None, "icmp_code": None,
+                    "from_ip": None, "saw_reply": False}
+        finally:
+            if cls._icmp_sock is not None:
+                try:
+                    cls._icmp_sock.setblocking(False)
+                except Exception:
+                    pass
+
+        return {"reachable": False, "icmp_type": None, "icmp_code": None,
+                "from_ip": None, "saw_reply": False}
 
     @staticmethod
     def _icmp_checksum(data: bytes) -> int:
