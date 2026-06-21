@@ -38,8 +38,7 @@ except ImportError:
 class ARPProtection:
     """ARP 防护：网关侦测 + 路由器 ARP 表刷新"""
 
-    # Linux ICMP 持久 raw socket（避免每 ping 创建/销毁）
-    _icmp_sock: Optional[socket.socket] = None
+    # ICMP sockets are now per-call and self-closing.
 
     def __init__(self, config_arp: dict, ping_interval: float = 0.80,
                  ping_targets_v4: list = None):
@@ -260,13 +259,8 @@ class ARPProtection:
 
     @classmethod
     def close_icmp_socket(cls):
-        """关闭 Linux 持久 ICMP raw socket（程序退出时调用）"""
-        if cls._icmp_sock is not None:
-            try:
-                cls._icmp_sock.close()
-            except Exception:
-                pass
-            cls._icmp_sock = None
+        """No-op: ICMP sockets are now per-call and self-closing."""
+        pass
 
     async def _recovery_worker_loop(self):
         """Worker 1: 永久等待 recovery_trigger → ping gw+ext → 通则 recovery_detected.set()"""
@@ -3563,16 +3557,14 @@ class ARPProtection:
 
     @staticmethod
     async def _ping_icmp_windows_native_detailed(ip: str, timeout_ms: int) -> dict:
-        """Windows raw socket ICMP with receive loop filtering stale/non-matching replies."""
+        """Windows raw socket ICMP with per-call socket (no shared state)."""
         import struct
-        cls = ARPProtection
         deadline = asyncio.get_event_loop().time() + timeout_ms / 1000.0
+        sock = None
         try:
-            if cls._icmp_sock is None:
-                cls._icmp_sock = socket.socket(socket.AF_INET, socket.SOCK_RAW,
-                                               socket.IPPROTO_ICMP)
-                cls._icmp_sock.setblocking(False)
-            sock = cls._icmp_sock
+            sock = socket.socket(socket.AF_INET, socket.SOCK_RAW,
+                                 socket.IPPROTO_ICMP)
+            sock.setblocking(False)
 
             pid = os.getpid() & 0xFFFF
             seq = 1
@@ -3580,7 +3572,7 @@ class ARPProtection:
 
             header = struct.pack("!BBHHH", 8, 0, 0, pid, seq)
             pkt = header + data
-            chk = cls._icmp_checksum(pkt)
+            chk = ARPProtection._icmp_checksum(pkt)
             header = struct.pack("!BBHHH", 8, 0, chk, pid, seq)
             pkt = header + data
 
@@ -3621,9 +3613,9 @@ class ARPProtection:
             return {"reachable": False, "icmp_type": None, "icmp_code": None,
                     "from_ip": None, "saw_reply": False}
         finally:
-            if cls._icmp_sock is not None:
+            if sock is not None:
                 try:
-                    cls._icmp_sock.setblocking(False)
+                    sock.close()
                 except Exception:
                     pass
 
@@ -3659,13 +3651,11 @@ class ARPProtection:
             - from_ip: 发回 ICMP 响应的设备 IP（网关在光纤断开时会回复）
             - saw_reply: 是否收到了任何 ICMP 响应（用于区分超时 vs 被回复）
         """
-        cls = ARPProtection
+        sock = None
         try:
-            if cls._icmp_sock is None:
-                cls._icmp_sock = socket.socket(socket.AF_INET, socket.SOCK_RAW,
-                                               socket.IPPROTO_ICMP)
-                cls._icmp_sock.setblocking(False)
-            sock = cls._icmp_sock
+            sock = socket.socket(socket.AF_INET, socket.SOCK_RAW,
+                                 socket.IPPROTO_ICMP)
+            sock.setblocking(False)
 
             pid = os.getpid() & 0xFFFF
             data = struct.pack('!d', asyncio.get_event_loop().time()) + b'\x00' * 24
@@ -3713,10 +3703,9 @@ class ARPProtection:
             return {"reachable": False, "icmp_type": None, "icmp_code": None,
                     "from_ip": None, "saw_reply": False}
         finally:
-            # 恢复非阻塞供下次复用
-            if cls._icmp_sock is not None:
+            if sock is not None:
                 try:
-                    cls._icmp_sock.setblocking(False)
+                    sock.close()
                 except Exception:
                     pass
 

@@ -622,7 +622,7 @@ class NDPProtection:
         持续监听 NA/NS/RA/Redirect 报文，实时检测投毒。
         同时学习合法 RA 源 MAC（替代 max_ra_routers 硬阈值）。
         检测 RA 参数欺骗（4.2.7）：CurHopLimit != 255、M/O 标志异常。
-        有报文时处理，无报文时冻结在 sniff(filter="ip6", ) 内（零 CPU）。
+        有报文时处理，无报文时冻结在 sniff(filter="icmp6", ) 内（零 CPU）。
         """
         if not self._scapy_available:
             await asyncio.Event().wait()
@@ -635,7 +635,7 @@ class NDPProtection:
 
         def _sniff():
             while self._ndp_running:
-                sniff(filter="ip6", 
+                sniff(filter="icmp6", 
                     count=0, timeout=5,
                     stop_filter=lambda pkt: not self._ndp_running,
                 lfilter=lambda p: (
@@ -935,7 +935,7 @@ class NDPProtection:
                 from scapy.layers.dhcp6 import DHCP6_Advertise, DHCP6_Reply
 
                 def _capture():
-                    return sniff(filter="ip6", count=20, timeout=3.0,
+                    return sniff(filter="udp and (port 546 or port 547)", count=20, timeout=3.0,
                                  lfilter=lambda p: p.haslayer(DHCP6_Advertise) or p.haslayer(DHCP6_Reply),
                                  quiet=True)
                 pkts = await loop.run_in_executor(None, _capture)
@@ -971,7 +971,7 @@ class NDPProtection:
                     src_lla = ICMPv6NDOptSrcLLAddr(lladdr=iface.mac)
                     ipv6 = IPv6(src=local_ll, dst=gw_ip, hlim=255)
                     sendp(eth / ipv6 / ns / src_lla, iface=iface.name, verbose=False)
-                na_pkts = sniff(filter="ip6", count=5, timeout=timeout,
+                na_pkts = sniff(filter="icmp6", count=5, timeout=timeout,
                                 lfilter=lambda p: p.haslayer(ICMPv6ND_NA) and
                                                   p.haslayer(ICMPv6NDOptDstLLAddr) and
                                                   str(p[ICMPv6ND_NA].target) == gw_ip,
@@ -1448,7 +1448,7 @@ class NDPProtection:
         loop = asyncio.get_event_loop()
 
         def _capture():
-            return sniff(filter="ip6", count=200, timeout=4.0,
+            return sniff(filter="icmp6", count=200, timeout=4.0,
                          lfilter=lambda p: p.haslayer(Ether) and p.haslayer(IPv6) and (
                              p.haslayer(ICMPv6ND_NA) or p.haslayer(ICMPv6ND_NS) or
                              p.haslayer(ICMPv6ND_RA) or p.haslayer(ICMPv6Error)),
