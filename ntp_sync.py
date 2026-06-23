@@ -180,6 +180,33 @@ def _apply_drift_windows(drift_ppm: float) -> bool:
         from ctypes import wintypes
 
         kernel32 = ctypes.windll.kernel32
+        advapi32 = ctypes.windll.advapi32
+
+        # 启用 SeSystemtimePrivilege（Windows 默认禁用，需显式启用）
+        token = wintypes.HANDLE()
+        if advapi32.OpenProcessToken(
+            kernel32.GetCurrentProcess(),
+            0x0028,  # TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY
+            ctypes.byref(token)
+        ):
+            luid = wintypes.LUID()
+            if advapi32.LookupPrivilegeValueW(
+                None, "SeSystemtimePrivilege", ctypes.byref(luid)
+            ):
+                class LUID_AND_ATTRIBUTES(ctypes.Structure):
+                    _fields_ = [("Luid", wintypes.LUID),
+                                ("Attributes", wintypes.DWORD)]
+                class TOKEN_PRIVILEGES(ctypes.Structure):
+                    _fields_ = [("PrivilegeCount", wintypes.DWORD),
+                                ("Privileges", LUID_AND_ATTRIBUTES * 1)]
+                tp = TOKEN_PRIVILEGES()
+                tp.PrivilegeCount = 1
+                tp.Privileges[0].Luid = luid
+                tp.Privileges[0].Attributes = 0x00000002  # SE_PRIVILEGE_ENABLED
+                advapi32.AdjustTokenPrivileges(token, False,
+                                                ctypes.byref(tp), 0, None, None)
+            kernel32.CloseHandle(token)
+
         DEFAULT_ADJUSTMENT = 10000
         MIN_ADJUSTMENT = 100
         MAX_ADJUSTMENT = 100000
@@ -189,7 +216,11 @@ def _apply_drift_windows(drift_ppm: float) -> bool:
 
         result = kernel32.SetSystemTimeAdjustment(True, wintypes.DWORD(adj))
         if not result:
-            logger.warning("Windows 频率补偿失败 (错误码: %d)", ctypes.GetLastError())
+            err = ctypes.GetLastError()
+            if err == 1314:
+                logger.warning("Windows 频率补偿失败: 缺少系统权限 (1314)")
+            else:
+                logger.warning("Windows 频率补偿失败 (错误码: %d)", err)
             return False
         logger.info("Windows 频率补偿已应用: 调整值=%d (漂移=%.2f PPM)", adj, drift_ppm)
         return True
@@ -564,21 +595,53 @@ async def get_ntp_time_async(min_delay: bool = True) -> Optional[float]:
     """
     异步并行查询所有 NTP 服务器，取最快返回的结果。
     支持最小延迟筛选：每台快速采样 NTP_MIN_DELAY_SAMPLES 次。
+    使用 asyncio.wait(FIRST_COMPLETED) 及时返回，不等待慢速服务器超时。
     """
-    tasks = [_query_server_best(server, min_delay) for server in NTP_SERVERS]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    tasks = [asyncio.create_task(_query_server_best(server, min_delay)) for server in NTP_SERVERS]
+    if not tasks:
+        return None
 
+    # 总超时兜底：30 秒后不再等待
+    TOTAL_TIMEOUT = 30.0
     best_time = None
     best_delay = float("inf")
-    for r in results:
-        if isinstance(r, tuple) and len(r) == 2:
-            unix_time, delay = r
-            if delay < best_delay:
-                best_delay = delay
-                best_time = unix_time
+    pending = set(tasks)
+    deadline = asyncio.get_event_loop().time() + TOTAL_TIMEOUT
+
+    while pending:
+        remaining = deadline - asyncio.get_event_loop().time()
+        if remaining <= 0:
+            break
+        try:
+            done, pending = await asyncio.wait(
+                pending, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
+            )
+        except asyncio.TimeoutError:
+            break
+
+        for task in done:
+            try:
+                result = task.result()
+            except (asyncio.CancelledError, Exception):
+                continue
+            if result is not None and isinstance(result, tuple) and len(result) == 2:
+                unix_time, delay = result
+                if delay < best_delay:
+                    best_delay = delay
+                    best_time = unix_time
+
+        # 已找到有效结果，取消剩余任务
+        if best_time is not None:
+            for t in pending:
+                t.cancel()
+            break
+
+    # 取消所有仍在 pending 的任务
+    for t in pending:
+        t.cancel()
 
     if best_time is not None:
-        logger.debug("异步并行NTP: 最小延迟=%.1fms", best_delay * 1000)
+        logger.debug("异步并行NTP: 最小延迟=%.1fms (最快服务器返回)", best_delay * 1000)
     return best_time
 
 

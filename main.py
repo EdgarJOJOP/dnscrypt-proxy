@@ -56,7 +56,7 @@ from network_monitor import NetworkMonitor
 from dnssec import DNSSECValidator, DNSSECQueryWrapper
 from consistency_verifier import ResponseConsistencyVerifier
 from anomaly_detector import AnomalyDetector
-from ntp_sync import (check_system_time_vs_ntp, check_system_time_vs_ntp_async,
+from ntp_sync import (check_system_time_vs_ntp_async,
                        DEVIATION_THRESHOLD, DRIFT_SAMPLE_INTERVAL, RLS_LAMBDA,
                        RLS_MIN_SAMPLES, MAX_JUMP, DriftEstimator, apply_drift_compensation)
 
@@ -129,6 +129,8 @@ class DNSProxyApp:
         self._filter_reload_gen = 0  # 递增 generation，防止过期重载覆盖
         self._ntp_freeze_event: asyncio.Event = asyncio.Event()  # NTP 冻结事件，set=暂停
         self._ntp_calibrate_task: Optional[asyncio.Task] = None  # NTP 定时校准
+        self._ntp_init_task: Optional[asyncio.Task] = None  # 启动时的异步 NTP 校时任务
+        self._bootstrap_init_task: Optional[asyncio.Task] = None  # 启动时的异步 bootstrap DNS 任务
         self._running = False
         self.network_monitor: Optional[NetworkMonitor] = None  # 网络连通性监控
 
@@ -180,17 +182,9 @@ class DNSProxyApp:
                      "启用" if self.config.dnssec_enabled else "禁用",
                      self.config.dnssec_mode)
 
-        # 3. 过滤器
-        # 2.5. NTP 校时
+        # 2.5. NTP 校时（异步，不阻塞事件循环）
         logger.info("[2.5/11] 校验系统时间（NTP）...")
-        try:
-            ntp_ok, ntp_offset = check_system_time_vs_ntp(min_delay=True)
-            if ntp_ok:
-                logger.info("  NTP 校时完成，偏差=%.2f 秒", ntp_offset)
-            else:
-                logger.warning("  NTP 校时失败，将使用当前系统时间")
-        except Exception as e:
-            logger.error("  NTP 校时异常: %s", e)
+        self._ntp_init_task = asyncio.create_task(self._ntp_initialize_async())
 
         # 3. 过滤器
         logger.info("[3/11] 初始化域名过滤引擎...")
@@ -208,14 +202,27 @@ class DNSProxyApp:
             # 先加载本地规则（快速，不阻塞启动）
             for fp in full_paths:
                 self.filter_engine.load_rules_from_file(fp)
-            # 远程 URL 规则后台原子加载（内部使用 async_reload 清除旧规则+重载全部）
-            if rule_urls:
-                self._filter_reload_task = asyncio.create_task(
-                    self._filter_reload_safe(full_paths, rule_urls)
-                )
+            # 保存规则路径，待加密上游就绪后再下载（步骤 5c）
+            self._filter_full_paths = full_paths
+            self._filter_rule_urls = rule_urls
         else:
             # 即使过滤规则关闭，也需要标记远程加载已完成（避免阻塞后续逻辑）
+            self._filter_full_paths = []
+            self._filter_rule_urls = []
             logger.info("  过滤规则已禁用")
+
+        # 3b. 提前创建 ResolverManager 并启动 bootstrap DNS 解析（与 NTP、过滤规则并行）
+        #     先不传 consistency_verifier/anomaly_detector（步骤 4.5 创建后再设）
+        self.resolver_manager = ResolverManager(
+            self.config, dnssec_wrapper=self._dnssec_wrapper,
+            consistency_verifier=None, anomaly_detector=None,
+        )
+        self._bootstrap_init_task = asyncio.create_task(
+            self.resolver_manager._init_bootstrap()
+        )
+
+        # 将 resolver_manager 注入 FilterEngine（过滤规则下载使用加密 DNS 解析域名）
+        self.filter_engine._resolver_manager = self.resolver_manager
 
         # 4. 日志记录器
         logger.info("[4/11] 初始化异步日志记录器...")
@@ -256,19 +263,53 @@ class DNSProxyApp:
         else:
             logger.info("  统计异常检测: 禁用")
 
-        # 5. 并行解析管理器（带 DNSSEC）
-        logger.info("[5/11] 初始化并行解析管理器...")
-        # 确保过滤规则已加载完毕，避免 bootstrap DNS 在规则未就绪时查询
-        if self._filter_reload_task is not None:
+        # 将步骤 4.5 创建的验证器注入 ResolverManager
+        self.resolver_manager._consistency_verifier = self._consistency_verifier
+        self.resolver_manager._anomaly_detector = self._anomaly_detector
+
+        # 5. 等待并行任务完成：NTP 校时 + bootstrap DNS 解析
+        logger.info("[5/11] 等待并行初始化任务完成...")
+        parallel_tasks = []
+        if self._ntp_init_task is not None:
+            parallel_tasks.append(self._ntp_init_task)
+        if self._bootstrap_init_task is not None:
+            parallel_tasks.append(self._bootstrap_init_task)
+
+        if parallel_tasks:
+            results = await asyncio.gather(*parallel_tasks, return_exceptions=True)
+            # 记录每个任务的结果（仅异常时警告）
+            task_map = {
+                id(self._ntp_init_task): "NTP 校时",
+                id(self._bootstrap_init_task): "bootstrap DNS",
+            }
+            for task, result in zip(
+                [self._ntp_init_task, self._bootstrap_init_task],
+                results
+            ):
+                if task is None:
+                    continue
+                if isinstance(result, Exception):
+                    logger.warning("  并行任务 [%s] 异常: %s",
+                                   task_map.get(id(task), "未知"), result)
+
+        self._ntp_init_task = None
+        self._bootstrap_init_task = None
+
+        # 5b. 完成 ResolverManager 剩余初始化（依赖 bootstrap 解析结果）
+        #     此时加密上游 DNS（DoH/DoT/DoQ）就绪
+        await self.resolver_manager._init_remaining()
+
+        # 5c. 启动过滤规则下载（使用加密 DNS 解析规则 URL 域名）
+        if hasattr(self, '_filter_rule_urls') and self._filter_rule_urls:
+            logger.info("[5c/11] 后台加载过滤规则（通过加密 DNS 解析域名）...")
+            self._filter_reload_task = asyncio.create_task(
+                self._filter_reload_safe(self._filter_full_paths, self._filter_rule_urls)
+            )
             try:
                 await self._filter_reload_task
             except Exception as e:
                 logger.debug("等待过滤规则加载异常: %s", e)
             self._filter_reload_task = None
-        self.resolver_manager = ResolverManager(self.config, dnssec_wrapper=self._dnssec_wrapper,
-                                                 consistency_verifier=self._consistency_verifier,
-                                                 anomaly_detector=self._anomaly_detector)
-        await self.resolver_manager.initialize()
 
         # 6. 资源优化器
         logger.info("[6/11] 初始化资源优化器...")
@@ -362,6 +403,18 @@ class DNSProxyApp:
         logger.info("=" * 60)
         logger.info("初始化完成！")
         logger.info("=" * 60)
+
+    async def _ntp_initialize_async(self):
+        """异步 NTP 校时（启动时使用，不阻塞事件循环）"""
+        logger = logging.getLogger("dns-proxy.app")
+        try:
+            ntp_ok, ntp_offset = await check_system_time_vs_ntp_async(min_delay=True)
+            if ntp_ok:
+                logger.info("  NTP 校时完成，偏差=%.2f 秒", ntp_offset)
+            else:
+                logger.warning("  NTP 校时失败，将使用当前系统时间")
+        except Exception as e:
+            logger.error("  NTP 校时异常: %s", e)
 
     async def _filter_reload_safe(self, files: List[str], urls: List[str]):
         """

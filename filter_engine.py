@@ -26,6 +26,13 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import aiohttp
+import socket
+import concurrent.futures
+import dns.message
+import dns.rdatatype
+import dns.rdataclass
+import dns.name
+import dns.flags
 
 logger = logging.getLogger("dns-proxy.filter")
 
@@ -795,6 +802,90 @@ class DomainIndex:
         return len(self._domain_set)
 
 
+class _EncryptedDNSResolver:
+    """
+    aiohttp 自定义 DNS 解析器 — 使用程序中的加密上游（DoH/DoT/DoQ）解析域名。
+    实现 aiohttp 的 resolver 接口，用于过滤规则下载时的安全域名解析。
+    """
+
+    def __init__(self, resolver_manager):
+        self._resolver_manager = resolver_manager
+
+    async def resolve(self, host: str, port: int = 0, family: int = 0):
+        """
+        aiohttp resolver 接口。
+        通过加密上游并行查询 A + AAAA 记录，返回 IP 列表。
+        aiohttp 自动使用原始 hostname 做 SNI 和证书验证。
+        """
+        if not host or not self._resolver_manager:
+            return []
+
+        # 根据 family 决定查询哪些记录类型
+        # family=0(AF_UNSPEC): 同时查 A + AAAA
+        # family=socket.AF_INET:  只查 A
+        # family=socket.AF_INET6: 只查 AAAA
+        if family == socket.AF_INET6:
+            qtypes = [dns.rdatatype.AAAA]
+        elif family == socket.AF_INET:
+            qtypes = [dns.rdatatype.A]
+        else:
+            qtypes = [dns.rdatatype.A, dns.rdatatype.AAAA]
+
+        async def _query_one(qtype):
+            """查询单个记录类型，返回 IP 列表"""
+            try:
+                qname = dns.name.from_text(host)
+                msg = dns.message.make_query(qname, qtype, dns.rdataclass.IN)
+                wire = msg.to_wire()
+
+                resp_wire = await self._resolver_manager.resolve(wire)
+                if resp_wire is None:
+                    return []
+
+                resp = dns.message.from_wire(resp_wire)
+                if resp.rcode() != dns.rcode.NOERROR:
+                    return []
+
+                ips = []
+                for rrset in resp.answer:
+                    if rrset.rdtype != qtype:
+                        continue
+                    for rd in rrset:
+                        ips.append(str(rd.address))
+                return ips
+            except Exception:
+                return []
+
+        # 并行查询（A 和 AAAA 可同时发）
+        results_lists = await asyncio.gather(
+            *[_query_one(qt) for qt in qtypes],
+            return_exceptions=True,
+        )
+
+        # 合并结果，去重
+        seen = set()
+        results = []
+        for ips in results_lists:
+            if not isinstance(ips, list):
+                continue
+            for ip in ips:
+                if ip not in seen:
+                    seen.add(ip)
+                    family_actual = socket.AF_INET6 if ":" in ip else socket.AF_INET
+                    results.append({
+                        "hostname": host,
+                        "host": ip,
+                        "port": port,
+                        "family": family_actual,
+                        "proto": socket.IPPROTO_TCP,
+                        "flags": socket.AI_NUMERICHOST,
+                    })
+        return results
+
+    async def close(self):
+        pass
+
+
 class FilterEngine:
     """
     域名过滤引擎（支持定时从远程更新规则）
@@ -809,7 +900,8 @@ class FilterEngine:
     def __init__(self, cache_dir: Optional[str] = None,
                  cache_ttl_blocked: int = 300,
                  cache_ttl_allowed: int = 60,
-                 cache_maxsize: int = 100000):
+                 cache_maxsize: int = 100000,
+                 resolver_manager=None):
         """
         Args:
             cache_dir: 缓存目录（未使用，保留兼容）
@@ -817,6 +909,8 @@ class FilterEngine:
             cache_ttl_allowed: 放行域名的过滤缓存 TTL（秒），默认 60
             cache_maxsize: 过滤缓存最大条目数，默认 100000
         """
+        # 黑名单索引（Go: filteringEngine）
+        self._resolver_manager = resolver_manager
         # 黑名单索引（Go: filteringEngine）
         self._block_index = DomainIndex()
         # 白名单索引（Go: filteringEngineAllow）
@@ -1164,9 +1258,11 @@ class FilterEngine:
                                timeout: int = 30) -> Optional[str]:
         """获取远程 URL 内容（全量模式，向下兼容）"""
         try:
+            headers = {"User-Agent": "SecureDNS-Proxy/1.0",
+                       "Accept-Encoding": "gzip, deflate"}
             async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=timeout),
-                headers={"User-Agent": "SecureDNS-Proxy/1.0"},
+                headers=headers,
             ) as session:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
                     if resp.status != 200:
@@ -1190,15 +1286,237 @@ class FilterEngine:
             logger.error("从 URL %s 加载规则失败: %s", url, e)
             return None
 
+    async def _process_rules_from_text(self, text: str, url: str) -> bool:
+        """
+        两遍解析全文规则并索引（使用 ThreadPoolExecutor 多线程并行）。
+        第 1 遍：收集 $badfilter 目标（确保顺序无关）
+        第 2 遍：索引规则，跳过被 badfilter 禁用的
+        调用方须确保 text 已通过 HTML/二进制检测。
+        """
+        lines = text.splitlines()
+        if not lines:
+            return False
+
+        NUM_WORKERS = 4
+        chunk_size = (len(lines) + NUM_WORKERS - 1) // NUM_WORKERS
+        loop = asyncio.get_running_loop()
+
+        # ===== 第 1 遍：收集 $badfilter 目标（确保顺序无关）=====
+        def collect_badfilters(start: int, end: int):
+            """扫描一个分块，收集 $badfilter 目标 pattern"""
+            for i in range(start, end):
+                raw_line = lines[i]
+                # 快速跳过：不含 $ 的行不可能有 badfilter
+                if "$" not in raw_line:
+                    continue
+                stripped = raw_line.rstrip("\r").strip()
+                if not stripped:
+                    continue
+                cleaned = AdGuardRuleParser._clean_rule_line(stripped)
+                if cleaned is None:
+                    continue
+                rule = FilterRule(cleaned)
+                if rule.is_badfilter:
+                    target = self._extract_badfilter_target(cleaned)
+                    if target:
+                        self._badfilter_patterns.add(target)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=NUM_WORKERS) as pool:
+            tasks = []
+            for i in range(0, len(lines), chunk_size):
+                end = min(i + chunk_size, len(lines))
+                tasks.append(
+                    loop.run_in_executor(pool, collect_badfilters, i, end)
+                )
+            await asyncio.gather(*tasks)
+
+        # ===== 第 2 遍：索引规则（_index_rule 自动处理 pending/active）=====
+        _index_rule = self._index_rule
+        _is_rule_badfiltered = self._is_rule_badfiltered
+        FilterRule_ = FilterRule
+        total_rules = 0
+        for raw_line in lines:
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith("!") or stripped.startswith("#"):
+                continue
+            # 快速跳过 cosmetic 规则（避免 FilterRule._parse 无谓开销）
+            if "##" in stripped or "#@#" in stripped or "$$" in stripped:
+                continue
+            rule = FilterRule_(stripped)
+            if rule._skip or rule.is_badfilter:
+                continue
+            if _is_rule_badfiltered(stripped):
+                continue
+            _index_rule(rule, stripped)
+            total_rules += 1
+
+        # 跟踪 URL（与流式路径一致）
+        if self._pending_block_index is not None:
+            self._pending_rule_count += total_rules
+            self._pending_loaded_urls.append(url)
+            total = self._pending_rule_count
+        else:
+            self._rule_count += total_rules
+            self._loaded_urls.append(url)
+            total = self._rule_count
+
+        logger.info("从 %s 加载了 %d 条规则 (总: %d)", url, total_rules, total)
+        return total_rules > 0
+
+    async def _download_url_parallel(self, url: str, num_chunks: int = 8,
+                                      timeout: int = 60) -> Optional[bytes]:
+        """
+        使用 HTTP Range 分片并行下载 URL 内容（类似迅雷多线程下载）。
+
+        先 HEAD 探测是否支持 Accept-Ranges: bytes，支持则将文件分成
+        num_chunks 片，并发 GET Range 下载，最后按序拼接。
+
+        Range 请求与 gzip 不兼容（无法解压部分压缩数据），因此原文下载。
+        8 路并发足够弥补未压缩的带宽开销。
+
+        Returns:
+            完整文件字节内容，不支持 Range 或任何失败返回 None（触发回退）
+        """
+        try:
+            headers = {"User-Agent": "SecureDNS-Proxy/1.0"}
+            connector = None
+            if self._resolver_manager is not None:
+                resolver = _EncryptedDNSResolver(self._resolver_manager)
+                connector = aiohttp.TCPConnector(resolver=resolver)
+
+            # 1. HEAD 探测 Range 支持和文件大小
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=15),
+                headers=headers,
+                connector=connector,
+            ) as session:
+                async with session.head(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    if resp.status != 200:
+                        return None
+                    accept_ranges = (resp.headers.get("Accept-Ranges", "")
+                                     .lower().strip())
+                    content_length = resp.headers.get("Content-Length")
+                    if "bytes" not in accept_ranges or not content_length:
+                        return None
+                    file_size = int(content_length)
+                    if file_size <= 0 or file_size > DEFAULT_MAX_SIZE:
+                        return None
+                    if file_size < 65536:  # 小于 64KB 不值得分片
+                        return None
+
+            logger.info("并行下载 %s (%d bytes, %d 片)", url, file_size, num_chunks)
+
+            # 2. 计算分片边界
+            chunk_size = (file_size + num_chunks - 1) // num_chunks
+            chunks = {}
+            lock = asyncio.Lock()
+
+            async def download_chunk(idx: int, start: int, end: int):
+                """下载单个分片 [start, end]（闭区间）"""
+                range_hdr = f"bytes={start}-{end}"
+                chunk_headers = {
+                    "User-Agent": "SecureDNS-Proxy/1.0",
+                    "Range": range_hdr,
+                }
+                async with aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=timeout),
+                    headers=chunk_headers,
+                    connector=connector,
+                ) as session:
+                    async with session.get(
+                        url, timeout=aiohttp.ClientTimeout(total=timeout)
+                    ) as resp:
+                        if resp.status not in (200, 206):
+                            raise IOError(
+                                f"分片 {idx} HTTP {resp.status}: {range_hdr}"
+                            )
+                        data = await resp.read()
+                        expected = end - start + 1
+                        if len(data) != expected:
+                            if idx < num_chunks - 1 or len(data) == 0:
+                                raise IOError(
+                                    f"分片 {idx}: 期望 {expected} bytes, 收到 {len(data)}"
+                                )
+                        async with lock:
+                            chunks[idx] = data
+                        logger.debug("  分片 %d/%d: %d bytes [%d-%d]",
+                                     idx + 1, num_chunks, len(data), start, end)
+
+            # 3. 并发下载所有分片
+            tasks = []
+            for i in range(num_chunks):
+                start = i * chunk_size
+                end = min(start + chunk_size, file_size) - 1
+                if start >= file_size:
+                    break
+                tasks.append(asyncio.create_task(download_chunk(i, start, end)))
+
+            try:
+                await asyncio.gather(*tasks)
+            except Exception as e:
+                logger.warning("URL %s 分片下载异常: %s，回退到流式下载", url, e)
+                for t in tasks:
+                    t.cancel()
+                return None
+
+            # 4. 验证完整性并按序拼接
+            if len(chunks) != len(tasks):
+                return None
+
+            result = bytearray(file_size)
+            offset = 0
+            for i in range(len(tasks)):
+                data = chunks.get(i)
+                if data is None:
+                    return None
+                result[offset:offset + len(data)] = data
+                offset += len(data)
+
+            logger.info("  并行下载完成: %d bytes (%d 片)", offset, len(tasks))
+            return bytes(result)
+
+        except asyncio.TimeoutError:
+            return None
+        except Exception as e:
+            logger.debug("URL %s 并行下载不可用: %s，回退到流式下载", url, e)
+            return None
+
     async def load_rules_from_url_async(self, url: str) -> bool:
         """
         异步从远程 URL 加载规则（带流式处理，避免全量文本驻留内存）。
         逐行读取并解析，不将整个文件同时加载到内存。
         """
         try:
+            # 优先尝试并行分片下载（HTTP Range 8 路并发，类似迅雷）
+            parallel_data = await self._download_url_parallel(url)
+            if parallel_data is not None:
+                # 并行下载成功 → 全量文本解析
+                text = parallel_data.decode("utf-8", errors="replace")
+                # HTML 检测
+                if self._parser._looks_like_html(text):
+                    logger.error("URL %s 内容包含 HTML，跳过", url)
+                    return False
+                # 二进制检测
+                has_binary, line_no, desc = self._parser._has_binary_chars(text)
+                if has_binary:
+                    logger.error("URL %s 包含二进制字符: %s", url, desc)
+                    return False
+                return await self._process_rules_from_text(text, url)
+
+            # 并行下载不可用 → 回退到全文 gzip 下载（使用 _process_rules_from_text 多进程解析）
+            # 显式请求 gzip 压缩（自定义 headers 会覆盖 aiohttp 默认的 Accept-Encoding）
+            headers = {"User-Agent": "SecureDNS-Proxy/1.0",
+                       "Accept-Encoding": "gzip, deflate"}
+            # 当加密上游就绪时，使用自定义 DNS 解析器（走 DoH/DoT/DoQ）
+            connector = None
+            if self._resolver_manager is not None:
+                resolver = _EncryptedDNSResolver(self._resolver_manager)
+                connector = aiohttp.TCPConnector(resolver=resolver)
+
             async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=80),
-                headers={"User-Agent": "SecureDNS-Proxy/1.0"},
+                headers=headers,
+                connector=connector,
             ) as session:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=80)) as resp:
                     if resp.status != 200:
@@ -1211,92 +1529,25 @@ class FilterEngine:
                                      url, content_length, DEFAULT_MAX_SIZE)
                         return False
 
-                    # 流式逐块读取，逐行处理
-                    total = 0
-                    line_buffer = ""
-                    rule_count = 0
-                    lines_processed = 0
-                    first_chunk = True
-                    raw_preview = bytearray()
+                    raw = await resp.read()
+                    if len(raw) > DEFAULT_MAX_SIZE:
+                        logger.error("URL %s 实际大小 %d 超过限制 %d",
+                                     url, len(raw), DEFAULT_MAX_SIZE)
+                        return False
 
-                    async for chunk, _ in resp.content.iter_chunks():
-                        total += len(chunk)
-                        if total > DEFAULT_MAX_SIZE:
-                            logger.error("URL %s 实际大小超过限制 %d", url, DEFAULT_MAX_SIZE)
-                            return False
+                    text = raw.decode("utf-8", errors="replace")
 
-                        # 收集前 64KB 用于 HTML/二进制检测
-                        if first_chunk and len(raw_preview) < 65536:
-                            raw_preview.extend(chunk)
-                            if len(raw_preview) >= 65536 or len(chunk) == 0:
-                                preview_text = raw_preview.decode("utf-8", errors="replace")
-                                # HTML 检测
-                                if self._parser._looks_like_html(preview_text):
-                                    logger.error("URL %s 内容包含 HTML，跳过", url)
-                                    return False
-                                # 二进制检测
-                                has_binary, line_no, desc = self._parser._has_binary_chars(preview_text)
-                                if has_binary:
-                                    logger.error("URL %s 包含二进制字符: %s", url, desc)
-                                    return False
-                                first_chunk = False
+                    # HTML 检测
+                    if self._parser._looks_like_html(text):
+                        logger.error("URL %s 内容包含 HTML，跳过", url)
+                        return False
+                    # 二进制检测
+                    has_binary, line_no, desc = self._parser._has_binary_chars(text)
+                    if has_binary:
+                        logger.error("URL %s 包含二进制字符: %s", url, desc)
+                        return False
 
-                        # 解码块并逐行处理
-                        decoded = chunk.decode("utf-8", errors="replace")
-                        line_buffer += decoded
-
-                        while "\n" in line_buffer:
-                            line, line_buffer = line_buffer.split("\n", 1)
-                            stripped = line.rstrip("\r").strip()
-                            if not stripped:
-                                continue
-
-                            cleaned = AdGuardRuleParser._clean_rule_line(stripped)
-                            if cleaned is None:
-                                continue
-
-                            # 直接编译规则（跳过 parse_to_text 的全量拆分）
-                            rule = FilterRule(cleaned)
-                            if rule._skip:
-                                continue
-                            if rule.is_badfilter:
-                                target = self._extract_badfilter_target(cleaned)
-                                if target:
-                                    self._badfilter_patterns.add(target)
-                                continue
-                            if self._is_rule_badfiltered(cleaned):
-                                continue
-                            self._index_rule(rule, cleaned)
-                            rule_count += 1
-                            lines_processed += 1
-
-                    # 处理最后一行（无换行符）
-                    if line_buffer.strip():
-                        cleaned = AdGuardRuleParser._clean_rule_line(line_buffer.strip())
-                        if cleaned:
-                            rule = FilterRule(cleaned)
-                            if not rule._skip:
-                                if rule.is_badfilter:
-                                    target = self._extract_badfilter_target(cleaned)
-                                    if target:
-                                        self._badfilter_patterns.add(target)
-                                elif self._is_rule_badfiltered(cleaned):
-                                    pass
-                                else:
-                                    self._index_rule(rule, cleaned)
-                                    rule_count += 1
-                                    lines_processed += 1
-
-                    if self._pending_block_index is not None:
-                        self._pending_rule_count += rule_count
-                        self._pending_loaded_urls.append(url)
-                        total = self._pending_rule_count
-                    else:
-                        self._rule_count += rule_count
-                        self._loaded_urls.append(url)
-                        total = self._rule_count
-                    logger.info("从 %s 流式加载了 %d 条规则 (总: %d)", url, rule_count, total)
-                    return rule_count > 0
+                    return await self._process_rules_from_text(text, url)
 
         except asyncio.TimeoutError:
             logger.error("从 URL %s 加载规则超时 (80s)", url)

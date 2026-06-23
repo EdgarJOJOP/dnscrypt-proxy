@@ -173,7 +173,15 @@ class ResolverManager:
         self._cleanup_idle_task: Optional[asyncio.Task] = None
 
     async def initialize(self):
-        """初始化所有解析器"""
+        """初始化所有解析器（先 bootstrap 再剩余部分，兼容旧接口）"""
+        await self._init_bootstrap()
+        await self._init_remaining()
+
+    async def _init_bootstrap(self):
+        """
+        第一阶段初始化：创建 bootstrap 解析器并解析上游服务器域名。
+        纯网络 IO，不依赖过滤规则或 NTP，可与其他启动任务并行执行。
+        """
         self._start_time = asyncio.get_event_loop().time()
         self._concurrent_semaphore = asyncio.Semaphore(self.config.max_concurrent)
 
@@ -195,6 +203,16 @@ class ResolverManager:
         # 2. 解析上游服务器域名 -> IP
         logger.info("正在通过 bootstrap DNS 解析上游服务器地址...")
         await self._resolve_upstream_hostnames()
+
+    async def _init_remaining(self):
+        """
+        第二阶段初始化：ECH fetchers、共享 DoH session、上游解析器等。
+        必须在 _init_bootstrap() 完成后调用（依赖 bootstrap 解析结果）。
+        """
+        total_upstreams = (len(self.config.doh_servers) + len(self.config.dot_servers)
+                           + len(self.config.doq_servers))
+        if total_upstreams == 0:
+            return
 
         # 3. 创建 ECH fetchers（每台上游一个，支持 TTL 缓存 + 后台刷新）
         if self.config.ech_enabled:
