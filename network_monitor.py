@@ -1,4 +1,4 @@
-﻿"""
+"""
 网络连通性监控器
 - 定期 ping/探测网络连通性（IPv4 + IPv6 双栈）
 - 检测网络中断/恢复，自动重新启用上游服务器
@@ -48,7 +48,8 @@ class NetworkMonitor:
 
         # 滑动窗口：记录最近 N 次 ping 结果
         self._gw_results: collections.deque = collections.deque(maxlen=10)   # 网关 ping 结果窗口 (~4s)
-        self._ext_results: collections.deque = collections.deque(maxlen=10)  # 外网 ping 结果窗口 (~2.4s)
+        self._ext_results: collections.deque = collections.deque(maxlen=10)  # 外网 ping 结果窗口 (~2.4s)
+
         self._ext_results_v6: collections.deque = collections.deque(maxlen=10)
 
         # 网络断开标记：滑动窗口全丢包+外网不通时设置，
@@ -94,7 +95,8 @@ class NetworkMonitor:
 
         # 外网 ping 轮询索引（轮流 ping 多个 v4 目标，每轮一个）
         self._ext_ping_index = 0
-        self._last_ext_check_time: float = 0.0  # 上次外网探测时间戳
+        self._last_ext_check_time: float = 0.0  # 上次外网探测时间戳
+
         self._ext_ping_index_v6 = 0
         self._last_ext_check_time_v6: float = 0.0
 
@@ -360,8 +362,10 @@ class NetworkMonitor:
                     elif self._arp_protection.enabled \
                             and not self._arp_protection.is_manual:
                         v6_has_ext = len(self._ext_results_v6) > 0 and sum(self._ext_results_v6) > 0
-                        if not v6_has_ext:
+                        if len(self._gw_results) >= 5 and not v6_has_ext:
                             self.resolver_manager.set_network_down(True)
+                        elif not v6_has_ext:
+                            logger.debug("ARP v4 gw window small (%d), skip DNS pause", len(self._gw_results))
                         else:
                             logger.debug("ARP v6 ext ok, skip DNS pause")
                         if not self._arp_task or self._arp_task.done():

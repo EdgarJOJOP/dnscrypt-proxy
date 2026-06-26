@@ -575,7 +575,7 @@ class ARPProtection:
                 arp_sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW,
                                          socket.htons(ARP_ETH_TYPE))
                 arp_sock.bind((self._interface_name or "", 0))
-                arp_sock.setblocking(True)
+                arp_sock.setblocking(False)
                 logger.info("ARP 防护: AF_PACKET 嗅探已启动")
             except Exception as e:
                 logger.warning("ARP 防护: 无法创建原始套接字 (%s)，回退到 arp 轮询", e)
@@ -3414,12 +3414,12 @@ class ARPProtection:
 
     async def _ping_gateway(self, gw_ip: str) -> bool:
         """ping 网关（直接使用 ping_interval 转为毫秒，公式 ping_interval×1000 ms）"""
-        timeout_ms = int(self._ping_interval * 1000)
+        timeout_ms = max(int(self._ping_interval * 1000), 500)
         return await ARPProtection._ping_icmp(gw_ip, timeout_ms=timeout_ms)
 
     async def _ping_gateway_fast(self, gw_ip: str) -> bool:
-        """ping 网关（快速验证，至少 500ms 超时，用于 GARP 爆发场景后的快速验证，不启用 TCP 兜底）"""
-        timeout_ms = max(int(self._ping_interval * 1000), 500)
+        """ping 网关（快速验证，至少 50ms 超时，用于 GARP 爆发场景后的快速验证，不启用 TCP 兜底）"""
+        timeout_ms = max(int(self._ping_interval * 1000), 50)
         return await ARPProtection._ping_icmp(gw_ip, timeout_ms=timeout_ms, use_tcp_fallback=False)
 
     @staticmethod
@@ -3463,12 +3463,12 @@ class ARPProtection:
             - diagnosis: "destination_unreachable" | "timeout" | "echo_reply" | "tcp_ok" | "tcp_fail"
         """
         if sys.platform == "win32":
-            try:
-                result = await ARPProtection._ping_icmp_windows_native_detailed(ip, timeout_ms)
-            except (PermissionError, OSError):
-                result = await ARPProtection._ping_icmp_windows_detailed(ip, timeout_ms)
+            # Windows: 直接用 ping.exe（raw socket 与 asyncio IOCP 不兼容，
+            # 且接收缓冲区的 IP 头偏移与 Linux 不同，导致 ~100% 误判超时）
+            result = await ARPProtection._ping_icmp_windows_detailed(ip, timeout_ms)
         else:
-            result = await ARPProtection._ping_icmp_linux_detailed(ip, timeout_ms)
+            # Linux: 同样用系统 ping 命令，raw socket 在 WSL/容器/VM 中不可靠
+            result = await ARPProtection._ping_icmp_linux_system_detailed(ip, timeout_ms)
 
         # 分析诊断结果
         if result.get("reachable"):
@@ -3717,15 +3717,22 @@ class ARPProtection:
                     loop.sock_recv(sock, 4096), timeout=remaining)
                 src_ip = addr[0]
 
-                if len(resp) < 8:
+                if len(resp) < 28:  # IP头(20) + ICMP头(8) 最小长度
                     continue
 
-                icmp_type = resp[0]
-                icmp_code = resp[1]
-                resp_pid = struct.unpack("!H", resp[4:6])[0]
-                resp_seq = struct.unpack("!H", resp[6:8])[0]
+                # 解析 IP 头长度
+                ip_ihl = (resp[0] & 0x0F) * 4
+                if len(resp) < ip_ihl + 8:
+                    continue
+                src_ip_from_hdr = socket.inet_ntoa(resp[12:16])
 
-                if icmp_type != 0 or resp_pid != pid or resp_seq != seq:
+                # 从 IP 头之后读 ICMP 字段（与 Linux 版 _ping_icmp_linux_detailed 一致）
+                icmp_type = resp[ip_ihl]
+                icmp_code = resp[ip_ihl + 1]
+                resp_pid = struct.unpack("!H", resp[ip_ihl+4:ip_ihl+6])[0]
+                resp_seq = struct.unpack("!H", resp[ip_ihl+6:ip_ihl+8])[0]
+
+                if icmp_type != 0 or resp_pid != pid or resp_seq != seq or src_ip_from_hdr != ip:
                     continue
 
                 reachable = (src_ip == ip)
@@ -3759,6 +3766,59 @@ class ARPProtection:
         s = (s >> 16) + (s & 0xFFFF)
         s += s >> 16
         return (~s) & 0xFFFF
+
+    @staticmethod
+    async def _ping_icmp_linux_system_detailed(ip: str, timeout_ms: int) -> dict:
+        """
+        Linux 系统 ping 命令详细探测 - 使用 ping -c 1 替代 raw socket。
+        raw socket 在以下场景不可靠:
+          - 非 root 用户运行（PermissionError 后回退不完整）
+          - WSL/WSL2 受限的原生 socket 支持
+          - Docker/容器环境限制 CAP_NET_RAW
+          - VMware/KVM 虚拟机中虚拟网卡驱动兼容性
+        ping 系统命令无此限制，且与 Windows 版 ping.exe 行为一致。
+        """
+        try:
+            timeout_s = max(timeout_ms / 1000.0, 0.5)
+            proc = await asyncio.create_subprocess_exec(
+                "ping", "-c", "1", "-W", str(int(timeout_s)), ip,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            stdout_bytes, _ = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout_s + 3)
+            stdout_text = stdout_bytes.decode("utf-8", errors="replace")
+            lines = stdout_text.splitlines()
+
+            reachable = (proc.returncode == 0)
+            from_ip = None
+            icmp_type = None
+            icmp_code = None
+            saw_reply = False
+
+            for line in lines:
+                if "unreachable" in line.lower() or "Destination Host Unreachable" in line:
+                    icmp_type = 3
+                    icmp_code = 1
+                    saw_reply = True
+                    m = re.search(r'(\d+\.\d+\.\d+\.\d+)', line)
+                    if m:
+                        from_ip = m.group(1)
+                elif "bytes from" in line or "64 bytes" in line:
+                    saw_reply = True
+                    if reachable:
+                        icmp_type = 0
+                        icmp_code = 0
+                    m = re.search(r'(\d+\.\d+\.\d+\.\d+)', line)
+                    if m:
+                        from_ip = m.group(1)
+
+            return {"reachable": reachable, "icmp_type": icmp_type, "icmp_code": icmp_code,
+                    "from_ip": from_ip, "saw_reply": saw_reply, "stdout_lines": lines}
+
+        except (asyncio.TimeoutError, FileNotFoundError, OSError):
+            return {"reachable": False, "icmp_type": None, "icmp_code": None,
+                    "from_ip": None, "saw_reply": False}
 
     @staticmethod
     async def _ping_icmp_linux(ip: str, timeout_ms: int) -> bool:
@@ -3797,29 +3857,36 @@ class ARPProtection:
 
             sock.sendto(pkt, (ip, 0))
 
-            # 异步等待回复，不阻塞事件循环
+            # 循环接收直到匹配的 Echo Reply 或超时
             loop = asyncio.get_event_loop()
-            resp, addr = await asyncio.wait_for(loop.sock_recv(sock, 4096), timeout=timeout_ms/1000.0)
-            # addr = (source_ip, port) — port is 0 for raw sockets
+            deadline = time.time() + timeout_ms / 1000.0
+            while time.time() < deadline:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                try:
+                    resp = await asyncio.wait_for(loop.sock_recv(sock, 4096), timeout=max(remaining, 0.001))
+                except asyncio.TimeoutError:
+                    break
 
-            # 解析 IP 头 + ICMP 载荷
-            # IP 头最小 20 字节（ihl * 4）
-            ip_ihl = (resp[0] & 0x0F) * 4
-            src_ip = socket.inet_ntoa(resp[12:16])  # 源 IP 在偏移 12-15
+                ip_ihl = (resp[0] & 0x0F) * 4
+                src_ip = socket.inet_ntoa(resp[12:16])
 
-            if len(resp) < ip_ihl + 8:
-                # 包太短，无法解析 ICMP 头
-                return {"reachable": False, "icmp_type": None, "icmp_code": None,
-                        "from_ip": src_ip, "saw_reply": True}
+                if len(resp) < ip_ihl + 8:
+                    continue
 
-            # ICMP 头在 IP 头之后
-            icmp_type = resp[ip_ihl]
-            icmp_code = resp[ip_ihl + 1]
+                icmp_type = resp[ip_ihl]
+                icmp_code = resp[ip_ihl + 1]
+                icmp_id = struct.unpack("!H", resp[ip_ihl+4:ip_ihl+6])[0]
 
-            # type=0 (Echo Reply) 且源 IP == 目标 → 真正的可达
-            reachable = (icmp_type == 0 and src_ip == ip)
-            return {"reachable": reachable, "icmp_type": icmp_type, "icmp_code": icmp_code,
-                    "from_ip": src_ip, "saw_reply": True}
+                if icmp_type == 0 and src_ip == ip and icmp_id == pid:
+                    return {"reachable": True, "icmp_type": icmp_type, "icmp_code": icmp_code,
+                            "from_ip": src_ip, "saw_reply": True}
+
+                continue
+
+            return {"reachable": False, "icmp_type": None, "icmp_code": None,
+                    "from_ip": None, "saw_reply": False}
 
         except (asyncio.TimeoutError, socket.timeout):
             return {"reachable": False, "icmp_type": None, "icmp_code": None,
