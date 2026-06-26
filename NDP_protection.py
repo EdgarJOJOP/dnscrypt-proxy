@@ -83,6 +83,7 @@ except Exception:
 class InterfaceInfo:
     """单个网卡的 IPv6 信息"""
     name: str = ""
+    idx: int = 0          # 接口索引（Windows: netsh 索引, Linux: if_nametoindex）
     mac: str = ""
     ipv6_globals: List[str] = field(default_factory=list)
     ipv6_ll: str = ""
@@ -144,6 +145,9 @@ class NDPProtection:
         self._check_task: Optional[asyncio.Task] = None
         self._last_fix_time = 0.0
         self._threat_events: List[Dict] = []
+        self._max_threat_events: int = 1000
+        self._last_ra_cleanup: float = 0.0
+        self._ra_cleanup_interval: float = 3600.0
 
         # ========== 常驻 Worker 框架 ==========
         self._ndp_running = False
@@ -160,8 +164,10 @@ class NDPProtection:
 
         # ========== 反击统计 ==========
         self._ndp_attack_stats: dict = {}
-        self._ndp_sender_queue: asyncio.Queue = asyncio.Queue()
+        self._ndp_sender_queue: asyncio.Queue = asyncio.Queue(maxsize=500)
         self._ndp_sender_ready: bool = False
+        # scapy sendp 运行时可用性（Windows 无 Npcap 时导入成功但发送失败）
+        self._scapy_sendp_ok: bool = _HAS_SCAPY
         self._ndp_ip_migrated: bool = True              # 全局NDP是否已标记迁移（永久禁用IP迁移，仅用反制）
         self._local_macs: set = set()              # 本机所有网络接口的 MAC 地址（防自伤反制）
         self._local_macs_loaded: bool = False      # 本地 MAC 是否已加载
@@ -320,6 +326,32 @@ class NDPProtection:
                         mac = parts[1].strip()
                         if mac and len(mac.replace("-", "")) == 12:
                             macs.add(mac.replace("-", ":").upper())
+                # getmac 失败时用 wmic 兜底
+                if not macs:
+                    try:
+                        proc2 = await asyncio.create_subprocess_exec(
+                            "wmic", "nic", "where", "NetEnabled=True", "get", "MACAddress",
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.DEVNULL,
+                        )
+                        out2, _ = await asyncio.wait_for(proc2.communicate(), timeout=5)
+                        for line2 in out2.decode("utf-8", errors="replace").splitlines():
+                            m = re.search(r'((?:[0-9A-Fa-f]{2}[-:]){5}[0-9A-Fa-f]{2})', line2)
+                            if m:
+                                macs.add(m.group(1).replace("-", ":").upper())
+                    except Exception:
+                        pass
+                # wmic 也失败时用 Python uuid.getnode() 兜底
+                if not macs:
+                    try:
+                        import uuid
+                        node = uuid.getnode()
+                        if node is not None and node != 0 and not (node & 0x010000000000):
+                            mac_str = ':'.join(f'{(node >> (5-i)*8) & 0xFF:02x}' for i in range(6)).upper()
+                            if len(mac_str.replace(":", "")) == 12:
+                                macs.add(mac_str)
+                    except Exception:
+                        pass
             else:
                 proc = await asyncio.create_subprocess_exec(
                     "ls", "/sys/class/net",
@@ -354,6 +386,29 @@ class NDPProtection:
 
     # ======================== 生命周期 ========================
 
+
+
+    @staticmethod
+    def _is_valid_mac(mac: str) -> bool:
+        """检查 MAC 地址是否是合法的物理网卡 MAC
+        - 拒绝全零 00:00:00:00:00:00
+        - 拒绝广播 FF:FF:FF:FF:FF:FF
+        - 拒绝组播（第 1 字节 bit0=1，如 01:xx:xx:xx:xx:xx、33:33:xx:xx:xx:xx）
+        """
+        if not mac:
+            return False
+        mac = mac.replace("-", ":").upper()
+        if mac == "00:00:00:00:00:00":
+            return False
+        if mac == "FF:FF:FF:FF:FF:FF":
+            return False
+        try:
+            first_byte = int(mac.split(":")[0], 16)
+            if first_byte & 0x01:  # 组播 MAC 第 1 字节最低位为 1
+                return False
+            return True
+        except (ValueError, IndexError):
+            return False
 
     async def _ping_ipv6(self, target: str, timeout_ms: int = 3000) -> bool:
         """Ping an IPv6 target using system ping -6."""
@@ -520,6 +575,7 @@ class NDPProtection:
         """每 30 秒执行一次主动探测（T2）+ 检查更新"""
         while self._running:
             try:
+                await self._cleanup_ra_sources()
                 await asyncio.sleep(30)
                 if not self._running:
                     break
@@ -617,43 +673,248 @@ class NDPProtection:
 
     async def _ndp_sniffer_worker_loop(self):
         """
-        Worker 4: 常驻 NDP 嗅探。
+        Worker 4: 常驻 NDP 嗅探 — 三级兜底。
+        
+        优先级:
+          1. scapy sniff（跨平台，最快）— 带快速 libpcap 预检
+          2. AF_PACKET 原始套接字（Linux，无需 libpcap）
+          3. 系统 NDP 表轮询（`ip -6 neighbor show`，最终兜底）
         
         持续监听 NA/NS/RA/Redirect 报文，实时检测投毒。
         同时学习合法 RA 源 MAC（替代 max_ra_routers 硬阈值）。
         检测 RA 参数欺骗（4.2.7）：CurHopLimit != 255、M/O 标志异常。
-        有报文时处理，无报文时冻结在 sniff(filter="icmp6", ) 内（零 CPU）。
         """
-        if not self._scapy_available:
-            await asyncio.Event().wait()
-            return
         # 收集本机所有 MAC 地址（用于检测本地 MAC 冒用攻击+防自伤）
         if not self._local_macs_loaded:
             self._local_macs = await NDPProtection._fetch_all_local_macs()
             self._local_macs_loaded = True
-        loop = asyncio.get_event_loop()
 
-        def _sniff():
-            while self._ndp_running:
-                sniff(filter="icmp6", 
-                    count=0, timeout=5,
-                    stop_filter=lambda pkt: not self._ndp_running,
-                lfilter=lambda p: (
-                    p.haslayer(Ether) and p.haslayer(IPv6) and (
-                        p.haslayer(ICMPv6ND_NA) or
-                        p.haslayer(ICMPv6ND_NS) or
-                        p.haslayer(ICMPv6ND_RA) or
-                        p.haslayer(ICMPv6Error)
+        # ==================== 路径 1: scapy 嗅探 ====================
+        if self._scapy_available:
+            loop = asyncio.get_event_loop()
+            # 快速 libpcap 预检
+            scapy_ok = True
+            try:
+                def _probe():
+                    sniff(filter="icmp6", count=1, timeout=0.1, store=False, quiet=True)
+                await loop.run_in_executor(None, _probe)
+            except Exception:
+                logger.warning("NDP 防护: scapy 嗅探预检失败 (libpcap 不可用)")
+                scapy_ok = False
+
+            if scapy_ok:
+                def _sniff():
+                    while self._ndp_running:
+                        sniff(filter="icmp6",
+                            stop_filter=lambda pkt: not self._ndp_running,
+                        lfilter=lambda p: (
+                            p.haslayer(Ether) and p.haslayer(IPv6) and (
+                                p.haslayer(ICMPv6ND_NA) or
+                                p.haslayer(ICMPv6ND_NS) or
+                                p.haslayer(ICMPv6ND_RA) or
+                                p.haslayer(ICMPv6Error)
+                            )
+                        ),
+                        prn=self._on_ndp_packet,
+                        store=False, quiet=True,
                     )
-                ),
-                prn=self._on_ndp_packet,
-                store=False, quiet=True,
-            )
+                try:
+                    await loop.run_in_executor(None, _sniff)
+                    return
+                except Exception as e:
+                    logger.debug("NDP 防护: scapy sniff 退出 (%s)，尝试 AF_PACKET", e)
+
+        # ==================== 路径 2: AF_PACKET 原始套接字（Linux） ====================
+        if sys.platform != "win32":
+            logger.info("NDP 防护: AF_PACKET 嗅探已启动")
+            await self._ndp_sniff_af_packet()
+            return
+
+        # ==================== 路径 3: 系统 NDP 表轮询（最终兜底，Windows 默认路径） ====================
+        if sys.platform == "win32":
+            logger.info("NDP 防护: scapy 嗅探不可用（Windows 请安装 Npcap），"
+                        "回退到系统 NDP 表轮询。"
+                        "如需实时抓包，请安装 Npcap (https://npcap.com/)")
+        else:
+            logger.info("NDP 防护: scapy 和 AF_PACKET 均不可用，回退到 NDP 表轮询")
+        await self._poll_ndp_table()
+
+    async def _ndp_sniff_af_packet(self):
+        """
+        AF_PACKET 原始套接字 NDP 嗅探（Linux 无 libpcap 时兜底）。
+        解析原始以太网帧，提取 ICMPv6 NA/NS/RA/Redirect 报文并检测。
+        """
+        ETH_P_IPV6 = 0x86DD
+        ICMPV6_TYPE_NA = 136
+        ICMPV6_TYPE_NS = 135
+        ICMPV6_TYPE_RA = 134
+        ICMPV6_TYPE_REDIRECT = 137
+
+        ndp_sock = None
+        try:
+            ndp_sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW,
+                                      socket.htons(ETH_P_IPV6))
+            ndp_sock.bind((self.interface_name or "", 0))
+            ndp_sock.setblocking(True)
+        except Exception as e:
+            logger.warning("NDP 防护: 无法创建 AF_PACKET IPv6 套接字 (%s)", e)
+            return
+
+        loop = asyncio.get_event_loop()
+        while self._ndp_running:
+            try:
+                frame = await loop.sock_recv(ndp_sock, 65535)
+            except (asyncio.CancelledError, OSError):
+                break
+            except Exception:
+                continue
+
+            if len(frame) < 54:  # 14(eth) + 40(ipv6) + 4(icmpv6 header minimum)
+                continue
+
+            # 提取 src_mac（以太网头字节 6-11）
+            raw_src_mac = ':'.join(f'{b:02x}' for b in frame[6:12]).upper()
+            # IPv6 next header 在字节 20 的帧偏移 = 14+6=20
+            # 实际上 IPv6 header 从字节 14 开始，next header 在偏移 14+6=20
+            next_header = frame[20]  # 第 21 字节（0-based）
+            if next_header != 58:  # 58 = ICMPv6
+                continue
+
+            # ICMPv6 type 在字节 54（14+40）
+            icmp6_type = frame[54]
+
+            # IPv6 src IP 在字节 22-37（IPv6 header 内偏移 8-23）
+            src_ip = socket.inet_ntop(socket.AF_INET6, frame[22:38])
+
+            # ========== 检测逻辑 ==========
+            if icmp6_type == ICMPV6_TYPE_NA:
+                # NA: target address 在 ICMPv6 payload 字节 8-23（帧偏移 54+8=62）
+                if len(frame) >= 78:
+                    na_target = socket.inet_ntop(socket.AF_INET6, frame[62:78])
+                    await self._check_ndp_raw_na(raw_src_mac, src_ip, na_target)
+            elif icmp6_type == ICMPV6_TYPE_NS:
+                if len(frame) >= 78:
+                    ns_target = socket.inet_ntop(socket.AF_INET6, frame[62:78])
+                    await self._check_ndp_raw_ns(raw_src_mac, src_ip, ns_target)
+            elif icmp6_type == ICMPV6_TYPE_RA:
+                # RA: CurHopLimit = IPv6 header byte 7 (hop limit)
+                hop_limit = frame[21]  # IPv6 header 偏移 7
+                await self._check_ndp_raw_ra(raw_src_mac, src_ip, hop_limit)
+            elif icmp6_type == ICMPV6_TYPE_REDIRECT:
+                await self._check_ndp_raw_redirect(raw_src_mac, src_ip)
 
         try:
-            await loop.run_in_executor(None, _sniff)
-        except Exception as e:
-            logger.debug("NDP 防护: 嗅探 worker 退出 (%s)", e)
+            ndp_sock.close()
+        except Exception:
+            pass
+
+    async def _check_ndp_raw_na(self, src_mac: str, src_ip: str, na_target: str):
+        """AF_PACKET NA 检测：检查网关 MAC 是否被篡改（T1）"""
+        if not self._enabled:
+            return
+        all_gw_ips = {ip for ip, _, _ in self.gateway_pairs if ip}
+        if src_ip not in all_gw_ips:
+            return
+        # 检查从网关 IP 发来的 NA 的 MAC 是否匹配预期
+        expected_mac = None
+        for ip, mac, _ in self.gateway_pairs:
+            if ip == src_ip and mac:
+                expected_mac = self._mac_normalize(mac)
+                break
+        if expected_mac and self._mac_normalize(src_mac) != expected_mac:
+            logger.warning("NDP 防护 [T1/AF_PACKET]: NA 投毒! %s 声称 MAC=%s, 预期 %s",
+                           src_ip, src_mac, expected_mac)
+            self._poison_detected.set()
+
+    async def _check_ndp_raw_ns(self, src_mac: str, src_ip: str, ns_target: str):
+        """AF_PACKET NS 检测：DAD 检测（T4）+ NUD 追踪（T5）"""
+        if not self._enabled:
+            return
+        # T4: DAD — src_ip == "::" 表示重复地址检测
+        if src_ip == "::":
+            addr_key = ns_target
+            now = time.time()
+            # 清理过期记录
+            self._nud_tracker = {
+                t: [ts for ts in times if now - ts < self._nud_window]
+                for t, times in self._nud_tracker.items()
+            }
+            if addr_key not in self._nud_tracker:
+                self._nud_tracker[addr_key] = []
+            self._nud_tracker[addr_key].append(now)
+            if len(self._nud_tracker[addr_key]) >= 3:
+                logger.warning("NDP 防护 [T4/AF_PACKET]: DAD 攻击! %s 被重复检测 ≥3 次", addr_key)
+                self._nud_tracker[addr_key] = []
+
+    async def _check_ndp_raw_ra(self, src_mac: str, src_ip: str, hop_limit: int):
+        """AF_PACKET RA 检测：未知 RA 源（T3）+ CurHopLimit 异常"""
+        if not self._enabled:
+            return
+        known_gw_macs = {self._mac_normalize(mac) for _, mac, _ in self.gateway_pairs if mac}
+        known_baseline_macs = set(self._baseline_mac_per_gw.values())
+        all_trusted = known_gw_macs | known_baseline_macs | self._trusted_ra_sources
+
+        if src_mac in all_trusted:
+            return
+
+        if src_mac in self._suspicious_ra_sources:
+            return
+
+        # CurHopLimit 异常检测
+        if hop_limit < 255:
+            logger.warning("NDP 防护 [4.2.7/AF_PACKET]: CurHopLimit=%d (异常) RA 源 %s (%s)",
+                           hop_limit, src_ip, src_mac)
+            self._suspicious_ra_sources.add(src_mac)
+            self._threat_events.append({
+                "type": "ra_param_spoof", "time": time.time(),
+                "src_mac": src_mac, "src_ip": src_ip,
+                "detail": f"CurHopLimit={hop_limit} (expected >=255)",
+            })
+            self._trim_threat_events()
+            return
+
+        # 未知 RA 源
+        logger.warning("NDP 嗅探 [T3/AF_PACKET]: 未知 RA 源! %s (%s)", src_ip, src_mac)
+        self._suspicious_ra_sources.add(src_mac)
+        self._threat_events.append({
+            "type": "rogue_ra", "time": time.time(),
+            "src_mac": src_mac, "src_ip": src_ip,
+        })
+        self._trim_threat_events()
+
+    async def _check_ndp_raw_redirect(self, src_mac: str, src_ip: str):
+        """AF_PACKET Redirect 检测（T6）：非信任源 Redirect"""
+        if not self._enabled:
+            return
+        known_gw_macs = {self._mac_normalize(mac) for _, mac, _ in self.gateway_pairs if mac}
+        if known_gw_macs and src_mac not in known_gw_macs:
+            logger.warning("NDP 防护 [T6/AF_PACKET]: 非信任 Redirect! %s (%s)", src_ip, src_mac)
+            self._threat_events.append({
+                "type": "rogue_redirect", "time": time.time(),
+                "src_mac": src_mac, "src_ip": src_ip,
+            })
+            self._trim_threat_events()
+
+    async def _poll_ndp_table(self):
+        """
+        系统 NDP 表轮询（最终兜底）：定期执行 `ip -6 neighbor show` 检测网关 MAC 变更。
+        """
+        logger.info("NDP 防护: NDP 表轮询已启动 (间隔=5s)")
+        while self._ndp_running:
+            try:
+                # T1: 检查所有网关的 NDP 表项
+                for gw_ip, expected_mac, _ in self.gateway_pairs:
+                    if not gw_ip:
+                        continue
+                    actual_mac = await self._resolve_mac_single(gw_ip)
+                    if expected_mac and actual_mac:
+                        if self._mac_normalize(actual_mac) != self._mac_normalize(expected_mac):
+                            logger.warning("NDP 防护 [T1/轮询]: 网关 %s MAC 变更! %s -> %s",
+                                           gw_ip, expected_mac, actual_mac)
+                            self._poison_detected.set()
+            except Exception as e:
+                logger.debug("NDP 防护: NDP 表轮询异常: %s", e)
+            await asyncio.sleep(5)
 
     def _on_ndp_packet(self, pkt):
         if not pkt.haslayer(Ether) or not pkt.haslayer(IPv6):
@@ -668,7 +929,7 @@ class NDPProtection:
             ra = pkt[ICMPv6ND_RA]
 
             # --- 4.2.7 参数欺骗检测 ---
-            hop_limit = ra.hlim
+            hop_limit = pkt[IPv6].hlim
             m_flag = bool(ra.M)
             o_flag = bool(ra.O)
 
@@ -691,6 +952,7 @@ class NDPProtection:
                         "src_mac": src_mac, "src_ip": src_ip,
                         "detail": f"CurHopLimit={hop_limit} (expected >=255)",
                     })
+                    self._trim_threat_events()
                 # M/O 标志与基线不一致
                 base_m = self._ra_m_flag_baseline
                 base_o = self._ra_o_flag_baseline
@@ -703,6 +965,7 @@ class NDPProtection:
                             "src_mac": src_mac, "src_ip": src_ip,
                             "detail": f"M={m_flag} O={o_flag} (baseline M={base_m} O={base_o})",
                         })
+                        self._trim_threat_events()
                         self._suspicious_ra_sources.add(src_mac)
 
                 # --- RA 源自动学习（替代 max_ra_routers）---
@@ -727,6 +990,7 @@ class NDPProtection:
                             "type": "rogue_ra", "time": time.time(),
                             "src_mac": src_mac, "src_ip": src_ip,
                         })
+                        self._trim_threat_events()
 
         # ==================== T5 NUD 追踪 ====================
         if pkt.haslayer(ICMPv6ND_NS):
@@ -747,12 +1011,18 @@ class NDPProtection:
                     "type": "nud_failure", "time": now,
                     "target": ns_target, "count": len(self._nud_tracker[ns_target]),
                 })
+                self._trim_threat_events()
                 self._nud_tracker[ns_target] = []
 
         # ==================== 基线学习 ====================
-        if pkt.haslayer(ICMPv6ND_RA) or pkt.haslayer(ICMPv6ND_NS):
+        if not self._baseline_learned and (pkt.haslayer(ICMPv6ND_RA) or pkt.haslayer(ICMPv6ND_NS)):
             for gw_ip in all_gw_ips:
                 if src_ip == gw_ip:
+                    if not NDPProtection._is_valid_mac(src_mac):
+                        logger.warning("NDP 防护: 基线学习忽略非法 MAC %s（来源 IP %s）", src_mac, src_ip)
+                        if gw_ip in self._baseline_proposed:
+                            del self._baseline_proposed[gw_ip]
+                        break
                     if gw_ip not in self._baseline_proposed:
                         self._baseline_proposed[gw_ip] = src_mac
                         self._baseline_proposed_time[gw_ip] = time.time()
@@ -785,6 +1055,7 @@ class NDPProtection:
                         "type": "na_poison", "time": time.time(),
                         "gateway": gw_ip, "expected_mac": baseline, "actual_mac": src_mac,
                     })
+                    self._trim_threat_events()
                     logger.warning("NDP 嗅探 [T1]: NA 投毒! %s -> 预期 %s != 实际 %s",
                                    gw_ip, baseline, src_mac)
                     # 自适应防抖：根据攻击频率缩短间隔，同ARP逻辑
@@ -813,12 +1084,13 @@ class NDPProtection:
         # ==================== IP 冲突 ====================
         for local_ip in all_local_ips:
             if local_ip and (src_ip == local_ip or (
-                pkt.haslayer(ICMPv6ND_NA) and str(pkt[ICMPv6ND_NA].target) == local_ip
+                pkt.haslayer(ICMPv6ND_NA) and str(pkt[ICMPv6ND_NA].tgt) == local_ip
             )) and self._mac_normalize(src_mac) != self._mac_normalize(self.local_mac):
                 self._threat_events.append({
                     "type": "ip_conflict", "time": time.time(),
                     "ip": local_ip, "attacker_mac": src_mac,
                 })
+                self._trim_threat_events()
                 logger.warning("NDP 嗅探: IP 冲突! %s 被 %s 宣告", local_ip, src_mac)
                 _now_ipc = time.time()
                 _stats_ipc = self._ndp_attack_stats.get(src_mac, {})
@@ -847,6 +1119,7 @@ class NDPProtection:
                 "type": "local_mac_spoof", "time": time.time(),
                 "attacker_mac": src_mac, "src_ip": src_ip,
             })
+            self._trim_threat_events()
             logger.warning("NDP 嗅探: 本地 MAC 冒用攻击！攻击者冒用本机 MAC %s 以 %s 身份发送 NDP", src_mac, src_ip)
             _now_lm = time.time()
             _stats_lm = self._ndp_attack_stats.get(src_mac, {})
@@ -922,8 +1195,16 @@ class NDPProtection:
     # ======================== Worker 5: DHCPv6 ========================
 
     async def _dhcpv6_worker_loop(self):
-        if not self._scapy_available:
-            await asyncio.Event().wait()
+        if not self._scapy_available or sys.platform == "win32":
+            # 无 scapy 时 DHCPv6 嗅探不可用，仅消费事件信号避免队列积压
+            while self._ndp_running:
+                try:
+                    await asyncio.wait_for(self._run_dhcpv6_check.wait(), timeout=30)
+                    self._run_dhcpv6_check.clear()
+                except asyncio.TimeoutError:
+                    continue
+                except Exception:
+                    break
             return
         loop = asyncio.get_event_loop()
         while self._ndp_running:
@@ -955,40 +1236,162 @@ class NDPProtection:
     # ======================== T2: 主动 NS 探测 ========================
 
     async def _probe_gateway_ns(self, gw_ip: str, timeout: float = 2.0) -> Optional[str]:
-        if not self._scapy_available:
+        if not self.interfaces:
             return None
-        loop = asyncio.get_event_loop()
-        result: List[str] = []
+        # 尝试 scapy 路径（有 libpcap 时）
+        if self._scapy_available:
+            loop = asyncio.get_event_loop()
+            result: List[str] = []
 
-        def _send_ns_and_listen():
+            def _send_ns_and_listen():
+                try:
+                    for iface in self.interfaces:
+                        local_ll = iface.ipv6_ll
+                        if not local_ll or not iface.mac:
+                            continue
+                        eth = Ether(dst="33:33:ff:00:00:01", src=iface.mac)
+                        ns = ICMPv6ND_NS(target=gw_ip)
+                        src_lla = ICMPv6NDOptSrcLLAddr(lladdr=iface.mac)
+                        ipv6 = IPv6(src=local_ll, dst=gw_ip, hlim=255)
+                        sendp(eth / ipv6 / ns / src_lla, iface=iface.name, verbose=False)
+                    na_pkts = sniff(filter="icmp6", count=5, timeout=timeout,
+                                    lfilter=lambda p: p.haslayer(ICMPv6ND_NA) and
+                                                      p.haslayer(ICMPv6NDOptDstLLAddr) and
+                                                      str(p[ICMPv6ND_NA].target) == gw_ip,
+                                    quiet=True)
+                    for pkt in na_pkts:
+                        na = pkt[ICMPv6ND_NA]
+                        if na.haslayer(ICMPv6NDOptDstLLAddr):
+                            mac = na[ICMPv6NDOptDstLLAddr].lladdr.upper()
+                            result.append(mac)
+                except Exception:
+                    pass
+
             try:
-                for iface in self.interfaces:
-                    local_ll = iface.ipv6_ll
-                    if not local_ll or not iface.mac:
-                        continue
-                    eth = Ether(dst="33:33:ff:00:00:01", src=iface.mac)
-                    ns = ICMPv6ND_NS(target=gw_ip)
-                    src_lla = ICMPv6NDOptSrcLLAddr(lladdr=iface.mac)
-                    ipv6 = IPv6(src=local_ll, dst=gw_ip, hlim=255)
-                    sendp(eth / ipv6 / ns / src_lla, iface=iface.name, verbose=False)
-                na_pkts = sniff(filter="icmp6", count=5, timeout=timeout,
-                                lfilter=lambda p: p.haslayer(ICMPv6ND_NA) and
-                                                  p.haslayer(ICMPv6NDOptDstLLAddr) and
-                                                  str(p[ICMPv6ND_NA].target) == gw_ip,
-                                quiet=True)
-                for pkt in na_pkts:
-                    na = pkt[ICMPv6ND_NA]
-                    if na.haslayer(ICMPv6NDOptDstLLAddr):
-                        mac = na[ICMPv6NDOptDstLLAddr].lladdr.upper()
-                        result.append(mac)
-            except Exception:
-                pass
+                await loop.run_in_executor(None, _send_ns_and_listen)
+            except Exception as e:
+                logger.debug("NDP 防护 [T2]: scapy NS 探测异常: %s", e)
+            if result:
+                return result[0]
+
+        # scapy 不可用或失败：使用 AF_PACKET 原始套接字（Linux）
+        if sys.platform != "win32":
+            try:
+                return await self._probe_gateway_ns_af_packet(gw_ip, timeout)
+            except Exception as e:
+                logger.debug("NDP 防护 [T2]: AF_PACKET NS 探测异常: %s", e)
+        return None
+
+    async def _probe_gateway_ns_af_packet(self, gw_ip: str, timeout: float = 2.0) -> Optional[str]:
+        """使用 AF_PACKET 发送 NS 并监听 NA 回复（Linux 无 libpcap 时兜底）"""
+        ETH_P_IPV6 = 0x86DD
+        ICMPV6_TYPE_NA = 136
+
+        # 找到第一个可用的接口
+        iface = None
+        for i in self.interfaces:
+            if i.ipv6_ll and i.mac:
+                iface = i
+                break
+        if not iface:
+            return None
+
+        local_ll = iface.ipv6_ll
+        local_mac = iface.mac
 
         try:
-            await loop.run_in_executor(None, _send_ns_and_listen)
+            # 计算 NS 组播目标 MAC: 33:33:ff:xx:xx:xx where xx:xx:xx is last 3 bytes of target
+            gw_bytes = socket.inet_pton(socket.AF_INET6, gw_ip)
+            ns_dst_mac = bytes([0x33, 0x33, 0xff, gw_bytes[13], gw_bytes[14], gw_bytes[15]])
+            s_mac = bytes.fromhex(local_mac.replace("-", "").replace(":", ""))
+            d_mac = ns_dst_mac
+
+            # 构造 NS 报文
+            # ICMPv6 NS: type=135, code=0
+            ns_payload = struct.pack('!BBH', 135, 0, 0)  # type, code, checksum(0)
+            ns_payload += struct.pack('!I', 0)            # reserved
+            ns_payload += socket.inet_pton(socket.AF_INET6, gw_ip)  # target
+
+            # ICMPv6 Option: Src LLAddr (type=1, len=1, 6 bytes MAC)
+            ns_payload += struct.pack('!BB', 1, 1) + s_mac
+
+            # IPv6 头
+            ipv6_src = socket.inet_pton(socket.AF_INET6, local_ll.split('%')[0])
+            ipv6_dst = socket.inet_pton(socket.AF_INET6, gw_ip)
+            payload_len = len(ns_payload)
+            ipv6_header = struct.pack('!IHBB', 0x60000000, payload_len, 58, 255)
+            ipv6_header += ipv6_src + ipv6_dst
+
+            # 计算 ICMPv6 checksum
+            pseudo = ipv6_src + ipv6_dst
+            pseudo += struct.pack('!I', payload_len)
+            pseudo += b'\x00\x00\x00\x00' + struct.pack('!B', 58)
+            cksum_data = pseudo + ns_payload
+            if len(cksum_data) % 2:
+                cksum_data += b'\x00'
+            total = 0
+            for i in range(0, len(cksum_data), 2):
+                total += (cksum_data[i] << 8) + cksum_data[i+1]
+            while total >> 16:
+                total = (total & 0xFFFF) + (total >> 16)
+            ns_checksum = ~total & 0xFFFF
+            # 填入 checksum (在 payload 偏移 2 处)
+            ns_payload_list = bytearray(ns_payload)
+            struct.pack_into('!H', ns_payload_list, 2, ns_checksum)
+            ns_payload = bytes(ns_payload_list)
+
+            # 完整帧
+            frame = d_mac + s_mac
+            frame += struct.pack('!H', ETH_P_IPV6)
+            frame += ipv6_header + ns_payload
+
+            with socket.socket(socket.AF_PACKET, socket.SOCK_RAW,
+                               socket.htons(ETH_P_IPV6)) as s:
+                s.bind((iface.name, 0))
+                s.send(frame)
+
+                # 监听 NA 回复（timeout 内）
+                s.setblocking(True)
+                s.settimeout(timeout)
+                deadline = time.time() + timeout
+                while time.time() < deadline:
+                    try:
+                        resp = s.recv(65535)
+                    except socket.timeout:
+                        break
+                    except Exception:
+                        continue
+                    if len(resp) < 54:
+                        continue
+                    # 检查以太网类型
+                    if len(resp) < 14:
+                        continue
+                    # 检查是否为 ICMPv6 NA (type=136)
+                    if resp[20] != 58:  # next header != ICMPv6
+                        continue
+                    if resp[54] != ICMPV6_TYPE_NA:
+                        continue
+                    # 提取 src_mac
+                    na_src_mac = ':'.join(f'{b:02x}' for b in resp[6:12]).upper()
+                    # 提取 NA target 在偏移 62-77
+                    if len(resp) >= 78:
+                        na_target = socket.inet_ntop(socket.AF_INET6, resp[62:78])
+                        if na_target == gw_ip:
+                            # 提取 Dst LLAddr option
+                            # option 在 ICMPv6 头后: 偏移 54+4+4=62 (type=2, len=1)
+                            opt_offset = 54 + 8  # ICMPv6 头 + reserved/target
+                            while opt_offset + 2 <= len(resp):
+                                opt_type = resp[opt_offset]
+                                opt_len = resp[opt_offset + 1]
+                                if opt_type == 2 and opt_len == 1 and opt_offset + 8 <= len(resp):
+                                    return ':'.join(f'{b:02x}' for b in resp[opt_offset+2:opt_offset+8]).upper()
+                                if opt_len == 0:
+                                    break
+                                opt_offset += opt_len * 8
+                            return na_src_mac
         except Exception as e:
-            logger.debug("NDP 防护 [T2]: NS 探测异常: %s", e)
-        return result[0] if result else None
+            logger.debug("NDP 防护 [T2]: AF_PACKET 探测异常: %s", e)
+        return None
 
     # ======================== 多接口探测 ========================
 
@@ -1162,10 +1565,31 @@ class NDPProtection:
                     mac = m.group(1).replace("-", ":").upper()
                     if not iface.mac:
                         iface.mac = mac
+                # 如果 ipconfig 未解析到 MAC，用 getmac 命令兜底
+                if not iface.mac and iface.name:
+                    try:
+                        proc2 = await asyncio.create_subprocess_exec(
+                            "getmac", "/FO", "CSV", "/NH",
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.DEVNULL,
+                        )
+                        out2, _ = await asyncio.wait_for(proc2.communicate(), timeout=5)
+                        for line2 in self._decode_win_output(out2).splitlines():
+                            line2 = line2.strip().strip('"')
+                            parts = line2.split('","')
+                            if len(parts) >= 2:
+                                mac2 = parts[1].strip()
+                                if mac2 and len(mac2.replace("-", "")) == 12:
+                                    iface.mac = mac2.replace("-", ":").upper()
+                                    break
+                    except Exception:
+                        pass
             if iface.ipv6_ll or iface.ipv6_global:
                 for gw, idx in default_routes:
                     if not any(g == gw for g, _, _ in iface.gateways):
                         iface.gateways.append((gw, "", ""))
+                # 解析接口索引，供 sendp 使用数字索引替代中文接口名
+                iface.idx = await self._resolve_iface_idx(iface.name)
                 self.interfaces.append(iface)
         await self._resolve_all_gateway_macs()
 
@@ -1501,9 +1925,11 @@ class NDPProtection:
 
     async def send_unsolicited_na(self, target: str = "ff02::1"):
         if self._scapy_available:
-            return await self._send_na_scapy_all(target)
-        else:
-            return await self._send_na_system_all()
+            result = await self._send_na_scapy_all(target)
+            if result:
+                return True
+            # scapy NA 失败（如无 libpcap 导致 sendp 不可用），回退系统方法
+        return await self._send_na_system_all()
 
     @staticmethod
     def _get_ndp_intensity(attack_rate: int) -> tuple:
@@ -1569,6 +1995,26 @@ class NDPProtection:
             await self.protect_ndp_entry()
             return
 
+        # 全零 MAC 攻击者：定向反制发给不存在的 MAC，完全无效
+        if attacker_mac == "00:00:00:00:00:00":
+            logger.warning("NDP 反制: 攻击者使用全零 MAC，定向反制无效，改用广播 NA 爆发 + 静态 NDP 绑定")
+            # 广播 NA 爆发
+            for iface in self.interfaces:
+                local_ip = iface.ipv6_global or iface.ipv6_ll
+                local_mac_real = iface.mac
+                if local_ip and local_mac_real:
+                    vlan_id = self._manual_gateway_vlan
+                    try:
+                        self._ndp_sender_queue.put_nowait(
+                            ("ff:ff:ff:ff:ff:ff", local_ip, local_mac_real, local_ip, max(na_rounds * 3, 15), 0.01, vlan_id)
+                        )
+                    except Exception:
+                        pass
+                    break
+            # 静态 NDP 绑定
+            await self.protect_ndp_entry()
+            return
+
         # 定向反制：单播 NA 到攻击者网卡，毒化其邻居缓存
         if attacker_mac and self._ndp_sender_ready:
             # 收集本机 IPv6 和 MAC 信息
@@ -1576,12 +2022,12 @@ class NDPProtection:
                 local_ip = iface.ipv6_global or iface.ipv6_ll
                 local_mac_real = iface.mac
                 if local_ip and local_mac_real:
-                    # 网关 IPv6 -> 00:00:00:00:00:00 毒化包（打残攻击者）
-                    null_mac = "00:00:00:00:00:00"
+                    # 网关 IPv6 -> 随机不可达 MAC 毒化包（打残攻击者）
+                    poison_mac = self._generate_poison_mac()
                     vlan_id = self._manual_gateway_vlan
                     try:
                         self._ndp_sender_queue.put_nowait(
-                            (attacker_mac, local_ip, null_mac, attacker_ip or self.gateway_ipv6 or local_ip, na_rounds, inter, vlan_id)
+                            (attacker_mac, local_ip, poison_mac, attacker_ip or self.gateway_ipv6 or local_ip, na_rounds, inter, vlan_id)
                         )
                     except Exception:
                         pass
@@ -1592,6 +2038,19 @@ class NDPProtection:
                         )
                     except Exception:
                         pass
+
+                    # 攻击者冒充网关 IPv6 时，额外宣告真实网关的 IPv6-MAC 绑定
+                    # 这样网络上其他设备不会因为 NDP 投毒而错误地学到网关 IPv6 在攻击者 MAC
+                    all_gw_ips = {ip for ip, _, _ in self.gateway_pairs if ip}
+                    gw_ipv6 = self.gateway_ipv6
+                    gw_mac = self.gateway_mac
+                    if (attacker_ip in all_gw_ips or (gw_ipv6 and attacker_ip == gw_ipv6)) and gw_mac and gw_ipv6:
+                        try:
+                            self._ndp_sender_queue.put_nowait(
+                                ("ff:ff:ff:ff:ff:ff", gw_ipv6, gw_mac, gw_ipv6, max(na_rounds // 3, 1), inter, vlan_id)
+                            )
+                        except Exception:
+                            pass
                     break
 
         # 回退：如果 sender 就绪就用队列，否则走原广播逻辑
@@ -1606,11 +2065,103 @@ class NDPProtection:
                     break
         logger.info("NDP 反制: %d 轮 NA 完成", na_rounds)
 
+    async def _send_na_af_packet(self, dst_mac: str, local_ip: str, local_mac: str,
+                                  target_ip: str, count: int = 1,
+                                  inter: float = 0.0, vlan_id: str = ""):
+        """
+        使用 AF_PACKET 原始套接字发送 Unsolicited NA 报文（Linux 无 libpcap 时替代 sendp）。
+        构造：Ethernet / IPv6 / ICMPv6 NA / ICMPv6OptDstLLAddr
+        """
+        if sys.platform == "win32":
+            return
+        try:
+            ETH_P_IPV6 = 0x86DD
+            d_mac = bytes.fromhex(dst_mac.replace("-", "").replace(":", ""))
+            s_mac = bytes.fromhex(local_mac.replace("-", "").replace(":", ""))
+            dst_ip = target_ip if dst_mac != "ff:ff:ff:ff:ff:ff" else "ff02::1"
+
+            # IPv6 头
+            ipv6_src = socket.inet_pton(socket.AF_INET6, local_ip)
+            ipv6_dst = socket.inet_pton(socket.AF_INET6, dst_ip)
+
+            # ICMPv6 NA: type=136, code=0, R=0, S=0, O=1
+            # flags: R(bit 7)=0, S(bit 6)=0, O(bit 5)=1 → 0x20
+            na_payload = struct.pack('!BBH', 136, 0, 0)  # type, code, checksum(0)
+            na_payload += struct.pack('!I', 0x20000000)   # RSO flags + reserved
+            na_payload += socket.inet_pton(socket.AF_INET6, target_ip)  # target
+
+            # ICMPv6 Option: Dst LLAddr (type=2, len=1, 6 bytes MAC)
+            na_payload += struct.pack('!BB', 2, 1) + s_mac
+
+            # IPv6 头 (40 bytes)
+            payload_len = len(na_payload)
+            ipv6_header = struct.pack('!IHBB', 0x60000000, payload_len, 58, 255)  # next=58(ICMPv6), hlim=255
+            ipv6_header += ipv6_src + ipv6_dst
+
+            frame = d_mac + s_mac
+            if vlan_id and not self._vxlan_enabled:
+                frame += struct.pack('!HH', 0x8100, int(vlan_id) & 0xFFF)
+            frame += struct.pack('!H', ETH_P_IPV6)
+            frame += ipv6_header + na_payload
+
+            # 计算 ICMPv6 checksum
+            pseudo_header = ipv6_src + ipv6_dst
+            pseudo_header += struct.pack('!I', payload_len)
+            pseudo_header += b'\x00\x00\x00\x00'  # next header 的零填充
+            pseudo_header += struct.pack('!B', 58)  # next header = ICMPv6
+            checksum_data = pseudo_header + na_payload
+            if len(checksum_data) % 2:
+                checksum_data += b'\x00'
+            checksum = self._checksum(checksum_data)
+
+            # 更新 checksum 在帧中的位置
+            # ICMPv6 checksum 在帧中偏移: 14(eth) + 40(ipv6) + 2(icmpv6 type+code)
+            csum_offset = len(frame) - len(na_payload) + 2
+            struct.pack_into('!H', frame, csum_offset, checksum)
+
+            with socket.socket(socket.AF_PACKET, socket.SOCK_RAW,
+                               socket.htons(ETH_P_IPV6)) as s:
+                s.bind((self.interface_name or "", 0))
+                for _ in range(count):
+                    s.send(frame)
+                    if inter > 0:
+                        await asyncio.sleep(inter)
+        except Exception as e:
+            logger.debug("NDP 防护: AF_PACKET NA 发送失败 (%s)", e)
+
+    @staticmethod
+    def _checksum(data: bytes) -> int:
+        """计算 Internet Checksum (RFC 1071)"""
+        if len(data) % 2:
+            data += b'\x00'
+        total = 0
+        for i in range(0, len(data), 2):
+            total += (data[i] << 8) + data[i+1]
+        while total >> 16:
+            total = (total & 0xFFFF) + (total >> 16)
+        return ~total & 0xFFFF
+
     async def _ndp_sender_worker_loop(self):
         """常驻 NDP 发送器：一次性导入 scapy，从队列取任务发送，进程冻结"""
         if not self._scapy_available:
             self._ndp_sender_ready = False
-            await asyncio.Event().wait()
+            # 不冻结，允许后续收到信号时检查是否有替代发送方式（AF_PACKET）
+            while self._ndp_running:
+                try:
+                    task = await asyncio.wait_for(self._ndp_sender_queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+                except Exception:
+                    break
+                if task is None:
+                    break
+                # scapy 不可用时尝试 AF_PACKET 发送
+                if sys.platform != "win32":
+                    dst_mac, local_ip, local_mac, target_ip, count, inter, vlan_id = task
+                    await self._send_na_af_packet(
+                        dst_mac=dst_mac, local_ip=local_ip, local_mac=local_mac,
+                        target_ip=target_ip, count=count, inter=inter, vlan_id=vlan_id,
+                    )
             return
         try:
             from scapy.all import Ether, IPv6, ICMPv6ND_NA, ICMPv6NDOptDstLLAddr, sendp
@@ -1619,8 +2170,19 @@ class NDPProtection:
             self._ndp_sender_ready = False
             await asyncio.Event().wait()
             return
-        self._ndp_sender_ready = True
-        logger.debug("NDP 防护: NDP 发送器已就绪")
+
+        # === 快速 sendp 预检 ===
+        sendp_ok = True
+        if sys.platform != "win32":
+            try:
+                test_pkt = Ether(dst="ff:ff:ff:ff:ff:ff") / IPv6(src="::1", dst="ff02::1", hlim=255) / ICMPv6ND_NA()
+                sendp(test_pkt, iface=self.interface_name or "lo", verbose=False, count=1, inter=0)
+            except Exception:
+                logger.debug("NDP 防护: sendp 预检失败 (Linux 无 libpcap)，使用 AF_PACKET 兜底")
+                sendp_ok = False
+
+        self._ndp_sender_ready = sendp_ok
+        logger.debug("NDP 防护: NDP 发送器已就绪 (sendp=%s)", sendp_ok)
         while self._ndp_running:
             try:
                 task = await asyncio.wait_for(self._ndp_sender_queue.get(), timeout=1.0)
@@ -1632,66 +2194,122 @@ class NDPProtection:
                 break
             try:
                 dst_mac, local_ip, local_mac, target_ip, count, inter, vlan_id = task
-                eth = Ether(dst=dst_mac, src=local_mac)
-                na = ICMPv6ND_NA(R=0, S=0, O=1, target=target_ip)
-                lla = ICMPv6NDOptDstLLAddr(lladdr=local_mac)
-                ipv6 = IPv6(src=local_ip, dst=target_ip if dst_mac != "ff:ff:ff:ff:ff:ff" else "ff02::1", hlim=255)
-                pkt = eth / ipv6 / na / lla
-                # VLAN 802.1Q tag when vlan_id is set and not VXLAN
-                if vlan_id and not self._vxlan_enabled:
+                # scapy sendp 尝试
+                if sendp_ok:
                     try:
-                        pkt = Ether(dst=dst_mac, src=local_mac) / Dot1Q(vlan=int(vlan_id)) / ipv6 / na / lla
+                        eth = Ether(dst=dst_mac, src=local_mac)
+                        na = ICMPv6ND_NA(R=1, S=0, O=1, tgt=target_ip)
+                        lla = ICMPv6NDOptDstLLAddr(lladdr=local_mac)
+                        ipv6 = IPv6(src=local_ip, dst=target_ip if dst_mac != "ff:ff:ff:ff:ff:ff" else "ff02::1", hlim=255)
+                        pkt = eth / ipv6 / na / lla
+                        if vlan_id and not self._vxlan_enabled:
+                            try:
+                                pkt = Ether(dst=dst_mac, src=local_mac) / Dot1Q(vlan=int(vlan_id)) / ipv6 / na / lla
+                            except Exception:
+                                pass
+                        elif vlan_id and self._vxlan_enabled:
+                            try:
+                                inner_pkt = eth / ipv6 / na / lla
+                                pkt = (Ether(dst=dst_mac, src=local_mac)
+                                       / scapy_module.IPv6(src=local_ip, dst=target_ip, hlim=64)
+                                       / scapy_module.UDP(sport=4789, dport=4789)
+                                       / scapy_module.VXLAN(vni=int(vlan_id))
+                                       / inner_pkt)
+                            except Exception:
+                                pass
+                        for _ in range(count):
+                            sendp(pkt, iface=self.interface_name or "", verbose=False)
+                            if inter > 0:
+                                await asyncio.sleep(inter)
+                        log_target = f"定向 {dst_mac}" if dst_mac != "ff:ff:ff:ff:ff:ff" else "广播"
+                        logger.warning("NDP 反制: 定向 NA %s %s(%s) -> %s x%d", log_target, target_ip, dst_mac, local_mac, count)
+                        continue
                     except Exception:
-                        pass
-                elif vlan_id and self._vxlan_enabled:
-                    try:
-                        inner_pkt = eth / ipv6 / na / lla
-                        # VXLAN外层使用IPv6封装（NDP为IPv6协议族）
-                        pkt = (Ether(dst=dst_mac, src=local_mac)
-                               / scapy_module.IPv6(src=local_ip, dst=target_ip, hlim=64)
-                               / scapy_module.UDP(sport=4789, dport=4789)
-                               / scapy_module.VXLAN(vni=int(vlan_id))
-                               / inner_pkt)
-                    except Exception:
-                        pass
-                for _ in range(count):
-                    sendp(pkt, iface=self.interface_name or "", verbose=False)
-                    if inter > 0:
-                        await asyncio.sleep(inter)
-                log_target = f"定向 {dst_mac}" if dst_mac != "ff:ff:ff:ff:ff:ff" else "广播"
-                logger.warning("NDP 反制: 定向 NA %s %s(%s) -> %s x%d", log_target, target_ip, dst_mac, local_mac, count)
+                        logger.debug("NDP 防护: sendp 运行失败，回退 AF_PACKET 发送")
+                # AF_PACKET 兜底（Linux）
+                if sys.platform != "win32":
+                    await self._send_na_af_packet(
+                        dst_mac=dst_mac, local_ip=local_ip, local_mac=local_mac,
+                        target_ip=target_ip, count=count, inter=inter, vlan_id=vlan_id,
+                    )
+                    log_target = f"定向 {dst_mac}" if dst_mac != "ff:ff:ff:ff:ff:ff" else "广播"
+                    logger.warning("NDP 反制: 定向 NA (AF_PACKET) %s %s(%s) -> %s x%d",
+                                   log_target, target_ip, dst_mac, local_mac, count)
+                else:
+                    logger.debug("NDP 防护: 当前平台无可用 NDP 发送方式")
             except Exception as e:
                 logger.debug("NDP 防护: NDP 发送失败 (%s)", e)
 
     async def _send_na_scapy_all(self, target: str) -> bool:
         if not self._scapy_available:
             return False
+
+        # 运行时 sendp 预检：Windows 无 Npcap 时 scapy 导入成功但发送失败
+        if not self._scapy_sendp_ok and sys.platform == "win32":
+            logger.info("NDP 防护: scapy sendp 不可用（需安装 Npcap），走系统 fallback 发送")
+            return False
+
         loop = asyncio.get_event_loop()
         sent = 0
 
         def _send_one(iface: InterfaceInfo):
             local_ip = iface.ipv6_global or iface.ipv6_ll
-            if not local_ip or not iface.mac:
+            # 清理 IPv6 地址
+            if local_ip:
+                local_ip = local_ip.strip().split("%")[0]
+            # iface.mac 可能为空，用 _local_macs 兜底
+            iface_mac = iface.mac
+            if not iface_mac and self._local_macs:
+                iface_mac = next(iter(self._local_macs), "")
+            if not iface_mac:
+                try:
+                    import uuid
+                    node = uuid.getnode()
+                    if node is not None and node != 0 and not (node & 0x010000000000):
+                        iface_mac = ':'.join(f'{(node >> (5-i)*8) & 0xFF:02x}' for i in range(6)).upper()
+                except Exception:
+                    pass
+            if not local_ip or not iface_mac:
+                logger.warning("NDP 防护: 接口 %s 无 MAC (mac=%s, local_macs=%s)，跳过 NA 发送",
+                               iface.name, iface.mac, self._local_macs)
                 return 0
             try:
-                eth = Ether(dst="ff:ff:ff:ff:ff:ff", src=iface.mac)
-                na = ICMPv6ND_NA(R=0, S=0, O=1, target=local_ip)
-                lla = ICMPv6NDOptDstLLAddr(lladdr=iface.mac)
-                ipv6 = IPv6(src=local_ip, dst=target, hlim=255)
+                # 预验证 IPv6 地址
+                import socket
+                socket.inet_pton(socket.AF_INET6, local_ip)
+                import scapy.all
+                Ether = scapy.all.Ether
+                IPv6 = scapy.all.IPv6
+                ICMPv6ND_NA = scapy.all.ICMPv6ND_NA
+                ICMPv6NDOptDstLLAddr = scapy.all.ICMPv6NDOptDstLLAddr
+                sendp = scapy.all.sendp
+                dst_ip = "ff02::1" if target == "ff02::1" else target.strip().split("%")[0] if "%" in target else target.strip()
+                eth = Ether(dst="ff:ff:ff:ff:ff:ff", src=iface_mac)
+                na = ICMPv6ND_NA(R=1, S=0, O=1, tgt=local_ip)
+                lla = ICMPv6NDOptDstLLAddr(lladdr=iface_mac)
+                ipv6 = IPv6(src=local_ip, dst=dst_ip, hlim=255)
                 pkt = eth / ipv6 / na / lla
+                iface_arg = iface.idx if iface.idx > 0 else iface.name
+                logger.info("NDP 防护: NA 发送中 接口=%s idx=%s IP=%s MAC=%s", iface.name, iface_arg, local_ip, iface_mac)
                 for _ in range(5):
-                    sendp(pkt, iface=iface.name, verbose=False)
+                    sendp(pkt, iface=iface_arg, verbose=False)
                     time.sleep(0.02)
                 return 5
-            except Exception:
+            except Exception as e:
+                self._scapy_sendp_ok = False
+                logger.warning("NDP 防护: 接口 %s NA sendp 失败: %s (idx=%s)", iface.name, e, iface.idx)
                 return 0
 
         try:
             for iface in self.interfaces:
                 if iface.ipv6_global or iface.ipv6_ll:
                     sent += await loop.run_in_executor(None, _send_one, iface)
-            logger.info("NDP 防护: NA x%d 已在 %d 个接口发送", sent,
-                        sum(1 for i in self.interfaces if i.ipv6_global or i.ipv6_ll))
+            if sent > 0:
+                logger.info("NDP 防护: NA x%d 已在 %d 个接口发送", sent,
+                            sum(1 for i in self.interfaces if i.ipv6_global or i.ipv6_ll))
+            else:
+                logger.info("NDP 防护: scapy NA 发送不可用（需安装 Npcap），"
+                            "走系统 fallback 发送")
             return sent > 0
         except Exception as e:
             logger.warning("NDP 防护: scapy NA 失败: %s", e)
@@ -1842,6 +2460,34 @@ class NDPProtection:
                 return False
 
     @property
+
+    @staticmethod
+    def _generate_poison_mac() -> str:
+        """生成一个单播、locally administered 的虚假 MAC（不会与真实设备冲突）
+        使用 02:xx:xx:xx:xx:xx 范围（locally administered unicast），
+        比全零 MAC 更具欺骗性，能更有效毒化攻击者的 NDP 邻居缓存。
+        """
+        import random
+        suffix = random.randint(1, 0xFFFFFF)
+        return f"02:00:00:{suffix >> 16:02X}:{(suffix >> 8) & 0xFF:02X}:{suffix & 0xFF:02X}"
+
+    def _trim_threat_events(self):
+        if len(self._threat_events) > self._max_threat_events:
+            self._threat_events = self._threat_events[-self._max_threat_events:]
+
+    async def _cleanup_ra_sources(self):
+        now = time.time()
+        if now - self._last_ra_cleanup < self._ra_cleanup_interval:
+            return
+        self._last_ra_cleanup = now
+        if len(self._suspicious_ra_sources) > 100:
+            self._suspicious_ra_sources.clear()
+            logger.debug("NDP 防护: 清理可疑 RA 源集合 (%d 条)", 100)
+        if len(self._trusted_ra_sources) > 200:
+            known_gw_macs = {self._mac_normalize(mac) for _, mac, _ in self.gateway_pairs if mac}
+            self._trusted_ra_sources.intersection_update(known_gw_macs)
+            logger.debug("NDP 防护: 精简信任 RA 源集合为 %d 条", len(self._trusted_ra_sources))
+
     def stats(self) -> dict:
         return {
             "enabled": self._enabled,

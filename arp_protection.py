@@ -139,7 +139,7 @@ class ARPProtection:
         self._ip_migrated: bool = True              # 全局IP是否已迁移（永久禁用IP迁移，仅用反制）
 
         # ========== 常驻 scapy 发送器 worker（进程冻结，避免重复创建）==========
-        self._scapy_sender_queue: asyncio.Queue = asyncio.Queue()
+        self._scapy_sender_queue: asyncio.Queue = asyncio.Queue(maxsize=500)
         self._scapy_sender_ready: bool = False      # scapy 发送器是否已就绪
 
     async def _scapy_sender_worker_loop(self):
@@ -2423,6 +2423,134 @@ class ARPProtection:
 
         # GARP 广播按攻击强度等比放大（burst_size 已由 _get_intensity 按 attack_rate 计算）
         await self._garp_broadcast_burst(count=max(burst_size, 1))
+
+        # 攻击者冒充网关 IP 时，额外宣告真实网关的 IP-MAC 绑定
+        # 这样网络上其他设备不会因为攻击者的 ARP 投毒而错误地学到网关 IP 在攻击者 MAC
+        gw_ips = {ip for ip, _, _ in self.gateway_pairs}
+        if attacker_ip in gw_ips and self.gateway_mac:
+            await self._garp_broadcast_gateway(count=max(burst_size // 2, 1))
+
+    async def _garp_broadcast_gateway(self, count: int = 5, inter: float = 0.01):
+        """
+        广播宣告真实网关的 IP-MAC 绑定，用于攻击者冒充网关 IP 时的反制。
+        发送 GARP 包宣称网关 IP 在真实网关 MAC，纠正网络上被投毒设备的 ARP 缓存。
+
+        Linux: 使用 AF_PACKET 原始套接字发送。
+        Windows: 优先用 scapy 发送（需 Npcap），不可用时回退到静态 ARP 绑定。
+
+        Args:
+            count: 发送次数
+            inter: 包间间隔（秒）
+        """
+        gw_ip = self.gateway_ip
+        gw_mac = self.gateway_mac
+        if not gw_ip or not gw_mac:
+            return
+
+        logger.info("ARP 防护: 广播宣告真实网关 %s -> MAC=%s x%d", gw_ip, gw_mac, count)
+
+        if sys.platform != "win32":
+            # Linux: 用 AF_PACKET 发送真实 GARP 包
+            if not self._local_mac:
+                return
+            try:
+                local_mac_bytes = bytes.fromhex(self._local_mac.replace("-", "").replace(":", ""))
+                gw_mac_bytes = bytes.fromhex(gw_mac.replace("-", "").replace(":", ""))
+                if len(local_mac_bytes) != 6 or len(gw_mac_bytes) != 6:
+                    return
+
+                dest_mac = b"\xff\xff\xff\xff\xff\xff"
+                eth_type = struct.pack("!H", 0x0806)
+                htype = struct.pack("!H", 1)
+                ptype = struct.pack("!H", 0x0800)
+                hlen = struct.pack("B", 6)
+                plen = struct.pack("B", 4)
+                opcode = struct.pack("!H", 1)
+
+                ip_bytes = socket.inet_aton(gw_ip)
+                sender_mac = gw_mac_bytes
+                sender_ip = ip_bytes
+                target_mac = b"\x00\x00\x00\x00\x00\x00"
+                target_ip = ip_bytes
+
+                arp_payload = (htype + ptype + hlen + plen + opcode +
+                               sender_mac + sender_ip + target_mac + target_ip)
+
+                vlan_id = self._manual_gateway_vlan
+                if vlan_id and not self._vxlan_enabled:
+                    vlan_tag = struct.pack("!HH", 0x8100, int(vlan_id) & 0xFFF)
+                    frame = dest_mac + local_mac_bytes + vlan_tag + eth_type + arp_payload
+                elif vlan_id and self._vxlan_enabled:
+                    try:
+                        import sys as _sys
+                        _sys.path.insert(0, "D:/dns/3/dnscrypt-proxy")
+                        from vxlan_encap import encap_vxlan
+                        inner_arp = dest_mac + local_mac_bytes + eth_type + arp_payload
+                        frame = encap_vxlan(inner_arp, int(vlan_id),
+                                             self._local_mac, dest_mac.hex(),
+                                             self._local_ipv4 or "0.0.0.0", gw_ip)
+                    except Exception:
+                        frame = dest_mac + local_mac_bytes + eth_type + arp_payload
+                else:
+                    frame = dest_mac + local_mac_bytes + eth_type + arp_payload
+
+                for _ in range(count):
+                    with socket.socket(socket.AF_PACKET, socket.SOCK_RAW,
+                                       socket.htons(0x0806)) as s:
+                        s.bind((self._interface_name or "", 0))
+                        s.send(frame)
+                    if inter > 0:
+                        await asyncio.sleep(inter)
+                logger.info("ARP 防护: 网关 GARP 广播完成 (AF_PACKET) %s -> %s x%d", gw_ip, gw_mac, count)
+                return
+            except Exception as e:
+                logger.debug("ARP 防护: 网关 GARP AF_PACKET 发送失败 (%s)", e)
+
+        # Windows: 用 scapy 发送真实 GARP
+        if _SCAPY_AVAILABLE and self._local_mac and gw_mac:
+            try:
+                from scapy.all import Ether, ARP, sendp
+                for _ in range(count):
+                    garp_pkt = (
+                        Ether(dst="ff:ff:ff:ff:ff:ff", src=self._local_mac) /
+                        ARP(op=1,
+                            hwsrc=gw_mac,
+                            psrc=gw_ip,
+                            hwdst="00:00:00:00:00:00",
+                            pdst=gw_ip)
+                    )
+                    vlan_id = self._manual_gateway_vlan
+                    if vlan_id and not self._vxlan_enabled:
+                        try:
+                            from scapy.all import Dot1Q
+                            garp_pkt = (
+                                Ether(dst="ff:ff:ff:ff:ff:ff", src=self._local_mac) /
+                                Dot1Q(vlan=int(vlan_id)) /
+                                ARP(op=1,
+                                    hwsrc=gw_mac,
+                                    psrc=gw_ip,
+                                    hwdst="00:00:00:00:00:00",
+                                    pdst=gw_ip)
+                            )
+                        except Exception:
+                            pass
+                    sendp(garp_pkt, iface=self._interface_name or "",
+                          verbose=False, count=1, inter=0)
+                    if inter > 0:
+                        await asyncio.sleep(inter)
+                logger.info("ARP 防护: 网关 GARP 广播完成 (scapy) %s -> %s x%d", gw_ip, gw_mac, count)
+                return
+            except Exception as e:
+                logger.debug("ARP 防护: 网关 GARP scapy 发送失败 (%s)，回退到静态 ARP", e)
+
+        # 兜底：如果本机 ARP 表中网关 MAC 被投毒，设静态 ARP 绑定修复
+        if sys.platform == "win32":
+            actual_mac = await self._arp_get_mac_windows(gw_ip)
+            if actual_mac and self._mac_normalize(actual_mac) != self._mac_normalize(gw_mac):
+                logger.warning("ARP 防护: 本机 ARP 表中网关 MAC 被篡改 %s -> %s，设置静态绑定",
+                               gw_mac, actual_mac)
+                await self._protect_gateway_arp()
+    
 
     async def _switch_ip(self, new_ip: str) -> bool:
         """

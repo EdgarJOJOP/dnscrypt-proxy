@@ -656,7 +656,11 @@ class NetworkMonitor:
                     iface_task.cancel()
 
             if result:
-                # ARP 防护成功
+                # ARP 防护成功 — 强制填充滑动窗口成功结果，加速恢复判定
+                for _ in range(self._gw_results.maxlen):
+                    self._gw_results.append(True)
+                for _ in range(self._ext_results.maxlen):
+                    self._ext_results.append(True)
                 if abort_check() or await self._arp_protection._ping_gateway_fast(gw_ip):
                     logger.info("ARP 防护: 后台修复完成，网关已恢复")
                     # 如果是从 network_down 恢复，触发常驻 recover worker
@@ -666,6 +670,12 @@ class NetworkMonitor:
                         # 未标记断网（波动中快速修复），直接恢复 DNS
                         self._arp_network_down = False
                         self.resolver_manager.set_network_down(False)
+                else:
+                    # GARP 修复后 ping 网关超时：可能是刚广播完的临时波动，
+                    # 强制标记恢复，让主循环滑动窗口自行验证
+                    logger.info("ARP 防护: 修复完成但 ping 网关超时 (临时波动)，强制恢复 DNS")
+                    self._arp_network_down = False
+                    self.resolver_manager.set_network_down(False)
             else:
                 # ARP 防护后网关仍不通 → 检查外网
                 ext_ok = abort_check() or ((len(self._ext_results) > 0 and sum(self._ext_results) > 0) or (len(self._ext_results_v6) > 0 and sum(self._ext_results_v6) > 0))
@@ -694,12 +704,22 @@ class NetworkMonitor:
         try:
             result = await self._ndp_protection.refresh_router_ndp(abort_check=abort_check)
             if result:
+                # NDP 防护成功 — 强制填充滑动窗口成功结果
+                for _ in range(self._ndp_gw_results.maxlen):
+                    self._ndp_gw_results.append(True)
+                for _ in range(self._ext_results_v6.maxlen):
+                    self._ext_results_v6.append(True)
                 ndp_gw = self._ndp_protection.gateway_ipv6
                 if abort_check() or (ndp_gw and await self._ndp_protection._ping_ipv6(ndp_gw)):
                     logger.info("NDP 防护: 后台修复完成，IPv6 网关已恢复")
                     if self.resolver_manager._network_down and not self._arp_network_down:
                         self.resolver_manager.set_network_down(False)
                     self._ndp_network_down = False
+                else:
+                    logger.info("NDP 防护: 修复完成但 ping IPv6 网关超时 (临时波动)，强制恢复 DNS")
+                    self._ndp_network_down = False
+                    if self.resolver_manager._network_down and not self._arp_network_down:
+                        self.resolver_manager.set_network_down(False)
             else:
                 ext_ok = abort_check() or ((len(self._ext_results) > 0 and sum(self._ext_results) > 0) or (len(self._ext_results_v6) > 0 and sum(self._ext_results_v6) > 0))
                 if not ext_ok:
