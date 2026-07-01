@@ -131,7 +131,15 @@ class DoHResolver(BaseResolver):
           防御系统 CA 已被入侵的 MITM 场景
         - 如果未配置 ca_path: 使用系统默认 CA
         """
-        ciphers = "HIGH:!aNULL:!kRSA:!PSK:!SRP:!MD5:!RC4"
+        # 检测是否为国密SM2服务器：添加SM2密码套件支持
+        is_sm2 = "sm2." in self.url.lower()
+        if is_sm2:
+            ciphers = ("HIGH:!aNULL:!kRSA:!PSK:!SRP:!MD5:!RC4:"
+                       "ECC-SM2-SM4-CBC-SM3:ECDHE-SM2-SM4-CBC-SM3:"
+                       "ECC-SM2-SM4-GCM-SM3:ECDHE-SM2-SM4-GCM-SM3")
+            logger.info("DoH %s: 国密SM2密码套件已启用", self.url)
+        else:
+            ciphers = "HIGH:!aNULL:!kRSA:!PSK:!SRP:!MD5:!RC4"
         if self._ca_path:
             # 自定义 CA 模式：创建空上下文，只加载自定义 CA
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
