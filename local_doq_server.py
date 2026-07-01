@@ -214,6 +214,12 @@ class LocalDoQServer:
         if not HAS_AIOQUIC:
             logger.error("aioquic 未安装，DoQ 服务器无法启动")
             self.enabled = False
+            self.config = None
+            self.resolver_manager = None
+            self.cache = None
+            self.filter_engine = None
+            self.request_logger = None
+            self._dnssec_wrapper = None
             return
 
         self.config = config

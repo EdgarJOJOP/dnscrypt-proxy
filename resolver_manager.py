@@ -103,8 +103,11 @@ class UpstreamServer:
         return score
 
     def record_success(self, response_time: Optional[float] = None):
+        # 指数衰减：不硬清零，保留部分历史失败记录
+        # 防止刚恢复的服务器因一次成功就获得过高权重
         self.consecutive_failures = 0
-        self.failures = 0
+        if self.failures > 0:
+            self.failures = max(0, self.failures - 2)  # 每次成功衰减2
         if response_time is not None:
             self._response_times.append(response_time)
 

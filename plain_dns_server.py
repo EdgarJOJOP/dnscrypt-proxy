@@ -1,13 +1,15 @@
 """
-本地纯 DNS 服务器（UDP 53 端口）
+本地纯 DNS 服务器（UDP 53 端口 + TCP 53 端口）
 - 不加密的 DNS 协议，用于局域网客户端
 - 支持 IPv4 + IPv6 双栈
 - 默认关闭，需在配置中手动开启
+- TCP 支持用于 nginx stream DoT 反代转发
 """
 
 import asyncio
 import logging
 import time
+import struct
 from typing import Optional, Dict, Tuple
 
 import dns.message
@@ -32,7 +34,7 @@ MAX_UDP_SIZE = 1232
 
 
 class PlainDNSServer:
-    """纯 DNS 服务器（UDP 53 端口，默认关闭）"""
+    """纯 DNS 服务器（UDP 53 + TCP 53 端口，默认关闭）"""
 
     def __init__(
         self,
@@ -56,8 +58,12 @@ class PlainDNSServer:
         self.ipv6_enabled = config.plain_dns_ipv6_enabled
         self.ipv6_host = config.plain_dns_ipv6_host
 
+        # UDP transport
         self._transport_v4: Optional[asyncio.DatagramTransport] = None
         self._transport_v6: Optional[asyncio.DatagramTransport] = None
+        # TCP server
+        self._tcp_server_v4: Optional[asyncio.AbstractServer] = None
+        self._tcp_server_v6: Optional[asyncio.AbstractServer] = None
         self._running = False
         self._concurrency_semaphore = asyncio.Semaphore(config.max_concurrent)
 
@@ -118,19 +124,83 @@ class PlainDNSServer:
     async def _do_process_query(self, data: bytes, addr: tuple,
                                  transport: Optional[asyncio.DatagramTransport],
                                  client_ip: str):
-        """DNS 查询处理核心逻辑"""
+        """DNS 查询处理核心逻辑（UDP 版：发送响应后返回 None）"""
+        result = await self._resolve_and_respond(data, addr, client_ip)
+        if result is not None:
+            self._send_raw_response(result, addr, transport)
+
+    # ======================== TCP 协议 ========================
+
+    async def _handle_tcp_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        """处理 TCP DNS 查询（RFC 1035 §4.2.2：2 字节长度前缀 + DNS 消息）"""
+        peer = writer.get_extra_info('peername')
+        client_ip = peer[0] if peer else "unknown"
+        try:
+            while True:
+                # 读取 2 字节长度前缀（带 30s 超时防慢速 Loris 攻击）
+                length_bytes = await asyncio.wait_for(
+                    reader.readexactly(2), timeout=30.0
+                )
+                length = struct.unpack('!H', length_bytes)[0]
+                if length == 0:
+                    break
+                if length < 12:
+                    logger.warning("TCP DNS 消息长度 %d 过短（最小 12）", length)
+                    break
+                data = await asyncio.wait_for(
+                    reader.readexactly(length), timeout=30.0
+                )
+
+                # 并发控制 + 限速（复用 UDP 的 _process_query 逻辑，但改为 TCP 发送）
+                if not self._is_localhost(client_ip):
+                    sem = await self._get_per_ip_semaphore(client_ip)
+                    async with sem:
+                        async with self._concurrency_semaphore:
+                            result_wire = await self._resolve_and_respond(data, peer, client_ip)
+                else:
+                    async with self._concurrency_semaphore:
+                        result_wire = await self._resolve_and_respond(data, peer, client_ip)
+
+                if result_wire:
+                    # TCP DNS 响应：2 字节长度前缀 + DNS 消息
+                    writer.write(struct.pack('!H', len(result_wire)) + result_wire)
+                    await writer.drain()
+        except asyncio.TimeoutError:
+            logger.debug("TCP DNS 读取超时，关闭连接")
+        except asyncio.IncompleteReadError:
+            pass
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.debug("TCP DNS 连接异常: %s", e)
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    # ======================== 核心解析逻辑（UDP/TCP 共用） ========================
+
+    async def _resolve_and_respond(self, data: bytes, addr: tuple,
+                                    client_ip: str) -> Optional[bytes]:
+        """
+        DNS 查询解析核心逻辑。
+        返回响应 wire bytes（发送由调用方决定）。
+        返回 None 表示不需要发送响应（例如空查询）。
+        """
         qname = ""
         qtype_str = ""
         status = "ok"
         block_reason = ""
+        result_wire: Optional[bytes] = None
         start_time = asyncio.get_event_loop().time()
 
         try:
             # 解析 DNS 查询
             query = dns.message.from_wire(data)
             if not query.question:
-                self._send_raw_response(b"", addr, transport)
-                return
+                return b""
 
             question = query.question[0]
             qname = str(question.name).rstrip(".")
@@ -166,10 +236,10 @@ class PlainDNSServer:
                     response.set_rcode(dns.rcode.NOERROR)
                     if self.config.cache_enabled:
                         await self.cache.set(cache_key, response)
-                    self._send_raw_response(response.to_wire(), addr, transport)
+                    result_wire = response.to_wire()
                     elapsed = asyncio.get_event_loop().time() - start_time
                     await self._log_query(client_ip, qname, qtype_str, elapsed, "custom_hosts", "")
-                    return
+                    return result_wire
 
             # 1. 检查域名过滤
             if self.config.filter_enabled:
@@ -177,13 +247,12 @@ class PlainDNSServer:
                 if blocked:
                     block_reason = reason
                     status = "blocked"
-                    # 像 AdGuard 一样重写 IP：A → 0.0.0.0，AAAA → ::，其他类型 → NXDOMAIN
                     response = dns.message.make_response(query)
                     if question.rdtype == dns.rdatatype.A:
                         response.answer.append(
                             dns.rrset.RRset(question.name, question.rdclass, dns.rdatatype.A)
                         )
-                        response.answer[0].add(dns.rdtypes.IN.A.A(dns.rdataclass.IN, dns.rdatatype.A, "0.0.0.0"), ttl=3600)  # nosec B104 - blocked A record, not binding
+                        response.answer[0].add(dns.rdtypes.IN.A.A(dns.rdataclass.IN, dns.rdatatype.A, "0.0.0.0"), ttl=3600)  # nosec B104
                         response.set_rcode(dns.rcode.NOERROR)
                     elif question.rdtype == dns.rdatatype.AAAA:
                         response.answer.append(
@@ -193,33 +262,32 @@ class PlainDNSServer:
                         response.set_rcode(dns.rcode.NOERROR)
                     else:
                         response.set_rcode(dns.rcode.NXDOMAIN)
-                    # 缓存拦截结果
                     if self.config.cache_enabled:
                         await self.cache.set(cache_key, response)
-                    self._send_raw_response(response.to_wire(), addr, transport)
+                    result_wire = response.to_wire()
                     elapsed = asyncio.get_event_loop().time() - start_time
                     await self._log_query(client_ip, qname, qtype_str, elapsed, status, block_reason)
-                    return
+                    return result_wire
 
             # 2. 检查缓存
             if self.config.cache_enabled:
                 cached = await self.cache.get(cache_key)
                 if cached is not None:
-                    self._send_raw_response(cached.to_wire(), addr, transport)
+                    cached.id = query.id  # 修复DNS ID不匹配
+                    result_wire = cached.to_wire()
                     elapsed = asyncio.get_event_loop().time() - start_time
                     await self._log_query(
                         client_ip, qname, qtype_str, elapsed, "cached", ""
                     )
-                    return
+                    return result_wire
 
             # 3. 上游并行查询
             result_wire = await self.resolver_manager.resolve(data)
 
             if result_wire is None:
-                # 所有上游失败
                 response = dns.message.make_response(query)
                 response.set_rcode(dns.rcode.SERVFAIL)
-                self._send_raw_response(response.to_wire(), addr, transport)
+                result_wire = response.to_wire()
                 status = "error"
             else:
                 # DNSSEC 验证
@@ -230,17 +298,15 @@ class PlainDNSServer:
                     if not dnssec_ok and self.config.dnssec_drop_bogus:
                         response = dns.message.make_response(query)
                         response.set_rcode(dns.rcode.SERVFAIL)
-                        self._send_raw_response(response.to_wire(), addr, transport)
+                        result_wire = response.to_wire()
                         status = "dnssec_bogus"
                     else:
-                        self._send_raw_response(result_wire, addr, transport)
                         status = "resolved"
                 else:
-                    self._send_raw_response(result_wire, addr, transport)
                     status = "resolved"
 
                 # 缓存结果
-                if self.config.cache_enabled and status == "resolved":
+                if self.config.cache_enabled and status == "resolved" and result_wire is not None:
                     try:
                         response_msg = dns.message.from_wire(result_wire)
                         is_negative = response_msg.rcode() in (
@@ -253,15 +319,20 @@ class PlainDNSServer:
 
             elapsed = asyncio.get_event_loop().time() - start_time
             await self._log_query(client_ip, qname, qtype_str, elapsed, status, block_reason)
+            return result_wire
 
         except dns.exception.DNSException as e:
             logger.debug("DNS 解析错误: %s", e)
+            return None
         except Exception as e:
             logger.error("处理 DNS 查询异常: %s", e)
+            return None
 
     def _send_raw_response(self, data: bytes, addr: tuple,
                             transport: Optional[asyncio.DatagramTransport] = None):
-        """发送 DNS 响应"""
+        """发送 UDP DNS 响应"""
+        if not data:
+            return
         t = transport or self._transport_v4 or self._transport_v6
         if t is None or t.is_closing():
             return
@@ -288,24 +359,24 @@ class PlainDNSServer:
     # ======================== 启动 / 停止 ========================
 
     async def start(self):
-        """启动 DNS 服务器（UDP 53，默认关闭）"""
+        """启动 DNS 服务器（UDP 53 + TCP 53，默认关闭）"""
         if not self.enabled:
-            logger.info("普通 DNS 服务器 (UDP 53) 已关闭（可在配置中启用）")
+            logger.info("普通 DNS 服务器 (UDP/TCP 53) 已关闭（可在配置中启用）")
             return
 
         loop = asyncio.get_running_loop()
 
+        # ---------- UDP ----------
         try:
             transport_v4, protocol_v4 = await loop.create_datagram_endpoint(
                 lambda: self._DnsProtocol(self),
                 local_addr=(self.host, self.port),
             )
             self._transport_v4 = transport_v4
-            logger.info("普通 DNS [IPv4] udp://%s:%d", self.host, self.port)
+            logger.info("普通 DNS [UDP IPv4] udp://%s:%d", self.host, self.port)
         except OSError as e:
-            logger.warning("普通 DNS [IPv4] 启动失败: %s", e)
+            logger.warning("普通 DNS [UDP IPv4] 启动失败: %s", e)
 
-        # IPv6
         if self.ipv6_enabled:
             try:
                 transport_v6, protocol_v6 = await loop.create_datagram_endpoint(
@@ -313,9 +384,27 @@ class PlainDNSServer:
                     local_addr=(self.ipv6_host, self.port),
                 )
                 self._transport_v6 = transport_v6
-                logger.info("普通 DNS [IPv6] udp://[%s]:%d", self.ipv6_host, self.port)
+                logger.info("普通 DNS [UDP IPv6] udp://[%s]:%d", self.ipv6_host, self.port)
             except OSError as e:
-                logger.warning("普通 DNS [IPv6] 启动失败: %s", e)
+                logger.warning("普通 DNS [UDP IPv6] 启动失败: %s", e)
+
+        # ---------- TCP ----------
+        try:
+            self._tcp_server_v4 = await asyncio.start_server(
+                self._handle_tcp_connection, self.host, self.port
+            )
+            logger.info("普通 DNS [TCP IPv4] tcp://%s:%d", self.host, self.port)
+        except OSError as e:
+            logger.warning("普通 DNS [TCP IPv4] 启动失败: %s", e)
+
+        if self.ipv6_enabled:
+            try:
+                self._tcp_server_v6 = await asyncio.start_server(
+                    self._handle_tcp_connection, self.ipv6_host, self.port
+                )
+                logger.info("普通 DNS [TCP IPv6] tcp://[%s]:%d", self.ipv6_host, self.port)
+            except OSError as e:
+                logger.warning("普通 DNS [TCP IPv6] 启动失败: %s", e)
 
         self._running = True
 
@@ -323,7 +412,7 @@ class PlainDNSServer:
         self._ip_semaphore_task = asyncio.create_task(self._cleanup_stale_per_ip_semaphores())
 
     async def stop(self):
-        """停止 DNS 服务器"""
+        """停止 DNS 服务器（UDP + TCP）"""
         self._running = False
         if self._ip_semaphore_task:
             self._ip_semaphore_task.cancel()
@@ -332,6 +421,8 @@ class PlainDNSServer:
             except asyncio.CancelledError:
                 pass
             self._ip_semaphore_task = None
+
+        # 关闭 UDP transport
         for transport in [self._transport_v4, self._transport_v6]:
             if transport and not transport.is_closing():
                 try:
@@ -340,6 +431,18 @@ class PlainDNSServer:
                     logger.debug("Plain DNS 传输关闭异常: %s", e)
         self._transport_v4 = None
         self._transport_v6 = None
+
+        # 关闭 TCP server
+        for tcp_server in [self._tcp_server_v4, self._tcp_server_v6]:
+            if tcp_server:
+                try:
+                    tcp_server.close()
+                    await tcp_server.wait_closed()
+                except Exception as e:
+                    logger.debug("Plain DNS TCP server 关闭异常: %s", e)
+        self._tcp_server_v4 = None
+        self._tcp_server_v6 = None
+
         logger.info("普通 DNS 服务器已停止")
 
     async def restart(self):

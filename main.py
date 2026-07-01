@@ -335,6 +335,11 @@ class DNSProxyApp:
             self.request_logger,
             dnssec_wrapper=self._dnssec_wrapper,
         )
+        if self.config.doh_enabled:
+            logger.info("  本地 DoH 服务器已启用（https://%s:%s%s）",
+                        self.config.doh_host, self.config.doh_port, self.config.doh_path)
+        else:
+            logger.info("  本地 DoH 服务器已禁用（可在配置中启用）")
 
         # 9. 本地 DoT 服务器
         logger.info("[9/11] 初始化本地 DoT 服务器...")
@@ -666,7 +671,8 @@ class DNSProxyApp:
             await self._filter_reload_task
 
         # 启动 DoH 服务器（IPv4 + IPv6）
-        await self.doh_server.start()
+        if self.config.doh_enabled:
+            await self.doh_server.start()
 
         # 启动本地 DoT 服务器
         if self.config.local_dot_enabled:
@@ -686,7 +692,8 @@ class DNSProxyApp:
         if self.network_monitor and hasattr(self.network_monitor, '_arp_protection'):
             ap = self.network_monitor._arp_protection
             if ap.enabled:
-                ap.register_restart_hook(self.doh_server.restart)
+                if self.config.doh_enabled:
+                    ap.register_restart_hook(self.doh_server.restart)
                 if self.config.local_dot_enabled:
                     ap.register_restart_hook(self.local_dot_server.restart)
                 if self.config.local_doq_enabled:
@@ -841,19 +848,13 @@ async def main_async(config_path: Optional[str] = None):
             stop_event.set()
 
         # 注册信号处理（Windows 上有限支持）
-        try:
-            loop = asyncio.get_running_loop()
-            if sys.platform != "win32":
-                for sig in (signal.SIGINT, signal.SIGTERM):
-                    loop.add_signal_handler(sig, signal_handler)
-            else:
-                # Windows 上使用 asyncio 的事件处理
-                def win_signal_handler():
-                    signal_handler()
-                loop.add_signal_handler(signal.SIGINT, win_signal_handler)
-                loop.add_signal_handler(signal.SIGTERM, win_signal_handler)
-        except NotImplementedError:
-            pass
+        # 注意: 分别 try/except 防止 SIGTERM 失败导致 SIGINT 也失效
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, signal_handler)
+            except NotImplementedError:
+                logger.debug("信号 %s 在当前平台不支持，跳过注册", sig)
 
         await stop_event.wait()
 
