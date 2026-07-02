@@ -3,6 +3,7 @@ title dnscrypt-proxy
 
 set EXE_PATH=%~dp0main.exe
 set TASK_NAME=dnscrypt-proxy
+set PYTHONMALLOC=mimalloc
 
 :menu
 cls
