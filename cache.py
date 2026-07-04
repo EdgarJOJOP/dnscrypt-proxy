@@ -31,8 +31,36 @@ MAX_CACHED_WIRE_SIZE = 8 * 1024
 
 # ======================== 查询模板缓存 ========================
 # 预构建常见 DNS 查询的 wire_bytes，避免每次 make_query() 重建对象
+# 使用 functools.lru_cache 实现有界缓存 + LRU 淘汰：
+#   - 内存始终 <= 512 条目 -> 攻击下内存有界
+#   - 使用原始 (str, int, bool) 作为键 -> 无 hash 碰撞风险
+#   - LRU 自动淘汰冷条目 -> 热域名长期保留，冷域名释放
 
-_query_template_cache: Dict[Tuple[str, int, bool], bytes] = {}
+
+@lru_cache(maxsize=512)
+def _cached_get_query_wire(qname: str, rdtype: int, want_dnssec: bool) -> bytes:
+    """带 LRU 缓存的查询 wire bytes 构建（内部函数）。
+
+    使用 functools.lru_cache 而非手写 Dict，原因：
+    - 自动 LRU 淘汰：攻击场景下旧条目自动释放，内存有界
+    - 正确的键语义：不存在 hash 碰撞风险
+    - 冷域名字符串随 LRU 淘汰自动 GC
+
+    Args:
+        qname: 已 lower() 的域名
+        rdtype: DNS 记录类型
+        want_dnssec: 是否请求 DNSSEC
+    Returns:
+        wire bytes 或空 bytes（异常时）
+    """
+    try:
+        name = dns.name.from_text(qname)
+        msg = dns.message.make_query(name, rdtype, 1, want_dnssec=want_dnssec)
+        wire = msg.to_wire()
+        return wire
+    except (UnicodeError, ValueError) as e:
+        logger.warning("get_query_wire: 跳过非法域名 '%s' (%s)", qname, e)
+        return b""
 
 
 def get_query_wire(qname: str, rdtype: int, rdclass: int = 1,
@@ -40,46 +68,29 @@ def get_query_wire(qname: str, rdtype: int, rdclass: int = 1,
     """
     获取预构建的 DNS 查询 wire bytes。
     缓存常见查询（A/AAAA/TXT/HTTPS 等类型），避免反复 make_query() + to_wire()。
+
+    缓存策略：
+    - lru_cache(maxsize=512)：内存始终有界
+    - LRU 淘汰：热域名命中率高，冷域名自动释放
+
     抛出 UnicodeError 时返回空 bytes，由调用者处理。
     """
-    key = (qname.lower(), rdtype, want_dnssec)
-    cached = _query_template_cache.get(key)
-    if cached is not None:
-        return cached
-
-    try:
-        name = dns.name.from_text(qname)
-        msg = dns.message.make_query(name, rdtype, rdclass, want_dnssec=want_dnssec)
-        wire = msg.to_wire()
-    except (UnicodeError, ValueError) as e:
-        logger.warning("get_query_wire: 跳过非法域名 '%s' (%s)", qname, e)
-        return b""
-    # 仅缓存有限数量（常见域名查询可复用，极端域名不计）
-    if len(_query_template_cache) < 512:
-        _query_template_cache[key] = wire
-    return wire
+    return _cached_get_query_wire(qname.lower(), rdtype, want_dnssec)
 
 
 def clear_query_cache():
     """清空查询模板缓存（配置变更时调用）"""
-    _query_template_cache.clear()
+    _cached_get_query_wire.cache_clear()
 
 
 def evict_cold_query_templates():
-    """保留最近 256 条查询模板，其余清空重建。
+    """清理冷查询模板缓存。
 
-    查询模板缓存是 Dict[Tuple, bytes]，key 是包含 str 的 tuple。
-    长时间运行后积累大量冷模板，散布在 pymalloc arena 中。
-    定期重建可让活跃模板聚集在更少 arena 中。
+    lru_cache 已自动处理 LRU 淘汰，此函数保留以兼容 optimizer.py 调用。
+    全量清空后在下次 rebuild 后给缓存一个干净起点。
     """
-    if len(_query_template_cache) <= 256:
-        return
-    items = list(_query_template_cache.items())
-    _query_template_cache.clear()
-    # 保留后半部分（最近添加的条目）
-    for k, v in items[-256:]:
-        _query_template_cache[k] = v
-    logger.debug("查询模板缓存重建: %d -> %d", len(items), len(_query_template_cache))
+    _cached_get_query_wire.cache_clear()
+    logger.debug("查询模板缓存已全量清空 (lru_cache maxsize=512)")
 
 
 class CacheEntry:
@@ -136,12 +147,38 @@ class CacheEntry:
         """
         获取已调整 TTL 的响应（浅拷贝 + TTL 覆写，避免 from_wire 全量反序列化）。
         通过 self.response_msg property 获取 Message（必要时从 wire 惰性水合）。
+
+        ★ 修复 P3: 剩余 TTL >= 95% 原始 TTL 时走轻量路径，跳过逐段深拷贝
         """
         elapsed = time.time() - self.created_at
         remaining = max(1, int(self.ttl - elapsed))
 
         # 通过 property 获取 Message（惰性水合），然后浅拷贝
         msg = self.response_msg
+
+        # ★ P3: 剩余 TTL >= 95% → 轻量路径（只改第一个 answer 的 TTL）
+        if remaining >= self.ttl * 0.95:
+            response = copy.copy(msg)
+            response.answer = list(msg.answer)
+            if response.answer:
+                # 只覆写第一个 rrset 的 TTL（避免全量深拷贝）
+                first_rrset = response.answer[0]
+                new_rrset = dns.rrset.RRset(
+                    first_rrset.name, first_rrset.rdclass, first_rrset.rdtype,
+                    first_rrset.covers,
+                )
+                for rd in first_rrset:
+                    new_rd = copy.copy(rd)
+                    if hasattr(new_rd, "ttl"):
+                        new_rd.ttl = remaining
+                    new_rrset.add(new_rd)
+                response.answer[0] = new_rrset
+            # authority 和 additional 直接用原引用
+            response.authority = list(msg.authority)
+            response.additional = list(msg.additional)
+            return response
+
+        # ===== 完整深拷贝路径（TTL 偏差 > 5%） =====
         response = copy.copy(msg)
         response.answer = list(msg.answer)
         # 为每个 RRset 创建新实例以安全修改 TTL
@@ -226,6 +263,9 @@ class DNSCache:
         self._current_epoch: int = 0          # 当前活跃世代编号
         self._epoch_stats: Dict[int, int] = {}  # epoch -> 存活条目数
 
+        # ===== ★ 修复 P1: 插入计数器（用于 defrag 触发） =====
+        self._insert_count: int = 0            # 自上次 defrag/重置以来的插入次数
+
     def _bump_epoch(self):
         """递增世代编号（在 rebuild 时调用），标记 arena 代际边界"""
         self._current_epoch += 1
@@ -295,6 +335,8 @@ class DNSCache:
 
             self._cache[key] = entry
             self._stats["size"] = len(self._cache)
+            # ★ P1: 记录一次插入（用于 defrag 触发计数）
+            self._insert_count += 1
 
     def _calculate_ttl(self, response: dns.message.Message) -> int:
         """从 DNS 响应中计算合适 TTL"""
@@ -383,18 +425,35 @@ class DNSCache:
             return dropped
 
     async def compact_messages(self, ratio: float = 0.3) -> int:
-        """智能丢弃低命中率条目的 Message 对象。
+        """★ 修复 P2: 智能丢弃最低命中率条目的 Message 对象。
 
-        当前简化实现：丢弃未被访问次数最多的条目。
-        完整版本可追踪 _hit_count。
-
-        Args:
-            ratio: 丢弃比例
-        Returns:
-            实际丢弃的条目数
+        利用 _hit_count 追踪，丢弃缓存中命中率最低的 N% 条目的
+        Message 加速缓存（保留 wire bytes）。
         """
-        # 复用 drop_messages_lru 的逻辑
-        return await self.drop_messages_lru(ratio)
+        async with self._lock:
+            if not self._cache:
+                return 0
+            target = max(1, int(len(self._cache) * ratio))
+            # 按命中次数升序排序（最低命中的在前）
+            sorted_by_hits = sorted(
+                self._cache.items(),
+                key=lambda item: item[1]._hit_count,
+            )
+            dropped = 0
+            for key, entry in sorted_by_hits[:target]:
+                if entry.has_message():
+                    entry.drop_message()
+                    dropped += 1
+            if dropped:
+                logger.debug("★ 智能丢弃 %d 个低命中率条目的 Message 对象 (按 _hit_count)", dropped)
+            return dropped
+
+    # ★ P1: 插入计数器读取/重置方法
+    def get_and_reset_insert_count(self) -> int:
+        """读取并重置插入计数器（asyncio 单线程下 int 赋值原子）。"""
+        count = self._insert_count
+        self._insert_count = 0
+        return count
 
     async def rebuild(self) -> int:
         """全量撤离+重建 — TLB 友好分配版本
@@ -409,7 +468,7 @@ class DNSCache:
         3. 释放锁：4 轮全量 GC → 让旧 arena 变成 fully-free → munmap
         4. 重新持有锁：TLB 批量分配所有新 CacheEntry（无 Message 对象）
         5. 新条目标记为新世代，初始 _hit_count = 0
-
+           ★ 不覆盖 GC 期间其他协程写入的新数据
         Returns:
             幸存条目数
         """
@@ -441,6 +500,9 @@ class DNSCache:
             # 按 wire 大小升序回填：同大小 wire 连续分配，减少堆碎片
             items.sort(key=lambda x: len(x[1]))
             for key, wire, ttl, created_at in items:
+                # ★ 修复 P0: 不覆盖锁外 GC 期间其他协程写入的新数据
+                if key in self._cache:
+                    continue
                 # 通过 __new__ + 手动赋值（TLB 友好：无额外对象分配）
                 entry = CacheEntry.__new__(CacheEntry)
                 entry._wire = wire
@@ -449,19 +511,25 @@ class DNSCache:
                 entry.created_at = created_at
                 entry.epoch = new_epoch       # 标记新世代
                 entry._hit_count = 0          # 重置命中计数
-                if key not in self._cache:
-                    self._cache[key] = entry
-                    survived += 1
+                self._cache[key] = entry
+                survived += 1
 
             self._stats["size"] = len(self._cache)
             self._stats["evictions"] += old_count - survived
 
-        logger.info("缓存重建完成: 旧条目 %d -> 新世代 %d 幸存 %d (淘汰 %d 过期)",
-                    old_count, new_epoch, survived, old_count - survived)
+        logger.info("缓存重建完成: 旧条目 %d -> 新世代 %d 幸存 %d (淘汰 %d 过期, 跳过 %d 新写入)",
+                    old_count, new_epoch, survived, old_count - survived,
+                    len(items) - survived)
         return survived
 
     async def defrag(self) -> int:
-        """轻量碎片整理：仅重排条目顺序，跳过过期条目，不触发全量 GC"""
+        """碎片整理：重排条目 + 全代 GC
+
+        重排条目顺序使其在 pymalloc arena 中紧凑排列，
+        self._cache.clear() 触发引用计数释放老 CacheEntry，
+        其 pymalloc pool 变为 fully-free 后被 munmap。
+        然后执行 gc.collect(2) 作为安全网，确保循环引用也被清理。
+        """
         async with self._lock:
             if not self._cache:
                 return 0
@@ -481,8 +549,17 @@ class DNSCache:
                 entry._hit_count = hit_count
                 self._cache[key] = entry
             self._stats["size"] = len(self._cache)
-            logger.debug("缓存轻量碎片整理完成，条目数: %d", len(self._cache))
-            return len(self._cache)
+
+        # ★ P2: 锁外执行 3 轮全代 GC — 确保所有旧 arena 变为 fully-free → munmap
+        #     多轮 GC 确保所有链式引用被彻底遍历（与 rebuild() 逻辑一致）
+        for _ in range(3):
+            gc.collect(generation=2)
+
+        # ★ P2: defrag 后重置插入计数器，下次 defrag 从干净起点开始计数
+        self._insert_count = 0
+
+        logger.debug("★ 缓存碎片整理完成，条目数: %d (3轮全代GC, 重置insert_count)", len(self._cache))
+        return len(self._cache)
 
     async def clear(self):
         """清空缓存"""

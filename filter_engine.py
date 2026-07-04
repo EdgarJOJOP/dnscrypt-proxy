@@ -1981,6 +1981,11 @@ class FilterEngine:
         logger.debug("Filter cache 撤离重建: %d -> %d (priority=%d, active=%d)",
                      old_count, len(self._filter_cache), len(priority_items), len(active_items))
 
+        # ★ GC 释放旧 _filter_cache 占用的 arena 碎片
+        #     清空旧 dict 后，大量 str key + tuple value 的引用已释放，
+        #     显式 GC 确保这些对象占用的 pymalloc pool 变为 fully-free → munmap
+        import gc as _gc
+        _gc.collect(generation=2)
 
 
     # ======================== 定时更新 ========================

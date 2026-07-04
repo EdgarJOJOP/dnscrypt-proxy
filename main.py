@@ -821,6 +821,14 @@ async def main_async(config_path: Optional[str] = None):
     logger_root = setup_logging(max_log_size_mb=100)
     logger = logger_root  # 给异常处理器等使用
 
+    # 记录 PYTHONMALLOC 分配器状态（用户设置 PYTHONMALLOC=mimalloc 时验证生效）
+    _pymalloc = os.environ.get("PYTHONMALLOC", "")
+    if _pymalloc:
+        logger.info("PYTHONMALLOC=%s — 内存分配器: %s", _pymalloc,
+                     "mimalloc" if "mimalloc" in _pymalloc.lower() else _pymalloc)
+    else:
+        logger.info("PYTHONMALLOC 未设置 (使用默认 pymalloc)")
+
     app = DNSProxyApp(config_path)
 
     # 用配置文件中的 max_log_size 更新文件日志处理器
