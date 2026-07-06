@@ -28,6 +28,7 @@ import logging
 import time
 from pathlib import Path
 from typing import Optional, List
+import subprocess
 
 import dns.message
 import dns.rdatatype
@@ -715,6 +716,7 @@ class DNSProxyApp:
             async def _on_filter_update(rules_count):
                 await self._sweep_cache_after_filter_load()
             self.filter_engine.on_update(lambda count: asyncio.create_task(_on_filter_update(count)))
+            self.filter_engine.on_restart(self._trigger_restart)
 
             await self.filter_engine.start_auto_update(
                 interval_hours=self.config.filter_update_interval,
@@ -763,6 +765,15 @@ class DNSProxyApp:
         logger.info("  - 过滤规则:   %d 条", self.filter_engine.stats["total_rules"] if self.config.filter_enabled else 0)
         logger.info("=" * 60)
 
+    def _trigger_restart(self, best_hour):
+        logger = logging.getLogger("dns-proxy.app")
+        logger.info("Triggering restart at hour %d", best_hour)
+        try:
+            subprocess.Popen([sys.executable]+sys.argv,close_fds=True)
+        except Exception as e:
+            logger.error("Restart failed: %s",e)
+            return
+        os._exit(0)
     async def stop(self):
         """优雅关闭所有服务"""
         logger = logging.getLogger("dns-proxy.app")

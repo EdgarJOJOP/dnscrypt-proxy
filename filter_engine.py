@@ -28,6 +28,7 @@ from urllib.parse import urlparse
 import aiohttp
 import socket
 import concurrent.futures
+import gc
 import dns.message
 import dns.rdatatype
 import dns.rdataclass
@@ -216,11 +217,190 @@ class AdGuardRuleParser:
         return cleaned_text, result
 
 
+# =============================================================================
+# ★ OPTIMIZATION Phase 1: 紧凑域名规则匹配
+# ★ 对简单域名规则（||domain^、裸域名、hosts格式）使用字符串匹配而非正则
+# =============================================================================
+
+# 紧凑规则类型常量（DomainTrie 用）
+_RT_NONE = 0
+_RT_BLOCK_EXACT = 1       # 精确域名拦截
+_RT_BLOCK_SUBDOMAIN = 2   # ||domain^ 子域名拦截
+_RT_ALLOW_EXACT = 3       # 精确白名单
+_RT_ALLOW_SUBDOMAIN = 4   # @@||domain^ 子域名白名单
+_RT_IMPORTANT_EXACT = 5   # 重要规则精确
+_RT_IMPORTANT_SUBDOMAIN = 6  # 重要规则子域名
+
+
+class _DomainTrieNode:
+    """域名 Trie 节点 — 紧凑存储，无正则编译"""
+    __slots__ = ('children', 'rule_type', 'dnsrewrite', 'raw_short')
+
+    def __init__(self):
+        # ★ 惰性初始化：不预先分配空 dict，叶子节点永远不需要 children
+        self.children = None  # type: Optional[Dict[str, '_DomainTrieNode']]
+        self.rule_type: int = _RT_NONE
+        self.dnsrewrite: Optional[dict] = None
+        self.raw_short: str = ""
+
+
+class _DomainTrie:
+    """
+    域名 Trie 索引 — 反向标签索引。
+    
+    为 95% 以上的简单域名规则提供紧凑存储和快速匹配，
+    避免创建 FilterRule 对象和编译正则表达式。
+    """
+
+    __slots__ = ('_root', '_count', '_domain_count')
+
+    def __init__(self):
+        self._root = _DomainTrieNode()
+        self._count = 0
+        self._domain_count = 0
+
+    def add(self, domain: str, rule_type: int, dnsrewrite: Optional[dict] = None,
+            raw_short: str = "") -> bool:
+        """添加域名规则到 Trie"""
+        labels = domain.lower().rstrip('.').split('.')[::-1]
+        node = self._root
+        for label in labels:
+            if node.children is None:
+                node.children = {}
+            if label not in node.children:
+                node.children[label] = _DomainTrieNode()
+            node = node.children[label]
+
+        is_new_domain = (node.rule_type == _RT_NONE)
+
+        # 合并规则类型：同一域名可能有多条规则，保留最高优先级
+        if rule_type in (_RT_IMPORTANT_EXACT, _RT_IMPORTANT_SUBDOMAIN):
+            node.rule_type = rule_type
+        elif rule_type in (_RT_BLOCK_EXACT, _RT_BLOCK_SUBDOMAIN):
+            if node.rule_type not in (_RT_IMPORTANT_EXACT, _RT_IMPORTANT_SUBDOMAIN):
+                node.rule_type = rule_type
+        elif rule_type in (_RT_ALLOW_EXACT, _RT_ALLOW_SUBDOMAIN):
+            if node.rule_type == _RT_NONE:
+                node.rule_type = rule_type
+
+        if dnsrewrite:
+            node.dnsrewrite = dnsrewrite
+        if raw_short and not node.raw_short:
+            node.raw_short = raw_short
+
+        self._count += 1
+        if is_new_domain:
+            self._domain_count += 1
+        return is_new_domain
+
+    def match(self, domain: str) -> Optional[Tuple[Optional['_MatchInfo'], str]]:
+        """
+        匹配域名，返回 (_MatchInfo, 匹配方式)。
+        按精确域名 → 父域名链匹配。
+        """
+        labels = domain.lower().rstrip('.').split('.')[::-1]
+        if not labels or not labels[0]:
+            return None
+
+        node = self._root
+        matched = None
+
+        for i, label in enumerate(labels):
+            if node.children is not None and label in node.children:
+                node = node.children[label]
+                if node.rule_type != _RT_NONE:
+                    if i == len(labels) - 1:
+                        # 精确到完整域名
+                        matched = (node, i + 1)
+                    elif node.rule_type in (_RT_BLOCK_SUBDOMAIN, _RT_ALLOW_SUBDOMAIN,
+                                            _RT_IMPORTANT_SUBDOMAIN):
+                        matched = (node, i + 1)
+            else:
+                break
+
+        if matched is not None:
+            matched_node, depth = matched
+            matched_domain = '.'.join(labels[:depth][::-1])
+            return (_MatchInfo(matched_node), f"域名匹配 ({matched_domain})")
+
+        return None
+
+    def has_domain(self, domain: str) -> bool:
+        """域名是否在索引中（快速检查）"""
+        labels = domain.lower().rstrip('.').split('.')[::-1]
+        node = self._root
+        for label in labels:
+            if node.children is not None and label in node.children:
+                node = node.children[label]
+                if node.rule_type != _RT_NONE:
+                    return True
+            else:
+                return False
+        return node.rule_type != _RT_NONE
+
+    def clear(self):
+        self._root = _DomainTrieNode()
+        self._count = 0
+        self._domain_count = 0
+
+    @property
+    def count(self) -> int:
+        return self._count
+
+    @property
+    def domain_count(self) -> int:
+        return self._domain_count
+
+
+class _MatchInfo:
+    """
+    匹配结果信息 — 轻量替代 FilterRule。
+    由 DomainTrie.match() 返回，兼容 FilterRule 的接口子集。
+    """
+    __slots__ = ('_node',)
+
+    def __init__(self, node: _DomainTrieNode):
+        self._node = node
+
+    @property
+    def is_important(self) -> bool:
+        return self._node.rule_type in (_RT_IMPORTANT_EXACT, _RT_IMPORTANT_SUBDOMAIN)
+
+    @property
+    def is_exception(self) -> bool:
+        return self._node.rule_type in (_RT_ALLOW_EXACT, _RT_ALLOW_SUBDOMAIN)
+
+    @property
+    def dnsrewrite(self) -> Optional[dict]:
+        return self._node.dnsrewrite
+
+    @property
+    def raw(self) -> str:
+        if self._node.raw_short:
+            return self._node.raw_short
+        rt = self._node.rule_type
+        if rt == _RT_BLOCK_EXACT:
+            return "compact:block"
+        elif rt == _RT_BLOCK_SUBDOMAIN:
+            return "compact:block+sub"
+        elif rt == _RT_ALLOW_EXACT:
+            return "compact:allow"
+        elif rt == _RT_ALLOW_SUBDOMAIN:
+            return "compact:allow+sub"
+        elif rt == _RT_IMPORTANT_EXACT:
+            return "compact:important"
+        elif rt == _RT_IMPORTANT_SUBDOMAIN:
+            return "compact:important+sub"
+        return "compact:unknown"
+
+
 class FilterRule:
     """单条过滤规则（编译后的匹配规则）"""
 
     __slots__ = ("pattern", "is_exception", "is_important", "is_regex", "raw", "_skip",
-                 "is_badfilter", "dnsrewrite")
+                 "is_badfilter", "dnsrewrite",
+                 # ★ Phase 1: 紧凑匹配字段
+                 "_simple_match", "_simple_domain", "_match_subdomains")
 
     def __init__(self, rule_text: str):
         self.raw = rule_text
@@ -231,6 +411,10 @@ class FilterRule:
         self._skip = False
         self.is_badfilter = False
         self.dnsrewrite = None
+        # ★ Phase 1: 紧凑匹配初始化
+        self._simple_match = False
+        self._simple_domain = ""
+        self._match_subdomains = False
 
         self._parse()
 
@@ -404,11 +588,19 @@ class FilterRule:
         except re.error:
             return None
 
+    def _set_simple_match(self, clean_domain: str, match_subdomains: bool):
+        """
+        ★ Phase 1: 设置为紧凑匹配模式（不编译正则）。
+        clean_domain: 清理后的域名（小写，无 ||^ 等前缀）
+        match_subdomains: 是否匹配子域名 ||domain^
+        """
+        self._simple_match = True
+        self._simple_domain = clean_domain.lower().rstrip('.')
+        self._match_subdomains = match_subdomains
+        self.pattern = None  # 不编译正则
+        self.is_regex = False
+
     def _parse(self):
-        """
-        解析 AdGuard 规则语法（官方规范实现）
-        参见: https://adguard.com/kb/general/ad-filtering/create-own-filters/
-        """
         text = self.raw.strip()
 
         if not text:
@@ -510,6 +702,10 @@ class FilterRule:
                     if parsed.path and parsed.path not in ("/", ""):
                         self._skip = True
                         return
+                    # ★ Phase 1: 简单域名 → 紧凑匹配（无需正则）
+                    if '*' not in domain and domain.count('.') >= 1:
+                        self._set_simple_match(domain, False)
+                        return
                     self.pattern = self._pattern_to_regex(domain, match_subdomains=False)
                     if self.pattern:
                         self.is_regex = True
@@ -529,6 +725,10 @@ class FilterRule:
                     # 含路径的 URL 规则同上，DNS 级别无法评估路径
                     if parsed.path and parsed.path not in ("/", ""):
                         self._skip = True
+                        return
+                    # ★ Phase 1: 简单域名 → 紧凑匹配（无需正则）
+                    if '*' not in domain and domain.count('.') >= 1:
+                        self._set_simple_match(domain, False)
                         return
                     self.pattern = self._pattern_to_regex(domain, match_subdomains=False)
                     if self.pattern:
@@ -553,6 +753,10 @@ class FilterRule:
             if domain.startswith("*."):
                 domain = domain[2:]
             if domain and "." in domain:
+                # ★ Phase 1: 不含通符且含点号 → 紧凑匹配
+                if '*' not in domain:
+                    self._set_simple_match(domain, True)
+                    return
                 self.pattern = self._pattern_to_regex(domain, match_subdomains=True)
                 if self.pattern:
                     self.is_regex = True
@@ -569,17 +773,25 @@ class FilterRule:
             if has_start_pipe and has_end_pipe:
                 # |exact.domain.com| — 精确匹配
                 domain = text[1:-1].rstrip("^")
+                # ★ Phase 1: 不含通配符且含点号 → 紧凑匹配
+                if '*' not in domain and '.' in domain:
+                    self._set_simple_match(domain, False)
+                    return
                 self.pattern = self._pattern_to_regex(domain, exact_start=True, exact_end=True)
             elif has_start_pipe and has_end_caret:
                 # |domain.com^ — 精确匹配（^ 标记域名结束）
                 domain = text[1:-1].rstrip("^")
+                # ★ Phase 1: 不含通配符且含点号 → 紧凑匹配
+                if '*' not in domain and '.' in domain:
+                    self._set_simple_match(domain, False)
+                    return
                 self.pattern = self._pattern_to_regex(domain, exact_start=True, exact_end=True)
             elif has_start_pipe:
-                # |example — 匹配以 example 开头的域名
+                # |example — 匹配以 example 开头的域名（前缀匹配，不能走紧凑路径）
                 domain = text[1:].rstrip("^")
                 self.pattern = self._pattern_to_regex(domain, exact_start=True)
             else:
-                # example.com| — 匹配以 example.com 结尾的域名
+                # example.com| — 匹配以 example.com 结尾的域名（后缀匹配，不能走紧凑路径）
                 domain = text[:-1].rstrip("^")
                 self.pattern = self._pattern_to_regex(domain, exact_end=True)
 
@@ -616,6 +828,10 @@ class FilterRule:
             # 纯通配符 * 会匹配所有域名，DNS 级别不应使用
             if clean == '*':
                 self._skip = True
+                return
+            # ★ Phase 1: 不含通配符且含点号 → 紧凑匹配（无需正则）
+            if "*" not in clean and "." in clean:
+                self._set_simple_match(clean, False)
                 return
             # 包含 * 通配符的普通域名
             if "*" in clean:
@@ -715,6 +931,15 @@ class FilterRule:
 
     def matches(self, domain: str) -> bool:
         """检查域名是否匹配此规则"""
+        # ★ Phase 1: 紧凑匹配路径（无需正则）
+        if self._simple_match:
+            if self._match_subdomains:
+                # ||domain.com 匹配 domain.com 和 sub.domain.com
+                return domain == self._simple_domain or domain.endswith('.' + self._simple_domain)
+            else:
+                # 精确匹配
+                return domain == self._simple_domain
+        # 正则匹配路径
         try:
             return bool(self.pattern.search(domain))
         except Exception:
@@ -726,71 +951,82 @@ class FilterRule:
 
 class DomainIndex:
     """
-    域名索引 — 按域名索引规则，支持父域名链查找。
-
-    类似 Go urlfilter 的 domain-based matching:
-    匹配 sub.example.com 时，按 sub.example.com → example.com → com 顺序查找。
+    域名索引 — 支持紧凑域名 Trie 和传统正则规则。
+    
+    ★ Phase 1+2: 简单域名规则存入 _trie（紧凑），复杂规则存入 _pattern_rules（正则）。
+    ★ Phase 2: 单规则域名直接用对象而非 List 包装。
     """
 
+    __slots__ = ('_trie', '_pattern_rules', '_count')
+
     def __init__(self):
-        # 域名 -> 规则列表（精确域名索引）
-        self._by_domain: Dict[str, List[FilterRule]] = {}
-        # 通配/无特定域名的规则（正则、前缀后缀等）
+        # ★ Phase 1: 紧凑 Trie 替代 _by_domain Dict
+        self._trie = _DomainTrie()
+        # 复杂正则/通配规则（无法用紧凑匹配的）
         self._pattern_rules: List[FilterRule] = []
-        # 已索引的域名集合（类似于 Go 的快速过滤）
-        self._domain_set: Set[str] = set()
         self._count = 0
 
     def add_rule(self, rule: FilterRule, index_domain: Optional[str]):
-        """向索引添加一条规则"""
-        if index_domain:
-            self._by_domain.setdefault(index_domain, []).append(rule)
-            self._domain_set.add(index_domain)
+        """
+        向索引添加一条规则。
+        
+        ★ Phase 1: 简单规则 → Trie；复杂规则 → _pattern_rules
+        """
+        if index_domain and rule._simple_match:
+            # 紧凑规则 → 存入 Trie
+            if rule.is_exception:
+                rt = _RT_ALLOW_SUBDOMAIN if rule._match_subdomains else _RT_ALLOW_EXACT
+            elif rule.is_important:
+                rt = _RT_IMPORTANT_SUBDOMAIN if rule._match_subdomains else _RT_IMPORTANT_EXACT
+            else:
+                rt = _RT_BLOCK_SUBDOMAIN if rule._match_subdomains else _RT_BLOCK_EXACT
+            self._trie.add(index_domain, rt, rule.dnsrewrite, rule.raw)
+        elif index_domain:
+            # 有域名但不能紧凑匹配（如含通配符）→ 需保留 FilterRule
+            self._pattern_rules.append(rule)
         else:
             self._pattern_rules.append(rule)
         self._count += 1
 
-    def match(self, domain: str) -> Optional[Tuple[FilterRule, str]]:
+    def match(self, domain: str) -> Optional[Tuple[object, str]]:
         """
-        匹配域名，返回 (匹配的规则, 匹配方式)。
-        按父域名链从精确到宽泛查找。
+        匹配域名，返回 (匹配对象, 匹配方式)。
+        
+        ★ Phase 1: 先查 Trie（紧凑匹配），再查 _pattern_rules（正则）
         """
-        # 1. 精确域名
-        if domain in self._by_domain:
-            for rule in self._by_domain[domain]:
-                if rule.matches(domain):
-                    return rule, "精确域名匹配"
+        domain_lower = domain.lower().rstrip('.')
 
-        # 2. 父域名链 (sub.example.com → example.com → com)
-        parts = domain.split(".")
-        for i in range(1, len(parts)):
-            parent = ".".join(parts[i:])
-            if parent in self._by_domain:
-                for rule in self._by_domain[parent]:
-                    if rule.matches(domain):
-                        return rule, f"父域名匹配 ({parent})"
+        # 1. Trie 紧凑匹配（覆盖 95% 以上规则）
+        trie_result = self._trie.match(domain_lower)
+        if trie_result is not None:
+            return trie_result
 
-        # 3. 通配/正则规则
+        # 2. _pattern_rules 正则匹配（复杂规则）
         for rule in self._pattern_rules:
-            if rule.matches(domain):
-                return rule, "模式匹配"
+            try:
+                if rule.matches(domain_lower):
+                    return rule, "模式匹配"
+            except Exception:
+                continue
 
         return None
 
     def has_domain(self, domain: str) -> bool:
         """域名是否在索引中（快速检查）"""
-        if domain in self._domain_set:
+        # 检查 Trie
+        if self._trie.has_domain(domain.lower().rstrip('.')):
             return True
-        parts = domain.split(".")
-        for i in range(1, len(parts)):
-            if ".".join(parts[i:]) in self._domain_set:
+        # 检查 _pattern_rules
+        for rule in self._pattern_rules:
+            if rule._simple_domain and domain.lower().rstrip('.') == rule._simple_domain:
+                return True
+            if rule._match_subdomains and domain.lower().rstrip('.').endswith('.' + rule._simple_domain):
                 return True
         return False
 
     def clear(self):
-        self._by_domain.clear()
+        self._trie.clear()
         self._pattern_rules.clear()
-        self._domain_set.clear()
         self._count = 0
 
     @property
@@ -799,7 +1035,8 @@ class DomainIndex:
 
     @property
     def domain_count(self) -> int:
-        return len(self._domain_set)
+        """返回 Trie 中唯一域名数 + pattern 规则数"""
+        return self._trie.domain_count + len(self._pattern_rules)
 
 
 class _EncryptedDNSResolver:
@@ -946,6 +1183,10 @@ class FilterEngine:
         self._update_interval_hours = 0
         self._update_files: List[str] = []
         self._update_urls: List[str] = []
+        self._hourly_traffic = [0]*24
+        self._traffic_slot = -1
+        self._traffic_lock = asyncio.Lock()
+        self._restart_cb = None
 
         # ========== 自定义 hosts 映射 ==========
         # 格式: {domain: [(ip, rdtype), ...]}
@@ -1104,6 +1345,12 @@ class FilterEngine:
         else:
             index_domain = self._extract_index_domain(rule_text)
             block_idx.add_rule(rule, index_domain)
+
+        # ★ Phase 3: 非重要的紧凑规则可以释放 raw（节省内存）
+        #     紧凑规则匹配不需要 raw，仅保留用于日志的短版本
+        if not rule.is_important and not rule.is_exception and rule._simple_match:
+            if len(rule.raw) > 40:
+                rule.raw = rule.raw[:40] + "…"
 
         # 为纯域名拦截规则（无通配符/正则）添加快速 set-lookup
         # 例外规则不加入 _plain_domains：该检查在白名单之后执行，
@@ -1345,7 +1592,9 @@ class FilterEngine:
             rule = FilterRule_(stripped)
             if rule._skip or rule.is_badfilter:
                 continue
-            if _is_rule_badfiltered(stripped):
+            # ★ BUGFIX: 使用 cleaned 行检查 badfilter（与第 1 阶段格式一致）
+            cleaned = AdGuardRuleParser._clean_rule_line(stripped)
+            if cleaned is not None and _is_rule_badfiltered(cleaned):
                 continue
             _index_rule(rule, stripped)
             total_rules += 1
@@ -1578,6 +1827,7 @@ class FilterEngine:
         }
 
         # 2. 创建 pending 状态（不触碰活跃索引）
+        gc.collect(generation=2)
         self._pending_block_index = DomainIndex()
         self._pending_allow_index = DomainIndex()
         self._pending_plain_domains = set()
@@ -1612,7 +1862,7 @@ class FilterEngine:
                 self._loaded_urls = self._pending_loaded_urls
                 self._rule_count = self._pending_rule_count
                 # 清除 filter_cache：旧缓存基于旧规则集，可能不再正确
-                self._filter_cache.clear()
+                self._filter_cache = {}
 
                 logger.info("规则重载完成，共 %d 条规则 (本地: %d, 远程: %d)",
                              self._rule_count, len(files), len(urls or []))
@@ -1625,6 +1875,12 @@ class FilterEngine:
             self._pending_loaded_files = []
             self._pending_loaded_urls = []
             self._loading = False
+
+        # ★ 重载后显式释放旧状态 + GC：释放旧 DomainIndex 占用的 pymalloc arena
+        del saved_state
+        import gc as _gc_after_reload
+        for _ in range(3):
+            _gc_after_reload.collect(generation=2)
 
         if self._update_callback:
             try:
@@ -1648,6 +1904,7 @@ class FilterEngine:
         }
 
         # 2. 创建 pending 状态（不触碰活跃索引）
+        gc.collect(generation=2)
         self._pending_block_index = DomainIndex()
         self._pending_allow_index = DomainIndex()
         self._pending_plain_domains = set()
@@ -1692,7 +1949,7 @@ class FilterEngine:
                 self._loaded_files = self._pending_loaded_files
                 self._loaded_urls = self._pending_loaded_urls
                 self._rule_count = self._pending_rule_count
-                self._filter_cache.clear()
+                self._filter_cache = {}
 
                 logger.info("规则重载完成，共 %d 条规则 (本地: %d, 远程: %d)",
                              self._rule_count, len(files), len(urls or []))
@@ -1900,7 +2157,7 @@ class FilterEngine:
         """清除过滤结果缓存（保留 priority 条目如自定义 hosts）"""
         priority_keys = [k for k, v in self._filter_cache.items()
                          if len(v) >= 4 and v[3]]  # v = (blocked, reason, ts, priority)
-        self._filter_cache.clear()
+        self._filter_cache = {}
         for k in priority_keys:
             if k in self._custom_hosts:
                 self._filter_cache[k] = (True, "custom_hosts", time.monotonic(), True)
@@ -1972,7 +2229,7 @@ class FilterEngine:
         ]
         old_count = len(self._filter_cache)
         # 清空旧 dict
-        self._filter_cache.clear()
+        self._filter_cache = {}
         # 重建：新 dict 条目在连续 arena 中分配
         for k, v in priority_items:
             self._filter_cache[k] = v
@@ -1990,71 +2247,56 @@ class FilterEngine:
 
     # ======================== 定时更新 ========================
 
-    def on_update(self, callback: Callable):
-        """注册规则更新回调"""
-        self._update_callback = callback
-
-    async def start_auto_update(self, interval_hours: int, urls: List[str],
-                                 files: Optional[List[str]] = None):
-        """
-        启动定时更新任务。
-        与 `async_reload` 一致：先清除全部旧规则，再重新从文件和 URL 加载。
-        避免规则累加导致的重复和内存膨胀。
-        """
-        if interval_hours <= 0 or not urls:
-            logger.info("远程规则自动更新未启用 (interval=%dh, urls=%d)",
-                         interval_hours, len(urls))
-            return
-
+    def on_update(self,cb): self._update_callback = cb
+    def on_restart(self,cb): self._restart_cb = cb
+    def record_query(self):
+        h = time.localtime().tm_hour
+        if self._traffic_slot != h: self._traffic_slot = h
+        self._hourly_traffic[h] += 1
+    def _lowest_hour(self):
+        t = self._hourly_traffic
+        if sum(t)==0: return (time.localtime().tm_hour+1)%24
+        m = min(t); cand = [i for i,v in enumerate(t) if v==m]
+        cur = time.localtime().tm_hour
+        fut = [h for h in cand if h>cur]
+        return min(fut) if fut else min(cand)
+    async def start_auto_update(self,interval_hours,urls=None,files=None):
+        if interval_hours<=0: return
         self._update_interval_hours = interval_hours
         self._running = True
-        self._update_files = files or []
-        self._update_urls = urls
-        self._update_task = asyncio.create_task(self._update_loop())
-        logger.info("远程规则自动更新已启动 (间隔=%d小时, %d个源, 规则替换模式)",
-                     interval_hours, len(urls))
-
+        self._update_task = asyncio.create_task(self._restart_loop())
     async def stop_auto_update(self):
-        """停止定时更新"""
         self._running = False
         if self._update_task:
             self._update_task.cancel()
-            try:
-                await self._update_task
-            except asyncio.CancelledError:
-                pass
+            try: await self._update_task
+            except asyncio.CancelledError: pass
             self._update_task = None
-
-    async def _update_loop(self):
-        """
-        定时更新循环 — 使用 async_reload 完整替换而非追加规则。
-        每次更新先清除全部旧规则，再从文件和 URL 重新加载。
-        """
+    async def _restart_loop(self):
         while self._running:
             try:
-                await asyncio.sleep(self._update_interval_hours * 3600)
-                if not self._running:
-                    break
-
-                logger.info("开始远程规则自动更新（完整替换模式）...")
-
-                # 使用 async_reload 完整替换全部规则（清空旧规则 + 从文件+URL重新加载）
-                await self.async_reload(self._update_files, urls=self._update_urls if self._update_urls else None)
-
-                logger.info("远程规则更新完成，当前共 %d 条规则", self._rule_count)
-
-                if self._update_callback:
-                    try:
-                        self._update_callback(self._rule_count)
-                    except Exception as e:
-                        logger.debug("过滤器更新循环回调异常: %s", e)
-
-            except asyncio.CancelledError:
-                break
+                await asyncio.sleep(self._update_interval_hours*3600)
+                if not self._running: break
+                await self._schedule_restart()
+            except asyncio.CancelledError: break
             except Exception as e:
-                logger.error("远程规则更新异常（将在 %d 小时后重试）: %s",
-                              self._update_interval_hours, e)
-
+                logger.error("restart loop error: %s",e)
+    async def _schedule_restart(self):
+        if not self._restart_cb: return
+        bh = self._lowest_hour()
+        ch = time.localtime().tm_hour
+        cm = time.localtime().tm_min
+        if bh>ch: ws = (bh-ch)*3600-cm*60
+        elif bh<ch: ws = (24-ch+bh)*3600-cm*60
+        else:
+            ws = 3600-cm*60
+            if ws<60: ws += 3600
+        logger.info("restart in %d min at hour %d",ws//60,bh)
+        await asyncio.sleep(ws)
+        if self._restart_cb:
+            try:
+                self._restart_cb(bh)
+            except Exception as e: logger.error("restart cb error: %s",e)
     @property
     def stats(self) -> dict:
         # 从索引实时计算，不再维护冗余列表
@@ -2073,6 +2315,8 @@ class FilterEngine:
             "title": self._title,
             "update_interval_hours": self._update_interval_hours,
             "auto_update_running": self._running,
+            "hourly_traffic": list(self._hourly_traffic),
+            "lowest_traffic_hour": self._lowest_hour(),
             "custom_hosts_count": len(self._custom_hosts),
             "custom_hosts_enabled": self._custom_hosts_enabled,
         }
