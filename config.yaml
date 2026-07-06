@@ -126,7 +126,9 @@ filter:
   rules_files:
   # 远程规则列表（定时自动更新）
   rules_urls:
-    - https://proxy.gitwarp.top/https://raw.githubusercontent.com/hululu1068/AdGuard-Rule/main/rule/all.txt
+    # 注释掉的全网收集的adguard拦截规则总和，容易误拦截
+    #- https://proxy.gitwarp.top/https://raw.githubusercontent.com/hululu1068/AdGuard-Rule/main/rule/all.txt
+    - https://cdn.jsdelivr.net/gh/hululu1068/AdGuard-Rule@main/rule/domain.txt
   update_interval: 24
   # 是否拦截后返回 NXDOMAIN
   block_nxdomain: true
