@@ -3,6 +3,11 @@
 
 # 加密dns与ECH同属于网络加密的最后一块拼图，类似只输入223.6.6.6的都输入明文dns，完全能对任何设备进行流量劫持(默认被流量劫持)，所以必须使用加密dns并且放弃类似223.6.6.6的明文传输。
 
+# 推荐开源的拦截规则项目：
+    - https://github.com/hululu1068/AdGuard-Rule
+    - https://github.com/sjhgvr/oisd
+    - https://github.com/hagezi/dns-blocklists
+
 # 新功能：
 
 新增自动提权为管理员和root，如果不给，可能只影响arp防护功能。
