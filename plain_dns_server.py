@@ -8,8 +8,10 @@
 
 import asyncio
 import logging
-import time
+import socket
 import struct
+import sys
+import time
 from typing import Optional, Dict, Tuple
 
 import dns.message
@@ -72,18 +74,39 @@ class PlainDNSServer:
             per_ip_limit=config.max_concurrent_per_ip,
         )
         self._per_ip_limit = config.max_concurrent_per_ip
-        self._ip_semaphore_task: Optional[asyncio.Task] = None
+        self._recovering_v4 = False
+        self._recovering_v6 = False
 
     @staticmethod
     def _is_localhost(ip: str) -> bool:
         return ip in ("127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost")
 
+    @staticmethod
+    def _create_udp_socket(host: str, port: int, family: int) -> socket.socket:
+        """Create UDP socket with SIO_UDP_CONNRESET disabled on Windows."""
+        sock = socket.socket(family, socket.SOCK_DGRAM)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if family == socket.AF_INET6:
+                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            sock.bind((host, port))
+            if sys.platform == "win32":
+                try:
+                    sock.ioctl(socket.SIO_UDP_CONNRESET, False)
+                except (AttributeError, OSError, ValueError):
+                    try:
+                        sock.ioctl(0x58000001, False)
+                    except (AttributeError, OSError, ValueError):
+                        pass
+            return sock
+        except Exception:
+            sock.close()
+            raise
+
     async def _get_per_ip_semaphore(self, client_ip: str) -> asyncio.Semaphore:
         return await self._per_ip_limiter.acquire(client_ip)
 
-    async def _cleanup_stale_per_ip_semaphores(self):
-        # 由共享 PerIPRateLimiter 后台管理
-        await asyncio.Event().wait()
+
 
     # ======================== UDP 协议 ========================
 
@@ -102,7 +125,10 @@ class PlainDNSServer:
             self.server._handle_query(data, addr, self.transport)
 
         def error_received(self, exc):
+            """UDP socket error callback - auto-recover on WSAECONNRESET."""
             logger.warning("UDP 错误: %s", exc)
+            if sys.platform == "win32" and getattr(exc, 'winerror', None) == 10054:
+                asyncio.ensure_future(self.server._recover_udp_transport(self.transport))
 
     def _handle_query(self, data: bytes, addr: tuple, transport: asyncio.DatagramTransport):
         """处理 DNS 查询（异步执行，避免阻塞 UDP 接收）"""
@@ -336,13 +362,67 @@ class PlainDNSServer:
         """发送 UDP DNS 响应"""
         if not data:
             return
-        t = transport or self._transport_v4 or self._transport_v6
+        if transport is not None and not transport.is_closing():
+            t = transport
+        else:
+            if addr and len(addr) > 0 and ":" in str(addr[0]):
+                t = self._transport_v6
+            else:
+                t = self._transport_v4
         if t is None or t.is_closing():
             return
         try:
             t.sendto(data, addr)
         except Exception as e:
             logger.warning("发送 UDP 响应失败: %s", e)
+
+    async def _recover_udp_transport(self, broken_transport: Optional[asyncio.DatagramTransport]):
+        """Recover UDP transport broken by WSAECONNRESET.
+        M1: create new before closing old.
+        M2: concurrent guard.
+        M3: check _running.
+        """
+        if broken_transport is None or broken_transport.is_closing():
+            return
+        if not self._running:
+            logger.debug("skip recovery: server stopped")
+            return
+        sock = broken_transport.get_extra_info("socket")
+        if sock is None:
+            return
+        is_v6 = (sock.family == socket.AF_INET6)
+        flag = "_recovering_v6" if is_v6 else "_recovering_v4"
+        if getattr(self, flag):
+            logger.debug("recovery already in progress, skip")
+            return
+        setattr(self, flag, True)
+        try:
+            host = self.ipv6_host if is_v6 else self.host
+            family = socket.AF_INET6 if is_v6 else socket.AF_INET
+            loop = asyncio.get_running_loop()
+            new_sock = self._create_udp_socket(host, self.port, family)
+            new_transport, _ = await loop.create_datagram_endpoint(
+                lambda: self._DnsProtocol(self), sock=new_sock,
+            )
+            if not self._running:
+                new_transport.close()
+                logger.debug("recovery cancelled: server stopped")
+                return
+            if not broken_transport.is_closing():
+                try:
+                    broken_transport.close()
+                except Exception:
+                    pass
+            if is_v6:
+                self._transport_v6 = new_transport
+                logger.info("plain DNS [UDP IPv6] transport recovered udp://[%s]:%d", host, self.port)
+            else:
+                self._transport_v4 = new_transport
+                logger.info("plain DNS [UDP IPv4] transport recovered udp://%s:%d", host, self.port)
+        except Exception as e:
+            logger.warning("plain DNS UDP transport recovery failed: %s", e)
+        finally:
+            setattr(self, flag, False)
 
     async def _log_query(self, client_ip, domain, qtype, elapsed, status, block_reason):
         """记录查询日志"""
@@ -371,9 +451,10 @@ class PlainDNSServer:
 
         # ---------- UDP ----------
         try:
+            sock_v4 = self._create_udp_socket(self.host, self.port, socket.AF_INET)
             transport_v4, protocol_v4 = await loop.create_datagram_endpoint(
                 lambda: self._DnsProtocol(self),
-                local_addr=(self.host, self.port),
+                sock=sock_v4,
             )
             self._transport_v4 = transport_v4
             logger.info("普通 DNS [UDP IPv4] udp://%s:%d", self.host, self.port)
@@ -382,9 +463,10 @@ class PlainDNSServer:
 
         if self.ipv6_enabled:
             try:
+                sock_v6 = self._create_udp_socket(self.ipv6_host, self.port, socket.AF_INET6)
                 transport_v6, protocol_v6 = await loop.create_datagram_endpoint(
                     lambda: self._DnsProtocol(self),
-                    local_addr=(self.ipv6_host, self.port),
+                    sock=sock_v6,
                 )
                 self._transport_v6 = transport_v6
                 logger.info("普通 DNS [UDP IPv6] udp://[%s]:%d", self.ipv6_host, self.port)
@@ -411,19 +493,11 @@ class PlainDNSServer:
 
         self._running = True
 
-        # 启动单 IP 限速清理任务
-        self._ip_semaphore_task = asyncio.create_task(self._cleanup_stale_per_ip_semaphores())
+
 
     async def stop(self):
         """停止 DNS 服务器（UDP + TCP）"""
         self._running = False
-        if self._ip_semaphore_task:
-            self._ip_semaphore_task.cancel()
-            try:
-                await self._ip_semaphore_task
-            except asyncio.CancelledError:
-                pass
-            self._ip_semaphore_task = None
 
         # 关闭 UDP transport
         for transport in [self._transport_v4, self._transport_v6]:
