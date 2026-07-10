@@ -552,6 +552,9 @@ class DNSProxyApp:
         if "hosts" in changed_sections and "hosts" in new_config:
             self.filter_engine.load_custom_hosts(new_config.get("hosts", {}))
             logger.info("自定义 hosts 映射已重新加载")
+            # 清除 DNS 响应缓存，防止旧 0.0.0.0 拦截结果残留
+            if self.cache:
+                await self.cache.clear()
 
         # 如果完全不涉及 filter/cache/hosts 的变化，直接跳过所有过滤相关操作
         if not filter_cache_changed:

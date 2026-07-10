@@ -266,9 +266,12 @@ class DoHServer:
                     result["Comment"] = "自定义 hosts 映射"
                     return result
 
+            # 0b. 检查自定义 hosts 白名单（纯域名绕过，无自定义IP）
+            is_hosts_bypass = self.filter_engine.is_custom_hosts_bypass(qname)
+
             # 1. 检查域名过滤
             cache_key = (question.name, question.rdtype, question.rdclass)
-            if self.config.filter_enabled:
+            if self.config.filter_enabled and not is_hosts_bypass:
                 blocked, reason = self.filter_engine.check_domain(qname)
                 if blocked:
                     result["Status"] = 3  # NXDOMAIN
@@ -482,8 +485,11 @@ class DoHServer:
                     )
                     return self._make_response(response_wire, response_format)
 
+            # 0b. 检查自定义 hosts 白名单（纯域名绕过，无自定义IP）
+            is_hosts_bypass = self.filter_engine.is_custom_hosts_bypass(qname)
+
             # 1. 检查域名过滤
-            if self.config.filter_enabled:
+            if self.config.filter_enabled and not is_hosts_bypass:
                 blocked, reason = self.filter_engine.check_domain(qname)
                 if blocked:
                     block_reason = reason

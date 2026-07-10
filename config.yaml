@@ -106,13 +106,34 @@ dnssec:
   drop_bogus: false
 
 # ============================================================
-# 自定义域名 IP 映射（类似 Windows hosts 文件）
-# 格式: "域名 IP1,IP2" (域名和IP用空格分隔,多IP用逗号)
+# 自定义域名映射（白名单功能，类似 Windows hosts 文件）
+#
+# ⚠️ 白名单功能：在此 mappings 中列出的域名将绕过所有过滤规则！
+#    即使有拦截规则（如 ||123.com^ 或 *.123.com），也不会被拦截。
+#
+# 支持两种格式：
+#
+#   格式1（纯域名白名单 - 绕过过滤，正常解析）:
+#     - "123.com"
+#     仅填写域名，不指定 IP。该域名将绕过所有过滤规则，正常通过上游 DNS 解析。
+#     适用于：某些网站被拦截规则误杀导致无法访问时，强制放行。
+#
+#   格式2（自定义 IP 映射 - 直接返回指定 IP）:
+#     - "my.dns 127.0.0.1,192.168.1.1"
+#     域名 + 空格 + IP（多个IP用逗号分隔）。直接返回指定 IP，完全跳过过滤和上游解析。
+#     适用于：内网域名解析、开发测试环境、广告服务器重定向等。
+#
 # 支持 IPv4 和 IPv6
+# 运行时修改此配置会自动热加载，无需重启程序
 # ============================================================
 hosts:
-  enabled: false
+  enabled: true
   mappings:
+    # 白名单示例：只写域名，不写 IP，绕过 ||123.com^ 等拦截规则
+    # - "123.com"
+    # - "fe-static.deepseek.com"
+    # - "example.com"
+    # 自定义 IP 示例：
     # - "my.dns 127.0.0.1,192.168.1.1"
     # - "router.local 192.168.1.1"
     # - "ipv6test.local ::1"
@@ -126,9 +147,7 @@ filter:
   rules_files:
   # 远程规则列表（定时自动更新）
   rules_urls:
-    # 注释掉的全网收集的adguard拦截规则总和，容易误拦截
-    #- https://proxy.gitwarp.top/https://raw.githubusercontent.com/hululu1068/AdGuard-Rule/main/rule/all.txt
-    - https://cdn.jsdelivr.net/gh/hululu1068/AdGuard-Rule@main/rule/domain.txt
+    - https://ghfast.top/https://raw.githubusercontent.com/hululu1068/AdGuard-Rule/main/rule/all.txt
   update_interval: 24
   # 是否拦截后返回 NXDOMAIN
   block_nxdomain: true

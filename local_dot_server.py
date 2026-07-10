@@ -319,8 +319,11 @@ class LocalDoTServer:
                     await self._log_query(client_ip, qname, qtype_name, status, block_reason)
                     return response_wire
 
+            # 0b. 检查自定义 hosts 白名单（纯域名绕过，无自定义IP）
+            is_hosts_bypass = self.filter_engine.is_custom_hosts_bypass(qname)
+
             # 1. 域名过滤
-            if self.config.filter_enabled:
+            if self.config.filter_enabled and not is_hosts_bypass:
                 blocked, reason = self.filter_engine.check_domain(qname)
                 if blocked:
                     block_reason = reason

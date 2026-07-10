@@ -1188,10 +1188,11 @@ class FilterEngine:
         self._traffic_lock = asyncio.Lock()
         self._restart_cb = None
 
-        # ========== 自定义 hosts 映射 ==========
+        # ========== 自定义 hosts 映射（白名单） ==========
         # 格式: {domain: [(ip, rdtype), ...]}
         # 例如: {"my.dns": [("127.0.0.1", dns.rdatatype.A), ("192.168.1.1", dns.rdatatype.A)]}
         self._custom_hosts: Dict[str, List[Tuple[str, int]]] = {}
+        self._custom_hosts_bypass: Set[str] = set()  # 纯域名白名单：无自定义IP，仅绕过过滤规则
         self._custom_hosts_enabled = True
         # 内存压力下暂停过滤缓存写入（由优化器控制）
         self._cache_suspended = False
@@ -1985,10 +1986,16 @@ class FilterEngine:
         domain = domain.lower().rstrip(".")
         now = time.monotonic()
 
-        # 0. 检查自定义 hosts 映射（最高优先级，存入统一缓存且标记 priority）
-        if self._custom_hosts_enabled and domain in self._custom_hosts:
-            self._filter_cache[domain] = (True, "custom_hosts", now, True)
-            return True, "custom_hosts"
+        # 0. 检查自定义 hosts 映射（最高优先级白名单）
+        #    无论是有自定义IP还是纯域名绕过，都跳过所有过滤规则。
+        #    返回 False（不拦截）确保缓存扫描（_sweep_once）不会误覆写。
+        if self._custom_hosts_enabled:
+            if domain in self._custom_hosts:
+                self._filter_cache[domain] = (False, "custom_hosts", now, True)
+                return False, "custom_hosts"
+            if domain in self._custom_hosts_bypass:
+                self._filter_cache[domain] = (False, "custom_hosts_bypass", now, True)
+                return False, "custom_hosts_bypass"
 
         # 1. 检查统一过滤结果缓存
         cached = self._filter_cache.get(domain)
@@ -2093,6 +2100,7 @@ class FilterEngine:
               - "ipv6test.local ::1,fe80::1"
         """
         self._custom_hosts.clear()
+        self._custom_hosts_bypass.clear()
         # 统一缓存中 priority 标记的自定义 hosts 条目在下次 check_domain 时会自动覆盖
 
         if not hosts_config:
@@ -2114,27 +2122,38 @@ class FilterEngine:
             entry = entry.strip()
             if not entry:
                 continue
-            # 格式: "domain ip1,ip2,ip3"
-            parts = entry.split(None, 1)  # 用空白分割，只切第一段
-            if len(parts) != 2:
-                continue
-            domain, ip_str = parts
-            domain = domain.strip().lower()
+            # 格式1: "domain" — 纯域名白名单，绕过过滤规则，正常解析
+            # 格式2: "domain ip1,ip2" — 自定义 IP 映射
+            parts = entry.split(None, 1)
+            domain = parts[0].strip().lower()
             if not domain:
                 continue
-            ips = []
-            for ip in ip_str.split(","):
-                ip = ip.strip()
-                if not ip:
-                    continue
-                if ":" in ip:
-                    ips.append((ip, dns.rdatatype.AAAA))
-                else:
-                    ips.append((ip, dns.rdatatype.A))
-            if ips:
-                self._custom_hosts[domain] = ips
+            if len(parts) == 1:
+                # 纯域名白名单（无自定义IP）
+                self._custom_hosts_bypass.add(domain)
+            else:
+                # 域名 + IP 映射
+                ip_str = parts[1]
+                ips = []
+                for ip in ip_str.split(","):
+                    ip = ip.strip()
+                    if not ip:
+                        continue
+                    if ":" in ip:
+                        ips.append((ip, dns.rdatatype.AAAA))
+                    else:
+                        ips.append((ip, dns.rdatatype.A))
+                if ips:
+                    self._custom_hosts[domain] = ips
 
-        logger.info("自定义 hosts 映射已加载: %d 条", len(self._custom_hosts))
+        total = len(self._custom_hosts) + len(self._custom_hosts_bypass)
+        logger.info("自定义 hosts 映射已加载: %d 条 (IP映射: %d, 白名单绕过: %d)",
+                     total, len(self._custom_hosts), len(self._custom_hosts_bypass))
+
+    def is_custom_hosts_bypass(self, domain: str) -> bool:
+        """检查域名是否在纯域名白名单中（无自定义IP，仅跳过过滤规则）"""
+        domain = domain.lower().rstrip(".")
+        return domain in self._custom_hosts_bypass
 
     def get_custom_hosts_ips(self, domain: str) -> Optional[List[Tuple[str, int]]]:
         """获取自定义 hosts 中域名对应的 IP 列表"""
@@ -2159,8 +2178,8 @@ class FilterEngine:
                          if len(v) >= 4 and v[3]]  # v = (blocked, reason, ts, priority)
         self._filter_cache = {}
         for k in priority_keys:
-            if k in self._custom_hosts:
-                self._filter_cache[k] = (True, "custom_hosts", time.monotonic(), True)
+            if k in self._custom_hosts or k in self._custom_hosts_bypass:
+                self._filter_cache[k] = (False, "custom_hosts", time.monotonic(), True)
         logger.debug("过滤缓存已清除（保留 %d 条 priority 条目）", len(priority_keys))
 
     def _defer_trim(self):
@@ -2317,6 +2336,6 @@ class FilterEngine:
             "auto_update_running": self._running,
             "hourly_traffic": list(self._hourly_traffic),
             "lowest_traffic_hour": self._lowest_hour(),
-            "custom_hosts_count": len(self._custom_hosts),
+            "custom_hosts_count": len(self._custom_hosts) + len(self._custom_hosts_bypass),
             "custom_hosts_enabled": self._custom_hosts_enabled,
         }
