@@ -771,12 +771,24 @@ class DNSProxyApp:
     def _trigger_restart(self, best_hour):
         logger = logging.getLogger("dns-proxy.app")
         logger.info("Triggering restart at hour %d", best_hour)
-        try:
-            subprocess.Popen([sys.executable]+sys.argv,close_fds=True)
-        except Exception as e:
-            logger.error("Restart failed: %s",e)
-            return
-        os._exit(0)
+        if os.name == 'posix':
+            # Linux: os.execv 替换当前进程，PID 不变，systemd 继续跟踪
+            # 内核丢弃旧地址空间，加载全新程序镜像，内存完全重新分配
+            try:
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+            except Exception as e:
+                logger.error("execv restart failed: %s", e)
+                # fallback: 传统方式
+                subprocess.Popen([sys.executable] + sys.argv, close_fds=True)
+                os._exit(0)
+        else:
+            # Windows: 没有真正的 exec，保持原有方式
+            try:
+                subprocess.Popen([sys.executable] + sys.argv, close_fds=True)
+            except Exception as e:
+                logger.error("Restart failed: %s", e)
+                return
+            os._exit(0)
     async def stop(self):
         """优雅关闭所有服务"""
         logger = logging.getLogger("dns-proxy.app")
