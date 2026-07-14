@@ -667,7 +667,7 @@ class FilterRule:
             # 拦截规则带范围限制修饰符（如 $domain=xxx、$app=xxx 等）
             # 则跳过该规则。这些修饰符将拦截范围限制在特定页面/应用中，
             # DNS 无法评估这些条件，若不跳过会导致全局拦截 → 误拦合法域名。
-            if not self.is_exception and not self.is_important:
+            if not self.is_exception:
                 for mod in modifiers_str.split(','):
                     mod = mod.strip()
                     if '=' in mod:
