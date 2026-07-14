@@ -135,14 +135,14 @@ class AdGuardRuleParser:
         # 注释: ! 或 #
         if line.startswith("!") or line.startswith("#"):
             return None
-        # cosmetic 规则: ## #@# $$
-        if "##" in line or "#@#" in line or "$$" in line:
+        # cosmetic 规则: ## #@# $$ 以及 scriptlet 规则 #%#
+        if "##" in line or "#@#" in line or "$$" in line or "#%#" in line:
             return None
 
         # etc/hosts 格式: 0.0.0.0 domain.com 或 127.0.0.1 domain.com
         # 官方定义：精确匹配域名，不匹配子域名
         hosts_match = re.match(
-            r'^(?:\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|::1|0\.0\.0\.0)\s+(\S+)$',
+            r'^(?:\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|::1)\s+(\S+)$',
             line
         )
         if hosts_match:
@@ -432,6 +432,15 @@ class FilterRule:
         'document', 'websocket', 'other', 'all',
         'ping', 'webrtc', 'popup', 'frame', 'xhr',
         'inline-font', 'inline-script',
+        # 修饰符别名（AdGuard 规范定义）
+        'css',           # $stylesheet 的别名
+        'doc',           # $document 的别名
+        'ehide',         # $elemhide 的别名
+        'ghide',         # $generichide 的别名
+        'shide',         # $specifichide 的别名
+        '3p',            # $third-party 的别名
+        'strict3p',      # $strict-third-party 的别名
+        'strict1p',      # $strict-first-party 的别名
         # 条件修饰符（需要请求上下文，DNS 无法评估）
         'domain', 'match-case', 'method', 'to', 'header', 'app',
         # URL/内容修改
@@ -447,16 +456,18 @@ class FilterRule:
         'noop', 'reason', 'stealth', 'mp4',
     }
 
-    # 例外规则上 DNS 级别无法评估的修饰符集合
+    # 例外规则上 DNS 级别无法评估/不需要的修饰符集合
     # 这些修饰符限制了例外规则的适用范围（如仅限特定页面/请求类型），
     # 但 DNS 代理无法区分请求来源和类型，所以带这些修饰符的例外规则应跳过。
+    # 注意：$document 不在其中 —— 它在例外规则上的含义是"完全禁用该域名的所有过滤"，
+    # 等价于 DNS 级别的白名单，应被接受为普通例外规则处理。
     _EXCEPTION_RESTRICTIVE_MODIFIERS = frozenset({
         # 条件修饰符（需要页面域名/请求来源上下文）
         'domain', 'third-party', 'strict-third-party', 'strict-first-party',
         'denyallow', 'app', 'method', 'to', 'header', 'client', 'ctag', 'dnstype',
         # Content-type（需要请求类型信息）
         'script', 'image', 'stylesheet', 'object', 'xmlhttprequest',
-        'subdocument', 'font', 'media', 'popup', 'document',
+        'subdocument', 'font', 'media', 'popup',
         'websocket', 'other', 'all', 'ping', 'webrtc', 'popup',
         'frame', 'xhr', 'inline-font', 'inline-script',
         # match-case（DNS 大小写不敏感）
@@ -492,6 +503,8 @@ class FilterRule:
         'header',    # 限制到特定 HTTP 头
         'client',    # 限制到特定 DHCP 客户端
         'ctag',      # 限制到特定客户端标签
+        'dnstype',   # 限制到特定 DNS 记录类型（DNS 无法评估）
+        'denyallow', # 限制到特定排除域名（DNS 无法评估排除逻辑）
         # ========== HTTP 级别操作修饰符 ==========
         # 以下修饰符表示规则意图是修改 HTTP 请求/响应而非 DNS 拦截。
         # DNS 代理无法执行这些操作，跳过以避免误拦截整个域名。
@@ -527,6 +540,9 @@ class FilterRule:
             # ~ 前缀表示排除
             if name.startswith('~'):
                 name = name[1:]
+            # noop 修饰符：纯下划线序列（任意长度），不做任何事
+            if re.fullmatch(r'_+', name):
+                continue
             # 允许 s@...@...@ 格式（内容替换，DNS 级别不适用，跳过规则本身）
             if name == 's':
                 return False
@@ -612,8 +628,8 @@ class FilterRule:
             self.is_exception = True
             text = text[2:]
 
-        # 2. 跳过 cosmetic 规则
-        if "##" in text or "#@#" in text or "$$" in text:
+        # 2. 跳过 cosmetic 规则（## #@# $$）和 scriptlet 规则（#%#）
+        if "##" in text or "#@#" in text or "$$" in text or "#%#" in text:
             self._skip = True
             return
 
@@ -813,7 +829,7 @@ class FilterRule:
 
         # 9. hosts 格式: 0.0.0.0 domain / 127.0.0.1 domain / ::1 domain
         hosts_match = re.match(
-            r'^(?:\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|::1|0\.0\.0\.0)\s+(\S+)$',
+            r'^(?:\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|::1)\s+(\S+)$',
             text
         )
         if hosts_match:
@@ -1255,7 +1271,7 @@ class FilterEngine:
 
         # hosts 格式
         hosts_match = re.match(
-            r'^(?:\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|::1|0\.0\.0\.0)\s+(\S+)$',
+            r'^(?:\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|::1)\s+(\S+)$',
             line
         )
         if hosts_match:
@@ -1588,7 +1604,7 @@ class FilterEngine:
             if not stripped or stripped.startswith("!") or stripped.startswith("#"):
                 continue
             # 快速跳过 cosmetic 规则（避免 FilterRule._parse 无谓开销）
-            if "##" in stripped or "#@#" in stripped or "$$" in stripped:
+            if "##" in stripped or "#@#" in stripped or "$$" in stripped or "#%#" in stripped:
                 continue
             rule = FilterRule_(stripped)
             if rule._skip or rule.is_badfilter:
