@@ -8,8 +8,8 @@ Type=simple
 User=root
 WorkingDirectory=/root/dnscrypt-proxy
 Environment=PYTHONMALLOC=mimalloc
-#记得替换为自己的启动路径
-ExecStart=/root/Python-3.13.2/python /root/dnscrypt-proxy/main.py
+#记得替换为自己的启动路径,-B是防止生成__pycache__文件夹每次启动都得编译运行
+ExecStart=/root/Python-3.13.2/python -B /root/dnscrypt-proxy/main.py
 
 Restart=on-failure
 RestartSec=5s
