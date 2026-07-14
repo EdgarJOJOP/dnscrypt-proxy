@@ -13,6 +13,7 @@ ExecStart=/root/Python-3.13.2/python /root/dnscrypt-proxy/main.py
 
 Restart=on-failure
 RestartSec=5s
+KillMode=process
 
 # 安全加固（可选）
 NoNewPrivileges=yes
