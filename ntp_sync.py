@@ -696,7 +696,8 @@ async def check_system_time_vs_ntp_async(freeze_event: asyncio.Event = None,
     )
 
     if sys.platform == "win32":
-        calibrated = _set_system_time_windows(ntp_time)
+        loop = asyncio.get_event_loop()
+        calibrated = await loop.run_in_executor(None, _set_system_time_windows, ntp_time)
     elif sys.platform.startswith("linux"):
         calibrated = _set_system_time_linux(ntp_time)
     else:

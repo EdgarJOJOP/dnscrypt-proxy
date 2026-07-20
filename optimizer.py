@@ -25,10 +25,10 @@ import logging
 
 import time
 
-from typing import Optional
+from typing import Optional, List
 
 import ctypes
-
+import ctypes.util
 import ctypes.wintypes
 
 
@@ -158,7 +158,7 @@ class ResourceOptimizer:
 
                 logger.debug("优化器初始化 psutil 异常: %s", e)
 
-        self._arena_pressure_history: list[float] = []
+        self._arena_pressure_history: List[float] = []
 
         self._last_rebuild_time: float = 0.0
 

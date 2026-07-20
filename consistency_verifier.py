@@ -24,6 +24,7 @@ import asyncio
 import hashlib
 import io
 import logging
+import random
 import struct
 import time
 from typing import List, Optional, Tuple, Dict, Any
@@ -83,7 +84,7 @@ class ResponseConsistencyVerifier:
         self.min_responses = min_responses
         self.consistency_window_ms = consistency_window_ms
         self._anomaly_detector = anomaly_detector
-        self.max_background_servers = max_background_servers  # 保留兼容，不再使用
+        self.max_background_servers = max_background_servers  # 后台验证随机抽样的最大上游数
 
         self._stats: Dict[str, Any] = {
             "total_verifications": 0,
@@ -200,6 +201,7 @@ class ResponseConsistencyVerifier:
         all_servers: List[Any],
         query_bytes: bytes,
         timeout: float,
+        exclude_servers: set = None,
     ) -> Tuple[bytes, Optional[ConsistencyVerdict]]:
         """两阶段策略主入口。"""
         if not self.enabled or len(all_servers) < self.min_responses:
@@ -218,6 +220,14 @@ class ResponseConsistencyVerifier:
         remaining = [s for s in all_servers if s.name != fast_server and s.enabled]
         if not remaining:
             return fast_bytes, None
+
+        # 排除优选上游（它们不参与后台验证抽样）
+        if exclude_servers:
+            remaining = [s for s in remaining if s.name not in exclude_servers]
+
+        # 真随机抽样，减少连接数暴涨
+        if self.max_background_servers > 0 and len(remaining) > self.max_background_servers:
+            remaining = random.sample(remaining, self.max_background_servers)
 
         collected = await self._collect_responses(
             remaining, query_bytes, timeout

@@ -528,6 +528,8 @@ class DoHServer:
                 cached_response = await self.cache.get(cache_key)
 
             if cached_response is not None:
+                import copy
+                cached_response = copy.copy(cached_response)
                 cached_response.id = query.id  # 修复DNS ID不匹配
                 response_wire = cached_response.to_wire()
                 status = "cached"

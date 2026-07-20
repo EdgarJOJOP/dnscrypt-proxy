@@ -19,6 +19,7 @@ class QPSCounter:
         self._max_qps = max_qps
         self._name = name
         self._timestamps: deque = deque()
+        self._lock = asyncio.Lock()
 
     @property
     def max_qps(self) -> int:
@@ -33,24 +34,25 @@ class QPSCounter:
         if self._max_qps <= 0:
             return  # 0 或负数表示无限制
 
-        now = time.monotonic()
-        cutoff = now - 1.0
-
-        # 清理超过 1 秒的旧时间戳
-        while self._timestamps and self._timestamps[0] <= cutoff:
-            self._timestamps.popleft()
-
-        if len(self._timestamps) >= self._max_qps:
-            # 超过 QPS 上限，等待最旧的请求过期
-            wait = self._timestamps[0] + 1.0 - now
-            if wait > 0:
-                if self._name:
-                    logger.debug("QPS[%s] 限速中，等待 %.1fms", self._name, wait * 1000)
-                await asyncio.sleep(wait)
-            # 等待后重新清理
+        async with self._lock:
             now = time.monotonic()
             cutoff = now - 1.0
+
+            # 清理超过 1 秒的旧时间戳
             while self._timestamps and self._timestamps[0] <= cutoff:
                 self._timestamps.popleft()
 
-        self._timestamps.append(now)
+            if len(self._timestamps) >= self._max_qps:
+                # 超过 QPS 上限，等待最旧的请求过期
+                wait = self._timestamps[0] + 1.0 - now
+                if wait > 0:
+                    if self._name:
+                        logger.debug("QPS[%s] 限速中，等待 %.1fms", self._name, wait * 1000)
+                    await asyncio.sleep(wait)
+                # 等待后重新清理
+                now = time.monotonic()
+                cutoff = now - 1.0
+                while self._timestamps and self._timestamps[0] <= cutoff:
+                    self._timestamps.popleft()
+
+            self._timestamps.append(now)

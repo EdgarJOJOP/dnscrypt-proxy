@@ -699,13 +699,27 @@ class ResolverManager:
                 if self._consistency_check_count % 10 == 0:
                     should_verify = True
 
-        # 后台一致性验证（复用健康评分，只选最优 5 个加密上游）
+        # 后台一致性验证：优选上游可配置，随机抽样排除优选
         if should_verify and result is not None:
-            selected = self._select_encrypted_upstreams(count=5)
+            preferred_count = self.config.preferred_server_count
+            preferred = self._select_preferred_servers(count=preferred_count)
+            bg_count = self.config.response_verification_max_background_servers
+            if bg_count > 0 and preferred:
+                exclude_names = set(s.name for s in preferred)
+                all_enabled = [
+                    s for s in self._upstream_servers if s.enabled
+                    and s.server_type in ("doh", "dot", "doq")
+                    and s.name not in exclude_names
+                ]
+                import random
+                selected = random.sample(all_enabled, min(bg_count, len(all_enabled))) if all_enabled else []
+            else:
+                selected = self._select_encrypted_upstreams(count=max(bg_count, 3))
             if selected:
                 asyncio.create_task(
                     self._background_consistency_check(
-                        dnssec_query, result, selected
+                        dnssec_query, result, selected,
+                        exclude_servers=set(s.name for s in preferred) if preferred else None,
                     )
                 )
 
@@ -863,6 +877,41 @@ class ResolverManager:
             logger.warning("并行查询: 全部 %d 个上游均失败 (%d 次重试后放弃)", alive, 3)
             return None
 
+    @staticmethod
+    def _get_suffix(hostname: str) -> str:
+        """提取域名的注册后缀（如 alidns.com、cloudflare.com）"""
+        parts = hostname.lower().split(".")
+        if len(parts) >= 2:
+            return ".".join(parts[-2:])
+        return hostname
+
+    def _select_preferred_servers(self, count: int) -> List[UpstreamServer]:
+        """
+        全类型混排（DoH/DoT/DoQ 统一排序），按最低延迟排序，
+        延迟数据已从历史查询中收集（avg_response_time），
+        然后遍历确保后缀域名不同。
+        返回优选上游列表（数量 <= count）。
+        """
+        if count <= 0:
+            return []
+        encrypted = [
+            s for s in self._upstream_servers
+            if s.enabled and s.server_type in ("doh", "dot", "doq")
+        ]
+        # 全类型按平均延迟升序排序（延迟数据已存在，无需额外测量）
+        encrypted.sort(key=lambda s: s.avg_response_time)
+        preferred = []
+        used_suffixes = set()
+        for s in encrypted:
+            if len(preferred) >= count:
+                break
+            suffix = self._get_suffix(s.name)
+            if self.config.suffix_dedup_enabled and suffix in used_suffixes:
+                continue
+            preferred.append(s)
+            used_suffixes.add(suffix)
+        return preferred
+
     def _select_encrypted_upstreams(self, count: int = 3) -> List[UpstreamServer]:
         """
         按健康评分选择最优的 N 个加密上游（DoH/DoT/DoQ）。
@@ -1003,6 +1052,7 @@ class ResolverManager:
         query_bytes: bytes,
         fast_response: bytes,
         enabled_servers: List,
+        exclude_servers: set = None,
     ):
         """
         后台一致性验证任务（不阻塞主响应返回）。
@@ -1029,6 +1079,7 @@ class ResolverManager:
                 all_servers=enabled_servers,
                 query_bytes=query_bytes,
                 timeout=window,
+                exclude_servers=exclude_servers,
             )
         except Exception as e:
             logger.debug("后台一致性验证异常: %s", e)

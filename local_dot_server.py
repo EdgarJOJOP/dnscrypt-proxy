@@ -354,6 +354,7 @@ class LocalDoTServer:
             if self.config.cache_enabled:
                 cached = await self.cache.get(cache_key)
                 if cached is not None:
+                    cached.id = query.id
                     response_wire = cached.to_wire()
                     status = "cached"
                     await self._log_query(client_ip, qname, qtype_name, status, "")

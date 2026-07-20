@@ -109,9 +109,9 @@ class Config:
     async def check_reload(self) -> set:
         if not self._path.exists():
             return set()
-        mtime = self._path.stat().st_mtime
-        if mtime > self._last_mtime:
-            async with self._lock:
+        async with self._lock:
+            mtime = self._path.stat().st_mtime
+            if mtime > self._last_mtime:
                 old_snapshots = dict(self._section_snapshots)
                 self._load()
                 sections_to_check = {"cache", "filter", "hosts", "server", "upstream",
@@ -167,6 +167,15 @@ class Config:
     @property
     def doq_servers(self) -> List[str]:
         return self._data.get("upstream", {}).get("doq", []) or []
+    @property
+    def preferred_server_count(self) -> int:
+        return int(self._data.get("upstream", {}).get("preferred_count", 3))
+    @property
+    def bootstrap_compare_enabled(self) -> bool:
+        return bool(self._data.get("upstream", {}).get("bootstrap_compare", True))
+    @property
+    def suffix_dedup_enabled(self) -> bool:
+        return bool(self._data.get("upstream", {}).get("suffix_dedup", True))
     @property
     def all_upstream_addresses(self) -> List[str]:
         addrs = []

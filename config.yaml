@@ -67,6 +67,14 @@ upstream:
     - 119.29.29.29
     - 2400:3200::1
     - 2001:dc7:1000::1
+
+  # ============================================================
+  # 上游优选配置
+  # ============================================================
+  preferred_count: 5          # 优选上游数量（全类型混排选最低延迟，后缀去重）
+  bootstrap_compare: true     # 是否对比 IPv4/IPv6 bootstrap 延迟后选择更快者
+  suffix_dedup: true          # 优选时是否避免选中相同后缀域名的上游
+
   doh:
     - https://dns.alidns.com/dns-query
     - https://doh.pub/dns-query
@@ -74,9 +82,12 @@ upstream:
     - https://dns.cloudflare.com/dns-query
     - https://dns11.quad9.net/dns-query
     - https://sm2.doh.pub/dns-query          # 腾讯国密SM2加密DNS
+    - https://doh.360.cn/dns-query
+    - https://doh.dns.sb/dns-query
   dot:
     - dns.alidns.com
-    - dns.pub
+    - dot.pub
+    - dot.sb
     - dns.adguard-dns.com
     - one.one.one.one
     - 1dot1dot1dot1.cloudflare-dns.com
@@ -84,6 +95,7 @@ upstream:
     - quic://dns9.quad9.net:853
     - quic://dns.caliph.dev:853
     - quic://dns.alidns.com:853
+    - quic://dns-unfiltered.adguard.com:853
 cache:
   enabled: true
   max_size: 10000           # 最大缓存条目数，超限 LRU 淘汰

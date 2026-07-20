@@ -30,13 +30,6 @@ logger = logging.getLogger("dns-proxy.dnssec")
 # IANA 根区 KSK 信任锚（2024 年发布）
 # 来源: https://data.iana.org/root-anchors/
 # ============================================================
-ROOT_TRUST_ANCHOR_DNSKEY = {
-    "owner": ".",
-    "flags": 257,      # Secure Entry Point (SEP) + Zone Key
-    "protocol": 3,
-    "algorithm": 13,   # ECDSAP256SHA256 (ECDSAP256SHA256)
-    "public_key": "oJ9d7l5l6l7m8n9o0p1q2r3s4t5u6v7w8x9y0z1a2b3c4d5e6f7g8h9i0j1k",
-}
 # 实际的根信任锚 - 从 IANA 官方获取
 # 来源: https://data.iana.org/root-anchors/root-anchors.xml
 ROOT_ANCHOR_KEYS = {
@@ -93,9 +86,7 @@ def set_dnssec_do_bit(query_bytes: bytes) -> bytes:
                     break
         else:
             # 添加 OPT 记录（EDNS0）并设置 DO 位
-            opt = dns.message.Message._make_optional_message(
-                payload=4096, flags=0x8000
-            )
+            opt = dns.message.make_edns(flags=0x8000, payload=4096)
             msg.additional.append(opt)
 
         return msg.to_wire()
@@ -130,7 +121,7 @@ class DNSSECValidator:
         self._root_keys: Dict = self._parse_root_anchor()
         self._dns_query_callback: Optional[Callable] = None
         self._verified_zone_cache: Dict = {}  # zone_name → DNSKEY rrset
-        self._zone_cache_lock = threading.Lock()
+        self._zone_cache_lock = asyncio.Lock()
         self._stats: Dict[str, Any] = {
             "validated": 0,
             "failed": 0,
@@ -313,7 +304,7 @@ class DNSSECValidator:
         for signer in list(signers):
             if signer == root_name:
                 continue  # 根区已在 _root_keys 中
-            with self._zone_cache_lock:
+            async with self._zone_cache_lock:
                 if signer in keys:
                     continue  # 已加载
                 if signer in self._verified_zone_cache:
@@ -324,7 +315,7 @@ class DNSSECValidator:
             dnskey_rrset = await self._query_zone_dnskey(signer)
             if dnskey_rrset is not None:
                 keys[signer] = dnskey_rrset
-                with self._zone_cache_lock:
+                async with self._zone_cache_lock:
                     self._verified_zone_cache[signer] = dnskey_rrset
 
         # 4. 用完整的 keys 验证 answer 中的所有 RRset
@@ -332,16 +323,22 @@ class DNSSECValidator:
             if rrset.rdtype == dns.rdatatype.RRSIG:
                 continue
             # 查找对应的 RRSIG
-            rrsig_set = response.find_rrset(
-                response.answer,
-                rrset.name,
-                rrset.rdclass,
-                dns.rdatatype.RRSIG,
-                create=False,
-            )
+            try:
+                rrsig_set = response.find_rrset(
+                    response.answer,
+                    rrset.name,
+                    rrset.rdclass,
+                    dns.rdatatype.RRSIG,
+                    create=False,
+                )
+            except KeyError:
+                continue
             if rrsig_set:
-                dns.dnssec.validate(rrset, rrsig_set, keys)
-                return True  # 至少一个 RRset 验证通过即成功
+                try:
+                    dns.dnssec.validate(rrset, rrsig_set, keys)
+                except (dns.dnssec.ValidationFailure, KeyError) as e:
+                    logger.debug("DNSSEC 验证失败 (%s): %s", rrset.name, e)
+                    continue
 
         # 5. 如果 answer 段没有找到可验证的 RRset，检查 authority 段
         for rrset in response.authority:

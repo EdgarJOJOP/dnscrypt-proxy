@@ -156,24 +156,23 @@ class CacheEntry:
         # 通过 property 获取 Message（惰性水合），然后浅拷贝
         msg = self.response_msg
 
-        # ★ P3: 剩余 TTL >= 95% → 轻量路径（只改第一个 answer 的 TTL）
+        # ★ P3: 剩余 TTL >= 95% 时走轻量路径（仍修改所有 answer，仅跳过 authority/additional 深拷贝）
         if remaining >= self.ttl * 0.95:
             response = copy.copy(msg)
             response.answer = list(msg.answer)
-            if response.answer:
-                # 只覆写第一个 rrset 的 TTL（避免全量深拷贝）
-                first_rrset = response.answer[0]
+            # 修改所有 answer 的 TTL（不依赖 rrset 顺序）
+            new_answer = []
+            for rrset in response.answer:
                 new_rrset = dns.rrset.RRset(
-                    first_rrset.name, first_rrset.rdclass, first_rrset.rdtype,
-                    first_rrset.covers,
+                    rrset.name, rrset.rdclass, rrset.rdtype,
+                    rrset.covers,
                 )
-                for rd in first_rrset:
+                for rd in rrset:
                     new_rd = copy.copy(rd)
-                    if hasattr(new_rd, "ttl"):
-                        new_rd.ttl = remaining
-                    new_rrset.add(new_rd)
-                response.answer[0] = new_rrset
-            # authority 和 additional 直接用原引用
+                    new_rrset.add(new_rd, ttl=remaining)
+                new_answer.append(new_rrset)
+            response.answer = new_answer
+            # authority 和 additional 直接用原引用（它们的 TTL 不影响答案）
             response.authority = list(msg.authority)
             response.additional = list(msg.additional)
             return response
@@ -190,9 +189,7 @@ class CacheEntry:
             )
             for rd in rrset:
                 new_rd = copy.copy(rd)
-                if hasattr(new_rd, "ttl"):
-                    new_rd.ttl = remaining
-                new_rrset.add(new_rd)
+                new_rrset.add(new_rd, ttl=remaining)
             new_answer.append(new_rrset)
         response.answer = new_answer
 
@@ -206,9 +203,7 @@ class CacheEntry:
             )
             for rd in rrset:
                 new_rd = copy.copy(rd)
-                if hasattr(new_rd, "ttl"):
-                    new_rd.ttl = remaining
-                new_rrset.add(new_rd)
+                new_rrset.add(new_rd, ttl=remaining)
             new_auth.append(new_rrset)
         response.authority = new_auth
 
@@ -221,9 +216,7 @@ class CacheEntry:
             )
             for rd in rrset:
                 new_rd = copy.copy(rd)
-                if hasattr(new_rd, "ttl"):
-                    new_rd.ttl = remaining
-                new_rrset.add(new_rd)
+                new_rrset.add(new_rd, ttl=remaining)
             new_add.append(new_rrset)
         response.additional = new_add
 
@@ -342,9 +335,8 @@ class DNSCache:
         """从 DNS 响应中计算合适 TTL"""
         min_ttl = self.default_ttl
         for rrset in response.answer:
-            for rd in rrset:
-                if hasattr(rd, "ttl") and rd.ttl < min_ttl:
-                    min_ttl = rd.ttl
+            if hasattr(rrset, 'ttl') and rrset.ttl is not None and rrset.ttl < min_ttl:
+                min_ttl = rrset.ttl
         # 约束到配置范围
         return max(self.min_ttl, min(min_ttl, self.max_ttl))
 

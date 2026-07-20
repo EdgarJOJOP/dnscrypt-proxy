@@ -302,6 +302,8 @@ class PlainDNSServer:
             if self.config.cache_enabled:
                 cached = await self.cache.get(cache_key)
                 if cached is not None:
+                    import copy
+                    cached = copy.copy(cached)
                     cached.id = query.id  # 修复DNS ID不匹配
                     result_wire = cached.to_wire()
                     elapsed = asyncio.get_event_loop().time() - start_time
