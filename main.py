@@ -175,7 +175,9 @@ class DNSProxyApp:
 
         # 2. DNSSEC 验证器
         logger.info("[2/11] 初始化 DNSSEC 验证器...")
-        self._dnssec_validator = DNSSECValidator(enabled=self.config.dnssec_enabled)
+        self._dnssec_validator = DNSSECValidator(
+            enabled=self.config.dnssec_enabled, mode=self.config.dnssec_mode
+        )
         self._dnssec_wrapper = DNSSECQueryWrapper(
             self._dnssec_validator, enabled=self.config.dnssec_enabled
         )
@@ -299,6 +301,13 @@ class DNSProxyApp:
         # 5b. 完成 ResolverManager 剩余初始化（依赖 bootstrap 解析结果）
         #     此时加密上游 DNS（DoH/DoT/DoQ）就绪
         await self.resolver_manager._init_remaining()
+
+        # 5b2. 注入 DNSSEC 链验证回调（使用已就绪的上游解析器查询 DNSKEY）
+        if self._dnssec_validator is not None and hasattr(self._dnssec_validator, 'set_dns_query_callback'):
+            self._dnssec_validator.set_dns_query_callback(
+                self.resolver_manager.resolve_dnskey
+            )
+            logger.debug("  DNSSEC 链验证回调已注入")
 
         # 5c. 启动过滤规则下载（使用加密 DNS 解析规则 URL 域名）
         if hasattr(self, '_filter_rule_urls') and self._filter_rule_urls:

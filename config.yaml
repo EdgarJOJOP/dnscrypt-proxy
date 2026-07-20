@@ -101,9 +101,9 @@ dnssec:
   # 验证模式:
   #   ad_check       - 仅检查 AD 位（快速，依赖上游验证）
   #   strict         - 严格本地验证 RRSIG 签名链（安全但较慢）
-  mode: ad_check
+  mode: strict
   # 是否丢弃验证失败的响应（bogus）
-  drop_bogus: false
+  drop_bogus: true
 
 # ============================================================
 # 自定义域名映射（白名单功能，类似 Windows hosts 文件）

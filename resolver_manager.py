@@ -664,6 +664,18 @@ class ResolverManager:
 
             result = await self._parallel_resolve(dnssec_query)
 
+        # DNSSEC 验证（在 resolver 层统一执行，所有 server 类型自动受益）
+        if result is not None and self._dnssec is not None and self._dnssec.enabled:
+            try:
+                dnssec_ok, dnssec_status = await self._dnssec.validate_response(
+                    dnssec_query, result
+                )
+                if not dnssec_ok and self.config.dnssec_drop_bogus:
+                    logger.warning("DNSSEC bogus (resolver层): %s，丢弃响应", dnssec_status)
+                    return None
+            except Exception as e:
+                logger.debug("resolver层 DNSSEC 验证异常: %s", e)
+
         # 异常检测 + 可疑域名触发交叉验证（不阻塞响应返回）
         should_verify = False
         if result is not None:
@@ -1206,6 +1218,14 @@ class ResolverManager:
                 logger.debug("关闭 bootstrap %s 空闲连接失败: %s", server.name, e)
         if closed:
             logger.debug("关闭了 %d 个解析器的空闲连接", closed)
+
+    async def resolve_dnskey(self, query_bytes: bytes) -> Optional[bytes]:
+        """
+        DNSKEY 专用查询（跳过 DNSSEC 验证防止递归）。
+        由 DNSSECValidator 在链验证时调用。
+        """
+        async with self._concurrent_semaphore:
+            return await self._parallel_resolve(query_bytes)
 
     @property
     def stats(self) -> Dict[str, Any]:
