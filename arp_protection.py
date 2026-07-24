@@ -526,7 +526,7 @@ class ARPProtection:
                     None,
                     lambda: scapy.sniff(
                         prn=_handle_pkt, store=False,
-                        filter="arp", timeout=5,
+                        filter="arp", timeout=None,
                         stop_filter=lambda pkt: not self._arp_running,
                     ),
                 )
