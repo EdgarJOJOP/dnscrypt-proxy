@@ -1,4 +1,4 @@
-"""
+﻿"""
 DNS over QUIC (DoQ) 解析器
 - 强制 Transaction ID = 0（RFC 9250）
 - 标准 ALPN "doq"（不尝试 doq-i11/dq 等旧版本）
@@ -244,13 +244,13 @@ if HAS_AIOQUIC:
             """关闭 QUIC 连接"""
             self._closed = True
             try:
-                self._quic.close()
-            except Exception as e:
-                logger.debug("DoQ 解析器关闭 QUIC 异常: %s", e)
-            try:
                 self._flush_send(time.monotonic())
             except Exception as e:
                 logger.debug("DoQ 解析器关闭刷新异常: %s", e)
+            try:
+                self._quic.close()
+            except Exception as e:
+                logger.debug("DoQ 解析器关闭 QUIC 异常: %s", e)
             self._close_transport()
 
         @property

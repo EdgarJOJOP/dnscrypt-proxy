@@ -1,4 +1,4 @@
-"""
+﻿"""
 并行解析管理器
 - 并行查询所有上游服务器
 - 取最快成功响应返回
@@ -117,7 +117,7 @@ class UpstreamServer:
         # 连续失败 5 次，暂时禁用
         if self.consecutive_failures >= 5:
             self.enabled = False
-            logger.warning("上游 %s 连续失败 %d 次，已暂时禁用", self.name, self.consecutive_failures)
+            logger.debug("上游 %s 连续失败 %d 次，已暂时禁用", self.name, self.consecutive_failures)
 
     def reenable(self):
         if not self.enabled:
@@ -157,6 +157,15 @@ class ResolverManager:
         # 网络断开标志：网络不可达时不查询上游、不打日志，直接返回 SERVFAIL
         self._network_down = False
         self._network_down_reported = False  # 避免重复日志
+        # 连续全部失败计数器与静默模式（阶段1：智能退避 + 日志压制）
+        self._consecutive_all_failed_counter: int = 0       # 连续全部失败轮数
+        self._all_failed_start_time: float = 0.0            # 首次全部失败时间戳
+        self._silent_mode: bool = False                     # 静默模式：抑制所有日志
+        self._last_silent_probe_time: float = 0.0           # 末次探活时间
+        self._silent_probe_interval: float = 60.0           # 探活间隔（秒）
+        self._all_failed_silent_rounds: int = getattr(config, 'all_failed_silent_rounds', 5)  # 进入静默的阈值
+        # 跨层回调：ResolverManager → NetworkMonitor（全部失败时通知）
+        self._on_all_upstreams_failed: Optional[callable] = None
         self._ech_fetchers: Dict[str, ECHConfigFetcher] = {}  # hostname -> ECHConfigFetcher
         self._ech_warmup_failed: set = set()  # hostnames whose ECH warmup all failed
         self._openssl4_wrapper = None  # OpenSSL 4.0 wrapper（ECH；如不可用则为 None）
@@ -804,6 +813,26 @@ class ResolverManager:
         if self._network_down:
             return None
 
+        # === 静默模式探活 ===
+        # 连续多轮全部失败后进入静默模式：每分钟只实际执行一次探活查询
+        if self._silent_mode:
+            elapsed_since_last_probe = now - self._last_silent_probe_time
+            if elapsed_since_last_probe < self._silent_probe_interval:
+                # 未到探活时间，静默返回 SERVFAIL，不打印任何日志
+                return None
+            # 到探活时间了：执行一次实际查询，重置探活计时器
+            self._last_silent_probe_time = now
+            result = await self._parallel_resolve_once(query_bytes)
+            if result is not None:
+                logger.info("并行查询: 静默探活成功，上游服务器已恢复域名解析")
+                self._last_all_failed_time = 0.0
+                self._consecutive_all_failed_counter = 0
+                self._all_failed_start_time = 0.0
+                self._silent_mode = False
+                return result
+            # 探活仍失败，不打印任何日志，静默返回
+            return None
+
         # === 启动缓冲期 ===
         # 程序刚启动时，上游 DNS 连接尚未建立，给它们 3 秒时间
         startup_elapsed = now - self._start_time
@@ -841,10 +870,31 @@ class ResolverManager:
             if self._last_all_failed_time > 0:
                 logger.info("并行查询: 上游服务器已恢复域名解析")
                 self._last_all_failed_time = 0.0
+            # 恢复成功：重置连续失败计数器、退出静默模式
+            if self._consecutive_all_failed_counter > 0 or self._silent_mode:
+                self._consecutive_all_failed_counter = 0
+                self._all_failed_start_time = 0.0
+                self._silent_mode = False
             return result
 
-        # === 全部失败 → 仅一个请求执行重试 ===
+        # === 全部失败 → 更新计数器，触发跨层回调，仅一个请求执行重试 ===
         self._last_all_failed_time = asyncio.get_event_loop().time()
+        self._consecutive_all_failed_counter += 1
+        if self._consecutive_all_failed_counter == 1:
+            self._all_failed_start_time = self._last_all_failed_time
+            self._silent_mode = False  # 首次失败时确保退出静默模式
+
+        # 触发跨层回调，通知 NetworkMonitor 进行深度检测
+        if self._on_all_upstreams_failed is not None:
+            elapsed = self._last_all_failed_time - (self._all_failed_start_time if self._all_failed_start_time > 0 else self._last_all_failed_time)
+            try:
+                await self._on_all_upstreams_failed(self._consecutive_all_failed_counter, elapsed)
+            except Exception:
+                pass
+
+        # 静默模式：全部失败达到阈值，不执行重试、不打印任何日志
+        if self._silent_mode:
+            return None
 
         if self._retry_lock.locked():
             # 已有其他请求在重试，这个请求直接返回（避免重复日志）
@@ -859,9 +909,33 @@ class ResolverManager:
             if _version != self._retry_version:
                 return None
 
-            for retry, delay in enumerate([0.2, 0.5, 1.0], start=1):
-                logger.warning("并行查询: 全部 %d 个上游均失败，%.1fs 后第 %d 次重试...",
-                               alive, delay, retry)
+            # 根据连续失败轮数选择退避延迟
+            if self._consecutive_all_failed_counter >= self._all_failed_silent_rounds:
+                # 连续全部失败达到阈值 → 进入静默模式
+                self._silent_mode = True
+                logger.warning("并行查询: 全部 %d 个上游持续失败 %d 轮 (历时 %.0fs)，"
+                               "进入静默模式，每分钟仅探活一次",
+                               alive, self._consecutive_all_failed_counter,
+                               self._last_all_failed_time - self._all_failed_start_time)
+                # 重置时间戳以便探活检测使用
+                self._last_silent_probe_time = self._last_all_failed_time
+                self._last_all_failed_time = 0.0
+                self._retry_version += 1
+                return None
+            elif self._consecutive_all_failed_counter >= 2:
+                retry_delays = [1.0, 3.0, 10.0]  # 升级退避
+                log_level = "DEBUG"  # 降级日志级别
+            else:
+                retry_delays = [0.2, 0.5, 1.0]   # 正常退避
+                log_level = "WARNING"
+
+            for retry, delay in enumerate(retry_delays, start=1):
+                if log_level == "WARNING":
+                    logger.warning("并行查询: 全部 %d 个上游均失败，%.1fs 后第 %d 次重试...",
+                                   alive, delay, retry)
+                else:
+                    logger.debug("并行查询: 全部 %d 个上游均失败，%.1fs 后第 %d 次重试 (连续%d轮)",
+                                 alive, delay, retry, self._consecutive_all_failed_counter)
                 await asyncio.sleep(delay)
                 result = await self._parallel_resolve_once(query_bytes)
                 if result is not None:
@@ -869,12 +943,16 @@ class ResolverManager:
                                 retry,
                                 asyncio.get_event_loop().time() - _failure_start)
                     self._last_all_failed_time = 0.0
+                    self._consecutive_all_failed_counter = 0
+                    self._all_failed_start_time = 0.0
+                    self._silent_mode = False
                     self._retry_version += 1
                     return result
                 self._last_all_failed_time = asyncio.get_event_loop().time()
 
             self._retry_version += 1
-            logger.warning("并行查询: 全部 %d 个上游均失败 (%d 次重试后放弃)", alive, 3)
+            logger.warning("并行查询: 全部 %d 个上游均失败 (%d 次重试后放弃, 连续%d轮)",
+                           alive, 3, self._consecutive_all_failed_counter)
             return None
 
     @staticmethod
@@ -942,7 +1020,6 @@ class ResolverManager:
                     query_bytes
                 )
                 if result is not None:
-                    self.exit_recovery_mode()
                     server.record_success(response_time=elapsed)
                     return (result, elapsed, server)
                 if not self._recovery_mode:
@@ -995,6 +1072,7 @@ class ResolverManager:
 
         if successful:
             successful.sort(key=lambda x: x[1])
+            self.exit_recovery_mode()
             return successful[0]
         return None
 

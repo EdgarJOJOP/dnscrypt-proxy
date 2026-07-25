@@ -109,6 +109,12 @@ class _DoQConnection:
             return
 
         msg_len = struct.unpack("!H", payload[:2])[0]
+        if len(payload) < 2 + msg_len:
+            logger.warning("DoQ truncation: need %d, got %d", 2 + msg_len, len(payload))
+            return
+        if len(payload) < 2 + msg_len:
+            logger.warning("DoQ truncation: need %d, got %d", 2 + msg_len, len(payload))
+            return
         dns_data = payload[2 : 2 + msg_len]
         if len(dns_data) < 12:
             return
@@ -174,7 +180,31 @@ class _DoQUdpProtocol(asyncio.DatagramProtocol):
     def datagram_received(self, data: bytes, addr: tuple):
         if self._closed:
             return
-        conn = self._connections.get(addr)
+        # Support QUIC connection migration (CID lookup then addr fallback)
+        conn = None
+        for cid, c in list(self._connections.items()):
+            if hasattr(c, "_quic") and c._quic and hasattr(c._quic, "host"):
+                if c._quic.host == addr[0]:
+                    conn = c
+                    break
+        if conn is None:
+            # Support QUIC connection migration (CID lookup then addr fallback)
+            conn = None
+            for cid, c in list(self._connections.items()):
+                if hasattr(c, "_quic") and c._quic and hasattr(c._quic, "host"):
+                    if c._quic.host == addr[0]:
+                        conn = c
+                        break
+            if conn is None:
+                # Support QUIC connection migration (CID lookup then addr fallback)
+                conn = None
+                for cid, c in list(self._connections.items()):
+                    if hasattr(c, "_quic") and c._quic and hasattr(c._quic, "host"):
+                        if c._quic.host == addr[0]:
+                            conn = c
+                            break
+                if conn is None:
+                    conn = self._connections.get(addr)
         if conn is None:
             # 最大 QUIC 连接数限制
             if len(self._connections) >= self._max_connections:

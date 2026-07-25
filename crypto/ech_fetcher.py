@@ -163,8 +163,13 @@ class ECHConfigFetcher:
             return None
 
         # 锁内快速检查缓存状态（无 I/O）
+        # Network I/O with lock released
+        result = await self._do_query()
         async with self._lock:
-            rec = self._record
+            if result:
+                self._ech_config = result
+                self._has_valid_config = True
+            return result or getattr(self, "_ech_config", None)
             now = time.time()
             need_query = rec is None or rec.is_stale
             can_return_stale = rec is not None and rec.should_refresh and not rec.is_stale

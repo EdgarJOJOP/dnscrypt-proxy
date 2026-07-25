@@ -665,7 +665,11 @@ class DoHServer:
         site_v4 = web.TCPSite(
             self._runner, self.host, self.port, ssl_context=ssl_context,
         )
-        await site_v4.start()
+        try:
+            await site_v4.start()
+        except OSError as e:
+            logger.error("DoH IPv4 bind failed (%s:%s): %s", self.host, self.port, e)
+            raise
         self._sites.append(site_v4)
         logger.info(
             "DoH [IPv4] https://%s:%s%s",

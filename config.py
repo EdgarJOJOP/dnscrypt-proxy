@@ -1,4 +1,4 @@
-"""
+﻿"""
 配置管理模块 - 支持 YAML 配置文件热加载
 
 NDP 防护参数说明（位于 config.yaml network_monitor.ndp_protection）:
@@ -90,10 +90,11 @@ class Config:
             from ruamel.yaml import YAML
             ryaml = YAML()
             ryaml.indent(mapping=2, sequence=4, offset=2)
-            if self._path.exists():
+            ryaml_data = None
+            if self._path.exists() and self._path.stat().st_size > 0:
                 with open(self._path, "r", encoding="utf-8") as f:
                     ryaml_data = ryaml.load(f)
-            else:
+            if not ryaml_data:
                 ryaml_data = yaml.safe_load(CONFIG_TEMPLATE)
             def _deep_update(dst, src):
                 for k, v in src.items():
@@ -130,7 +131,7 @@ class Config:
                             cb(self._data, changed)
                     except Exception as e:
                         logger.warning("配置回调异常: %s", e)
-            return changed
+                return changed
         return set()
 
     def on_reload(self, callback):
@@ -411,6 +412,10 @@ class Config:
     def network_monitor_enabled(self) -> bool:
         return self._data.get("network_monitor", {}).get("enabled", True)
     @property
+    def all_failed_silent_rounds(self) -> int:
+        """进入静默模式的连续全部失败轮数阈值（默认5）"""
+        return int(self._data.get("network_monitor", {}).get("all_failed_silent_rounds", 5))
+    @property
     def network_monitor_config(self) -> dict:
         return self._data.get("network_monitor", {})
     @property
@@ -459,8 +464,9 @@ class Config:
         return int(self._data.get("network_monitor", {}).get("response_verification", {}).get("consistency", {}).get("max_background_servers", 5))
     def get_raw(self) -> Dict[str, Any]:
         return dict(self._data)
-    def update_section(self, section: str, data: dict):
-        keys = section.split(".")
+    async def update_section(self, section: str, data: dict):
+        async with self._lock:
+            keys = section.split(".")
         current = self._data
         for k in keys[:-1]:
             current = current.setdefault(k, {})

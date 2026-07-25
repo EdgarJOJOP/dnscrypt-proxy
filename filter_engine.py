@@ -1180,7 +1180,7 @@ class FilterEngine:
         # 统一过滤结果缓存（合并原 _filter_cache + _custom_hosts_cache）
         # 格式: {domain: (blocked, reason, timestamp, priority)}
         # priority=True 的条目（自定义 hosts）永不淘汰
-        self._filter_cache: Dict[str, Tuple[bool, str, float, bool]] = {}
+        self._filter_cache: Dict[str, Tuple[bool, str, float, bool, Optional[dict]]] = {}
         self._cache_ttl_blocked: int = cache_ttl_blocked
         self._cache_ttl_allowed: int = cache_ttl_allowed
         self._cache_trim_pending: bool = False  # call_soon 防重复
@@ -2010,13 +2010,14 @@ class FilterEngine:
                 self._filter_cache[domain] = (False, "custom_hosts", now, True)
                 return False, "custom_hosts"
             if domain in self._custom_hosts_bypass:
-                self._filter_cache[domain] = (False, "custom_hosts_bypass", now, True)
+                self._filter_cache[domain] = (False, "custom_hosts_bypass", now, True, None)
                 return False, "custom_hosts_bypass"
 
         # 1. 检查统一过滤结果缓存
         cached = self._filter_cache.get(domain)
         if cached is not None:
-            result, reason, ts, priority = cached
+            result, reason, ts, priority, *dnsrewrite_extra = cached
+            dnsrewrite_data = dnsrewrite_extra[0] if dnsrewrite_extra else None
             # blocked 结果永久有效（直到规则重载清空 _filter_cache）；
             # allowed 结果使用 _cache_ttl_allowed 检查；priority 条目永不超时
             if priority or result:
@@ -2024,6 +2025,9 @@ class FilterEngine:
                     logger.debug("FilterCache HIT(blocked): %s | %s (永久)", domain, reason[:60])
                 else:
                     logger.debug("FilterCache HIT(allow/priority): %s", domain)
+                # Restore dnsrewrite data for consumer
+                if dnsrewrite_data and reason == "dnsrewrite":
+                    self._last_dnsrewrite = dnsrewrite_data
                 return result, reason
             # allowed 结果检查 TTL
             if now - ts < self._cache_ttl_allowed:
@@ -2046,12 +2050,12 @@ class FilterEngine:
                     self._last_dnsrewrite = rule.dnsrewrite
                     reason = "dnsrewrite"
                     if not self._cache_suspended:
-                        self._filter_cache[domain] = (True, reason, now, False)
+                        self._filter_cache[domain] = (True, reason, now, False, self._last_dnsrewrite)
                     self._defer_trim()
                     return True, reason
                 reason = f"重要规则拦截: {rule.raw}"
                 if not self._cache_suspended:
-                    self._filter_cache[domain] = (True, reason, now, False)
+                    self._filter_cache[domain] = (True, reason, now, False, None)
                 self._defer_trim()
                 logger.debug("拦截(重要规则): %s | %s", domain, rule.raw[:60])
                 return True, reason
@@ -2063,7 +2067,7 @@ class FilterEngine:
         if match is not None:
             rule, method = match
             if not self._cache_suspended and not self._loading:
-                self._filter_cache[domain] = (False, "", now, False)
+                self._filter_cache[domain] = (False, "", now, False, None)
             logger.debug("放行(白名单): %s | %s: %s", domain, method, rule.raw[:60])
             return False, ""
 
@@ -2084,14 +2088,14 @@ class FilterEngine:
             else:
                 reason = f"{method}: {rule.raw}"
             if not self._cache_suspended:
-                self._filter_cache[domain] = (True, reason, now, False)
+                self._filter_cache[domain] = (True, reason, now, False, rule.dnsrewrite if rule.dnsrewrite else None)
             self._defer_trim()
             logger.debug("拦截: %s | %s (%s)", domain, method, rule.raw[:80])
             return True, reason
 
         # 未匹配：缓存并放行
         if not self._cache_suspended and not self._loading:
-            self._filter_cache[domain] = (False, "", now, False)
+            self._filter_cache[domain] = (False, "", now, False, None)
         self._defer_trim()
         logger.log(logging.DEBUG-1, "放行(无匹配): %s (共 %d 条拦截规则)", domain, self._rule_count)
         return False, ""

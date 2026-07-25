@@ -333,6 +333,11 @@ class DNSProxyApp:
         logger.info("[7/11] 初始化网络连通性监控器...")
         self.network_monitor = NetworkMonitor(self.config, self.resolver_manager,
                                                  filter_engine=self.filter_engine)
+        # 连接 ResolverManager → NetworkMonitor 回调（全部上游失败时深度诊断）
+        self.resolver_manager._on_all_upstreams_failed = self.network_monitor.on_all_upstreams_failed
+        # 连接 NetworkMonitor → App 回调（断网时停止本地服务，恢复时重启）
+        self.network_monitor._on_network_down = self.stop_local_servers
+        self.network_monitor._on_network_up = self.start_local_servers
         await self.network_monitor.start()
 
         # 8. 本地 DoH 服务器（带 IPv6 + DNSSEC）
@@ -846,6 +851,66 @@ class DNSProxyApp:
 
         logger.info("所有服务已停止")
 
+    async def stop_local_servers(self):
+        """断网时停止所有本地加密 DNS 服务"""
+        logger = logging.getLogger("dns-proxy.app")
+        if self.doh_server and self.config.doh_enabled:
+            try:
+                await self.doh_server.stop()
+                logger.warning("  DoH 服务器已暂停 (断网)")
+            except Exception:
+                pass
+        if self.local_dot_server and self.config.local_dot_enabled:
+            try:
+                await self.local_dot_server.stop()
+                logger.warning("  DoT 服务器已暂停 (断网)")
+            except Exception:
+                pass
+        if self.local_doq_server and self.config.local_doq_enabled:
+            try:
+                await self.local_doq_server.stop()
+                logger.warning("  DoQ 服务器已暂停 (断网)")
+            except Exception:
+                pass
+        if self.plain_dns_server and self.config.plain_dns_enabled:
+            try:
+                await self.plain_dns_server.stop()
+                logger.warning("  Plain DNS 服务器已暂停 (断网)")
+            except Exception:
+                pass
+
+        logger.warning("所有加密 DNS 服务已暂停 (断网)")
+
+    async def start_local_servers(self):
+        """网络恢复时重新启动所有本地加密 DNS 服务"""
+        logger = logging.getLogger("dns-proxy.app")
+        if self.doh_server and self.config.doh_enabled:
+            try:
+                await self.doh_server.start()
+                logger.info("  DoH 服务器已启动 (网络恢复)")
+            except Exception:
+                pass
+        if self.local_dot_server and self.config.local_dot_enabled:
+            try:
+                await self.local_dot_server.start()
+                logger.info("  DoT 服务器已启动 (网络恢复)")
+            except Exception:
+                pass
+        if self.local_doq_server and self.config.local_doq_enabled:
+            try:
+                await self.local_doq_server.start()
+                logger.info("  DoQ 服务器已启动 (网络恢复)")
+            except Exception:
+                pass
+        if self.plain_dns_server and self.config.plain_dns_enabled:
+            try:
+                await self.plain_dns_server.start()
+                logger.info("  Plain DNS 服务器已启动 (网络恢复)")
+            except Exception:
+                pass
+
+        logger.info("所有加密 DNS 服务已恢复 (网络恢复)")
+
 
 # ======================== 入口 ========================
 
@@ -932,9 +997,10 @@ def _elevate():
 
     if sys.platform == "win32":
         try:
-            import ctypes
+            import ctypes, subprocess
+            cmdline = subprocess.list2cmdline(sys.argv)
             ctypes.windll.shell32.ShellExecuteW(
-                None, "runas", sys.executable, " ".join(sys.argv), None, 1
+                None, "runas", sys.executable, cmdline, None, 1
             )
         except Exception as e:
             print(f"UAC 提权失败: {e}，继续以当前权限运行")

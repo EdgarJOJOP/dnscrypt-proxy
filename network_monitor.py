@@ -117,6 +117,10 @@ class NetworkMonitor:
         # 日志抑制："网络已恢复" 防洪（ARP 攻击期间 GARP 脉冲反复触发）
         self._last_recovery_log_time: float = 0.0
 
+        # 断网/恢复回调：由 DNSProxyApp 连接，断网时停止本地服务，恢复时重启
+        self._on_network_down: Optional[callable] = None
+        self._on_network_up: Optional[callable] = None
+
         # ========== Destination Unreachable 快速断网检测（硬编码，始终启用） ==========
         self._wan_unreachable_codes = [0, 1]  # 0=Network Unreachable, 1=Host Unreachable
         # 缓存上次探测结果（避免每轮都重复分析）
@@ -322,9 +326,7 @@ class NetworkMonitor:
                         else:
                             # ARP/NDP 安静期：触发完整恢复
                             # 同时直接清除标志作为兜底，防止 recovery worker 异常后主循环卡死
-                            self._arp_network_down = False
-                            self._ndp_network_down = False
-                            self.resolver_manager.set_network_down(False)
+                            # DNS unblock done by recovery worker
                             self._run_recover.set()
                     # 取消还在运行的 ARP 防护任务
                     if self._arp_task and not self._arp_task.done():
@@ -344,6 +346,12 @@ class NetworkMonitor:
                             self._arp_network_down = True
                             self._ndp_network_down = True
                             self.resolver_manager.set_network_down(True)
+                            # 触发断网回调：停止所有本地加密 DNS 服务
+                            if self._on_network_down is not None:
+                                try:
+                                    await self._on_network_down()
+                                except Exception:
+                                    pass
                         # 取消可能还在跑的 ARP 防护任务（断网没必要跑）
                         if self._arp_task and not self._arp_task.done():
                             self._arp_task.cancel()
@@ -374,15 +382,18 @@ class NetworkMonitor:
                                 self._run_arp_defense(gw_ip, lambda: self._is_recovered())
                             )
 
-                    # NDP defense for IPv6 (parallel to IPv4 ARP)
+                    # NDP defense for IPv6 (仅当 IPv6 网关实际丢包时才触发)
                     if self._ndp_protection.enabled:
-                        if not self._ndp_task or self._ndp_task.done():
-                            ndp_gw = self._ndp_protection.gateway_ipv6
-                            if ndp_gw:
-                                logger.warning("NDP 防护: IPv6 网关丢包，启动后台 NDP 修复" + " [v4gw=" + str(sum(self._gw_results)) + "/" + str(len(self._gw_results)) + " v6gw=" + str(sum(self._ndp_gw_results)) + "/" + str(len(self._ndp_gw_results)) + " v4ext=" + str(sum(self._ext_results)) + "/" + str(len(self._ext_results)) + " v6ext=" + str(sum(self._ext_results_v6)) + "/" + str(len(self._ext_results_v6)) + "]")
-                                self._ndp_task = asyncio.create_task(
-                                    self._run_ndp_defense(ndp_gw, lambda: self._is_recovered())
-                                )
+                        v6gw_loss = (len(self._ndp_gw_results) > 0 and
+                                     sum(self._ndp_gw_results) < len(self._ndp_gw_results) * 0.8)
+                        if v6gw_loss:
+                            if not self._ndp_task or self._ndp_task.done():
+                                ndp_gw = self._ndp_protection.gateway_ipv6
+                                if ndp_gw:
+                                    logger.warning("NDP 防护: IPv6 网关丢包，启动后台 NDP 修复" + " [v4gw=" + str(sum(self._gw_results)) + "/" + str(len(self._gw_results)) + " v6gw=" + str(sum(self._ndp_gw_results)) + "/" + str(len(self._ndp_gw_results)) + " v4ext=" + str(sum(self._ext_results)) + "/" + str(len(self._ext_results)) + " v6ext=" + str(sum(self._ext_results_v6)) + "/" + str(len(self._ext_results_v6)) + "]")
+                                    self._ndp_task = asyncio.create_task(
+                                        self._run_ndp_defense(ndp_gw, lambda: self._is_recovered())
+                                    )
                 else:
                     # normal - reset network_down counter
                     self._consecutive_network_down = 0
@@ -661,10 +672,7 @@ class NetworkMonitor:
 
             if result:
                 # ARP 防护成功 — 强制填充滑动窗口成功结果，加速恢复判定
-                for _ in range(self._gw_results.maxlen):
-                    self._gw_results.append(True)
-                for _ in range(self._ext_results.maxlen):
-                    self._ext_results.append(True)
+                # ARP fix - let sliding window recover naturally
                 if abort_check() or await self._arp_protection._ping_gateway_fast(gw_ip):
                     logger.info("ARP 防护: 后台修复完成，网关已恢复")
                     # 如果是从 network_down 恢复，触发常驻 recover worker
@@ -709,10 +717,7 @@ class NetworkMonitor:
             result = await self._ndp_protection.refresh_router_ndp(abort_check=abort_check)
             if result:
                 # NDP 防护成功 — 强制填充滑动窗口成功结果
-                for _ in range(self._ndp_gw_results.maxlen):
-                    self._ndp_gw_results.append(True)
-                for _ in range(self._ext_results_v6.maxlen):
-                    self._ext_results_v6.append(True)
+                # NDP fix - let sliding window recover naturally
                 ndp_gw = self._ndp_protection.gateway_ipv6
                 if abort_check() or (ndp_gw and await self._ndp_protection._ping_ipv6(ndp_gw)):
                     logger.info("NDP 防护: 后台修复完成，IPv6 网关已恢复")
@@ -996,6 +1001,12 @@ class NetworkMonitor:
                 self._arp_network_down = False
                 self._ndp_network_down = False
                 self.resolver_manager.set_network_down(False)
+                # 触发网络恢复回调：重启本地加密 DNS 服务
+                if self._on_network_up is not None:
+                    try:
+                        await self._on_network_up()
+                    except Exception:
+                        pass
 
                 enabled = sum(1 for s in self.resolver_manager._upstream_servers if s.enabled)
                 total = len(self.resolver_manager._upstream_servers)
@@ -1010,3 +1021,211 @@ class NetworkMonitor:
                 self.resolver_manager.set_network_down(False)
             finally:
                 self._recovery_in_progress = False
+
+    # ======================== Resolver 全部失败回调 ========================
+
+    async def on_all_upstreams_failed(self, consecutive_count: int, elapsed_seconds: float):
+        """
+        ResolverManager 回调：所有上游 DNS 服务器连续全部失败时调用。
+        执行深度检测尝试定位问题根源。
+
+        Args:
+            consecutive_count: 连续全部失败的轮数
+            elapsed_seconds: 从首次全部失败到现在的持续时间
+        """
+        if not self._running:
+            return
+
+        # 日志：持续全部失败，但 NetworkMonitor 尚未判定断网
+        if consecutive_count == 1:
+            logger.warning("DNS 上游全部失败 (第1轮) — 但网络连通性检测正常，"
+                           "启动深度诊断: ARP/NDP 检查 + plain DNS 探活")
+        elif consecutive_count <= 3:
+            logger.warning("DNS 上游持续全部失败 (第%d轮, %.0fs) — "
+                           "深度诊断中...", consecutive_count, elapsed_seconds)
+        else:
+            # 超过3轮，降级为 DEBUG 避免日志洪流
+            logger.debug("DNS 上游持续全部失败 (第%d轮, %.0fs) — "
+                         "深度诊断持续中", consecutive_count, elapsed_seconds)
+
+        # 执行深度诊断
+        try:
+            await self._force_arp_ndp_check(consecutive_count)
+        except Exception as e:
+            logger.debug("深度诊断 ARP/NDP 检查异常: %s", e)
+
+        try:
+            plain_dns_ok = await self._probe_plain_dns_canary()
+        except Exception as e:
+            logger.debug("深度诊断 plain DNS 探活异常: %s", e)
+            plain_dns_ok = False
+
+        # 根据诊断结果决策
+        if plain_dns_ok:
+            if consecutive_count <= 3:
+                logger.warning("⚠️ 深度诊断: plain DNS 探活成功，但加密 DNS (DoH/DoT/DoQ) 全部失败 — "
+                               "可能原因: ① 光猫/路由器对加密 DNS 端口限速或劫持  "
+                               "② ISP 临时阻断非标准 DNS 流量  "
+                               "③ 上游 DNS 服务器集体故障")
+        else:
+            if consecutive_count >= 3:
+                # plain DNS 也失败，且已持续多轮 → 确认为网络中断
+                if not self._arp_network_down and not self._ndp_network_down:
+                    logger.warning("⚠️ 深度诊断: plain DNS 探活也失败 — "
+                                   "确认网络中断，自动抑制 DNS 查询")
+                    # 清空滑动窗口强制进入 network_down 状态
+                    self._ext_results.clear()
+                    for _ in range(self._ext_results.maxlen):
+                        self._ext_results.append(False)
+                    self._ext_results_v6.clear()
+                    for _ in range(self._ext_results_v6.maxlen):
+                        self._ext_results_v6.append(False)
+                    self._wan_dead_confirmed_at = asyncio.get_event_loop().time()
+                    self._arp_network_down = True
+                    self._ndp_network_down = True
+                    self.resolver_manager.set_network_down(True, detail="DNS 全失败 + plain DNS 探活也失败")
+
+    async def _force_arp_ndp_check(self, consecutive_count: int = 1):
+        """
+        强制 ARP/NDP 深度检测与完整反制（不依赖 ping）：
+        1. 直接检查本机 ARP/NDP 表是否被投毒
+        2. 发现投毒 → 直接触发 GARP/NA 反制（定向随机 MAC 毒化 + 广播爆发 + 静态绑定）
+        3. 无投毒时也对比基线 MAC 做预防性检查
+        4. 根据 DNS 连续失败轮数映射攻击频率，触发自适应强度
+
+        Args:
+            consecutive_count: DNS 连续全部失败轮数，用于映射攻击频率
+        """
+        # 将 consecutive_count 映射为等效 attack_rate（次/60s），
+        # 供 _get_intensity 选择反制强度等级
+        if consecutive_count >= 10:
+            attack_rate = 250      # MAX 级
+        elif consecutive_count >= 5:
+            attack_rate = 80       # L2 级
+        elif consecutive_count >= 3:
+            attack_rate = 40       # L1 级
+        else:
+            attack_rate = 10       # 默认级
+
+        # === IPv4 ARP 检查（不依赖 ping）===
+        if self._arp_protection.enabled:
+            gw_ip = self._arp_protection.gateway_ip
+            if gw_ip:
+                # 1. 直接检查本机 ARP 表是否有投毒条目
+                poisoned = await self._arp_protection._check_arp_poisoning()
+                if poisoned:
+                    for gw_ip_p, expected_mac, actual_mac in poisoned:
+                        logger.warning("深度诊断 [反制]: 检测到 ARP 投毒！"
+                                       "网关 %s 期望 MAC=%s, 当前 MAC=%s — 触发完整反制",
+                                       gw_ip_p, expected_mac, actual_mac)
+                        burst_size, directed_count, inter, _ = ARPProtection._get_intensity(attack_rate)
+                        await self._arp_protection._garp_counterstrike(
+                            # attacker_ip 传入网关 IP（投毒者冒充网关），用于 GARP 广播宣告真实网关绑定
+                            attacker_ip=gw_ip_p,
+                            attacker_mac=actual_mac,
+                            burst_size=burst_size,
+                            directed_count=directed_count,
+                            inter=inter,
+                        )
+                else:
+                    # 2. 无投毒时，对比基线 MAC 做预防性检查
+                    baseline_mac = self._arp_protection._baseline_mac
+                    if baseline_mac:
+                        try:
+                            if sys.platform == "win32":
+                                current_mac = await ARPProtection._arp_get_mac_windows(gw_ip)
+                            else:
+                                current_mac = await ARPProtection._arp_get_mac_linux(gw_ip)
+                            if current_mac and current_mac.upper() != baseline_mac:
+                                logger.warning("深度诊断 [反制]: 网关 %s MAC 变更 "
+                                               "(基线=%s, 当前=%s) — 可能 ARP 投毒，触发反制",
+                                               gw_ip, baseline_mac, current_mac)
+                                burst_size, directed_count, inter, _ = ARPProtection._get_intensity(attack_rate)
+                                await self._arp_protection._garp_counterstrike(
+                                    attacker_ip=gw_ip,
+                                    attacker_mac=current_mac,
+                                    burst_size=burst_size,
+                                    directed_count=directed_count,
+                                    inter=inter,
+                                )
+                        except Exception as e:
+                            logger.debug("深度诊断 ARP MAC 检查异常: %s", e)
+
+        # === IPv6 NDP 检查（不依赖 ping）===
+        if self._ndp_protection.enabled:
+            ndp_gw = self._ndp_protection.gateway_ipv6
+            if ndp_gw:
+                try:
+                    ndp_poisoned = await self._ndp_protection.check_ndp_poisoning()
+                    if ndp_poisoned:
+                        for entry in ndp_poisoned:
+                            # entry = (iface_name, ip, expected_mac, actual_mac)
+                            iface_name, ndp_ip, exp_mac, act_mac = entry
+                            logger.warning("深度诊断 [反制]: 检测到 NDP 投毒！"
+                                           "IPv6 网关 %s 期望 MAC=%s, 当前 MAC=%s — 触发 NDP 反制",
+                                           ndp_ip, exp_mac, act_mac)
+                            await self._ndp_protection._ndp_counterstrike(
+                                attacker_mac=act_mac,
+                                attacker_ip=ndp_ip,
+                            )
+                except Exception as e:
+                    logger.debug("深度诊断 NDP 检查异常: %s", e)
+
+    async def _probe_plain_dns_canary(self) -> bool:
+        """
+        使用 Plain DNS（普通 DNS）发送探活查询。
+        用于区分 '网络不通' 和 '加密 DNS 被拦截' 两种场景。
+
+        Returns:
+            True 表示 plain DNS 查询成功（网络层正常，问题在加密协议层）
+            False 表示 plain DNS 也失败（网络层中断）
+        """
+        # 获取 bootstrap DNS 地址
+        bootstrap_addrs = self.resolver_manager.get_bootstrap_addresses()
+        if not bootstrap_addrs:
+            bootstrap_addrs = self._ping_targets_v4 + self._ping_targets_v6
+        if not bootstrap_addrs:
+            return False
+
+        # 取一个探测域名
+        probe_domains = self._dns_probe_domains
+        if not probe_domains:
+            probe_domains = ["www.baidu.com", "www.qq.com"]
+
+        from resolvers.plain import PlainDNSResolver
+
+        for domain in probe_domains:
+            if not self._is_valid_domain(domain):
+                continue
+            for addr in bootstrap_addrs:
+                try:
+                    import dns.message
+                    import dns.rdatatype
+                    q = dns.message.make_query(domain, dns.rdatatype.A)
+                    qbytes = q.to_wire()
+
+                    is_ipv6 = ":" in addr
+                    family = "v6" if is_ipv6 else "v4"
+
+                    # 复用或创建解析器
+                    resolver = self._dns_probe_resolvers.get(addr)
+                    if resolver is None:
+                        resolver = PlainDNSResolver(
+                            addr, timeout=self._ping_timeout,
+                        )
+                        self._dns_probe_resolvers[addr] = resolver
+
+                    result = await asyncio.wait_for(
+                        resolver.resolve(qbytes, prefer_family=family),
+                        timeout=self._ping_timeout,
+                    )
+                    if result is not None:
+                        logger.debug("深度诊断 plain DNS 探活: %s → %s ✅", addr, domain)
+                        return True
+                except asyncio.TimeoutError:
+                    continue
+                except Exception as e:
+                    logger.debug("深度诊断 plain DNS 探活异常 (%s): %s", addr, e)
+                    continue
+        logger.debug("深度诊断 plain DNS 探活: 全部失败 ❌")
+        return False

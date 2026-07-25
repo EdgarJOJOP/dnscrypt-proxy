@@ -1,4 +1,4 @@
-"""
+﻿"""
 ARP 防护模块
 - 自动探测网关 IPv4 地址和 MAC 地址（支持 Windows / Linux）
 - 支持手动配置网关 IP/MAC（配置中指定后跳过自动探测）
@@ -10,6 +10,7 @@ import os
 import re
 import sys
 import struct
+import time
 import asyncio
 import socket
 import logging
@@ -89,13 +90,15 @@ class ARPProtection:
         # 本机网卡信息（从 ipconfig 解析填充）
         self._local_ipv4: Optional[str] = None
         self._local_mac: Optional[str] = None  # 本机 MAC（用于发送真实 GARP 包）
+        self._local_mac_win: str = ""  # Windows 专用 MAC（scapy sender 使用）
         self._subnet_mask: Optional[str] = None
         self._interface_name: Optional[str] = None  # 网卡名称（用于 netsh）
         self._interface_idx: Optional[int] = None   # 网卡索引（Idx，用于 netsh，无编码问题）
 
         # ARP 攻击检测
         self._arp_attack_detected = False  # 是否检测到持续的 ARP 异常
-        self._arp_attack_logged = False    # 是否已记录攻击警告（避免重复刷屏）
+        self._arp_attack_logged = False
+        self._arp_attack_logged_time = 0.0    # 是否已记录攻击警告（避免重复刷屏）
         self._conflict_resolved = False    # 本周期是否已自动修复 IP 冲突
 
         # 记录上次有效的非 APIPA IP（用于 APIPA 后恢复正确子网）
@@ -142,11 +145,16 @@ class ARPProtection:
         self._scapy_sender_queue: asyncio.Queue = asyncio.Queue(maxsize=500)
         self._scapy_sender_ready: bool = False      # scapy 发送器是否已就绪
 
+        # ========== 可信 MAC 列表（防止误伤正常设备）==========
+        self._trusted_sender_macs: set = set()      # 信任的 sender MAC（不触发检测③反制）
+        self._suspicious_zero_mac: dict = {}        # {sender_mac: [timestamp, ...]} — 全零 MAC 可疑计数
+
     async def _scapy_sender_worker_loop(self):
         """常驻 scapy 发送器：一次性导入 scapy，从队列取任务发送，进程冻结"""
         if not _SCAPY_AVAILABLE:
             self._scapy_sender_ready = False
-            await asyncio.Event().wait()
+            while self._arp_running:
+                await asyncio.sleep(1)
             return
         try:
             from scapy.all import Ether, ARP, sendp
@@ -168,7 +176,7 @@ class ARPProtection:
                 break
             try:
                 dst_mac, src_mac, src_ip, poison_mac, count, inter, vlan_id = task
-                spoof_pkt = Ether(dst=dst_mac) / ARP(
+                spoof_pkt = Ether(dst=dst_mac, src=self._local_mac_win or "00:00:00:00:00:00") / ARP(
                     op=2, hwsrc=poison_mac, psrc=src_ip,
                     hwdst=dst_mac, pdst=src_ip,
                 )
@@ -419,6 +427,14 @@ class ARPProtection:
                     return ""
             return ""
 
+        # === 防环路：反制发送的随机 MAC（02:00:00:xx:xx:xx）不触发检测 ===
+        if self._mac_normalize(sender_mac).startswith("020000"):
+            return ""
+
+        # === IP 段过滤：只处理与本机/网关同网段的包，忽略 APIPA(169.254.x.x) 等 ===
+        if sender_ip.startswith("169.254.") or target_ip.startswith("169.254."):
+            return ""
+
         # === 攻击向量检测 ===
         poisoned = False
         reason = ""
@@ -440,12 +456,39 @@ class ARPProtection:
             reason = f"本地 MAC 冒用攻击！攻击者冒用本机 MAC {sender_mac} 以 {sender_ip} 身份发送 ARP"
 
         # ③ Target = 网关 IP × MAC 不匹配（中间人回复劫持）
+        # 全零 target_mac 特殊处理：某些正常设备会发 target_mac=00:00:00:00:00:00 的 ARP 包
+        # （ARP 探测行为），不是攻击。需要同一 MAC 短时间内多次出现才确认为攻击。
         elif target_ip == gw_ip and self._baseline_mac and target_mac and self._mac_normalize(target_mac) != self._mac_normalize(self._baseline_mac):
-            poisoned = True
-            # ⑥ 细化日志：全零目标 MAC 是一种特定的路由器侧投毒攻击模式
-            if self._mac_normalize(target_mac) == "000000000000":
-                reason = f"MITM 劫持！攻击者向网关 {target_ip} 发送全零 MAC 回复（期望 {self._baseline_mac}），路由器 ARP 表被污染"
+            norm_tmac = self._mac_normalize(target_mac)
+            norm_smac = self._mac_normalize(sender_mac)
+            if norm_smac in self._trusted_sender_macs:
+                # 信任列表中的 MAC → 仅 DEBUG 日志，不触发任何反制
+                logger.debug("ARP 嗅探: 信任设备 %s 发来可疑 ARP (target_mac=%s)，已信任跳过",
+                             sender_mac, target_mac)
+                return ""
+            if norm_tmac == "000000000000":
+                # 全零 target_mac：可能是正常设备行为，需要多次确认
+                now_ts = asyncio.get_event_loop().time()
+                record = self._suspicious_zero_mac.setdefault(norm_smac, [])
+                record.append(now_ts)
+                # 只保留最近 10 秒的记录
+                cutoff = now_ts - 10.0
+                self._suspicious_zero_mac[norm_smac] = [t for t in record if t > cutoff]
+                count_10s = len(self._suspicious_zero_mac[norm_smac])
+                if count_10s >= 3:
+                    # 同一 MAC 在 10 秒内 ≥3 次全零 target → 确认为攻击
+                    poisoned = True
+                    reason = (f"MITM 劫持！设备 {sender_ip}({sender_mac}) 重复向网关 {target_ip} "
+                              f"发送全零 MAC 回复（10s内{count_10s}次），路由器 ARP 表被污染")
+                else:
+                    # 不足 3 次：仅记录可疑日志，不触发反制
+                    logger.warning("ARP 嗅探: 可疑 ARP 包 — %s 向网关 %s 发送全零 MAC 回复 "
+                                   "(10s内第%d次，≥3次才确认)，暂不反制",
+                                   sender_mac, target_ip, count_10s)
+                    return ""
             else:
+                # 非全零但不匹配基线 → 直接确认为攻击
+                poisoned = True
                 reason = f"MITM 劫持！回复目标 {target_ip} → 期望 MAC {self._baseline_mac} ≠ 实际 {target_mac}"
 
         # ④ GARP 宣告伪造（Opcode=2 且 Sender=Target=网关, MAC 不对）
@@ -464,6 +507,17 @@ class ARPProtection:
             stale_macs = [m for m, s in self._attack_stats.items() if now - s.get("last_attack", 0) > 300.0]
             for m in stale_macs:
                 del self._attack_stats[m]
+            # 可疑全零 MAC 自动学习为信任：超 300 秒无活动说明无害
+            stale_suspicious = [m for m, ts_list in self._suspicious_zero_mac.items()
+                                if ts_list and now - max(ts_list) > 300.0]
+            for m in stale_suspicious:
+                self._trusted_sender_macs.add(m)
+                del self._suspicious_zero_mac[m]
+                logger.info("ARP 防护: 设备 %s 已自动学习为信任（300s无活动）", m)
+            # 信任列表防无限增长（最多保留 200 条）
+            if len(self._trusted_sender_macs) > 200:
+                self._trusted_sender_macs.clear()
+                logger.info("ARP 防护: 信任列表已清空（超200条阈值）")
             # 更新攻击统计（60 秒窗口计数）
             stats = self._attack_stats.setdefault(sender_mac, {"count": 0, "bursts_sent": 0, "last_attack": 0.0, "last_counterstrike": 0.0, "window_start": now, "ip_switched": False})
             # 如果窗口超过 60 秒，重置计数
@@ -547,6 +601,11 @@ class ARPProtection:
                                 logger.warning("ARP 防护: scapy sniff 已停止 (%s)，切换到 arp 轮询", e)
                                 sniff_failed = True
                                 break
+                            # sniff 正常结束但程序仍在运行（不应发生），重启嗅探
+                            if self._arp_running:
+                                logger.info("ARP 防护: 嗅探已结束，重新启动...")
+                                sniff_failed = True
+                                break
                         continue
                     except Exception:
                         break
@@ -619,6 +678,33 @@ class ARPProtection:
                 for gw_ip_p, expected, actual in poisoned:
                     logger.warning("ARP 防护: 检测到 ARP 投毒！网关 %s → 预期 %s ≠ 实际 %s",
                                    gw_ip_p, expected, actual)
+                    # 无 Npcap 时无法发原始 GARP，改用系统命令主动修复：
+                    # 1) 删除本机 ARP 条目 → 2) ping 触发重新学习 → 3) 若仍错则静态绑定
+                    if sys.platform == "win32" and not _SCAPY_AVAILABLE:
+                        try:
+                            import subprocess
+                            subprocess.run(["arp", "-d", gw_ip_p], capture_output=True, timeout=2)
+                        except Exception:
+                            pass
+                        # ping 网关触发系统 ARP 请求，获取正确 MAC
+                        await self._ping_gateway_fast(gw_ip_p)
+                        await asyncio.sleep(0.05)
+                        # 检查学习到的 MAC 是否正确
+                        new_mac = await self._arp_get_mac_windows(gw_ip_p)
+                        if new_mac and self._baseline_mac and \
+                           self._mac_normalize(new_mac) != self._mac_normalize(self._baseline_mac):
+                            logger.warning("ARP 防护: ping 后网关 MAC 仍异常 (%s)，执行静态 ARP 绑定",
+                                           new_mac)
+                            await self._protect_gateway_arp()
+                    elif sys.platform != "win32":
+                        # Linux：删除条目触发 ARP 请求
+                        try:
+                            import subprocess
+                            subprocess.run(["ip", "neigh", "del", gw_ip_p],
+                                           capture_output=True, timeout=2)
+                        except Exception:
+                            pass
+                        await self._ping_gateway_fast(gw_ip_p)
                 self._poison_detected.set()
             await asyncio.sleep(self._ping_interval)
 
@@ -1542,7 +1628,7 @@ class ARPProtection:
                 diagnosis = "network_down"
             else:
                 diagnosis = "arp_poisoning"
-        elif loss_rate >= 0.25:
+        elif loss_rate >= 0.4:
             diagnosis = "ip_conflict"
         else:
             diagnosis = "normal"
@@ -1860,9 +1946,18 @@ class ARPProtection:
                 actual_mac = await self._arp_get_mac_windows(gw_ip)
             else:
                 actual_mac = await self._arp_get_mac_linux(gw_ip)
-            if actual_mac and self._mac_normalize(actual_mac) != self._mac_normalize(expected_mac):
+            is_poisoned = False
+            if actual_mac:
+                norm_actual = self._mac_normalize(actual_mac)
+                if norm_actual != self._mac_normalize(expected_mac):
+                    is_poisoned = True
+                # 异常 MAC 检测：全零、广播、组播（非单播 MAC）
+                elif norm_actual in ("000000000000", "FFFFFFFFFFFF") or norm_actual.startswith("01"):
+                    is_poisoned = True
+            if is_poisoned:
                 poisoned.append((gw_ip, expected_mac, actual_mac))
                 self._arp_attack_logged = True
+                self._arp_attack_logged_time = time.time()
         return poisoned
 
     async def refresh_router_arp(self, abort_check=None) -> bool:
@@ -2268,7 +2363,13 @@ class ARPProtection:
         logger.info("ARP 防护: 检测 ARP 表并修复 x%d (网关=%s, 间隔=%.4fs)", count, gw_ip, inter)
 
         for i in range(count):
-            # 发送真实 GARP 宣告（skip_arp_del=True，已由循环前统一删除）
+            # 发送真实 GARP 宣告前，先清空系统 ARP 缓存
+            if sys.platform == "win32":
+                try:
+                    import subprocess
+                    subprocess.run(["arp", "-d", self.gateway_ip], capture_output=True, timeout=2)
+                except Exception:
+                    pass
             await self._send_single_garp(skip_arp_del=True)
             # 每 3 次加一次网关快速 ping（双重确认），成功则提前结束
             if i % 3 == 0:
@@ -2388,6 +2489,19 @@ class ARPProtection:
             logger.warning("ARP 反制 %s: %s %d次/60s(%s) -> %d包GARP+%d包定向 @%.0fms",
                            log_tag, sender_mac, attack_rate, reason[:40], burst_size, directed_count, inter*1000)
 
+        # 反制前验证：对于 MITM 劫持类告警（非高频攻击），快速 ping 网关二次确认
+        # 如果网关可达，说明是正常设备误报，仅记录日志不触发反制
+        if "MITM 劫持" in reason and attack_rate < 20:
+            gw_ip = self.gateway_ip
+            if gw_ip:
+                gw_ok = await self._ping_gateway_fast(gw_ip)
+                if gw_ok:
+                    logger.warning("ARP 嗅探: %s — 但网关可达，判定为正常设备误报，跳过反制",
+                                   reason[:80])
+                    if self._poison_detected.is_set():
+                        self._poison_detected.clear()
+                    return
+
         await self._garp_counterstrike(sender_ip, sender_mac, burst_size=burst_size, directed_count=directed_count, inter=inter)
 
         if self._poison_detected.is_set():
@@ -2413,12 +2527,18 @@ class ARPProtection:
                 await self._protect_gateway_arp()
             return
         if attacker_mac:
-            poison_mac = "FF:FF:FF:FF:FF:FE" if (self._counterstrike_count % 2 == 0) else "00:00:00:00:00:00"
+            # 随机 MAC 反制：生成 02:xx:xx:xx:xx:xx 范围本地管理单播 MAC
+            # 每次反制使用不同随机 MAC，比固定交替 MAC 更难被攻击者识别和防御
+            _suffix = random.randint(1, 0xFFFFFF)
+            poison_mac = f"02:00:00:{_suffix >> 16:02X}:{(_suffix >> 8) & 0xFF:02X}:{_suffix & 0xFF:02X}"
             if _SCAPY_AVAILABLE and self._scapy_sender_ready:
                 # 通过常驻 sender 队列发送（一次性导入 scapy，不重复创建）
-                self._scapy_sender_queue.put_nowait(
-                    (attacker_mac, None, attacker_ip, poison_mac, directed_count, inter, self._manual_gateway_vlan)
-                )
+                try:
+                    self._scapy_sender_queue.put_nowait(
+                        (attacker_mac, None, attacker_ip, poison_mac, directed_count, inter, self._manual_gateway_vlan)
+                    )
+                except asyncio.QueueFull:
+                    logger.warning("GARP queue full, dropping counterstrike")
             # Windows fallback 已移除：netsh set neighbors 阻塞事件循环最多 5s。
 
         # GARP 广播按攻击强度等比放大（burst_size 已由 _get_intensity 按 attack_rate 计算）

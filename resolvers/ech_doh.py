@@ -113,7 +113,7 @@ class ECHDoHResolver(BaseResolver):
                     # 0. 获取最新的 ECHConfigList（每次连接刷新，fetcher 内部有缓存）
                     ech_config = await self._ech_fetcher.get_config()
                     if not ech_config:
-                        logger.debug("ECHDoH %s: ECH 配置不可用（fetcher 返回空），跳过", self.url)
+                        continue
                         return None
                     # 诊断: ECHConfigList 格式 = [2byte总长][2byte版本][2byte内容长]...
                     if len(ech_config) >= 6:

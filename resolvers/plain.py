@@ -69,13 +69,27 @@ class PlainDNSResolver(BaseResolver):
                 return response.to_wire()
             except (OSError, ConnectionError, asyncio.TimeoutError):
                 return None
-            except Exception:
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.debug("PlainDNS %s error: %s", self.address, e)
                 return None
 
     async def _resolve_udp(self, query_bytes: bytes) -> Optional[bytes]:
         """通过复用 UDP 套接字发送并接收 DNS 查询。"""
         try:
-            async with self._sock_lock:
+            # Use per-query socket to avoid draining other queries' responses
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(self._timeout)
+            try:
+                sock.sendto(wire_data, (self.address, self.port))
+                data, _ = sock.recvfrom(65535)
+                return data
+            except (socket.timeout, OSError) as e:
+                logger.debug("PlainDNS %s UDP error: %s", self.address, e)
+                return None
+            finally:
+                sock.close()
                 sock = self._get_socket()
                 loop = asyncio.get_running_loop()
                 # 发送

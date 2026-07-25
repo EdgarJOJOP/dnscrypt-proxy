@@ -173,8 +173,16 @@ class CacheEntry:
                 new_answer.append(new_rrset)
             response.answer = new_answer
             # authority 和 additional 直接用原引用（它们的 TTL 不影响答案）
-            response.authority = list(msg.authority)
-            response.additional = list(msg.additional)
+            response.authority = []
+            for rrset in msg.authority:
+                new_rrset = copy.copy(rrset)
+                new_rrset.ttl = remaining
+                response.authority.append(new_rrset)
+            response.additional = []
+            for rrset in msg.additional:
+                new_rrset = copy.copy(rrset)
+                new_rrset.ttl = remaining
+                response.additional.append(new_rrset)
             return response
 
         # ===== 完整深拷贝路径（TTL 偏差 > 5%） =====
@@ -338,6 +346,8 @@ class DNSCache:
             if hasattr(rrset, 'ttl') and rrset.ttl is not None and rrset.ttl < min_ttl:
                 min_ttl = rrset.ttl
         # 约束到配置范围
+        if min_ttl == 0:
+            return 0
         return max(self.min_ttl, min(min_ttl, self.max_ttl))
 
     async def evict_largest(self, ratio: float = 0.2) -> int:

@@ -1,4 +1,4 @@
-"""
+﻿"""
 NDP 防护模块 — IPv6 邻居发现协议 (NDP) 欺骗防护（多接口并行版）
 =============================================================
 IPv6 没有 ARP，替代者是 NDP（Neighbor Discovery Protocol, RFC 4861）。
@@ -190,6 +190,9 @@ class NDPProtection:
         # RA 源自动学习（替代 max_ra_routers 硬阈值）
         self._trusted_ra_sources: set = set()  # {MAC, ...} 已确认的合法 RA 源
         self._suspicious_ra_sources: set = set()  # {MAC, ...} 可疑源
+        # ========== 可信 MAC 列表（防止误伤正常设备）==========
+        self._trusted_sender_macs: set = set()      # 信任的 sender MAC（不触发反制）
+        self._suspicious_zero_mac: dict = {}        # {sender_mac: [timestamp, ...]} — 全零 MAC 可疑计数
 
     # ======================== 属性 ========================
 
@@ -897,9 +900,12 @@ class NDPProtection:
 
     async def _poll_ndp_table(self):
         """
-        系统 NDP 表轮询（最终兜底）：定期执行 `ip -6 neighbor show` 检测网关 MAC 变更。
+        系统 NDP 表轮询（最终兜底）：定期执行系统命令检测网关 MAC 变更。
+        无 Npcap 时无法发送原始 NA 帧，改用系统命令主动修复：
+        1) ping -6 触发邻居发现刷新路由器 NDP 表
+        2) netsh/ip 命令设静态 NDP 条目防篡改
         """
-        logger.info("NDP 防护: NDP 表轮询已启动 (间隔=5s)")
+        logger.info("NDP 防护: NDP 表轮询已启动 (间隔=%.1fs)", 5)
         while self._ndp_running:
             try:
                 # T1: 检查所有网关的 NDP 表项
@@ -907,19 +913,86 @@ class NDPProtection:
                     if not gw_ip:
                         continue
                     actual_mac = await self._resolve_mac_single(gw_ip)
-                    if expected_mac and actual_mac:
-                        if self._mac_normalize(actual_mac) != self._mac_normalize(expected_mac):
-                            logger.warning("NDP 防护 [T1/轮询]: 网关 %s MAC 变更! %s -> %s",
-                                           gw_ip, expected_mac, actual_mac)
-                            self._poison_detected.set()
+                    if not actual_mac:
+                        continue
+                    norm_actual = self._mac_normalize(actual_mac)
+                    # 检测：MAC 变更 或 异常 MAC（广播/组播）
+                    is_poisoned = False
+                    if expected_mac and norm_actual != self._mac_normalize(expected_mac):
+                        # 全零 MAC：Windows 上对不完整 NDP 条目的正常行为，不立即反制
+                        if norm_actual == "000000000000":
+                            logger.debug("NDP 防护 [T1/轮询]: 网关 %s NDP 条目为全零（可能不完整），跳过", gw_ip)
+                            continue
+                        is_poisoned = True
+                    elif norm_actual in ("ffffffffffff",) or norm_actual.startswith("01"):
+                        is_poisoned = True
+                    if is_poisoned:
+                        logger.warning("NDP 防护 [T1/轮询]: 网关 %s MAC 异常! %s -> %s",
+                                       gw_ip, expected_mac or "?", actual_mac)
+                        self._poison_detected.set()
+                        # 无 Npcap 时主动修复：ping -6 触发邻居发现刷新路由器 NDP 表
+                        if sys.platform == "win32":
+                            try:
+                                proc = await asyncio.create_subprocess_exec(
+                                    "ping", "-6", "-n", "5", gw_ip,
+                                    stdout=asyncio.subprocess.DEVNULL,
+                                    stderr=asyncio.subprocess.DEVNULL,
+                                )
+                                await asyncio.wait_for(proc.wait(), timeout=15)
+                                await asyncio.sleep(0.1)
+                                # 检查学习到的 MAC 是否正确
+                                new_mac = await self._resolve_mac_single(gw_ip)
+                                if new_mac and expected_mac and \
+                                   self._mac_normalize(new_mac) != self._mac_normalize(expected_mac):
+                                    logger.warning("NDP 防护: ping -6 后网关 MAC 仍异常 (%s)，"
+                                                   "执行静态 NDP 绑定", new_mac)
+                                    await self.protect_ndp_entry()
+                            except Exception as e:
+                                logger.debug("NDP 防护: ping -6 修复异常: %s", e)
+                        else:
+                            # Linux: 删除 NDP 条目触发重新学习
+                            try:
+                                proc = await asyncio.create_subprocess_exec(
+                                    "ip", "-6", "neigh", "del", gw_ip, "dev",
+                                    self.interfaces[0].name if self.interfaces else "",
+                                    stdout=asyncio.subprocess.DEVNULL,
+                                    stderr=asyncio.subprocess.DEVNULL,
+                                )
+                                await asyncio.wait_for(proc.wait(), timeout=2)
+                            except Exception:
+                                pass
+                            try:
+                                proc = await asyncio.create_subprocess_exec(
+                                    "ping", "-6", "-c", "5", gw_ip,
+                                    stdout=asyncio.subprocess.DEVNULL,
+                                    stderr=asyncio.subprocess.DEVNULL,
+                                )
+                                await asyncio.wait_for(proc.wait(), timeout=15)
+                            except Exception:
+                                pass
+                            await self.protect_ndp_entry()
             except Exception as e:
                 logger.debug("NDP 防护: NDP 表轮询异常: %s", e)
             await asyncio.sleep(5)
 
     def _on_ndp_packet(self, pkt):
+        try:
+            self._loop.call_soon_threadsafe(self._on_ndp_packet_sync, pkt)
+        except Exception:
+            pass
+
+    def _on_ndp_packet_sync(self, pkt):
+        if not pkt.haslayer(Ether) or not pkt.haslayer(IPv6):
+            return
+        if not pkt.haslayer(ICMPv6ND_NS) and not pkt.haslayer(ICMPv6ND_NA):
+            return
+        "Execute in event loop (via call_soon_threadsafe)"
         if not pkt.haslayer(Ether) or not pkt.haslayer(IPv6):
             return
         src_mac = self._mac_normalize(pkt[Ether].src)
+        # 防环路：本机反制发送的 02:xx:xx:xx:xx:xx 随机 MAC 不触发 NDP 检测
+        if src_mac.startswith("020000"):
+            return
         src_ip = str(pkt[IPv6].src)
         all_gw_ips = {ip for ip, _, _ in self.gateway_pairs if ip}
         all_local_ips = set(self.all_local_ipv6)
@@ -995,7 +1068,10 @@ class NDPProtection:
         # ==================== T5 NUD 追踪 ====================
         if pkt.haslayer(ICMPv6ND_NS):
             ns = pkt[ICMPv6ND_NS]
-            ns_target = str(ns.target)
+            try:
+                ns_target = str(ns.target)
+            except (AttributeError, ValueError):
+                return
             now = time.time()
             self._nud_tracker = {
                 t: [ts for ts in times if now - ts < self._nud_window]
@@ -1047,7 +1123,10 @@ class NDPProtection:
         # ==================== T1 NA 投毒 ====================
         if pkt.haslayer(ICMPv6ND_NA):
             na = pkt[ICMPv6ND_NA]
-            na_target = str(na.target)
+            try:
+                na_target = str(na.target)
+            except (AttributeError, ValueError):
+                return
             for gw_ip in all_gw_ips:
                 baseline = self._baseline_mac_per_gw.get(gw_ip)
                 if baseline and (src_ip == gw_ip or na_target == gw_ip) and self._mac_normalize(src_mac) != self._mac_normalize(baseline):
@@ -1058,6 +1137,25 @@ class NDPProtection:
                     self._trim_threat_events()
                     logger.warning("NDP 嗅探 [T1]: NA 投毒! %s -> 预期 %s != 实际 %s",
                                    gw_ip, baseline, src_mac)
+                    # --- 全零 MAC / 信任列表 处理 ---
+                    norm_smac = self._mac_normalize(src_mac) if src_mac else ""
+                    if norm_smac in self._trusted_sender_macs:
+                        logger.debug("NDP 嗅探: 信任设备 %s 发来可疑 NA，已跳过", src_mac)
+                        break
+                    if norm_smac == "000000000000":
+                        _now_zero = time.time()
+                        _rec = self._suspicious_zero_mac.setdefault(norm_smac, [])
+                        _rec.append(_now_zero)
+                        self._suspicious_zero_mac[norm_smac] = [t for t in _rec if t > _now_zero - 10.0]
+                        _cnt_10s = len(self._suspicious_zero_mac[norm_smac])
+                        if _cnt_10s >= 3:
+                            logger.warning("NDP 嗅探 [T1]: 设备 %s 发送全零 MAC NA 回复 "
+                                           "(10s内%d次)，确认为 NDP 投毒", src_mac, _cnt_10s)
+                        else:
+                            logger.warning("NDP 嗅探: 可疑 NA 包 — %s 发送全零 MAC 回复 "
+                                           "(10s内第%d次，≥3次才确认)，暂不反制", src_mac, _cnt_10s)
+                            break
+                    # --- 全零 MAC 处理结束 ---
                     # 自适应防抖：根据攻击频率缩短间隔，同ARP逻辑
                     _now_t1 = time.time()
                     _stats_t1 = self._ndp_attack_stats.get(src_mac, {})
@@ -1076,7 +1174,7 @@ class NDPProtection:
                     if _now_t1 - _last_time < _debounce_t1:
                         break
                     if not self._poison_detected.is_set():
-                        self._poison_detected.set()
+                        self._loop.call_soon_threadsafe(self._poison_detected.set)
                         self._loop.call_soon_threadsafe(
                             lambda: asyncio.create_task(self._on_poison_detected(attacker_mac=src_mac, attacker_ip=src_ip)))
                     break
@@ -1174,6 +1272,18 @@ class NDPProtection:
                 stats["window_start"] = now
             stats["count"] += 1
             stats["last_attack"] = now
+
+        # 可疑全零 MAC 自动学习为信任：超 300 秒无活动说明无害
+        stale_suspicious = [m for m, ts_list in self._suspicious_zero_mac.items()
+                            if ts_list and now - max(ts_list) > 300.0]
+        for m in stale_suspicious:
+            self._trusted_sender_macs.add(m)
+            del self._suspicious_zero_mac[m]
+            logger.info("NDP 防护: 设备 %s 已自动学习为信任（300s无活动）", m)
+        # 信任列表防无限增长（最多保留 200 条）
+        if len(self._trusted_sender_macs) > 200:
+            self._trusted_sender_macs.clear()
+            logger.info("NDP 防护: 信任列表已清空（超200条阈值）")
 
         logger.info("NDP 防护: 嗅探检测到投毒，触发修复")
         await self.refresh_router_ndp()
@@ -1812,18 +1922,28 @@ class NDPProtection:
             if not ip:
                 continue
             actual = await self._resolve_mac_single(ip)
-            if expected and actual and self._mac_normalize(actual) != self._mac_normalize(expected):
-                poisoned.append(("手动", ip, expected, actual))
+            if expected and actual:
+                norm_actual = self._mac_normalize(actual)
+                if norm_actual != self._mac_normalize(expected):
+                    if norm_actual == "000000000000":
+                        continue  # 全零 MAC 降级为可疑，不加入投毒列表
+                    poisoned.append(("手动", ip, expected, actual))
             if not expected and self._baseline_gateway_mac and actual:
                 if self._mac_normalize(actual) != self._mac_normalize(self._baseline_gateway_mac):
+                    if self._mac_normalize(actual) == "000000000000":
+                        continue
                     poisoned.append(("手动-基线", ip, self._baseline_gateway_mac, actual))
         for iface in self.interfaces:
             for gw_ip, expected, _ in iface.gateways:
                 if not gw_ip or not expected:
                     continue
                 actual = await self._resolve_mac_single(gw_ip)
-                if actual and self._mac_normalize(actual) != self._mac_normalize(expected):
-                    poisoned.append((iface.name, gw_ip, expected, actual))
+                if actual:
+                    norm_actual_iface = self._mac_normalize(actual)
+                    if norm_actual_iface != self._mac_normalize(expected):
+                        if norm_actual_iface == "000000000000":
+                            continue
+                        poisoned.append((iface.name, gw_ip, expected, actual))
         if poisoned:
             for iface_name, gw, exp, act in poisoned:
                 logger.warning("NDP 防护 [T1]: %s 网关 %s MAC 变更! %s -> %s", iface_name, gw, exp, act)
@@ -2459,8 +2579,6 @@ class NDPProtection:
             except Exception:
                 return False
 
-    @property
-
     @staticmethod
     def _generate_poison_mac() -> str:
         """生成一个单播、locally administered 的虚假 MAC（不会与真实设备冲突）
@@ -2500,6 +2618,8 @@ class NDPProtection:
             "last_fix_time": self._last_fix_time,
             "trusted_ra_sources": len(self._trusted_ra_sources),
             "suspicious_ra_sources": len(self._suspicious_ra_sources),
+            "trusted_sender_macs": len(self._trusted_sender_macs),
+            "suspicious_zero_mac": len(self._suspicious_zero_mac),
             "interface_details": [{
                 "name": iface.name, "mac": iface.mac,
                 "ipv6_global": iface.ipv6_global, "ipv6_globals": iface.ipv6_globals, "ipv6_ll": iface.ipv6_ll,

@@ -92,7 +92,7 @@ class ECHDoTResolver(BaseResolver):
                     # 0. 获取最新的 ECHConfigList（每次连接刷新，fetcher 内部有缓存）
                     ech_config = await self._ech_fetcher.get_config()
                     if not ech_config:
-                        logger.debug("ECHDoT %s: ECH 配置不可用（fetcher 返回空），跳过", self.host)
+                        continue
                         return None
 
                     # 1. 建立 ECH TLS 连接（使用 target 直连，绕过系统 DNS）
