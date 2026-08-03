@@ -78,42 +78,30 @@ class PlainDNSResolver(BaseResolver):
     async def _resolve_udp(self, query_bytes: bytes) -> Optional[bytes]:
         """通过复用 UDP 套接字发送并接收 DNS 查询。"""
         try:
-            # Use per-query socket to avoid draining other queries' responses
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.settimeout(self._timeout)
+            sock = self._get_socket()
+            loop = asyncio.get_running_loop()
+            addr = (self.address, 53, 0, 0) if self._is_v6 else (self.address, 53)
+            # 发送
+            await loop.sock_sendto(sock, query_bytes, addr)
+            # 接收（带超时）
             try:
-                sock.sendto(wire_data, (self.address, self.port))
-                data, _ = sock.recvfrom(65535)
+                data, _ = await asyncio.wait_for(
+                    loop.sock_recvfrom(sock, 65535),
+                    timeout=self.timeout,
+                )
                 return data
-            except (socket.timeout, OSError) as e:
-                logger.debug("PlainDNS %s UDP error: %s", self.address, e)
-                return None
-            finally:
-                sock.close()
-                sock = self._get_socket()
-                loop = asyncio.get_running_loop()
-                # 发送
-                addr = (self.address, 53, 0, 0) if self._is_v6 else (self.address, 53)
-                await loop.sock_sendto(sock, query_bytes, addr)
-                # 接收（带超时）
+            except asyncio.TimeoutError:
+                logger.debug("PlainDNS %s UDP 查询超时", self.address)
+                # 超时后 drain socket：清空 OS 缓冲区中的过期响应
+                sock.setblocking(False)
                 try:
-                    data, _ = await asyncio.wait_for(
-                        loop.sock_recvfrom(sock, 65535),
-                        timeout=self.timeout,
-                    )
-                    return data
-                except asyncio.TimeoutError:
-                    logger.debug("PlainDNS %s UDP 查询超时", self.address)
-                    # 超时后 drain socket：清空 OS 缓冲区中的过期响应
+                    while True:
+                        sock.recvfrom(65535)
+                except BlockingIOError:
+                    pass
+                finally:
                     sock.setblocking(False)
-                    try:
-                        while True:
-                            sock.recvfrom(65535)
-                    except BlockingIOError:
-                        pass
-                    finally:
-                        sock.setblocking(False)
-                    return None
+                return None
         except OSError as e:
             logger.debug("PlainDNS %s UDP 错误: %s", self.address, e)
             return None

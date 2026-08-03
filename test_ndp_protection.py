@@ -452,6 +452,30 @@ async def test_trust_learning():
 # 主入口
 # ============================================================
 
+async def test_ip_mac_map_self_packet_ipv6():
+    """NDP 映射补全后本机 MAC 宣告本机 IPv6 不误判（多接口自包防误伤）"""
+    print("\n" + "=" * 60)
+    print("11. 本机 IPv6↔MAC 映射自包防误伤")
+    print("=" * 60)
+    config = _make_test_config()
+    from NDP_protection import InterfaceInfo
+    ndp = NDPProtection(config)
+    ndp.interfaces = [InterfaceInfo(name="接口B", mac="00:E0:4C:68:00:AB",
+                                    ipv6_globals=["2408:826c:511:83dd:4148:3c51:783e:1a7e"])]
+    ndp._local_macs = {"A4:5B:5C:B9:64:D0"}
+    ndp._local_ip_mac_map = {"00:E0:4C:68:00:AB": {"2408:826c:511:83dd:4148:3c51:783e:1a7e"}}
+    for mac_colon in ndp._local_ip_mac_map:
+        if mac_colon and mac_colon != "00:00:00:00:00:00":
+            ndp._local_macs.add(mac_colon)
+    from scapy.all import Ether as _E, IPv6 as _V6, ICMPv6ND_NA as _NA
+    na_own = _E(src="00:E0:4C:68:00:AB", dst="33:33:00:00:00:01") / \
+        _V6(src="2408:826c:511:83dd:4148:3c51:783e:1a7e", dst="ff02::1", hlim=255) / \
+        _NA(tgt="2408:826c:511:83dd:4148:3c51:783e:1a7e")
+    ndp._on_ndp_packet_sync(na_own)
+    check(not [e for e in ndp._threat_events if e["type"] == "ip_conflict"],
+          "本机 MAC 宣告本机 IPv6 不误判 IP 冲突")
+
+
 async def main():
     """运行所有 NDP 防护测试"""
     print("=" * 60)
@@ -468,6 +492,7 @@ async def main():
     await test_generate_poison_mac()
     await test_trusted_mac_skip()
     await test_trust_learning()
+    await test_ip_mac_map_self_packet_ipv6()
 
     total = _pass_count + _fail_count
     print("\n" + "=" * 60)

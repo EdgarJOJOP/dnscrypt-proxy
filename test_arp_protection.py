@@ -345,6 +345,73 @@ async def test_mac_normalize():
 # 主入口
 # ============================================================
 
+# ============================================================
+# 9. 本机 IP↔MAC 映射自包防误伤
+# ============================================================
+
+async def test_ip_mac_map_merge_self_packet():
+    """映射补全后本机 MAC 宣告本机 IP 不误判（多接口自包防误伤）"""
+    print("\n" + "=" * 60)
+    print("9. 本机 IP↔MAC 映射自包防误伤")
+    print("=" * 60)
+    config = _make_test_config()
+    arp = ARPProtection(config)
+    arp._local_ips = {"192.168.1.13"}
+    arp._local_mac = "A4:5B:5C:B9:64:D0"
+    arp._local_macs = {"A4:5B:5C:B9:64:D0"}
+    arp._local_ip_mac_map = {"00:E0:4C:68:00:AB": {"192.168.1.13"}}  # getmac 漏收集接口
+    async def _noop(*a, **k):
+        pass
+    arp._on_arp_attack = _noop  # 命中时不创建后台反制 task（避免 mock 泄漏到后续测试）
+    # 映射补全（与嗅探 worker 逻辑一致）
+    for mac_colon in arp._local_ip_mac_map:
+        if mac_colon and mac_colon != "00:00:00:00:00:00":
+            arp._local_macs.add(mac_colon)
+    r = await arp._check_arp_packet(sender_ip="192.168.1.13", sender_mac="00:E0:4C:68:00:AB",
+                                    target_ip="192.168.1.1", target_mac="00:11:22:33:44:55", opcode=1)
+    check(r == "", f"映射补全后本机 MAC 宣告本机 IP 不误判 (got {r!r})")
+    r2 = await arp._check_arp_packet(sender_ip="192.168.1.13", sender_mac="AA:BB:CC:DD:EE:50",
+                                     target_ip="192.168.1.1", target_mac="00:11:22:33:44:55", opcode=1)
+    check("IP 冲突" in r2, "外来 MAC 仍检测 IP 冲突")
+
+
+async def test_ip_mac_map_linux_parse():
+    """_build_local_ip_mac_map Linux 解析（ip -o 输出含 eth0: 尾冒号）"""
+    print("\n" + "=" * 60)
+    print("10. Linux IP↔MAC 映射解析")
+    print("=" * 60)
+    import types as _types
+    import arp_protection as _ap
+    class _FakeProc:
+        def __init__(self, text):
+            self._t = text.encode()
+        async def communicate(self):
+            return self._t, b""
+        async def wait(self):
+            return 0
+    _orig_sp = asyncio.create_subprocess_exec
+    _orig_sys = _ap.sys
+    _ap.sys = _types.SimpleNamespace(platform="linux")
+    _outputs = iter([
+        "2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc pfifo_fast state UP group default qlen 1000 link/ether 00:11:22:33:44:55 brd ff:ff:ff:ff:ff:ff\n",
+        "2: eth0    inet 192.168.1.13/24 brd 192.168.1.255 scope global dynamic eth0\n",
+    ])
+    async def _fake_sp(*a, **k):
+        return _FakeProc(next(_outputs))
+    asyncio.create_subprocess_exec = _fake_sp
+    try:
+        m = await ARPProtection._build_local_ip_mac_map()
+    finally:
+        asyncio.create_subprocess_exec = _orig_sp
+        _ap.sys = _orig_sys
+    check("00:11:22:33:44:55" in m and "192.168.1.13" in m["00:11:22:33:44:55"],
+          f"Linux ip -o 映射解析 (got {m})")
+
+
+# ============================================================
+# 主入口
+# ============================================================
+
 async def main():
     """运行所有 ARP 防护测试"""
     print("=" * 60)
@@ -359,6 +426,8 @@ async def main():
     await test_poison_to_full_defense()
     await test_poll_path3_active_fix()
     await test_mac_normalize()
+    await test_ip_mac_map_merge_self_packet()
+    await test_ip_mac_map_linux_parse()
 
     total = _pass_count + _fail_count
     print("\n" + "=" * 60)

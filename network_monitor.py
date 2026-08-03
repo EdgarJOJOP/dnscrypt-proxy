@@ -97,6 +97,9 @@ class NetworkMonitor:
                                               ping_interval=self._interval,
                                               ping_targets_v6=self._ping_targets_v6)
 
+        # ARP 侧 IP 冲突反制联动 NDP：宣告本机 IPv6-MAC + 静态 NDP 绑定
+        self._arp_protection._ndp_callback = self._ndp_announce_callback
+
         # 外网 ping 轮询索引（轮流 ping 多个 v4 目标，每轮一个）
         self._ext_ping_index = 0
         self._last_ext_check_time: float = 0.0  # 上次外网探测时间戳
@@ -222,7 +225,9 @@ class NetworkMonitor:
                     gw_ok = await self._arp_protection._ping_gateway(gw_ip)
                 elif self._ndp_protection.gateway_ipv6:
                     ndp_gw_ok = await self._ndp_protection._ping_ipv6(self._ndp_protection.gateway_ipv6, timeout_ms=50)
-                self._gw_results.append(gw_ok)
+                # 无 v4 网关时不向 _gw_results 填充（双栈独立性修复 L13：原恒填 True 稀释丢包率）
+                if gw_ip:
+                    self._gw_results.append(gw_ok)
                 ndp_gw = self._ndp_protection.gateway_ipv6
                 if ndp_gw:
                     self._ndp_gw_results.append(ndp_gw_ok)
@@ -258,7 +263,10 @@ class NetworkMonitor:
                 # 当光猫运行但光纤断开时，光猫会对外网 ping 回复 ICMP type=3
                 # (Destination Unreachable)。收到来自网关的 Dest Unreachable
                 # 立即判定为 WAN 断连，跳过滑动窗口等待。
-                if not ext_ok and ext_just_checked and not self._arp_network_down and not ext_v6_ok:
+                # （修复：原条件用每轮局部变量 ext_v6_ok（默认 True 仅 v6 探测轮更新），
+                #   使 v4 快速检测几乎永不触发；改用 v6 滑动窗口与 408 行降级判定一致）
+                ext_v6_window_alive = len(self._ext_results_v6) > 0 and sum(self._ext_results_v6) > 0
+                if not ext_ok and ext_just_checked and not self._arp_network_down and not ext_v6_window_alive:
                     now = asyncio.get_event_loop().time()
                     if now - self._last_wan_probe_time >= 1.0 and self._wan_detect_enabled:
                         await self._check_wan_unreachable()
@@ -302,11 +310,12 @@ class NetworkMonitor:
                 # 始终调用 _classify_loss 让滑动窗口真实数据判断，不会因 wan_dead 永久卡在 network_down
                 loss_pct, diagnosis = self._classify_loss()
                 # wan_dead 已经标记断网，但滑动窗口还未恢复时保持 network_down
-                # Bug #1: WAN 断开确认后 ping_interval*5 内强制 network_down（给 ext_results 滑动窗口时间填充 False）
-                if self._arp_network_down:
+                # 修复 M4：保护窗口与外网探测周期匹配（原 _interval*5 仅 0.05~0.25s，远小于 ext 窗口填充时间）
+                _protect_window = max(self._external_interval, 5.0)
+                if self._arp_network_down or self._ndp_network_down:
                     if diagnosis == "recovered" and self._wan_dead_confirmed_at > 0:
                         elapsed = asyncio.get_event_loop().time() - self._wan_dead_confirmed_at
-                        if elapsed < self._interval * 5:
+                        if elapsed < _protect_window:
                             diagnosis = "network_down"
                             loss_pct = 100
                     elif diagnosis != "recovered":
@@ -531,10 +540,11 @@ class NetworkMonitor:
                            "Destination Unreachable (code=%s)，光纤可能已断开",
                            result.get("from_ip", "?"), target,
                            result.get("unreachable_code", "?"))
-            # 清空 ext_results 防止首轮误判
-            self._ext_results.clear()
-            for _ in range(self._ext_results.maxlen):
-                self._ext_results.append(False)
+            # 清空 v6 外网窗口防止首轮误判恢复
+            # （原实现误清 v4 窗口 _ext_results 并填 False → ext_v4_alive 恒 False → _arp_network_down 无条件置 True）
+            self._ext_results_v6.clear()
+            for _ in range(self._ext_results_v6.maxlen):
+                self._ext_results_v6.append(False)
             self._wan_dead_confirmed_at = self._last_wan_probe_time_v6
             self._ndp_network_down = True
             ext_v4_alive = len(self._ext_results) > 0 and sum(self._ext_results) > 0
@@ -574,13 +584,17 @@ class NetworkMonitor:
         gw_fails = gw_len - sum(gw_results)
         gw_loss = int(gw_fails / gw_len * 100)
 
-        # IPv4 网关高丢包时，回退到 IPv6 网关检测
+        # 保存 IPv4 网关原始丢包率（ARP 修复触发必须用 v4 原始值——修复 M3：
+        # v6 回退只影响整网断/恢复判定，不得掩盖 IPv4 层 ARP 问题）
+        gw_loss_v4_raw = gw_loss
+
+        # IPv4 网关高丢包时，回退到 IPv6 网关检测（仅用于 network_down/recovered 判定）
         if gw_loss >= 50 and self._arp_protection.gateway_ip is not None                 and self._ndp_protection.gateway_ipv6:
             ndp_len = len(self._ndp_gw_results)
             if ndp_len >= 2:
                 ndp_fails = ndp_len - sum(self._ndp_gw_results)
                 ndp_loss = int(ndp_fails / ndp_len * 100)
-                # IPv6 正常说明网关本身可达，问题在 IPv4 层
+                # IPv6 正常说明网关本身可达，问题在 IPv4 层（丢包率替换仅用于"是否整网断"判断）
                 if ndp_loss < 30:
                     gw_loss = ndp_loss
                     gw_results = self._ndp_gw_results
@@ -598,20 +612,28 @@ class NetworkMonitor:
             ext_v6_loss = int(ext_v6_fails / ext_v6_len * 100)
         else:
             ext_v6_loss = 0
+        # v6 健康判定：窗口未满（<2 条）视为"未知"而非健康（双栈独立性——修复 L11：
+        # 纯 v4 环境/启动期 v6 空窗口按 0 曾误判 recovered）
+        ext_v6_healthy = ext_v6_len >= 2 and ext_v6_loss < 67
 
-        if ext_loss == 100 and ext_v6_loss < 67 and gw_loss < 20:
+        if ext_loss == 100 and ext_v6_healthy and gw_loss < 20:
             return (gw_loss, "recovered")
 
 
         # 网关正常但外网全丢——可能是 ONT 静默丢包（不发 Dest Unreachable）
-        if gw_loss < 20 and ext_loss == 100 and ext_v6_loss >= 67:
+        # v6 窗口未知（<2 条）或 v6 明确差时，以 v4 强信号（外网全丢+网关正常）判 network_down；
+        # v6 明确健康时不判（security_review MEDIUM：v6 未知不再推迟断网确认）
+        if gw_loss < 20 and ext_loss == 100 and not ext_v6_healthy:
             return (gw_loss, "network_down")
-        if gw_loss < 20 and ext_loss < 100:
+        if gw_loss < 20 and ext_loss < 100 and gw_loss_v4_raw < 20:
+            # v4 原始丢包 <20% 才判 recovered（security_review LOW：v6 回退不得让 v4 高丢包截胡 arp_issue）
             return (gw_loss, "recovered")
         elif gw_loss >= 90 and ext_loss >= 67 and ext_v6_loss >= 67:
             return (gw_loss, "network_down")
-        elif gw_loss >= 20 and ext_v6_loss >= 67:
-            return (gw_loss, "arp_issue")
+        elif gw_loss_v4_raw >= 20:
+            # v4 网关丢包 ≥20% → arp_issue，独立于 v6 健康（双栈独立性——修复 L10：
+            # v4 ARP 投毒在 v6 健康时原永不触发 _run_arp_defense）
+            return (gw_loss_v4_raw, "arp_issue")
         return (gw_loss, "normal")
 
     @staticmethod
@@ -638,9 +660,23 @@ class NetworkMonitor:
         """
         loss_pct, diagnosis = self._classify_loss()
         # 网关恢复率 > 50% 就算恢复（窗口内至少 3/5 成功）
-        gw_len = len(self._gw_results)
+        # 与 _classify_loss 完全对齐的窗口选择（两级回退：无 v4 网关 → v6 窗口；v4 高丢包且 v6 健康 → v6 窗口）
+        gw_results = self._gw_results
+        ndp_gw = self._ndp_protection.gateway_ipv6
+        if self._arp_protection.gateway_ip is None and ndp_gw:
+            gw_results = self._ndp_gw_results
+        elif ndp_gw and len(self._gw_results) >= 2:
+            _v4_fails = len(self._gw_results) - sum(self._gw_results)
+            _v4_loss = int(_v4_fails / len(self._gw_results) * 100)
+            if _v4_loss >= 50:
+                _ndp_len = len(self._ndp_gw_results)
+                if _ndp_len >= 2:
+                    _ndp_loss = int((_ndp_len - sum(self._ndp_gw_results)) / _ndp_len * 100)
+                    if _ndp_loss < 30:
+                        gw_results = self._ndp_gw_results
+        gw_len = len(gw_results)
         if gw_len >= 3:
-            gw_ok_count = sum(self._gw_results)
+            gw_ok_count = sum(gw_results)
             if gw_ok_count >= max(3, gw_len // 2 + 1):
                 return True
         return diagnosis == "recovered"
@@ -652,6 +688,21 @@ class NetworkMonitor:
     def _has_active_ndp_attacks(self, seconds: float = 5.0) -> bool:
         """检查过去 seconds 秒内 NDP 防护是否检测到攻击。"""
         return self._ndp_protection.enabled and self._ndp_protection.has_recent_attacks(seconds)
+
+    async def _ndp_announce_callback(self):
+        """ARP IP 冲突反制联动：NDP 侧宣告本机 IPv6-MAC + 静态 NDP 绑定"""
+        try:
+            ndp = self._ndp_protection
+            # running 检查：NDP 已停止时不再调用其方法（LOW 修复——原只查 enabled 不查运行时状态）
+            if not ndp or not ndp.enabled or not getattr(ndp, "_ndp_running", False):
+                return
+            # NA 广播宣告本机 IPv6-MAC（纠正网络上被投毒的邻居表）
+            await ndp.send_unsolicited_na()
+            # 静态 NDP 绑定保护网关条目
+            await ndp.protect_ndp_entry()
+            logger.info("NDP 联动: 已宣告本机 IPv6-MAC 并刷新静态 NDP 条目")
+        except Exception as e:
+            logger.debug("NDP 联动宣告失败: %s", e)
 
     async def _run_arp_defense(self, gw_ip: str, abort_check: Callable[[], bool]):
         """
@@ -973,7 +1024,7 @@ class NetworkMonitor:
 
     async def _check_connectivity(self) -> bool:
         """
-        综合检测网络连通性
+        [DEPRECATED - 无调用者] 综合检测网络连通性
         检测方式（任一成功即视为连通）：
         1. ICMP ping 检测（IPv4 + IPv6 双栈）
         2. TCP 连接测试（tcping，IPv4 + IPv6）
@@ -1001,7 +1052,7 @@ class NetworkMonitor:
 
     async def _recover(self):
         """
-        网络恢复后的自动恢复操作：
+        [DEPRECATED - 无调用者，实际恢复流程由 _recover_worker_loop 承担] 网络恢复后的自动恢复操作：
         1. 等待短暂延迟，让网络栈完全初始化（Windows 网卡重新启用后需要时间）
         2. 重置所有解析器的持久连接（关闭失效的 aiohttp 会话等）
         3. 重新启用所有上游服务器（包括 bootstrap）
@@ -1139,6 +1190,9 @@ class NetworkMonitor:
                 self.resolver_manager.set_network_down(False)
             finally:
                 self._recovery_in_progress = False
+                # 修复 M5：清除恢复期间累积的 _run_recover 触发，
+                # 否则回到 wait() 时事件仍置位会立即重放一轮完整恢复
+                self._run_recover.clear()
 
     # ======================== Resolver 全部失败回调 ========================
 
@@ -1226,48 +1280,52 @@ class NetworkMonitor:
             attack_rate = 10       # 默认级
 
         # === IPv4 ARP 检查（不依赖 ping）===
-        if self._arp_protection.enabled:
-            gw_ip = self._arp_protection.gateway_ip
-            if gw_ip:
-                # 1. 直接检查本机 ARP 表是否有投毒条目
-                poisoned = await self._arp_protection._check_arp_poisoning()
-                if poisoned:
-                    for gw_ip_p, expected_mac, actual_mac in poisoned:
-                        logger.warning("深度诊断 [反制]: 检测到 ARP 投毒！"
-                                       "网关 %s 期望 MAC=%s, 当前 MAC=%s — 触发完整反制",
-                                       gw_ip_p, expected_mac, actual_mac)
-                        burst_size, directed_count, inter, _ = ARPProtection._get_intensity(attack_rate)
-                        await self._arp_protection._garp_counterstrike(
-                            # attacker_ip 传入网关 IP（投毒者冒充网关），用于 GARP 广播宣告真实网关绑定
-                            attacker_ip=gw_ip_p,
-                            attacker_mac=actual_mac,
-                            burst_size=burst_size,
-                            directed_count=directed_count,
-                            inter=inter,
-                        )
-                else:
-                    # 2. 无投毒时，对比基线 MAC 做预防性检查
-                    baseline_mac = self._arp_protection._baseline_mac
-                    if baseline_mac:
-                        try:
-                            if sys.platform == "win32":
-                                current_mac = await ARPProtection._arp_get_mac_windows(gw_ip)
-                            else:
-                                current_mac = await ARPProtection._arp_get_mac_linux(gw_ip)
-                            if current_mac and current_mac.upper() != baseline_mac:
-                                logger.warning("深度诊断 [反制]: 网关 %s MAC 变更 "
-                                               "(基线=%s, 当前=%s) — 可能 ARP 投毒，触发反制",
-                                               gw_ip, baseline_mac, current_mac)
-                                burst_size, directed_count, inter, _ = ARPProtection._get_intensity(attack_rate)
-                                await self._arp_protection._garp_counterstrike(
-                                    attacker_ip=gw_ip,
-                                    attacker_mac=current_mac,
-                                    burst_size=burst_size,
-                                    directed_count=directed_count,
-                                    inter=inter,
-                                )
-                        except Exception as e:
-                            logger.debug("深度诊断 ARP MAC 检查异常: %s", e)
+        # 异常隔离：ARP 检查失败不得阻断 IPv6 NDP 深度检查（协程独立性修复）
+        try:
+            if self._arp_protection.enabled:
+                gw_ip = self._arp_protection.gateway_ip
+                if gw_ip:
+                    # 1. 直接检查本机 ARP 表是否有投毒条目
+                    poisoned = await self._arp_protection._check_arp_poisoning()
+                    if poisoned:
+                        for gw_ip_p, expected_mac, actual_mac in poisoned:
+                            logger.warning("深度诊断 [反制]: 检测到 ARP 投毒！"
+                                           "网关 %s 期望 MAC=%s, 当前 MAC=%s — 触发完整反制",
+                                           gw_ip_p, expected_mac, actual_mac)
+                            burst_size, directed_count, inter, _ = ARPProtection._get_intensity(attack_rate)
+                            await self._arp_protection._garp_counterstrike(
+                                # attacker_ip 传入网关 IP（投毒者冒充网关），用于 GARP 广播宣告真实网关绑定
+                                attacker_ip=gw_ip_p,
+                                attacker_mac=actual_mac,
+                                burst_size=burst_size,
+                                directed_count=directed_count,
+                                inter=inter,
+                            )
+                    else:
+                        # 2. 无投毒时，对比基线 MAC 做预防性检查
+                        baseline_mac = self._arp_protection._baseline_mac
+                        if baseline_mac:
+                            try:
+                                if sys.platform == "win32":
+                                    current_mac = await ARPProtection._arp_get_mac_windows(gw_ip)
+                                else:
+                                    current_mac = await ARPProtection._arp_get_mac_linux(gw_ip)
+                                if current_mac and current_mac.upper() != baseline_mac:
+                                    logger.warning("深度诊断 [反制]: 网关 %s MAC 变更 "
+                                                   "(基线=%s, 当前=%s) — 可能 ARP 投毒，触发反制",
+                                                   gw_ip, baseline_mac, current_mac)
+                                    burst_size, directed_count, inter, _ = ARPProtection._get_intensity(attack_rate)
+                                    await self._arp_protection._garp_counterstrike(
+                                        attacker_ip=gw_ip,
+                                        attacker_mac=current_mac,
+                                        burst_size=burst_size,
+                                        directed_count=directed_count,
+                                        inter=inter,
+                                    )
+                            except Exception as e:
+                                logger.debug("深度诊断 ARP MAC 检查异常: %s", e)
+        except Exception as e:
+            logger.debug("深度诊断 ARP 检查异常: %s", e)
 
         # === IPv6 NDP 检查（不依赖 ping）===
         if self._ndp_protection.enabled:

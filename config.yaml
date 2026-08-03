@@ -61,10 +61,13 @@ upstream:
   # bootstrap DNS：仅用于解析 DoH/DoT/DoQ 服务器的 IP 地址
   # 包含 IPv4 + IPv6 双栈 DNS 服务器
   bootstrap_resolvers:
-    - 9.9.9.9
+    - 193.0.14.129          # 中国境内根服务器
+    - 192.5.5.241          # 中国境内根服务器
     - 223.5.5.5
     - 114.114.114.114
     - 119.29.29.29
+    - 2001:7fd::1          # 中国境内根服务器
+    - 2001:500:2f::f          # 中国境内根服务器
     - 2400:3200::1
     - 2001:dc7:1000::1
 
@@ -84,9 +87,11 @@ upstream:
     - https://sm2.doh.pub/dns-query          # 腾讯国密SM2加密DNS
     - https://doh.360.cn/dns-query
     - https://doh.dns.sb/dns-query
+    - https://doh.onedns.net/dns-query
   dot:
     - dns.alidns.com
     - dot.pub
+    - dot.onedns.net
     - dot.sb
     - dns.adguard-dns.com
     - one.one.one.one

@@ -61,6 +61,7 @@ try:
     ICMPv6NDOptSrcLLAddr = scapy_module.ICMPv6NDOptSrcLLAddr
     ICMPv6ND_RA = scapy_module.ICMPv6ND_RA
     ICMPv6ND_RS = scapy_module.ICMPv6ND_RS
+    ICMPv6ND_Redirect = scapy_module.ICMPv6ND_Redirect
     ICMPv6NDOptRedirectedHdr = scapy_module.ICMPv6NDOptRedirectedHdr
     Dot1Q = scapy_module.Dot1Q
     sniff = scapy_module.sniff
@@ -111,7 +112,7 @@ class NDPProtection:
         self._nud_window = self._nud_window_ms / 1000.0
         self._nud_threshold = cfg.get("nud_threshold", 3)
         self._ndp_flood_threshold = cfg.get("ndp_flood_threshold", 50)  # T7 泛洪阈值（条/秒）
-        self._ndp_flood_suppress = False  # 泛洪抑制标志
+        self._ndp_flood_suppress = False  # 泛洪抑制标志（当前仅记录状态，未接入 RA/NA 学习入口——预留）
         self._baseline_learn_ms = int(cfg.get("baseline_learn_ms", 3000))
         # \u7f51\u53e3\u540d\u79f0->\u7d22\u5f15\u7f13\u5b58\uff0c\u7528\u4e8e\u9759\u6001 NDP \u7ed1\u5b9a
         self._iface_name_to_idx: Dict[str, int] = {}
@@ -171,10 +172,15 @@ class NDPProtection:
         self._ndp_ip_migrated: bool = True              # 全局NDP是否已标记迁移（永久禁用IP迁移，仅用反制）
         self._local_macs: set = set()              # 本机所有网络接口的 MAC 地址（防自伤反制）
         self._local_macs_loaded: bool = False      # 本地 MAC 是否已加载
+        # 本机 IPv6↔MAC 权威映射（多接口自包防误伤基线）：{mac_norm: set(ipv6)}
+        self._local_ip_mac_map: dict = {}
 
         # T5 NUD 追踪
         self._nud_tracker: Dict[str, list] = {}
         self._dad_tracker: Dict[str, list] = {}   # DAD 追踪器（与 NUD 分离，防数据污染）
+        self._recovery_last_trigger: Dict[str, float] = {}  # NUD 触发恢复 worker 节流（同 target ≥10s）
+        self._baseline_verify_pending: bool = False  # 嗅探兜底基线异步验证防重
+        self._ra_verify_pending: Dict[str, float] = {}  # RA 源异步信任验证节流（源MAC→上次验证时间，30s 重试）
 
         # 基线学习
         self._baseline_learned: bool = False
@@ -307,6 +313,80 @@ class NDPProtection:
         return data.decode('utf-8', errors='replace')
 
     @staticmethod
+    async def _build_local_ip_mac_map() -> dict:
+        """
+        建立本机 IPv6↔MAC 权威映射：{normalized_mac: set(ipv6)}（多接口各自归属）。
+        Windows: ipconfig /all 按适配器段解析（IPv6 地址 + 物理地址）
+        Linux: ip -o link（iface→mac）+ ip -o -6 addr（iface→ipv6）对齐
+        用于多接口自包防误伤（本机任一接口 MAC 宣告本机任一 IPv6 = 正常）。
+        """
+        ip_map: dict = {}
+        try:
+            if sys.platform == "win32":
+                proc = await asyncio.create_subprocess_exec(
+                    "ipconfig", "/all",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=8)
+                # staticmethod 内不能用 self（review blocking-3）：直接按系统编码解码
+                text = stdout.decode(locale.getpreferredencoding(False), errors="replace")
+                raw_sections = re.split(
+                    r'(?=^(?:以太网适配器 |Ethernet adapter |无线局域网适配器 |Wireless LAN adapter |WLAN 适配器 |WLAN adapter |本地连接|Local Area Connection))',
+                    text, flags=re.MULTILINE)
+                if raw_sections and not raw_sections[0].strip():
+                    raw_sections = raw_sections[1:]
+                cur_mac = None
+                for section in raw_sections:
+                    lines = section.strip().splitlines()
+                    if not lines:
+                        continue
+                    cur_mac = None
+                    for line in lines:
+                        s = line.strip()
+                        # 仅物理地址行更新 cur_mac（避免其他行 6 组十六进制子串污染——review should-fix）
+                        macm = re.search(r'((?:[0-9A-Fa-f]{2}[-:]){5}[0-9A-Fa-f]{2})', s)
+                        if macm and ("物理地址" in s or "Physical Address" in s or "Physical Address." in s):
+                            cand = macm.group(1).replace("-", ":").upper()
+                            if cand != "00:00:00:00:00:00" and cand != "FF:FF:FF:FF:FF:FF":
+                                cur_mac = cand
+                        if cur_mac and ("IPv6 地址" in s or "IPv6 Address" in s or "IPv6 地址." in s):
+                            ipm = re.search(r'((?:[0-9a-fA-F]{1,4}:){2,}[0-9a-fA-F:]+(?:%\d+)?)', s)
+                            if ipm:
+                                ip6 = ipm.group(1).split("%")[0]
+                                if not ip6.startswith("fe80") and ":" in ip6:
+                                    ip_map.setdefault(cur_mac, set()).add(ip6)
+            else:
+                # Linux: ip -o link → iface:mac；ip -o -6 addr → iface:ipv6
+                proc = await asyncio.create_subprocess_exec(
+                    "ip", "-o", "link", "show",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                out_l, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+                mac_of = {}
+                for line in out_l.decode("utf-8", errors="replace").splitlines():
+                    # ip -o link 输出 '2: eth0: <...>'——接口名带尾随冒号，捕获组排除冒号（review blocking-2）
+                    m = re.search(r'^\d+:\s+([^:@\s]+).*link/ether\s+((?:[0-9a-f]{2}:){5}[0-9a-f]{2})', line)
+                    if m:
+                        mac_of[m.group(1)] = m.group(2).upper()
+                proc = await asyncio.create_subprocess_exec(
+                    "ip", "-o", "-6", "addr", "show",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                out_a, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+                for line in out_a.decode("utf-8", errors="replace").splitlines():
+                    m = re.search(r'^\d+:\s+(\S+).*inet6\s+([0-9a-fA-F:]+)', line)
+                    if m and m.group(1) in mac_of:
+                        ip6 = m.group(2).split("%")[0]
+                        if not ip6.startswith("fe80"):
+                            ip_map.setdefault(mac_of[m.group(1)], set()).add(ip6)
+        except Exception as e:
+            logger.debug("NDP 防护: 本机 IPv6↔MAC 映射构建失败: %s", e)
+        return ip_map
+
+    @staticmethod
     async def _fetch_all_local_macs() -> set:
         """
         收集本机所有网络接口的 MAC 地址。
@@ -330,10 +410,16 @@ class NDPProtection:
                         continue
                     inner = line.strip('"')
                     parts = inner.split('","')
-                    if len(parts) >= 2:
-                        mac = parts[1].strip()
-                        if mac and len(mac.replace("-", "")) == 12:
-                            macs.add(mac.replace("-", ":").upper())
+                    # 兼容列序：getmac CSV 可能是 "连接名","MAC" 或 "MAC","传输名"（用户机器无连接名列）
+                    # 对每个字段做 MAC 格式校验，取第一个合法 MAC（修复 getmac 列序错位漏收集）
+                    for _p in parts[:3]:
+                        _m = _p.strip()
+                        if _m and len(_m.replace("-", "").replace(":", "")) == 12 and \
+                                re.match(r'^[0-9A-Fa-f]{2}([-:][0-9A-Fa-f]{2}){5}$', _m):
+                            _m_norm = _m.replace("-", ":").upper()
+                            if _m_norm not in ("00:00:00:00:00:00", "FF:FF:FF:FF:FF:FF"):
+                                macs.add(_m_norm)
+                            break
                 # getmac 失败时用 wmic 兜底
                 if not macs:
                     try:
@@ -354,7 +440,9 @@ class NDPProtection:
                     try:
                         import uuid
                         node = uuid.getnode()
-                        if node is not None and node != 0 and not (node & 0x010000000000):
+                        # 拒绝 locally-administered（0x020000000000）与 multicast（0x010000000000）：
+                        # uuid 无硬件时返回随机本地管理 MAC，会虚构本机 MAC（A4:5B... 污染根因）
+                        if node is not None and node != 0 and not (node & 0x030000000000):
                             mac_str = ':'.join(f'{(node >> (5-i)*8) & 0xFF:02x}' for i in range(6)).upper()
                             if len(mac_str.replace(":", "")) == 12:
                                 macs.add(mac_str)
@@ -698,6 +786,19 @@ class NDPProtection:
         if not self._local_macs_loaded:
             self._local_macs = await NDPProtection._fetch_all_local_macs()
             self._local_macs_loaded = True
+        # 本机 IPv6↔MAC 权威映射（多接口自包防误伤基线）+ 补全本机 MAC 集合
+        try:
+            self._local_ip_mac_map = await NDPProtection._build_local_ip_mac_map()
+            # 映射 key 为冒号大写格式，直接加入集合（review blocking-1：原按 12 位切片产生垃圾）
+            for mac_colon in self._local_ip_mac_map:
+                if mac_colon and mac_colon != "00:00:00:00:00:00":
+                    self._local_macs.add(mac_colon)
+        except Exception:
+            self._local_ip_mac_map = {}
+        logger.info("NDP 防护: 嗅探启动 — 本机 IPv6 集合=%s, 本机 MAC=%s, IP↔MAC映射=%s",
+                    sorted(self.all_local_ipv6) if self.all_local_ipv6 else "(空!)",
+                    (self.local_mac or (",".join(sorted(self._local_macs)) if self._local_macs else "(空!)")),
+                    {m: sorted(ips) for m, ips in self._local_ip_mac_map.items()} if self._local_ip_mac_map else "(空!)")
 
         # ==================== 路径 1: scapy 嗅探 ====================
         if self._scapy_available:
@@ -706,7 +807,9 @@ class NDPProtection:
             scapy_ok = True
             try:
                 def _probe():
-                    sniff(filter="icmp6", count=1, timeout=0.1, store=False, quiet=True)
+                    # 显式指定接口：不依赖 scapy 全局 conf.iface（避免被 ARP 侧写入干扰——协程独立性）
+                    sniff(filter="icmp6", count=1, timeout=0.1, store=False, quiet=True,
+                          iface=self.interface_name or None)
                 await loop.run_in_executor(None, _probe)
             except Exception:
                 logger.warning("NDP 防护: scapy 嗅探预检失败 (libpcap 不可用)")
@@ -716,12 +819,14 @@ class NDPProtection:
                 def _sniff():
                     while self._ndp_running:
                         sniff(filter="icmp6",
+                              iface=self.interface_name or None,  # 显式接口：不读 ARP 写入的 conf.iface
                             stop_filter=lambda pkt: not self._ndp_running,
                         lfilter=lambda p: (
                             p.haslayer(Ether) and p.haslayer(IPv6) and (
                                 p.haslayer(ICMPv6ND_NA) or
                                 p.haslayer(ICMPv6ND_NS) or
                                 p.haslayer(ICMPv6ND_RA) or
+                                p.haslayer(ICMPv6ND_Redirect) or
                                 p.haslayer(ICMPv6Error)
                             )
                         ),
@@ -848,11 +953,14 @@ class NDPProtection:
         if src_ip == "::":
             addr_key = ns_target
             now = time.time()
-            # 清理过期记录
+            # 清理过期记录（同时删除空 key，防无界增长）
             self._dad_tracker = {
                 t: [ts for ts in times if now - ts < self._nud_window]
                 for t, times in self._dad_tracker.items()
+                if any(now - ts < self._nud_window for ts in times)
             }
+            if len(self._dad_tracker) > 200:
+                self._dad_tracker.clear()  # 防无界增长（CPU/内存 DoS）
             if addr_key not in self._dad_tracker:
                 self._dad_tracker[addr_key] = []
             self._dad_tracker[addr_key].append(now)
@@ -864,21 +972,23 @@ class NDPProtection:
         """AF_PACKET RA 检测：未知 RA 源（T3）+ CurHopLimit + M/O 标志"""
         if not self._enabled:
             return
+        # 统一 MAC 格式（无分隔大写），与 scapy 路径/基线集合一致（MEDIUM-2）
+        src_mac_norm = self._mac_normalize(src_mac)
         known_gw_macs = {self._mac_normalize(mac) for _, mac, _ in self.gateway_pairs if mac}
-        known_baseline_macs = set(self._baseline_mac_per_gw.values())
+        known_baseline_macs = {self._mac_normalize(m) for m in self._baseline_mac_per_gw.values()}
         all_trusted = known_gw_macs | known_baseline_macs | self._trusted_ra_sources
 
-        if src_mac in all_trusted:
+        if src_mac_norm in all_trusted:
             return
 
-        if src_mac in self._suspicious_ra_sources:
+        if src_mac_norm in self._suspicious_ra_sources:
             return
 
         # CurHopLimit 异常检测
         if hop_limit < 255:
             logger.warning("NDP 防护 [4.2.7/AF_PACKET]: CurHopLimit=%d (异常) RA 源 %s (%s)",
                            hop_limit, src_ip, src_mac)
-            self._suspicious_ra_sources.add(src_mac)
+            self._suspicious_ra_sources.add(src_mac_norm)
             self._threat_events.append({
                 "type": "ra_param_spoof", "time": time.time(),
                 "src_mac": src_mac, "src_ip": src_ip,
@@ -893,9 +1003,25 @@ class NDPProtection:
             self._ra_m_flag_baseline = bool(m_flag)
             self._ra_o_flag_baseline = bool(o_flag)
             self._ra_baseline_learned = True
-            self._trusted_ra_sources.add(src_mac)
-            logger.info("NDP 防护 [AF_PACKET]: 学习 RA 基线 HopLimit=%d M=%d O=%d (源 %s)",
-                         hop_limit, m_flag, o_flag, src_mac)
+            # 信任验证：命中已知网关/基线 MAC 或系统 NDP 表交叉验证一致才信任（防首包投毒 HIGH-1）
+            if src_mac_norm in known_gw_macs | known_baseline_macs:
+                self._trusted_ra_sources.add(src_mac_norm)
+                logger.info("NDP 防护 [AF_PACKET]: 学习 RA 基线 HopLimit=%d M=%d O=%d (源 %s，命中网关MAC已信任)",
+                            hop_limit, m_flag, o_flag, src_mac)
+            else:
+                sys_mac = None
+                if src_ip and ":" in src_ip:
+                    try:
+                        sys_mac = await self._resolve_mac_single(src_ip)
+                    except Exception:
+                        sys_mac = None
+                if sys_mac and self._mac_normalize(sys_mac) == src_mac_norm:
+                    self._trusted_ra_sources.add(src_mac_norm)
+                    logger.info("NDP 防护 [AF_PACKET]: 学习 RA 基线 HopLimit=%d M=%d O=%d (源 %s，系统表验证已信任)",
+                                hop_limit, m_flag, o_flag, src_mac)
+                else:
+                    logger.warning("NDP 防护 [AF_PACKET]: RA 源 %s(%s) 未通过信任验证，仅记录参数基线不信任",
+                                   src_ip, src_mac)
             return
 
         # M/O 标志异常检测
@@ -906,7 +1032,7 @@ class NDPProtection:
                                "M=%d O=%d (基线 M=%s O=%s)",
                                src_ip, src_mac, m_flag, o_flag,
                                self._ra_m_flag_baseline, self._ra_o_flag_baseline)
-                self._suspicious_ra_sources.add(src_mac)
+                self._suspicious_ra_sources.add(src_mac_norm)
                 self._threat_events.append({
                     "type": "ra_param_spoof", "time": time.time(),
                     "src_mac": src_mac, "src_ip": src_ip,
@@ -917,7 +1043,7 @@ class NDPProtection:
 
         # 未知 RA 源
         logger.warning("NDP 嗅探 [T3/AF_PACKET]: 未知 RA 源! %s (%s)", src_ip, src_mac)
-        self._suspicious_ra_sources.add(src_mac)
+        self._suspicious_ra_sources.add(src_mac_norm)
         self._threat_events.append({
             "type": "rogue_ra", "time": time.time(),
             "src_mac": src_mac, "src_ip": src_ip,
@@ -928,8 +1054,9 @@ class NDPProtection:
         """AF_PACKET Redirect 检测（T6）：非信任源 Redirect"""
         if not self._enabled:
             return
+        src_mac_norm = self._mac_normalize(src_mac)  # 统一 MAC 格式（MEDIUM-2）
         known_gw_macs = {self._mac_normalize(mac) for _, mac, _ in self.gateway_pairs if mac}
-        if known_gw_macs and src_mac not in known_gw_macs:
+        if known_gw_macs and src_mac_norm not in known_gw_macs:
             logger.warning("NDP 防护 [T6/AF_PACKET]: 非信任 Redirect! %s (%s)", src_ip, src_mac)
             self._threat_events.append({
                 "type": "rogue_redirect", "time": time.time(),
@@ -1033,6 +1160,48 @@ class NDPProtection:
                 logger.debug("NDP 防护: NDP 表轮询异常: %s", e)
             await asyncio.sleep(5)
 
+    async def _verify_and_trust_ra_source(self, src_ip: str, src_mac: str, norm_src_mac: str):
+        """异步交叉验证 RA 源并授予信任（防首包投毒；不在事件循环线程同步阻塞）"""
+        try:
+            sys_mac = await self._resolve_mac_single(src_ip) if (src_ip and ":" in src_ip) else None
+        except Exception:
+            sys_mac = None
+        if sys_mac and self._mac_normalize(sys_mac) == norm_src_mac:
+            self._trusted_ra_sources.add(src_mac)
+            logger.info("NDP 嗅探: RA 源 %s(%s) 通过系统NDP表交叉验证，已信任", src_ip, src_mac)
+        else:
+            logger.warning("NDP 嗅探: RA 源 %s(%s) 未通过信任验证，不授予信任", src_ip, src_mac)
+
+    async def _verify_and_learn_baseline(self, gw_ip: str, src_mac: str):
+        """异步交叉验证嗅探兜底基线（防单包投毒；不在事件循环线程同步阻塞）"""
+        learned = False
+        try:
+            try:
+                sys_mac = await self._resolve_mac_single(gw_ip)
+            except Exception:
+                sys_mac = None
+            if sys_mac and self._mac_normalize(sys_mac) == self._mac_normalize(src_mac):
+                self._baseline_mac_per_gw[gw_ip] = src_mac
+                self._baseline_learned = True
+                learned = True
+                logger.info("NDP 防护: 基线已学习 (嗅探兜底+系统表验证) [%s] -> MAC=%s", gw_ip, src_mac)
+                for _iface in self.interfaces:
+                    _iface.gateways = [
+                        (_gw, self._baseline_mac_per_gw.get(_gw, _mac), _vlan)
+                        for _gw, _mac, _vlan in _iface.gateways
+                    ]
+                try:
+                    await self.protect_ndp_entry()
+                except Exception:
+                    pass
+            else:
+                logger.warning("NDP 防护: 嗅探到网关NDP包 MAC=%s 但系统NDP表为 %s，不采纳",
+                               src_mac, sys_mac or "空")
+        finally:
+            # 验证未成功时重置 pending，允许后续包再次触发（否则启动初期查表失败会永久禁用基线学习→T1漏报）
+            if not learned:
+                self._baseline_verify_pending = False
+
     def _on_ndp_packet(self, pkt):
         try:
             self._loop.call_soon_threadsafe(self._on_ndp_packet_sync, pkt)
@@ -1042,11 +1211,12 @@ class NDPProtection:
     def _on_ndp_packet_sync(self, pkt):
         if not pkt.haslayer(Ether) or not pkt.haslayer(IPv6):
             return
-        if not pkt.haslayer(ICMPv6ND_NS) and not pkt.haslayer(ICMPv6ND_NA):
+        # 仅处理 NDP 相关报文：NS/NA/RA/Redirect（Redirect type=137 由 ICMPv6ND_Redirect 表示）
+        # 修复：原先仅放行 NS/NA，导致 RA/Redirect 分支（Rogue RA、参数欺骗、前缀、Redirect）成为死代码
+        if not (pkt.haslayer(ICMPv6ND_NS) or pkt.haslayer(ICMPv6ND_NA) or
+                pkt.haslayer(ICMPv6ND_RA) or pkt.haslayer(ICMPv6ND_Redirect)):
             return
         "Execute in event loop (via call_soon_threadsafe)"
-        if not pkt.haslayer(Ether) or not pkt.haslayer(IPv6):
-            return
         src_mac = self._mac_normalize(pkt[Ether].src)
         # 防环路：精确匹配自身反制已发送MAC（优先），兜底 02:00:00 前缀
         if self._counterstrike_sent_macs and src_mac in self._counterstrike_sent_macs:
@@ -1066,17 +1236,50 @@ class NDPProtection:
             m_flag = bool(ra.M)
             o_flag = bool(ra.O)
 
-            # 学习合法 RA 参数基线（从第一个 RA 学习）
+            # 学习合法 RA 参数基线（从第一个 RA 学习；信任需验证，防首包投毒）
             if not self._ra_baseline_learned:
                 self._ra_hoplimit_baseline = hop_limit
                 self._ra_m_flag_baseline = m_flag
                 self._ra_o_flag_baseline = o_flag
                 self._ra_baseline_learned = True
-                # 将当前 RA 源加入信任列表
-                self._trusted_ra_sources.add(src_mac)
+                # 信任验证：仅当源 MAC 命中已知网关/基线 MAC，或与系统 NDP 表交叉验证一致时才加入信任
+                # （否则攻击者在 L2 发一个伪造 RA 即可永久豁免 4.2.7/T3/T6 全部 RA 检测）
+                known_gw_macs = {self._mac_normalize(mac) for _, mac, _ in self.gateway_pairs if mac}
+                known_baseline_macs = {self._mac_normalize(m) for m in self._baseline_mac_per_gw.values()}
+                norm_src_mac = self._mac_normalize(src_mac)
+                if norm_src_mac in known_gw_macs | known_baseline_macs:
+                    self._trusted_ra_sources.add(src_mac)
+                    logger.info("NDP 嗅探: 首个 RA 源 %s(%s) 命中已知网关 MAC，已信任", src_ip, src_mac)
+                else:
+                    # 异步交叉验证（fire-and-forget：避免事件循环线程内 run_coroutine_threadsafe().result() 阻塞死锁）
+                    try:
+                        asyncio.get_event_loop().create_task(
+                            self._verify_and_trust_ra_source(src_ip, src_mac, norm_src_mac))
+                    except Exception:
+                        pass
             else:
-                # CurHopLimit != 255 一定是伪造 RA
-                if self._ra_hoplimit_baseline is not None and hop_limit < 255:
+                # 信任集合提前计算：可信源跳过参数欺骗判定（与 AF_PACKET _check_ndp_raw_ra 顺序一致，
+                # 避免可信路由器因 CurHopLimit 非 255（部分设备行为）被误报）
+                known_gw_macs = {self._mac_normalize(mac) for _, mac, _ in self.gateway_pairs if mac}
+                known_baseline_macs = {self._mac_normalize(m) for m in self._baseline_mac_per_gw.values()}
+                all_trusted = known_gw_macs | known_baseline_macs | self._trusted_ra_sources
+
+                # 对未知源异步发起信任验证（防重+30s 节流重试）：启动初期系统 NDP 表常为空导致首包验证失败，
+                # 合法路由器（非网关）此后可经后续 RA 再次验证成功而获信任，消除永久误报（review should-fix）
+                if src_mac not in all_trusted and src_mac not in self._suspicious_ra_sources:
+                    _now_v = time.time()
+                    if _now_v - self._ra_verify_pending.get(src_mac, 0.0) > 30.0:
+                        self._ra_verify_pending[src_mac] = _now_v
+                        try:
+                            asyncio.get_event_loop().create_task(
+                                self._verify_and_trust_ra_source(src_ip, src_mac, self._mac_normalize(src_mac)))
+                        except Exception:
+                            pass
+                if len(self._ra_verify_pending) > 200:
+                    self._ra_verify_pending.clear()  # 防无界增长
+
+                # CurHopLimit 异常检测（仅对非可信源）
+                if src_mac not in all_trusted and self._ra_hoplimit_baseline is not None and hop_limit < 255:
                     logger.warning("NDP 嗅探 [4.2.7]: CurHopLimit=%d (异常) RA 源 %s (%s)",
                                    hop_limit, src_ip, src_mac)
                     self._suspicious_ra_sources.add(src_mac)
@@ -1086,10 +1289,10 @@ class NDPProtection:
                         "detail": f"CurHopLimit={hop_limit} (expected >=255)",
                     })
                     self._trim_threat_events()
-                # M/O 标志与基线不一致
+                # M/O 标志与基线不一致（仅对非可信源）
                 base_m = self._ra_m_flag_baseline
                 base_o = self._ra_o_flag_baseline
-                if base_m is not None and base_o is not None:
+                if src_mac not in all_trusted and base_m is not None and base_o is not None:
                     if m_flag != base_m or o_flag != base_o:
                         logger.warning("NDP 嗅探 [4.2.7]: M/O 标志异常 RA 源 %s (%s) M=%d O=%d (基线 M=%d O=%d)",
                                        src_ip, src_mac, m_flag, o_flag, base_m, base_o)
@@ -1135,9 +1338,7 @@ class NDPProtection:
 
                 # --- RA 源自动学习（替代 max_ra_routers）---
                 # 从手动配置的网关 MAC 或已确认的接口网关 MAC 发来的 RA = 信任
-                known_gw_macs = {self._mac_normalize(mac) for _, mac, _ in self.gateway_pairs if mac}
-                known_baseline_macs = set(self._baseline_mac_per_gw.values())
-                all_trusted = known_gw_macs | known_baseline_macs | self._trusted_ra_sources
+                # all_trusted 已在上方提前计算（含网关MAC + 基线MAC + 已确认RA源）
 
                 if src_mac not in all_trusted and src_mac not in self._suspicious_ra_sources:
                     # 新 RA 源但不属于信任/可疑列表 → 检查是否在手动网关列表中
@@ -1157,61 +1358,76 @@ class NDPProtection:
                         })
                         self._trim_threat_events()
 
-        # ==================== T5 NUD 追踪 ====================
+        # ==================== T5 NUD 追踪 / T4 DAD 检测 ====================
         if pkt.haslayer(ICMPv6ND_NS):
             ns = pkt[ICMPv6ND_NS]
             try:
-                ns_target = str(ns.target)
+                ns_target = str(ns.tgt)
             except (AttributeError, ValueError):
                 return
             now = time.time()
-            self._nud_tracker = {
-                t: [ts for ts in times if now - ts < self._nud_window]
-                for t, times in self._nud_tracker.items()
-            }
-            if ns_target not in self._nud_tracker:
-                self._nud_tracker[ns_target] = []
-            self._nud_tracker[ns_target].append(now)
-            if len(self._nud_tracker[ns_target]) >= self._nud_threshold:
-                logger.warning("NDP 嗅探 [T5]: NUD 失败 %s! %d 次 NS 重传",
-                               ns_target, len(self._nud_tracker[ns_target]))
-                self._threat_events.append({
-                    "type": "nud_failure", "time": now,
-                    "target": ns_target, "count": len(self._nud_tracker[ns_target]),
-                })
-                self._trim_threat_events()
-                self._nud_tracker[ns_target] = []
-                self._recovery_trigger.set()  # 触发恢复 worker 确认网关状态
+            if src_ip == "::":
+                # T4: DAD — 源为 :: 表示重复地址检测（与 NUD 分离，防数据污染）
+                self._dad_tracker = {
+                    t: [ts for ts in times if now - ts < self._nud_window]
+                    for t, times in self._dad_tracker.items()
+                    if any(now - ts < self._nud_window for ts in times)
+                }
+                if len(self._dad_tracker) > 200:
+                    self._dad_tracker.clear()  # 防无界增长（CPU/内存 DoS）
+                if ns_target not in self._dad_tracker:
+                    self._dad_tracker[ns_target] = []
+                self._dad_tracker[ns_target].append(now)
+                if len(self._dad_tracker[ns_target]) >= 3:
+                    logger.warning("NDP 嗅探 [T4]: DAD 攻击! %s 被重复检测 ≥3 次", ns_target)
+                    self._threat_events.append({
+                        "type": "dad_attack", "time": now,
+                        "target": ns_target, "count": len(self._dad_tracker[ns_target]),
+                    })
+                    self._trim_threat_events()
+                    self._dad_tracker[ns_target] = []
+            else:
+                self._nud_tracker = {
+                    t: [ts for ts in times if now - ts < self._nud_window]
+                    for t, times in self._nud_tracker.items()
+                    if any(now - ts < self._nud_window for ts in times)
+                }
+                if len(self._nud_tracker) > 200:
+                    self._nud_tracker.clear()  # 防无界增长（CPU/内存 DoS）
+                if ns_target not in self._nud_tracker:
+                    self._nud_tracker[ns_target] = []
+                self._nud_tracker[ns_target].append(now)
+                if len(self._nud_tracker[ns_target]) >= self._nud_threshold:
+                    logger.warning("NDP 嗅探 [T5]: NUD 失败 %s! %d 次 NS 重传",
+                                   ns_target, len(self._nud_tracker[ns_target]))
+                    self._threat_events.append({
+                        "type": "nud_failure", "time": now,
+                        "target": ns_target, "count": len(self._nud_tracker[ns_target]),
+                    })
+                    self._trim_threat_events()
+                    self._nud_tracker[ns_target] = []
+                    # 触发恢复 worker 确认网关状态（同 target ≥10s 节流，防伪造 NS 放大 ping 风暴）
+                    if len(self._recovery_last_trigger) > 200:
+                        self._recovery_last_trigger.clear()  # 防无界增长
+                    if now - self._recovery_last_trigger.get(ns_target, 0.0) >= 10.0:
+                        self._recovery_last_trigger[ns_target] = now
+                        self._recovery_trigger.set()
 
         # ==================== 基线兜底学习（嗅探器启动早于detect_gateway时，通过系统NDP表验证后学习）====================
         # 手动配置网关时不允许嗅探器覆盖基线（detect_gateway已锁定）
         if not self._baseline_learned and not self._manual_gateways:
-            for gw_ip in all_gw_ips:
-                if src_ip == gw_ip:
-                    if NDPProtection._is_valid_mac(src_mac):
-                        # 通过系统NDP表验证后再接受，防单包投毒（异步查询）
-                        loop = asyncio.get_event_loop()
-                        sys_mac_fut = asyncio.run_coroutine_threadsafe(
-                            self._resolve_mac_single(gw_ip), loop)
-                        try:
-                            sys_mac = sys_mac_fut.result(timeout=2.0)
-                        except Exception:
-                            sys_mac = None
-                        if sys_mac and self._mac_normalize(sys_mac) == self._mac_normalize(src_mac):
-                            self._baseline_mac_per_gw[gw_ip] = src_mac
-                            self._baseline_learned = True
-                            logger.info("NDP 防护: 基线已学习 (嗅探兜底+系统表验证) [%s] -> MAC=%s", gw_ip, src_mac)
-                            # 更新网关MAC
-                            for _iface in self.interfaces:
-                                _iface.gateways = [
-                                    (_gw, self._baseline_mac_per_gw.get(_gw, _mac), _vlan)
-                                    for _gw, _mac, _vlan in _iface.gateways
-                                ]
-                            loop.create_task(self.protect_ndp_entry())
-                        else:
-                            logger.warning("NDP 防护: 嗅探到网关NDP包 MAC=%s 但系统NDP表为 %s，不采纳",
-                                           src_mac, sys_mac or "空")
-                    break
+            if not self._baseline_verify_pending:
+                for gw_ip in all_gw_ips:
+                    if src_ip == gw_ip:
+                        if NDPProtection._is_valid_mac(src_mac):
+                            # 通过系统NDP表验证后再接受，防单包投毒（异步 fire-and-forget，不阻塞事件循环）
+                            self._baseline_verify_pending = True
+                            try:
+                                asyncio.get_event_loop().create_task(
+                                    self._verify_and_learn_baseline(gw_ip, src_mac))
+                            except Exception:
+                                self._baseline_verify_pending = False
+                        break
             return
 
         # ==================== 基线与实际MAC完全匹配时直接跳过（正确宣告/防自伤环路）====================
@@ -1224,7 +1440,7 @@ class NDPProtection:
         if pkt.haslayer(ICMPv6ND_NA):
             na = pkt[ICMPv6ND_NA]
             try:
-                na_target = str(na.target)
+                na_target = str(na.tgt)
             except (AttributeError, ValueError):
                 return
             for gw_ip in all_gw_ips:
@@ -1283,10 +1499,21 @@ class NDPProtection:
                     break
 
         # ==================== IP 冲突 ====================
+        # 本机 MAC 集合（检测层防自伤：本机任一接口 MAC 宣告本机 IPv6 = 自发的 NA/GARP，属正常）
+        # 修复：原仅对比单值 self.local_mac，本机 MAC 解析为空/不匹配时自包被误判为 IP 冲突
+        local_macs_norm = {self._mac_normalize(m) for m in self._local_macs} if self._local_macs else set()
+        if self.local_mac:
+            local_macs_norm.add(self._mac_normalize(self.local_mac))
+        if not local_macs_norm:
+            logger.debug("NDP 嗅探: 本机 MAC 集合为空，IP 冲突检测无法排除自包（可能误伤）")
+        # 剥离 IPv6 zone id（%9）：scapy 解析的 src_ip 无 %zone，all_local_ips 可能带 %zone（链路本地自包误判修复）
+        src_ip_clean = (src_ip or "").split("%")[0]
+        all_local_ips_clean = {ip.split("%")[0] for ip in all_local_ips}
         for local_ip in all_local_ips:
-            if local_ip and (src_ip == local_ip or (
-                pkt.haslayer(ICMPv6ND_NA) and str(pkt[ICMPv6ND_NA].tgt) == local_ip
-            )) and self._mac_normalize(src_mac) != self._mac_normalize(self.local_mac):
+            local_ip_clean = local_ip.split("%")[0]
+            if local_ip and (src_ip_clean == local_ip_clean or (
+                pkt.haslayer(ICMPv6ND_NA) and str(pkt[ICMPv6ND_NA].tgt).split("%")[0] == local_ip_clean
+            )) and self._mac_normalize(src_mac) not in local_macs_norm:
                 self._threat_events.append({
                     "type": "ip_conflict", "time": time.time(),
                     "ip": local_ip, "attacker_mac": src_mac,
@@ -1315,7 +1542,8 @@ class NDPProtection:
                 break
 
         # ==================== 本地 MAC 冒用攻击 ====================
-        if self._local_macs and any(self._mac_normalize(src_mac) == self._mac_normalize(m) for m in self._local_macs)                 and src_ip not in all_local_ips and src_mac != "000000000000":
+        # 本机 MAC 宣告"非本机 IP"才算冒用；IPv6 比较剥离 %zone（链路本地自包误判修复）
+        if self._local_macs and any(self._mac_normalize(src_mac) == self._mac_normalize(m) for m in self._local_macs)                 and src_ip_clean not in all_local_ips_clean and src_mac != "000000000000":
             self._threat_events.append({
                 "type": "local_mac_spoof", "time": time.time(),
                 "attacker_mac": src_mac, "src_ip": src_ip,
@@ -1472,7 +1700,7 @@ class NDPProtection:
                     na_pkts = sniff(filter="icmp6", count=5, timeout=timeout,
                                     lfilter=lambda p: p.haslayer(ICMPv6ND_NA) and
                                                       p.haslayer(ICMPv6NDOptDstLLAddr) and
-                                                      str(p[ICMPv6ND_NA].target) == gw_ip,
+                                                      str(p[ICMPv6ND_NA].tgt) == gw_ip,
                                     quiet=True)
                     for pkt in na_pkts:
                         na = pkt[ICMPv6ND_NA]
@@ -1540,7 +1768,7 @@ class NDPProtection:
             # 计算 ICMPv6 checksum
             pseudo = ipv6_src + ipv6_dst
             pseudo += struct.pack('!I', payload_len)
-            pseudo += b'\x00\x00\x00\x00' + struct.pack('!B', 58)
+            pseudo += b'\x00\x00\x00' + struct.pack('!B', 58)  # RFC4443: 3 字节零 + next header
             cksum_data = pseudo + ns_payload
             if len(cksum_data) % 2:
                 cksum_data += b'\x00'
@@ -1782,6 +2010,36 @@ class NDPProtection:
             )
         if raw_sections and not raw_sections[0].strip():
             raw_sections = raw_sections[1:]
+
+        # getmac 一次解析所有接口 MAC（原实现在行循环内每行启动子进程——修复 M2）
+        getmac_map = {}
+        try:
+            proc_gm = await asyncio.create_subprocess_exec(
+                "getmac", "/FO", "CSV", "/NH",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            out_gm, _ = await asyncio.wait_for(proc_gm.communicate(), timeout=5)
+            for line_gm in self._decode_win_output(out_gm).splitlines():
+                line_gm = line_gm.strip().strip('"')
+                parts_gm = line_gm.split('","')
+                # 兼容列序（同 _fetch_all_local_macs 修复）：MAC 可能在 0 或 1 列
+                _mac_gm = None
+                for _p in parts_gm[:3]:
+                    _m = _p.strip()
+                    if _m and len(_m.replace("-", "").replace(":", "")) == 12 and \
+                            re.match(r'^[0-9A-Fa-f]{2}([-:][0-9A-Fa-f]{2}){5}$', _m):
+                        _mac_gm = _m.replace("-", ":").upper()
+                        break
+                if _mac_gm and parts_gm:
+                    # 连接名取 MAC 字段之外的第一个非 MAC 字段（用户列序下为空则跳过映射，不影响 ipconfig 主路径）
+                    _conn = next((_p.strip().lower() for _p in parts_gm
+                                  if not re.match(r'^[0-9A-Fa-f]{2}([-:][0-9A-Fa-f]{2}){5}$', _p.strip())), None)
+                    if _conn:
+                        getmac_map[_conn] = _mac_gm
+        except Exception:
+            pass
+
         for section in raw_sections:
             lines = section.strip().splitlines()
             if not lines:
@@ -1812,25 +2070,11 @@ class NDPProtection:
                     mac = m.group(1).replace("-", ":").upper()
                     if not iface.mac:
                         iface.mac = mac
-                # 如果 ipconfig 未解析到 MAC，用 getmac 命令兜底
+                # 如果 ipconfig 未解析到 MAC，用 getmac 映射兑底（按接口名匹配，修复 M2）
                 if not iface.mac and iface.name:
-                    try:
-                        proc2 = await asyncio.create_subprocess_exec(
-                            "getmac", "/FO", "CSV", "/NH",
-                            stdout=asyncio.subprocess.PIPE,
-                            stderr=asyncio.subprocess.DEVNULL,
-                        )
-                        out2, _ = await asyncio.wait_for(proc2.communicate(), timeout=5)
-                        for line2 in self._decode_win_output(out2).splitlines():
-                            line2 = line2.strip().strip('"')
-                            parts = line2.split('","')
-                            if len(parts) >= 2:
-                                mac2 = parts[1].strip()
-                                if mac2 and len(mac2.replace("-", "")) == 12:
-                                    iface.mac = mac2.replace("-", ":").upper()
-                                    break
-                    except Exception:
-                        pass
+                    mac_gm = getmac_map.get(iface.name.lower())
+                    if mac_gm:
+                        iface.mac = mac_gm
             if iface.ipv6_ll or iface.ipv6_global:
                 for gw, idx in default_routes:
                     if not any(g == gw for g, _, _ in iface.gateways):
@@ -1968,7 +2212,9 @@ class NDPProtection:
                         else:
                             for iface in self.interfaces:
                                 if iface.mac:
-                                    iface.ipv6_globals.append(ip)
+                                    # 去重（修复 M3：同一 IP 可能被多行/多轮重复追加）
+                                    if ip not in iface.ipv6_globals:
+                                        iface.ipv6_globals.append(ip)
                                     break
                     m = mac_pat.search(s)
                     if m:
@@ -2123,8 +2369,10 @@ class NDPProtection:
                 )
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
                 lines = self._decode_win_output(stdout).splitlines()
-                # 跳过表头行（包含 -- 或 接口 的标题行）
-                return sum(1 for l in lines if l.strip() and "--" not in l and not l.strip().startswith("接口"))
+                # 跳过表头行（包含 -- 或"接口"开头，或 Internet/物理地址 表头——修复 L4）
+                return sum(1 for l in lines if l.strip() and "--" not in l
+                           and not l.strip().startswith(("接口", "Internet"))
+                           and "物理地址" not in l and "Physical Address" not in l)
             else:
                 proc = await asyncio.create_subprocess_exec(
                     "ip", "-6", "neigh", "show",
@@ -2148,7 +2396,7 @@ class NDPProtection:
             return sniff(filter="icmp6", count=200, timeout=4.0,
                          lfilter=lambda p: p.haslayer(Ether) and p.haslayer(IPv6) and (
                              p.haslayer(ICMPv6ND_NA) or p.haslayer(ICMPv6ND_NS) or
-                             p.haslayer(ICMPv6ND_RA) or p.haslayer(ICMPv6Error)),
+                             p.haslayer(ICMPv6ND_RA) or p.haslayer(ICMPv6ND_Redirect) or p.haslayer(ICMPv6Error)),
                          quiet=True)
         try:
             pkts = await loop.run_in_executor(None, _capture)
@@ -2157,6 +2405,9 @@ class NDPProtection:
             return {"t2_ns": [], "t3_ra": [], "t4_dad": [], "t6_redirect": []}
 
         known_gw_macs = {self._mac_normalize(mac) for _, mac, _ in self.gateway_pairs if mac}
+        known_baseline_macs = {self._mac_normalize(m) for m in self._baseline_mac_per_gw.values()}
+        # 信任集合与 _check_ndp_raw_ra / _on_ndp_packet_sync 统一：网关MAC + 基线MAC + 已确认RA源
+        all_trusted = known_gw_macs | known_baseline_macs | self._trusted_ra_sources
         ra_sources = {}
         ns_targets = defaultdict(int)
         dad_targets = defaultdict(int)
@@ -2174,20 +2425,21 @@ class NDPProtection:
                 ra_sources[src_mac] = (src_ip, prefix)
             if pkt.haslayer(ICMPv6ND_NS):
                 ns = pkt[ICMPv6ND_NS]
-                target = str(ns.target)
+                target = str(ns.tgt)
                 ns_targets[target] += 1
                 if src_ip == "::":
                     dad_targets[target] += 1
-                if known_gw_macs and src_mac not in known_gw_macs:
+                if all_trusted and src_mac not in all_trusted:
                     suspicious_ns.append((target, src_mac))
-            if pkt.haslayer(ICMPv6Error) and pkt.haslayer(ICMPv6NDOptRedirectedHdr):
+            if pkt.haslayer(ICMPv6ND_Redirect):
+                # 修复：原条件 haslayer(ICMPv6Error) 仅匹配 type 1-4 错误类，对 Redirect(type 137) 恒 False
                 redirect_sources.append((src_mac, src_ip))
 
         results = {}
         results["t2_ns"] = suspicious_ns
-        results["t3_ra"] = [(m, i, p) for m, (i, p) in ra_sources.items() if known_gw_macs and m not in known_gw_macs]
+        results["t3_ra"] = [(m, i, p) for m, (i, p) in ra_sources.items() if all_trusted and m not in all_trusted]
         results["t4_dad"] = [(t, c) for t, c in dad_targets.items() if c >= 3]
-        results["t6_redirect"] = [(m, i) for m, i in redirect_sources if known_gw_macs and m not in known_gw_macs]
+        results["t6_redirect"] = [(m, i) for m, i in redirect_sources if all_trusted and m not in all_trusted]
         if results["t3_ra"]:
             logger.warning("NDP 防护 [T3]: sniff 发现 %d 个未知 RA 源", len(results["t3_ra"]))
         if results["t4_dad"]:
@@ -2289,7 +2541,9 @@ class NDPProtection:
             return
 
         # 定向反制：单播 NA 到攻击者网卡，毒化其邻居缓存
-        if attacker_mac and self._ndp_sender_ready:
+        # Linux 无 scapy 时 worker 走 AF_PACKET 兜底（修复 M1：原条件使 AF_PACKET 分支死代码）
+        _af_packet_capable = sys.platform != "win32"
+        if attacker_mac and (self._ndp_sender_ready or _af_packet_capable):
             # 收集本机 IPv6 和 MAC 信息
             for iface in self.interfaces:
                 local_ip = iface.ipv6_global or iface.ipv6_ll
@@ -2330,8 +2584,8 @@ class NDPProtection:
                             pass
                     break
 
-        # 回退：如果 sender 就绪就用队列，否则走原广播逻辑
-        if not self._ndp_sender_ready:
+        # 回退：sender 就绪或 Linux AF_PACKET 兜底时用队列；仅 Windows 无 scapy 走系统命令广播
+        if not self._ndp_sender_ready and not _af_packet_capable:
             for i in range(1):  # 广播只需 1 轮
                 try:
                     await self.send_unsolicited_na()
@@ -2375,7 +2629,7 @@ class NDPProtection:
             ipv6_header = struct.pack('!IHBB', 0x60000000, payload_len, 58, 255)  # next=58(ICMPv6), hlim=255
             ipv6_header += ipv6_src + ipv6_dst
 
-            frame = d_mac + s_mac
+            frame = bytearray(d_mac + s_mac)  # bytearray：pack_into 写 checksum 需要可写缓冲区
             if vlan_id and not self._vxlan_enabled:
                 frame += struct.pack('!HH', 0x8100, int(vlan_id) & 0xFFF)
             frame += struct.pack('!H', ETH_P_IPV6)
@@ -2384,8 +2638,7 @@ class NDPProtection:
             # 计算 ICMPv6 checksum
             pseudo_header = ipv6_src + ipv6_dst
             pseudo_header += struct.pack('!I', payload_len)
-            pseudo_header += b'\x00\x00\x00\x00'  # next header 的零填充
-            pseudo_header += struct.pack('!B', 58)  # next header = ICMPv6
+            pseudo_header += b'\x00\x00\x00' + struct.pack('!B', 58)  # RFC4443: 3 字节零 + next header=ICMPv6
             checksum_data = pseudo_header + na_payload
             if len(checksum_data) % 2:
                 checksum_data += b'\x00'
@@ -2471,6 +2724,16 @@ class NDPProtection:
                 break
             try:
                 dst_mac, local_ip, local_mac, target_ip, count, inter, vlan_id = task
+                # 按 local_ip 匹配出接口（多接口场景防发错物理口——修复 M4）
+                send_iface = self.interface_name or ""
+                if len(self.interfaces) > 1:
+                    for _iface in self.interfaces:
+                        _iface_ips = list(_iface.ipv6_globals)
+                        if _iface.ipv6_ll:
+                            _iface_ips.append(_iface.ipv6_ll)
+                        if local_ip in _iface_ips:
+                            send_iface = _iface.name
+                            break
                 # scapy sendp 尝试
                 if sendp_ok:
                     try:
@@ -2495,7 +2758,9 @@ class NDPProtection:
                             except Exception:
                                 pass
                         for _ in range(count):
-                            sendp(pkt, iface=self.interface_name or "", verbose=False)
+                            # sendp 外包 executor：scapy 构造/发送在事件循环内同步执行会阻塞 ARP 侧协程（对称加固）
+                            await asyncio.get_event_loop().run_in_executor(
+                                None, lambda p=pkt, i=send_iface: sendp(p, iface=i, verbose=False))
                             if inter > 0:
                                 await asyncio.sleep(inter)
                         log_target = f"定向 {dst_mac}" if dst_mac != "ff:ff:ff:ff:ff:ff" else "广播"
@@ -2534,15 +2799,29 @@ class NDPProtection:
             # 清理 IPv6 地址
             if local_ip:
                 local_ip = local_ip.strip().split("%")[0]
-            # iface.mac 可能为空，用 _local_macs 兜底
+            # iface.mac 可能为空或为本地管理随机 MAC（uuid 兜底污染），
+            # 用 IP↔MAC 映射（ipconfig /all 物理地址，权威）校正——修复 NA 发送源 MAC 虚构
             iface_mac = iface.mac
+            _is_la = (iface_mac and len(iface_mac.replace(":", "")) == 12
+                      and (int(iface_mac.replace(":", "")[:2], 16) & 0x02))
+            if not iface_mac or _is_la:
+                _map_mac = None
+                for _mac_c, _ips in (self._local_ip_mac_map or {}).items():
+                    if local_ip in _ips:
+                        _map_mac = _mac_c
+                        break
+                if not _map_mac and self._local_ip_mac_map:
+                    _map_mac = next(iter(self._local_ip_mac_map), None)
+                if _map_mac:
+                    iface_mac = _map_mac
             if not iface_mac and self._local_macs:
                 iface_mac = next(iter(self._local_macs), "")
             if not iface_mac:
                 try:
                     import uuid
                     node = uuid.getnode()
-                    if node is not None and node != 0 and not (node & 0x010000000000):
+                    # 拒绝 locally-administered/multicast 随机 MAC（同 _fetch_all_local_macs 修复）
+                    if node is not None and node != 0 and not (node & 0x030000000000):
                         iface_mac = ':'.join(f'{(node >> (5-i)*8) & 0xFF:02x}' for i in range(6)).upper()
                 except Exception:
                     pass
@@ -2739,7 +3018,8 @@ class NDPProtection:
     @staticmethod
     def _generate_poison_mac() -> str:
         """生成一个单播、locally administered 的虚假 MAC（不会与真实设备冲突）
-        使用 02:xx:xx:xx:xx:xx 范围（locally administered unicast），
+        使用 02:00:00:xx:xx:xx 范围（locally administered unicast，后 3 字节随机，
+        与 _on_ndp_packet_sync 的 startswith("020000") 防环路一致），
         比全零 MAC 更具欺骗性，能更有效毒化攻击者的 NDP 邻居缓存。
         """
         import random
