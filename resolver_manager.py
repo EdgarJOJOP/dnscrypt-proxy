@@ -1401,3 +1401,8 @@ class ResolverManager:
     @property
     def upstream_count(self) -> int:
         return len(self._upstream_servers)
+
+    @property
+    def last_fast_server(self) -> Optional[str]:
+        """最后成功响应的最快上游服务器名称"""
+        return self._last_fast_server
