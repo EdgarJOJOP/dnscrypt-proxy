@@ -20,6 +20,7 @@ import dns.rdataclass
 import dns.rdtypes.IN.A
 import dns.rdtypes.IN.AAAA
 import dns.rrset
+from dns_utils import reorder_answer_aaaa_first, sort_dns_response_wire
 
 from config import Config
 from resolver_manager import ResolverManager
@@ -28,9 +29,6 @@ from filter_engine import FilterEngine
 from logger import RequestLogger
 from dnssec import DNSSECQueryWrapper
 from rate_limiter import get_per_ip_limiter
-
-# DNS 响应 Answer section 排序：AAAA (IPv6) 优先于 A (IPv4)
-from dns_utils import reorder_answer_aaaa_first, sort_dns_response_wire
 
 logger = logging.getLogger("dns-proxy.plain-dns")
 
@@ -62,7 +60,6 @@ class PlainDNSServer:
         self.port = config.plain_dns_port
         self.ipv6_enabled = config.plain_dns_ipv6_enabled
         self.ipv6_host = config.plain_dns_ipv6_host
-        self._tcp_backlog = config.max_concurrent
 
         # UDP transport
         self._transport_v4: Optional[asyncio.DatagramTransport] = None
@@ -72,6 +69,7 @@ class PlainDNSServer:
         self._tcp_server_v6: Optional[asyncio.AbstractServer] = None
         self._running = False
         self._concurrency_semaphore = asyncio.Semaphore(config.max_concurrent)
+        self._tcp_backlog = config.max_concurrent
 
         # 单 IP 限速（共享 PerIPRateLimiter 单例）
         self._per_ip_limiter = get_per_ip_limiter(
@@ -264,10 +262,9 @@ class PlainDNSServer:
                         matched = True
                 if matched:
                     response.set_rcode(dns.rcode.NOERROR)
-                    # AAAA 优先于 A 排序
-                    reorder_answer_aaaa_first(response)
                     if self.config.cache_enabled:
                         await self.cache.set(cache_key, response)
+                    reorder_answer_aaaa_first(response)
                     result_wire = response.to_wire()
                     elapsed = asyncio.get_event_loop().time() - start_time
                     await self._log_query(client_ip, qname, qtype_str, elapsed, "custom_hosts", "")
@@ -299,6 +296,7 @@ class PlainDNSServer:
                         response.set_rcode(dns.rcode.NXDOMAIN)
                     if self.config.cache_enabled:
                         await self.cache.set(cache_key, response)
+                    reorder_answer_aaaa_first(response)
                     result_wire = response.to_wire()
                     elapsed = asyncio.get_event_loop().time() - start_time
                     await self._log_query(client_ip, qname, qtype_str, elapsed, status, block_reason)
@@ -308,9 +306,10 @@ class PlainDNSServer:
             if self.config.cache_enabled:
                 cached = await self.cache.get(cache_key)
                 if cached is not None:
-                    cached.id = query.id  # 修复DNS ID不匹配
-                    # AAAA 优先于 A 排序
+                    import copy
+                    cached = copy.copy(cached)
                     reorder_answer_aaaa_first(cached)
+                    cached.id = query.id  # 修复DNS ID不匹配
                     result_wire = cached.to_wire()
                     elapsed = asyncio.get_event_loop().time() - start_time
                     await self._log_query(
@@ -346,7 +345,6 @@ class PlainDNSServer:
                 if self.config.cache_enabled and status == "resolved" and result_wire is not None:
                     try:
                         response_msg = dns.message.from_wire(result_wire)
-                        # AAAA 优先于 A 排序（确保缓存中数据顺序一致）
                         reorder_answer_aaaa_first(response_msg)
                         is_negative = response_msg.rcode() in (
                             dns.rcode.NXDOMAIN,
@@ -358,11 +356,7 @@ class PlainDNSServer:
 
             elapsed = asyncio.get_event_loop().time() - start_time
             await self._log_query(client_ip, qname, qtype_str, elapsed, status, block_reason)
-
-            # AAAA 优先于 A 排序（仅对成功解析的上游响应）
-            if result_wire is not None and status == "resolved":
-                result_wire = sort_dns_response_wire(result_wire)
-
+            result_wire = sort_dns_response_wire(result_wire)
             return result_wire
 
         except dns.exception.DNSException as e:
@@ -491,11 +485,7 @@ class PlainDNSServer:
         # ---------- TCP ----------
         try:
             self._tcp_server_v4 = await asyncio.start_server(
-                self._handle_tcp_connection,
-                host=self.host,
-                port=self.port,
-                family=socket.AF_INET,
-                reuse_address=True,
+                self._handle_tcp_connection, self.host, self.port,
                 backlog=self._tcp_backlog,
             )
             logger.info("普通 DNS [TCP IPv4] tcp://%s:%d", self.host, self.port)
@@ -505,11 +495,7 @@ class PlainDNSServer:
         if self.ipv6_enabled:
             try:
                 self._tcp_server_v6 = await asyncio.start_server(
-                    self._handle_tcp_connection,
-                    host=self.ipv6_host,
-                    port=self.port,
-                    family=socket.AF_INET6,
-                    reuse_address=True,
+                    self._handle_tcp_connection, self.ipv6_host, self.port,
                     backlog=self._tcp_backlog,
                 )
                 logger.info("普通 DNS [TCP IPv6] tcp://[%s]:%d", self.ipv6_host, self.port)
