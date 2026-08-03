@@ -1,4 +1,4 @@
-﻿"""
+"""
 并行解析管理器
 - 并行查询所有上游服务器
 - 取最快成功响应返回
@@ -324,8 +324,12 @@ class ResolverManager:
                 return await bs.resolver.resolve(qbytes, prefer_family=addr_family)
             except Exception:
                 return None
+        deadline = asyncio.get_event_loop().time() + 10.0  # 总超时 10 秒
 
         for attempt in range(3):  # 重试最多 3 次
+            if asyncio.get_event_loop().time() > deadline:
+                logger.debug("bootstrap 解析 %s 总超时 10s，终止重试", hostname)
+                break
             ips = []
             # A 和 AAAA 独立查询，一个失败不影响另一个
             for qtype in (dns.rdatatype.A, dns.rdatatype.AAAA):
@@ -844,6 +848,7 @@ class ResolverManager:
                     self._last_all_failed_time = 0.0
                 return result
             # 全部失败：等待到缓冲期结束再试
+            self._last_all_failed_time = asyncio.get_event_loop().time()
             wait = self._startup_buffer - (asyncio.get_event_loop().time() - self._start_time)
             if wait > 0:
                 logger.debug("并行查询: 启动缓冲期 %.1fs，等待上游连接...", wait)
@@ -1187,6 +1192,27 @@ class ResolverManager:
             self._bootstrap_cache[hostname] = ips
             logger.info("刷新 %s -> %s", hostname, ips)
         return ips
+
+    async def resolve_domain(self, hostname: str) -> List[str]:
+        """
+        通过优选上游解析域名（A + AAAA 双栈），返回 IP 地址列表。
+        优先读取 _bootstrap_cache 缓存，未命中时解析并写入缓存（带锁保护）。
+        """
+        # 先读缓存（锁外快速路径）
+        cached = self._bootstrap_cache.get(hostname)
+        if cached:
+            logger.debug("域名 %s 命中 bootstrap 缓存: %s", hostname, cached)
+            return list(cached)
+        # 未命中，加锁后双检，避免并发穿透
+        async with self._bootstrap_lock:
+            cached = self._bootstrap_cache.get(hostname)
+            if cached:
+                return list(cached)
+            ips = await self._bootstrap_resolve(hostname)
+            if ips:
+                self._bootstrap_cache[hostname] = ips
+                logger.debug("域名 %s 解析并缓存: %s", hostname, ips)
+            return ips
 
     async def refresh_all_upstream_ips(self) -> int:
         """刷新所有上游域名的 bootstrap IP 缓存"""

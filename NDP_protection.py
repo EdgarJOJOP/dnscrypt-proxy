@@ -50,8 +50,6 @@ logger = logging.getLogger("dns-proxy.ndp")
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, message=".*Socket.*failed.*")
 logging.getLogger("scapy").setLevel(logging.ERROR)
-logging.getLogger("scapy").setLevel(logging.ERROR)
-logging.getLogger("scapy").setLevel(logging.ERROR)
 _HAS_SCAPY = False
 try:
     import scapy.all as scapy_module
@@ -193,6 +191,9 @@ class NDPProtection:
         # ========== 可信 MAC 列表（防止误伤正常设备）==========
         self._trusted_sender_macs: set = set()      # 信任的 sender MAC（不触发反制）
         self._suspicious_zero_mac: dict = {}        # {sender_mac: [timestamp, ...]} — 全零 MAC 可疑计数
+
+        # ========== 反制 MAC 追踪（精确防环路，与ARP侧一致）==========
+        self._counterstrike_sent_macs: set = set()  # 自身反制已发送过的随机MAC集合
 
     # ======================== 属性 ========================
 
@@ -990,7 +991,9 @@ class NDPProtection:
         if not pkt.haslayer(Ether) or not pkt.haslayer(IPv6):
             return
         src_mac = self._mac_normalize(pkt[Ether].src)
-        # 防环路：本机反制发送的 02:xx:xx:xx:xx:xx 随机 MAC 不触发 NDP 检测
+        # 防环路：精确匹配自身反制已发送MAC（优先），兜底 02:00:00 前缀
+        if self._counterstrike_sent_macs and src_mac in self._counterstrike_sent_macs:
+            return
         if src_mac.startswith("020000"):
             return
         src_ip = str(pkt[IPv6].src)
@@ -1090,35 +1093,42 @@ class NDPProtection:
                 self._trim_threat_events()
                 self._nud_tracker[ns_target] = []
 
-        # ==================== 基线学习 ====================
-        if not self._baseline_learned and (pkt.haslayer(ICMPv6ND_RA) or pkt.haslayer(ICMPv6ND_NS)):
+        # ==================== 基线兜底学习（嗅探器启动早于detect_gateway时，通过系统NDP表验证后学习）====================
+        # 手动配置网关时不允许嗅探器覆盖基线（detect_gateway已锁定）
+        if not self._baseline_learned and not self._manual_gateways:
             for gw_ip in all_gw_ips:
                 if src_ip == gw_ip:
-                    if not NDPProtection._is_valid_mac(src_mac):
-                        logger.warning("NDP 防护: 基线学习忽略非法 MAC %s（来源 IP %s）", src_mac, src_ip)
-                        if gw_ip in self._baseline_proposed:
-                            del self._baseline_proposed[gw_ip]
-                        break
-                    if gw_ip not in self._baseline_proposed:
-                        self._baseline_proposed[gw_ip] = src_mac
-                        self._baseline_proposed_time[gw_ip] = time.time()
-                    elif self._baseline_proposed[gw_ip] == src_mac:
-                        elapsed = time.time() - self._baseline_proposed_time.get(gw_ip, 0)
-                        if elapsed > self._baseline_learn_time:
+                    if NDPProtection._is_valid_mac(src_mac):
+                        # 通过系统NDP表验证后再接受，防单包投毒（异步查询）
+                        loop = asyncio.get_event_loop()
+                        sys_mac_fut = asyncio.run_coroutine_threadsafe(
+                            self._resolve_mac_single(gw_ip), loop)
+                        try:
+                            sys_mac = sys_mac_fut.result(timeout=2.0)
+                        except Exception:
+                            sys_mac = None
+                        if sys_mac and self._mac_normalize(sys_mac) == self._mac_normalize(src_mac):
                             self._baseline_mac_per_gw[gw_ip] = src_mac
                             self._baseline_learned = True
-                            logger.info("NDP 防护: 基线学习完成 [%s] -> MAC=%s", gw_ip, src_mac)
-                            # 更新网关 MAC 为基线 MAC，用于 Static NDP 绑定
+                            logger.info("NDP 防护: 基线已学习 (嗅探兜底+系统表验证) [%s] -> MAC=%s", gw_ip, src_mac)
+                            # 更新网关MAC
                             for _iface in self.interfaces:
                                 _iface.gateways = [
                                     (_gw, self._baseline_mac_per_gw.get(_gw, _mac), _vlan)
                                     for _gw, _mac, _vlan in _iface.gateways
                                 ]
-                            asyncio.get_event_loop().create_task(self.protect_ndp_entry())
-                    else:
-                        self._baseline_proposed[gw_ip] = src_mac
-                        self._baseline_proposed_time[gw_ip] = time.time()
+                            loop.create_task(self.protect_ndp_entry())
+                        else:
+                            logger.warning("NDP 防护: 嗅探到网关NDP包 MAC=%s 但系统NDP表为 %s，不采纳",
+                                           src_mac, sys_mac or "空")
                     break
+            return
+
+        # ==================== 基线与实际MAC完全匹配时直接跳过（正确宣告/防自伤环路）====================
+        for gw_ip in all_gw_ips:
+            baseline = self._baseline_mac_per_gw.get(gw_ip)
+            if baseline and (src_ip == gw_ip) and self._mac_normalize(src_mac) == self._mac_normalize(baseline):
+                return
 
         # ==================== T1 NA 投毒 ====================
         if pkt.haslayer(ICMPv6ND_NA):
@@ -1129,7 +1139,10 @@ class NDPProtection:
                 return
             for gw_ip in all_gw_ips:
                 baseline = self._baseline_mac_per_gw.get(gw_ip)
-                if baseline and (src_ip == gw_ip or na_target == gw_ip) and self._mac_normalize(src_mac) != self._mac_normalize(baseline):
+                # 安全防护：基线为空或全零时不触发检测（防误判）
+                if not baseline or self._mac_normalize(baseline) == "000000000000":
+                    continue
+                if (src_ip == gw_ip or na_target == gw_ip) and self._mac_normalize(src_mac) != self._mac_normalize(baseline):
                     self._threat_events.append({
                         "type": "na_poison", "time": time.time(),
                         "gateway": gw_ip, "expected_mac": baseline, "actual_mac": src_mac,
@@ -1176,7 +1189,7 @@ class NDPProtection:
                     if not self._poison_detected.is_set():
                         self._loop.call_soon_threadsafe(self._poison_detected.set)
                         self._loop.call_soon_threadsafe(
-                            lambda: asyncio.create_task(self._on_poison_detected(attacker_mac=src_mac, attacker_ip=src_ip)))
+                            lambda _mac=src_mac, _ip=src_ip: asyncio.create_task(self._on_poison_detected(attacker_mac=_mac, attacker_ip=_ip)))
                     break
 
         # ==================== IP 冲突 ====================
@@ -1208,7 +1221,7 @@ class NDPProtection:
                     break
                 self._poison_detected.set()
                 self._loop.call_soon_threadsafe(
-                    lambda: asyncio.create_task(self._on_poison_detected(attacker_mac=src_mac, attacker_ip=src_ip)))
+                    lambda _mac=src_mac, _ip=src_ip: asyncio.create_task(self._on_poison_detected(attacker_mac=_mac, attacker_ip=_ip)))
                 break
 
         # ==================== 本地 MAC 冒用攻击 ====================
@@ -1236,7 +1249,7 @@ class NDPProtection:
             if _now_lm - _last_time_lm >= _debounce_lm:
                 self._poison_detected.set()
                 self._loop.call_soon_threadsafe(
-                    lambda: asyncio.create_task(self._on_poison_detected(attacker_mac=src_mac, attacker_ip=src_ip)))
+                    lambda _mac=src_mac, _ip=src_ip: asyncio.create_task(self._on_poison_detected(attacker_mac=_mac, attacker_ip=_ip)))
 
     def has_recent_attacks(self, seconds: float = 5.0) -> bool:
         """检查指定秒数内是否有任何 NDP 攻击被检测到。
@@ -1523,7 +1536,8 @@ class NDPProtection:
                     if iface.name:
                         await self._ensure_vlan_interface(iface.name, self._manual_gateway_vlan)
                         break
-            return
+            # 注意：不 return，继续执行后续的静态 NDP 绑定和基线锁定
+            # 确保手动配置的网关也能进入基线锁定流程
         if sys.platform == "win32":
             await self._detect_all_windows()
         else:
@@ -1548,7 +1562,7 @@ class NDPProtection:
                     break
 
 
-        # 立即用已探测的 MAC 做静态 NDP 绑定（后续基线学习完成后再覆盖）
+        # 立即用已探测的 MAC 做静态 NDP 绑定
         if self.interfaces:
             for iface in self.interfaces:
                 for _, gw_mac, _ in iface.gateways:
@@ -1556,6 +1570,37 @@ class NDPProtection:
                         await self.protect_ndp_entry()
                         break
                 break
+
+        # ========== 启动时主动 NDP 基线确认（一次性锁定，嗅探器启动前完成）==========
+        locked_count = 0
+        for gw_ip, gw_mac, _ in self.gateway_pairs:
+            if not gw_ip or not gw_mac:
+                continue
+            gw_mac_up = gw_mac.replace("-", ":").upper()
+            norm = self._mac_normalize(gw_mac_up)
+            # 基线有效性检查：拒绝全零/广播/组播MAC
+            if norm and NDPProtection._is_valid_mac(gw_mac_up):
+                self._baseline_mac_per_gw[gw_ip] = gw_mac_up
+                locked_count += 1
+                logger.info("NDP 防护: 基线已锁定 [%s] -> MAC=%s (启动时主动确认)", gw_ip, gw_mac_up)
+            else:
+                # MAC非法，主动触发NDP解析重试
+                logger.warning("NDP 防护: 基线 MAC %s 非法（全零/广播/组播），主动触发 NDP 解析重试 [%s]",
+                               gw_mac, gw_ip)
+                retry_mac = await self._resolve_mac_single(gw_ip)
+                if retry_mac and NDPProtection._is_valid_mac(retry_mac):
+                    retry_up = retry_mac.replace("-", ":").upper()
+                    self._baseline_mac_per_gw[gw_ip] = retry_up
+                    locked_count += 1
+                    # 更新接口网关MAC
+                    for iface in self.interfaces:
+                        for i, (ip_, mac_, vlan_) in enumerate(iface.gateways):
+                            if ip_ == gw_ip:
+                                iface.gateways[i] = (ip_, retry_up, vlan_)
+                    logger.info("NDP 防护: 基线已锁定 [%s] -> MAC=%s (重试后确认)", gw_ip, retry_up)
+        if locked_count > 0:
+            self._baseline_learned = True
+            logger.info("NDP 防护: 基线学习完成，已锁定 %d 个网关", locked_count)
     async def _ensure_vlan_interface(self, iface_name: str, vlan_id: str) -> bool:
         """确保 VLAN 子接口存在（vlan_id 非空且非 VXLAN 时自动创建）"""
         if not vlan_id or self._vxlan_enabled or not iface_name:
@@ -1781,7 +1826,7 @@ class NDPProtection:
                 )
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
                 for line in self._decode_win_output(stdout).splitlines():
-                    if ipv6.split("%")[0].lower() in line.lower():
+                    if ipv6.split('%')[0].lower() in line.lower().split():
                         parts = line.split()
                         if len(parts) >= 3:
                             mac = parts[1].strip().replace("-", ":").upper()
@@ -2144,6 +2189,10 @@ class NDPProtection:
                 if local_ip and local_mac_real:
                     # 网关 IPv6 -> 随机不可达 MAC 毒化包（打残攻击者）
                     poison_mac = self._generate_poison_mac()
+                    # 记录反制MAC到追踪集合，用于嗅探器精确防环路
+                    self._counterstrike_sent_macs.add(self._mac_normalize(poison_mac))
+                    if len(self._counterstrike_sent_macs) > 1000:
+                        self._counterstrike_sent_macs.clear()
                     vlan_id = self._manual_gateway_vlan
                     try:
                         self._ndp_sender_queue.put_nowait(

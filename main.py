@@ -43,6 +43,11 @@ PROJECT_ROOT = Path(__file__).parent.absolute()
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+
+# ----- DNS 响应排序工具（放在 import 之前，供各 server 模块循环导入使用）-----
+
+from dns_utils import reorder_answer_aaaa_first, sort_dns_response_wire
+
 from config import Config
 from cache import DNSCache
 from logger import RequestLogger, TrimFileHandler
@@ -614,6 +619,9 @@ class DNSProxyApp:
                      "变更" if old_urls != new_urls_set else "未变")
 
         full_paths = list(new_files_full) if new_files_full else [str(PROJECT_ROOT / f) for f in self.config.filter_rules_files]
+        # 取消旧的过滤规则重载任务，防止泄漏
+        if self._filter_reload_task is not None and not self._filter_reload_task.done():
+            self._filter_reload_task.cancel()
         # generation 机制确保先完成的重载不会覆盖后完成的
         self._filter_reload_task = asyncio.create_task(
             self._filter_reload_safe(full_paths, list(new_urls_set))
@@ -732,7 +740,7 @@ class DNSProxyApp:
             # 注册更新回调：定时更新规则后自动扫描 DNS 缓存
             async def _on_filter_update(rules_count):
                 await self._sweep_cache_after_filter_load()
-            self.filter_engine.on_update(lambda count: asyncio.create_task(_on_filter_update(count)))
+            self.filter_engine.on_update(lambda count: asyncio.ensure_future(_on_filter_update(count)))
             self.filter_engine.on_restart(self._trigger_restart)
 
             await self.filter_engine.start_auto_update(
@@ -782,7 +790,7 @@ class DNSProxyApp:
         logger.info("  - 过滤规则:   %d 条", self.filter_engine.stats["total_rules"] if self.config.filter_enabled else 0)
         logger.info("=" * 60)
 
-    def _trigger_restart(self, best_hour):
+    async def _trigger_restart(self, best_hour):
         logger = logging.getLogger("dns-proxy.app")
         logger.info("Triggering restart at hour %d", best_hour)
         if os.name == 'posix':
@@ -794,6 +802,7 @@ class DNSProxyApp:
                 logger.error("execv restart failed: %s", e)
                 # fallback: 传统方式
                 subprocess.Popen([sys.executable] + sys.argv, close_fds=True)
+                await self.stop()
                 os._exit(0)
         else:
             # Windows: 没有真正的 exec，保持原有方式
@@ -802,6 +811,7 @@ class DNSProxyApp:
             except Exception as e:
                 logger.error("Restart failed: %s", e)
                 return
+            await self.stop()
             os._exit(0)
     async def stop(self):
         """优雅关闭所有服务"""
@@ -844,6 +854,13 @@ class DNSProxyApp:
         # 停止网络监控
         if self.network_monitor:
             await self.network_monitor.stop()
+
+        # 停止单 IP 限速器
+        from rate_limiter import get_per_ip_limiter
+        try:
+            await get_per_ip_limiter().stop()
+        except Exception:
+            pass
 
         # 刷新日志
         if self.request_logger:

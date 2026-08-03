@@ -30,6 +30,9 @@ from dnssec import DNSSECQueryWrapper
 from qps_limiter import QPSCounter
 from rate_limiter import get_per_ip_limiter
 
+# DNS 响应 Answer section 排序：AAAA (IPv6) 优先于 A (IPv4)
+from dns_utils import reorder_answer_aaaa_first, sort_dns_response_wire
+
 logger = logging.getLogger("dns-proxy.local-dot")
 
 QTYPE_NAMES = {v: k for k, v in dns.rdatatype.__dict__.items() if isinstance(v, int)}
@@ -131,7 +134,7 @@ class LocalDoTServer:
                 host=self.host,
                 port=self.port,
                 ssl=self._ssl_context,
-                family=asyncio.AddressFamily.AF_INET,
+                family=socket.AF_INET,
                 reuse_address=True,
                 backlog=128,
             )
@@ -152,7 +155,7 @@ class LocalDoTServer:
                     host=self.ipv6_host,
                     port=self.ipv6_port,
                     ssl=self._ssl_context,
-                    family=asyncio.AddressFamily.AF_INET6,
+                    family=socket.AF_INET6,
                     reuse_address=True,
                     backlog=128,
                 )
@@ -312,6 +315,8 @@ class LocalDoTServer:
                         matched = True
                 if matched:
                     response.set_rcode(dns.rcode.NOERROR)
+                    # AAAA 优先于 A 排序
+                    reorder_answer_aaaa_first(response)
                     response_wire = response.to_wire()
                     status = "custom_hosts"
                     if self.config.cache_enabled:
@@ -354,7 +359,11 @@ class LocalDoTServer:
             if self.config.cache_enabled:
                 cached = await self.cache.get(cache_key)
                 if cached is not None:
+                    import copy
+                    cached = copy.copy(cached)
                     cached.id = query.id
+                    # AAAA 优先于 A 排序
+                    reorder_answer_aaaa_first(cached)
                     response_wire = cached.to_wire()
                     status = "cached"
                     await self._log_query(client_ip, qname, qtype_name, status, "")
@@ -387,12 +396,19 @@ class LocalDoTServer:
                 if self.config.cache_enabled and status == "resolved":
                     try:
                         response_msg = dns.message.from_wire(result_wire)
+                        # AAAA 优先于 A 排序（确保缓存中数据顺序一致）
+                        reorder_answer_aaaa_first(response_msg)
                         is_negative = response_msg.rcode() in (dns.rcode.NXDOMAIN, dns.rcode.REFUSED)
                         await self.cache.set(cache_key, response_msg, is_negative)
                     except Exception as e:
                         logger.debug("DoT 缓存写入异常: %s", e)
 
             await self._log_query(client_ip, qname, qtype_name, status, block_reason)
+
+            # AAAA 优先于 A 排序（仅对成功解析的上游响应）
+            if response_wire is not None and status == "resolved":
+                response_wire = sort_dns_response_wire(response_wire)
+
             return response_wire
 
         except dns.exception.DNSException:

@@ -18,6 +18,7 @@ import os
 import re
 import time
 import zlib
+import threading
 import asyncio
 import logging
 from typing import List, Tuple, Optional, Set, Callable, BinaryIO, TextIO
@@ -1219,6 +1220,7 @@ class FilterEngine:
         # $badfilter 禁用 pattern 集合
         self._badfilter_patterns: Set[str] = set()
         # $dnsrewrite 匹配结果缓存
+        self._badfilter_lock: threading.Lock = threading.Lock()
         self._last_dnsrewrite: Optional[dict] = None
         # ========== Atomic reload: pending state ==========
         # Rule reload writes new rules to pending indices while active indices
@@ -1583,7 +1585,7 @@ class FilterEngine:
                 if rule.is_badfilter:
                     target = self._extract_badfilter_target(cleaned)
                     if target:
-                        self._badfilter_patterns.add(target)
+                        with self._badfilter_lock: self._badfilter_patterns.add(target)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=NUM_WORKERS) as pool:
             tasks = []
@@ -2334,7 +2336,10 @@ class FilterEngine:
         await asyncio.sleep(ws)
         if self._restart_cb:
             try:
-                self._restart_cb(bh)
+                if asyncio.iscoroutinefunction(self._restart_cb):
+                    await self._restart_cb(bh)
+                else:
+                    self._restart_cb(bh)
             except Exception as e: logger.error("restart cb error: %s",e)
     @property
     def stats(self) -> dict:

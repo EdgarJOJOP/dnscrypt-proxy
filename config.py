@@ -70,11 +70,10 @@ class Config:
 
     def get_changed_sections(self) -> set:
         changed = set()
-        sections_to_check = {"cache", "filter", "hosts", "server", "upstream",
-                             "logging", "dnssec", "performance", "tls", "network_monitor"}
-        for section in sections_to_check:
-            old = self._section_snapshots.get(section, {})
-            new = self._data.get(section, {})
+        all_sections = set(self._section_snapshots.keys()) | set(self._data.keys())
+        for section in all_sections:
+            old = self._section_snapshots.get(section)
+            new = self._data.get(section)
             if old != new:
                 changed.add(section)
         return changed
@@ -83,6 +82,7 @@ class Config:
         return yaml.safe_load(CONFIG_TEMPLATE)
 
     def _save(self, use_template=False):
+        """保存配置到文件（调用方必须在 self._lock 保护下调用）"""
         if use_template:
             with open(self._path, "w", encoding="utf-8") as f:
                 f.write(CONFIG_TEMPLATE)
@@ -115,12 +115,11 @@ class Config:
             if mtime > self._last_mtime:
                 old_snapshots = dict(self._section_snapshots)
                 self._load()
-                sections_to_check = {"cache", "filter", "hosts", "server", "upstream",
-                                     "logging", "dnssec", "performance", "tls", "network_monitor"}
+                sections_to_check = set(old_snapshots.keys()) | set(self._section_snapshots.keys())
                 changed = set()
                 for section in sections_to_check:
-                    old = old_snapshots.get(section, {})
-                    new = self._section_snapshots.get(section, {})
+                    old = old_snapshots.get(section)
+                    new = self._section_snapshots.get(section)
                     if old != new:
                         changed.add(section)
                 for cb in self._reload_callbacks:
@@ -467,14 +466,15 @@ class Config:
     async def update_section(self, section: str, data: dict):
         async with self._lock:
             keys = section.split(".")
-        current = self._data
-        for k in keys[:-1]:
-            current = current.setdefault(k, {})
-        current[keys[-1]] = data
-        self._save()
-    def update_upstream(self, upstream_type: str, servers: List[str]):
+            current = self._data
+            for k in keys[:-1]:
+                current = current.setdefault(k, {})
+            current[keys[-1]] = data
+            self._save()
+    async def update_upstream(self, upstream_type: str, servers: List[str]):
         valid_types = {"bootstrap_resolvers", "doh", "dot", "doq"}
         if upstream_type not in valid_types:
             raise ValueError(f"类型必须为: {valid_types}")
-        self._data.setdefault("upstream", {})[upstream_type] = servers
-        self._save()
+        async with self._lock:
+            self._data.setdefault("upstream", {})[upstream_type] = servers
+            self._save()

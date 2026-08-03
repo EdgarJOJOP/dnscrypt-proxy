@@ -32,6 +32,9 @@ from dnssec import DNSSECQueryWrapper
 from qps_limiter import QPSCounter
 from rate_limiter import get_per_ip_limiter
 
+# DNS 响应 Answer section 排序：AAAA (IPv6) 优先于 A (IPv4)
+from dns_utils import reorder_answer_aaaa_first, sort_dns_response_wire
+
 logger = logging.getLogger("dns-proxy.local-doq")
 
 # aioquic 为可选依赖
@@ -339,7 +342,7 @@ class LocalDoQServer:
             self._transport_v4, _ = await loop.create_datagram_endpoint(
                 lambda: self._protocol_v4,
                 local_addr=(self.host, self.port),
-                family=asyncio.AddressFamily.AF_INET,
+                family=socket.AF_INET,
             )
             logger.info(
                 "本地 DoQ [IPv4] quic://%s:%d (域名: %s)",
@@ -357,7 +360,7 @@ class LocalDoQServer:
                 self._transport_v6, _ = await loop.create_datagram_endpoint(
                     lambda: self._protocol_v6,
                     local_addr=(self.ipv6_host, self.ipv6_port),
-                    family=asyncio.AddressFamily.AF_INET6,
+                    family=socket.AF_INET6,
                 )
                 logger.info(
                     "本地 DoQ [IPv6] quic://[%s]:%d (域名: %s)",
@@ -460,6 +463,8 @@ class LocalDoQServer:
                         matched = True
                 if matched:
                     response.set_rcode(dns.rcode.NOERROR)
+                    # AAAA 优先于 A 排序
+                    reorder_answer_aaaa_first(response)
                     response_wire = response.to_wire()
                     status = "custom_hosts"
                     if self.config.cache_enabled:
@@ -502,7 +507,11 @@ class LocalDoQServer:
             if self.config.cache_enabled:
                 cached = await self.cache.get(cache_key)
                 if cached is not None:
+                    import copy
+                    cached = copy.copy(cached)
                     cached.id = query.id
+                    # AAAA 优先于 A 排序
+                    reorder_answer_aaaa_first(cached)
                     response_wire = cached.to_wire()
                     status = "cached"
                     await self._log_query(client_ip, qname, qtype_name, status, "")
@@ -533,12 +542,19 @@ class LocalDoQServer:
                 if self.config.cache_enabled and status == "resolved":
                     try:
                         response_msg = dns.message.from_wire(result_wire)
+                        # AAAA 优先于 A 排序（确保缓存中数据顺序一致）
+                        reorder_answer_aaaa_first(response_msg)
                         is_negative = response_msg.rcode() in (dns.rcode.NXDOMAIN, dns.rcode.REFUSED)
                         await self.cache.set(cache_key, response_msg, is_negative)
                     except Exception as e:
                         logger.debug("DoQ 缓存写入异常: %s", e)
 
             await self._log_query(client_ip, qname, qtype_name, status, block_reason)
+
+            # AAAA 优先于 A 排序（仅对成功解析的上游响应）
+            if response_wire is not None and status == "resolved":
+                response_wire = sort_dns_response_wire(response_wire)
+
             return response_wire
 
         except dns.exception.DNSException:

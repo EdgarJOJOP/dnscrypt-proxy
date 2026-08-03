@@ -33,6 +33,9 @@ from dnssec import DNSSECQueryWrapper, DNSSECValidator
 from qps_limiter import QPSCounter
 from rate_limiter import get_per_ip_limiter
 
+# DNS 响应 Answer section 排序：AAAA (IPv6) 优先于 A (IPv4)
+from dns_utils import reorder_answer_aaaa_first, sort_dns_response_wire
+
 logger = logging.getLogger("dns-proxy.doh-server")
 
 # DNS 记录类型名称映射
@@ -411,12 +414,14 @@ class DoHServer:
         async with self._concurrency_semaphore:
             return await self._process_query(wire_data, request, response_format)
 
-    def _make_response(self, data: bytes, fmt: str = "wire") -> web.Response:
+    def _make_response(self, data: bytes, fmt: str = "wire",
+                    query: Optional[dns.message.Message] = None) -> web.Response:
         """根据格式创建响应"""
         if fmt == "json":
             try:
                 resp = dns.message.from_wire(data)
-                json_data = self._dns_response_to_json(resp, resp)
+                q = query if query is not None else resp
+                json_data = self._dns_response_to_json(resp, q)
                 return web.json_response(json_data)
             except Exception:
                 return web.json_response(
@@ -474,6 +479,8 @@ class DoHServer:
                         matched = True
                 if matched:
                     response.set_rcode(dns.rcode.NOERROR)
+                    # AAAA 优先于 A 排序
+                    reorder_answer_aaaa_first(response)
                     response_wire = response.to_wire()
                     status = "custom_hosts"
                     block_reason = f"自定义 hosts 映射"
@@ -483,7 +490,7 @@ class DoHServer:
                     await self._log_query(
                         client_ip, qname, qtype, elapsed, status, "", block_reason
                     )
-                    return self._make_response(response_wire, response_format)
+                    return self._make_response(response_wire, response_format, query=query)
 
             # 0b. 检查自定义 hosts 白名单（纯域名绕过，无自定义IP）
             is_hosts_bypass = self.filter_engine.is_custom_hosts_bypass(qname)
@@ -520,7 +527,7 @@ class DoHServer:
                         client_ip, qname, QTYPE_NAMES.get(question.rdtype, str(question.rdtype)),
                         elapsed, status, upstream, block_reason
                     )
-                    return self._make_response(response_wire, response_format)
+                    return self._make_response(response_wire, response_format, query=query)
 
             # 2. 检查缓存
             cached_response = None
@@ -528,16 +535,16 @@ class DoHServer:
                 cached_response = await self.cache.get(cache_key)
 
             if cached_response is not None:
-                import copy
-                cached_response = copy.copy(cached_response)
                 cached_response.id = query.id  # 修复DNS ID不匹配
+                # AAAA 优先于 A 排序
+                reorder_answer_aaaa_first(cached_response)
                 response_wire = cached_response.to_wire()
                 status = "cached"
                 elapsed = asyncio.get_event_loop().time() - start_time
                 await self._log_query(
                     client_ip, qname, qtype, elapsed, status, "", ""
                 )
-                return self._make_response(response_wire, response_format)
+                return self._make_response(response_wire, response_format, query=query)
 
             # 3. 通过上游解析器并行查询（自动添加 DNSSEC DO 位）
             result_wire = await self.resolver_manager.resolve(wire_data)
@@ -549,6 +556,7 @@ class DoHServer:
                 response_wire = response.to_wire()
                 status = "error"
             else:
+                upstream = self.resolver_manager.last_fast_server or ""
                 # 4. DNSSEC 验证（如果启用）
                 dnssec_ok = True
                 if self._dnssec_wrapper is not None and self.config.dnssec_enabled:
@@ -569,6 +577,8 @@ class DoHServer:
                         if self.config.cache_enabled:
                             try:
                                 response_msg = dns.message.from_wire(result_wire)
+                                # AAAA 优先于 A 排序（确保缓存中数据顺序一致）
+                                reorder_answer_aaaa_first(response_msg)
                                 is_negative = response_msg.rcode() in (
                                     dns.rcode.NXDOMAIN,
                                     dns.rcode.REFUSED,
@@ -583,6 +593,8 @@ class DoHServer:
                     if self.config.cache_enabled:
                         try:
                             response_msg = dns.message.from_wire(result_wire)
+                            # AAAA 优先于 A 排序（确保缓存中数据顺序一致）
+                            reorder_answer_aaaa_first(response_msg)
                             is_negative = response_msg.rcode() in (
                                 dns.rcode.NXDOMAIN,
                                 dns.rcode.REFUSED,
@@ -596,7 +608,11 @@ class DoHServer:
                 client_ip, qname, qtype, elapsed, status, upstream, block_reason
             )
 
-            return self._make_response(response_wire, response_format)
+            # AAAA 优先于 A 排序（仅对成功解析的上游响应）
+            if response_wire is not None and status == "resolved":
+                response_wire = sort_dns_response_wire(response_wire)
+
+            return self._make_response(response_wire, response_format, query=query)
 
         except dns.exception.DNSException as e:
             logger.warning("DNS 解析错误: %s", e)
