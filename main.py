@@ -998,7 +998,7 @@ def _is_admin() -> bool:
             import ctypes
             return bool(ctypes.windll.shell32.IsUserAnAdmin())
         except Exception:
-            return True  # 无法判断时默认放行
+            return False  # 无法判断时保守返回无权限
     else:
         return os.geteuid() == 0
 
@@ -1023,14 +1023,10 @@ def _elevate():
             print(f"UAC 提权失败: {e}，继续以当前权限运行")
             return
     else:
-        import shlex
-        import subprocess  # nosec B404 - not used with untrusted input
-        cmd = ["sudo", sys.executable] + sys.argv
         try:
-            subprocess.run(cmd, check=True)  # nosec B603 - constructed list, no shell=True
-        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            os.execv("/usr/bin/sudo", ["sudo", sys.executable] + sys.argv)
+        except Exception as e:
             print(f"sudo 提权失败: {e}，继续以当前权限运行")
-            return
 
     sys.exit()
 

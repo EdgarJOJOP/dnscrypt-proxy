@@ -69,7 +69,7 @@ class PlainDNSServer:
         self._tcp_server_v6: Optional[asyncio.AbstractServer] = None
         self._running = False
         self._concurrency_semaphore = asyncio.Semaphore(config.max_concurrent)
-        self._tcp_backlog = config.max_concurrent
+        self._tcp_backlog = config.connection_pool_size  # 从 connection_pool_size 取值（默认 100）
 
         # 单 IP 限速（共享 PerIPRateLimiter 单例）
         self._per_ip_limiter = get_per_ip_limiter(

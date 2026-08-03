@@ -138,6 +138,7 @@ class ARPProtection:
 
         # ========== 反击统计 ==========
         self._attack_stats: dict = {}
+        self._arp_storm_events: list = []       # ARP 风暴检测窗口 [(timestamp, mac, ip), ...]
         self._counterstrike_count: int = 0          # 反击轮次计数（用于交替毒化MAC）
         self._ip_migrated: bool = True              # 全局IP是否已迁移（永久禁用IP迁移，仅用反制）
 
@@ -148,6 +149,9 @@ class ARPProtection:
         # ========== 可信 MAC 列表（防止误伤正常设备）==========
         self._trusted_sender_macs: set = set()      # 信任的 sender MAC（不触发检测③反制）
         self._suspicious_zero_mac: dict = {}        # {sender_mac: [timestamp, ...]} — 全零 MAC 可疑计数
+
+        # ========== 反制 MAC 追踪（精确防环路，替代前缀过滤）==========
+        self._counterstrike_sent_macs: set = set()  # 自身反制已发送过的随机MAC集合
 
     async def _scapy_sender_worker_loop(self):
         """常驻 scapy 发送器：一次性导入 scapy，从队列取任务发送，进程冻结"""
@@ -404,31 +408,57 @@ class ARPProtection:
         if sender_mac == self._last_alert_mac and now - self._last_alert_time < debounce_interval:
             return ""
 
-        # === 安全基线学习（启动时防投毒）===
-        if not self._baseline_learned and not self._baseline_mac:
+        # === 启动时基线兜底（正常情况 detect_gateway 已锁定基线）===
+        # 如果嗅探器启动早于基线锁定，此处从系统ARP表验证后静默学习，防单包投毒
+        # 手动配置网关时不允许嗅探器覆盖基线（detect_gateway已锁定）
+        if not self._baseline_learned and not self._manual_gateways:
             if sender_ip == gw_ip and sender_mac:
-                if not self._baseline_proposed_mac:
-                    # 首次收到网关包，记录候选
-                    self._baseline_proposed_mac = sender_mac
-                    self._baseline_proposed_time = now
-                    return ""
-                elif sender_mac == self._baseline_proposed_mac and now - self._baseline_proposed_time >= 2.0:
-                    # 2 秒内同一 MAC 确认 → 学习为基线
-                    self._baseline_mac = sender_mac
-                    self._baseline_learned = True
-                    logger.info("ARP 防护: 基线 MAC 已学习: %s => %s", gw_ip, sender_mac)
-                    # 更新自动探测 MAC 为基线 MAC，用于静态 ARP 绑定
-                    self._auto_gateway_mac = sender_mac
-                    await self._protect_gateway_arp()
-                    return ""
-                elif sender_mac != self._baseline_proposed_mac:
-                    # 两次 MAC 不一致，可能启动时被攻击，清空候选等下一次
-                    self._baseline_proposed_mac = ""
-                    return ""
+                norm = self._mac_normalize(sender_mac)
+                if norm and norm != "000000000000" and norm != "FFFFFFFFFFFF" and not norm.startswith("01"):
+                    # 通过系统ARP表验证后再接受，防单包投毒
+                    sys_mac = await self._arp_get_mac_windows(gw_ip) if sys.platform == "win32" \
+                        else await self._arp_get_mac_linux(gw_ip)
+                    if sys_mac:
+                        sys_norm = self._mac_normalize(sys_mac)
+                        if sys_norm == norm:
+                            self._baseline_mac = sender_mac
+                            self._baseline_learned = True
+                            self._auto_gateway_mac = sender_mac
+                            logger.info("ARP 防护: 基线已学习 (嗅探兜底+系统表验证) %s => %s", gw_ip, sender_mac)
+                            await self._protect_gateway_arp()
+                        else:
+                            logger.warning("ARP 防护: 嗅探到网关包 MAC=%s 但系统ARP表为 %s，不采纳",
+                                           sender_mac, sys_mac)
+                    else:
+                        # 系统表为空，ping网关触发ARP学习后再尝试验证
+                        await self._ping_gateway_fast(gw_ip)
+                        await asyncio.sleep(0.05)
+                        sys_mac2 = await self._arp_get_mac_windows(gw_ip) if sys.platform == "win32" \
+                            else await self._arp_get_mac_linux(gw_ip)
+                        if sys_mac2 and self._mac_normalize(sys_mac2) == norm:
+                            self._baseline_mac = sender_mac
+                            self._baseline_learned = True
+                            self._auto_gateway_mac = sender_mac
+                            logger.info("ARP 防护: 基线已学习 (嗅探兜底+ping验证) %s => %s", gw_ip, sender_mac)
+                            await self._protect_gateway_arp()
             return ""
 
-        # === 防环路：反制发送的随机 MAC（02:00:00:xx:xx:xx）不触发检测 ===
+        # === 防环路：自身反制发送的随机 MAC 不触发检测 ===
+        # 优先使用已发送MAC集合精确过滤（比前缀过滤更安全）
+        if hasattr(self, '_counterstrike_sent_macs') and \
+                self._mac_normalize(sender_mac) in self._counterstrike_sent_macs:
+            return ""
+        # 兜底：02:00:00 前缀过滤（本地管理单播MAC范围）
         if self._mac_normalize(sender_mac).startswith("020000"):
+            return ""
+
+        # === 基线与实际MAC完全匹配时直接跳过检测（正确MAC，包括反制发送的正确包）===
+        if sender_ip in gw_ips and self._baseline_mac and \
+                self._mac_normalize(sender_mac) == self._mac_normalize(self._baseline_mac):
+            return ""
+
+        # === 基线全零安全防护：基线为全零时不触发任何攻击检测（防误判）===
+        if self._baseline_mac and self._mac_normalize(self._baseline_mac) == "000000000000":
             return ""
 
         # === IP 段过滤：只处理与本机/网关同网段的包，忽略 APIPA(169.254.x.x) 等 ===
@@ -442,7 +472,10 @@ class ARPProtection:
         # ① Sender = 网关 IP × MAC 不匹配（ARP 投毒/网关冒充）
         if sender_ip in gw_ips and self._baseline_mac and self._mac_normalize(sender_mac) != self._mac_normalize(self._baseline_mac):
             poisoned = True
-            reason = f"ARP 投毒！网关 {sender_ip} → 期望 {self._baseline_mac} ≠ 实际 {sender_mac}"
+            if opcode == 2:
+                reason = f"ARP Reply 投毒！网关 {sender_ip} → 期望 {self._baseline_mac} ≠ 实际 {sender_mac}（Opcode=2 回复劫持）"
+            else:
+                reason = f"ARP 投毒！网关 {sender_ip} → 期望 {self._baseline_mac} ≠ 实际 {sender_mac}"
 
         # ② Sender = 本机 IP × MAC 不匹配（IP 冲突）
         elif sender_ip in self._local_ips and self._mac_normalize(sender_mac) != self._mac_normalize(local_mac):
@@ -519,14 +552,36 @@ class ARPProtection:
                 self._trusted_sender_macs.clear()
                 logger.info("ARP 防护: 信任列表已清空（超200条阈值）")
             # 更新攻击统计（60 秒窗口计数）
-            stats = self._attack_stats.setdefault(sender_mac, {"count": 0, "bursts_sent": 0, "last_attack": 0.0, "last_counterstrike": 0.0, "window_start": now, "ip_switched": False})
-            # 如果窗口超过 60 秒，重置计数
+            stats = self._attack_stats.setdefault(sender_mac, {"count": 0, "bursts_sent": 0, "last_attack": 0.0, "last_counterstrike": 0.0, "window_start": now, "ip_switched": False, "seen_ips": set()})
+            # 如果窗口超过 60 秒，重置计数（但保留 seen_ips，防止缓慢攻击绕过双向 MITM 检测）
             if now - stats.get("window_start", now) > 60.0:
                 stats["count"] = 0
                 stats["bursts_sent"] = 0
                 stats["window_start"] = now
             stats["count"] += 1
             stats["last_attack"] = now
+            # 追踪该 MAC 出现过的 Sender IP，检测双向 MITM（同一MAC同时冒充网关和本机）
+            gw_ips = set(ip for ip, _, _ in self.gateway_pairs)
+            local_ips = self._local_ips or set()
+            seen = stats["seen_ips"]
+            seen.add(sender_ip)
+            # 检查是否同时包含网关 IP 和本机 IP
+            if seen & gw_ips and seen & local_ips:
+                logger.warning("ARP 嗅探: 双向 MITM 检测！设备 %s(%s) 同时冒充网关 %s 和本机 %s",
+                               sender_ip, sender_mac, next(iter(seen & gw_ips), ""), next(iter(seen & local_ips), ""))
+                reason = "双向 MITM 劫持！" + reason
+            # ARP 风暴检测：统计 10 秒内不同 MAC 宣告网关 IP 的数量
+            if sender_ip in gw_ips:
+                now_t = time.time()
+                # 清理过期条目
+                self._arp_storm_events = [(t, m, i) for t, m, i in self._arp_storm_events if now_t - t < 10.0]
+                self._arp_storm_events.append((now_t, sender_mac, sender_ip))
+                # 统计不同 MAC
+                distinct_macs = set(m for _, m, _ in self._arp_storm_events)
+                if len(distinct_macs) >= 5:
+                    logger.warning("ARP 风暴检测！10秒内 %d 个不同 MAC 宣告网关 IP：%s",
+                                   len(distinct_macs), ", ".join(distinct_macs))
+                    reason = "ARP 风暴！" + reason
             # 异步触发即时反击
             asyncio.create_task(self._on_arp_attack(sender_ip, sender_mac, reason))
             return reason
@@ -682,8 +737,12 @@ class ARPProtection:
                     # 1) 删除本机 ARP 条目 → 2) ping 触发重新学习 → 3) 若仍错则静态绑定
                     if sys.platform == "win32" and not _SCAPY_AVAILABLE:
                         try:
-                            import subprocess
-                            subprocess.run(["arp", "-d", gw_ip_p], capture_output=True, timeout=2)
+                            proc = await asyncio.create_subprocess_exec(
+                                "arp", "-d", gw_ip_p,
+                                stdout=asyncio.subprocess.DEVNULL,
+                                stderr=asyncio.subprocess.DEVNULL,
+                            )
+                            await asyncio.wait_for(proc.wait(), timeout=2)
                         except Exception:
                             pass
                         # ping 网关触发系统 ARP 请求，获取正确 MAC
@@ -699,9 +758,12 @@ class ARPProtection:
                     elif sys.platform != "win32":
                         # Linux：删除条目触发 ARP 请求
                         try:
-                            import subprocess
-                            subprocess.run(["ip", "neigh", "del", gw_ip_p],
-                                           capture_output=True, timeout=2)
+                            proc = await asyncio.create_subprocess_exec(
+                                "ip", "neigh", "del", gw_ip_p,
+                                stdout=asyncio.subprocess.DEVNULL,
+                                stderr=asyncio.subprocess.DEVNULL,
+                            )
+                            await asyncio.wait_for(proc.wait(), timeout=2)
                         except Exception:
                             pass
                         await self._ping_gateway_fast(gw_ip_p)
@@ -821,6 +883,39 @@ class ARPProtection:
             # 网关 MAC 已知时设静态 ARP 防止本机缓存被投毒
             if self.gateway_mac:
                 await self._protect_gateway_arp()
+
+            # ========== 启动时主动基线确认（一次性锁定，嗅探器启动前完成）==========
+            gw_mac_raw = self.gateway_mac
+            if gw_mac_raw:
+                # 将从系统ARP表获取的MAC统一为冒号大写格式
+                gw_mac_up = gw_mac_raw.replace("-", ":").upper()
+                norm = self._mac_normalize(gw_mac_up)
+                # 基线有效性检查：拒绝全零/广播/组播MAC
+                if norm and norm != "000000000000" and norm != "FFFFFFFFFFFF" and not norm.startswith("01"):
+                    self._baseline_mac = gw_mac_up
+                    self._baseline_learned = True
+                    logger.info("ARP 防护: 基线已锁定 gateway=%s -> MAC=%s (启动时主动确认)",
+                                self.gateway_ip, gw_mac_up)
+                else:
+                    # 基线非法（全零等），主动触发ARP解析后重试一次
+                    logger.warning("ARP 防护: 基线 MAC %s 非法（全零/广播/组播），主动触发 ARP 解析重试",
+                                   gw_mac_raw)
+                    await self._ping_gateway_fast(self.gateway_ip)
+                    await asyncio.sleep(0.1)
+                    if sys.platform == "win32":
+                        retry_mac = await self._arp_get_mac_windows(self.gateway_ip)
+                    else:
+                        retry_mac = await self._arp_get_mac_linux(self.gateway_ip)
+                    if retry_mac:
+                        retry_up = retry_mac.replace("-", ":").upper()
+                        retry_norm = self._mac_normalize(retry_up)
+                        if retry_norm and retry_norm != "000000000000" and retry_norm != "FFFFFFFFFFFF" and not retry_norm.startswith("01"):
+                            self._baseline_mac = retry_up
+                            self._baseline_learned = True
+                            # 更新自动探测MAC为正确值
+                            self._auto_gateway_mac = retry_up
+                            logger.info("ARP 防护: 基线已锁定 gateway=%s -> MAC=%s (重试后确认)",
+                                        self.gateway_ip, retry_up)
         else:
             logger.warning("ARP 防护: 无法自动探测网关地址（防火墙可能阻止了探测）")
         return ok
@@ -1335,7 +1430,7 @@ class ARPProtection:
                             return part.upper()
             return None
         except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
-            logger.warning("ARP 防护: arp -a %s 失败: %s", ip, e)
+            logger.debug("ARP 防护: arp -a %s 失败（非关键路径，攻击期 ARP 表波动属正常）: %s", ip, e)
             return None
 
     @staticmethod
@@ -1362,7 +1457,7 @@ class ARPProtection:
                 return m.group(1).upper()
             return None
         except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
-            logger.warning("ARP 防护: ip neigh show %s 失败: %s", ip, e)
+            logger.debug("ARP 防护: ip neigh show %s 失败: %s", ip, e)
             return None
 
     # ======================== 本地网卡状态检查 ========================
@@ -2327,7 +2422,16 @@ class ARPProtection:
                 except Exception as e:
                     logger.debug("ARP 防护: scapy GARP 发送失败 (%s)，回退到静态 ARP", e)
 
-            # 兔底：检测本机 ARP 表中网关 MAC 是否被投毒，若被篡改则设静态 ARP 绑定
+            # 兔底：基线已锁定时直接用基线值设静态 ARP 绑定，避免在 ARP 表波动时
+            # 调用 arp -a 获取空结果导致日志刷屏（已知基线值可信）
+            if self._baseline_learned and self._baseline_mac:
+                logger.debug("ARP 防护: 基线已锁定，直接设置静态 ARP 绑定 %s -> %s",
+                             gw_ip, self._baseline_mac)
+                bound = await self._protect_gateway_arp()
+                if bound:
+                    return await self._ping_gateway_fast(gw_ip)
+                return await self._ping_gateway_fast(gw_ip)
+            # 基线未锁定时回退到 arp -a 检测
             actual_mac = await self._arp_get_mac_windows(gw_ip)
             if actual_mac and self._baseline_mac and self._mac_normalize(actual_mac) != self._mac_normalize(self._baseline_mac):
                 logger.warning("ARP 防护: 检测到本机 ARP 表中网关 MAC 被篡改 "
@@ -2366,8 +2470,12 @@ class ARPProtection:
             # 发送真实 GARP 宣告前，先清空系统 ARP 缓存
             if sys.platform == "win32":
                 try:
-                    import subprocess
-                    subprocess.run(["arp", "-d", self.gateway_ip], capture_output=True, timeout=2)
+                    proc = await asyncio.create_subprocess_exec(
+                        "arp", "-d", self.gateway_ip,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await asyncio.wait_for(proc.wait(), timeout=2)
                 except Exception:
                     pass
             await self._send_single_garp(skip_arp_del=True)
@@ -2489,15 +2597,21 @@ class ARPProtection:
             logger.warning("ARP 反制 %s: %s %d次/60s(%s) -> %d包GARP+%d包定向 @%.0fms",
                            log_tag, sender_mac, attack_rate, reason[:40], burst_size, directed_count, inter*1000)
 
-        # 反制前验证：对于 MITM 劫持类告警（非高频攻击），快速 ping 网关二次确认
-        # 如果网关可达，说明是正常设备误报，仅记录日志不触发反制
-        if "MITM 劫持" in reason and attack_rate < 20:
+        # 反制前验证：对于 MITM 劫持类告警（极低频疑似误报），快速 ping 网关二次确认
+        # 即便 ping 通也只降级不跳过——嗅探已检测到明确攻击特征，GARP 保底必须持续压制
+        if "MITM 劫持" in reason and attack_rate < 3:
             gw_ip = self.gateway_ip
             if gw_ip:
                 gw_ok = await self._ping_gateway_fast(gw_ip)
                 if gw_ok:
-                    logger.warning("ARP 嗅探: %s — 但网关可达，判定为正常设备误报，跳过反制",
+                    logger.warning("ARP 嗅探: %s — 网关可达，降级为保底 GARP（攻击频率过低，疑似误报）",
                                    reason[:80])
+                    # 降级反制：不发定向反制，仅发少量 GARP 广播保底
+                    burst_size = 3
+                    directed_count = 0
+                    inter = 0.05
+                    await self._garp_counterstrike(sender_ip, sender_mac, burst_size=burst_size,
+                                                    directed_count=directed_count, inter=inter)
                     if self._poison_detected.is_set():
                         self._poison_detected.clear()
                     return
@@ -2531,6 +2645,11 @@ class ARPProtection:
             # 每次反制使用不同随机 MAC，比固定交替 MAC 更难被攻击者识别和防御
             _suffix = random.randint(1, 0xFFFFFF)
             poison_mac = f"02:00:00:{_suffix >> 16:02X}:{(_suffix >> 8) & 0xFF:02X}:{_suffix & 0xFF:02X}"
+            # 记录反制MAC到追踪集合，用于嗅探器精确防环路
+            self._counterstrike_sent_macs.add(self._mac_normalize(poison_mac))
+            # 限制追踪集合大小，防止无限增长
+            if len(self._counterstrike_sent_macs) > 1000:
+                self._counterstrike_sent_macs.clear()
             if _SCAPY_AVAILABLE and self._scapy_sender_ready:
                 # 通过常驻 sender 队列发送（一次性导入 scapy，不重复创建）
                 try:
@@ -2663,8 +2782,11 @@ class ARPProtection:
             except Exception as e:
                 logger.debug("ARP 防护: 网关 GARP scapy 发送失败 (%s)，回退到静态 ARP", e)
 
-        # 兜底：如果本机 ARP 表中网关 MAC 被投毒，设静态 ARP 绑定修复
-        if sys.platform == "win32":
+        # 兜底：基线已锁定时直接用基线值设静态 ARP 绑定，避免调用 arp -a
+        if self._baseline_learned and self._baseline_mac:
+            logger.debug("ARP 防护: 基线已锁定，直接设置静态 ARP 绑定 (garp_broadcast_gateway)")
+            await self._protect_gateway_arp()
+        elif sys.platform == "win32":
             actual_mac = await self._arp_get_mac_windows(gw_ip)
             if actual_mac and self._mac_normalize(actual_mac) != self._mac_normalize(gw_mac):
                 logger.warning("ARP 防护: 本机 ARP 表中网关 MAC 被篡改 %s -> %s，设置静态绑定",
@@ -3562,7 +3684,8 @@ class ARPProtection:
     @staticmethod
     async def _ping_icmp_detailed(ip: str, timeout_ms: int,
                                    use_tcp_fallback: bool = True,
-                                   gateway_ip: str = None) -> dict:
+                                   gateway_ip: str = None,
+                                   unreachable_codes: tuple = None) -> dict:
         """
         底层 ICMP 详细探测 — 返回结构化结果而非仅 bool。
 
@@ -3571,6 +3694,7 @@ class ARPProtection:
             timeout_ms: ping 内部超时（毫秒）
             use_tcp_fallback: 是否在 ICMP 失败时尝试 TCP 兜底
             gateway_ip: 本机网关 IP，用于判断 ICMP 回复是否来自网关
+            unreachable_codes: 视为断网的 ICMP code 元组，默认 (0, 1)
 
         Returns:
             {"reachable": bool, "icmp_type": int|None, "icmp_code": int|None,
@@ -3600,7 +3724,8 @@ class ARPProtection:
         from_ip = result.get("from_ip")
         icmp_type = result.get("icmp_type")
         icmp_code = result.get("icmp_code") if result.get("icmp_code") is not None else -1
-        gw_unreach = (icmp_type == 3 and icmp_code in (0, 1)
+        codes = unreachable_codes if unreachable_codes is not None else (0, 1)
+        gw_unreach = (icmp_type == 3 and icmp_code in codes
                       and from_ip is not None
                       and (gateway_ip is None or from_ip == gateway_ip))
 
@@ -3653,7 +3778,8 @@ class ARPProtection:
 
     @staticmethod
     async def probe_wan_unreachable(target_ip: str, gateway_ip: str = None,
-                                     timeout_ms: int = 3000) -> dict:
+                                     timeout_ms: int = 3000,
+                                     unreachable_codes: list = None) -> dict:
         """
         对外网目标发送 ICMP，检测是否收到来自网关的 Destination Unreachable。
 
@@ -3664,6 +3790,7 @@ class ARPProtection:
             target_ip: 外网探测目标 IP
             gateway_ip: 本机网关 IP（用于判断回复来源）
             timeout_ms: 探测超时（毫秒）
+            unreachable_codes: 视为断网的 ICMP code 列表，默认 [0, 1]
 
         Returns:
             {"wan_dead": bool, "unreachable_code": int|None,
@@ -3675,9 +3802,11 @@ class ARPProtection:
         """
         result = await ARPProtection._ping_icmp_detailed(
             target_ip, timeout_ms=timeout_ms,
-            use_tcp_fallback=False, gateway_ip=gateway_ip)
+            use_tcp_fallback=False, gateway_ip=gateway_ip,
+            unreachable_codes=tuple(unreachable_codes) if unreachable_codes else None)
 
-        is_unreachable = ARPProtection._is_destination_unreachable(result, [0, 1])
+        codes = unreachable_codes if unreachable_codes is not None else [0, 1]
+        is_unreachable = ARPProtection._is_destination_unreachable(result, codes)
         icmp_code = result.get("icmp_code")
         return {
             "wan_dead": is_unreachable,

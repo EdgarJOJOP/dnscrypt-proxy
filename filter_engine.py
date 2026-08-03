@@ -143,7 +143,7 @@ class AdGuardRuleParser:
         # etc/hosts 格式: 0.0.0.0 domain.com 或 127.0.0.1 domain.com
         # 官方定义：精确匹配域名，不匹配子域名
         hosts_match = re.match(
-            r'^(?:\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|::1)\s+(\S+)$',
+            r'^(?:\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|[0-9a-fA-F:]+:+[0-9a-fA-F:]*|0\.0\.0\.0)\s+(\S+)$',
             line
         )
         if hosts_match:
@@ -830,7 +830,7 @@ class FilterRule:
 
         # 9. hosts 格式: 0.0.0.0 domain / 127.0.0.1 domain / ::1 domain
         hosts_match = re.match(
-            r'^(?:\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|::1)\s+(\S+)$',
+            r'^(?:\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|[0-9a-fA-F:]+:+[0-9a-fA-F:]*|0\.0\.0\.0)\s+(\S+)$',
             text
         )
         if hosts_match:
@@ -1273,7 +1273,7 @@ class FilterEngine:
 
         # hosts 格式
         hosts_match = re.match(
-            r'^(?:\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|::1)\s+(\S+)$',
+            r'^(?:\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|[0-9a-fA-F:]+:+[0-9a-fA-F:]*|0\.0\.0\.0)\s+(\S+)$',
             line
         )
         if hosts_match:

@@ -110,6 +110,8 @@ class NDPProtection:
         self._nud_window_ms = int(cfg.get("nud_window_ms", 80))
         self._nud_window = self._nud_window_ms / 1000.0
         self._nud_threshold = cfg.get("nud_threshold", 3)
+        self._ndp_flood_threshold = cfg.get("ndp_flood_threshold", 50)  # T7 泛洪阈值（条/秒）
+        self._ndp_flood_suppress = False  # 泛洪抑制标志
         self._baseline_learn_ms = int(cfg.get("baseline_learn_ms", 3000))
         # \u7f51\u53e3\u540d\u79f0->\u7d22\u5f15\u7f13\u5b58\uff0c\u7528\u4e8e\u9759\u6001 NDP \u7ed1\u5b9a
         self._iface_name_to_idx: Dict[str, int] = {}
@@ -172,6 +174,7 @@ class NDPProtection:
 
         # T5 NUD 追踪
         self._nud_tracker: Dict[str, list] = {}
+        self._dad_tracker: Dict[str, list] = {}   # DAD 追踪器（与 NUD 分离，防数据污染）
 
         # 基线学习
         self._baseline_learned: bool = False
@@ -184,6 +187,7 @@ class NDPProtection:
         self._ra_m_flag_baseline: Optional[bool] = None
         self._ra_o_flag_baseline: Optional[bool] = None
         self._ra_baseline_learned: bool = False
+        self._known_prefixes: set = set()           # 已知合法前缀集合（4.2.5/4.2.6 虚假前缀检测）
 
         # RA 源自动学习（替代 max_ra_routers 硬阈值）
         self._trusted_ra_sources: set = set()  # {MAC, ...} 已确认的合法 RA 源
@@ -542,6 +546,8 @@ class NDPProtection:
         self._loop = asyncio.get_event_loop()
         self._check_task = asyncio.create_task(self._periodic_check_loop())
         await self._start_workers()
+        # 启动时自动设置静态 NDP 绑定，防止启动后被投毒
+        await self.protect_ndp_entry()
         logger.info("NDP 防护: 已启动 (接口=%d, 网关=%d, scapy=%s, workers=%d)",
                     len(self.interfaces), len(self.gateway_pairs), self._scapy_available,
                     len(self._ndp_workers))
@@ -759,7 +765,7 @@ class NDPProtection:
             ndp_sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW,
                                       socket.htons(ETH_P_IPV6))
             ndp_sock.bind((self.interface_name or "", 0))
-            ndp_sock.setblocking(True)
+            ndp_sock.setblocking(False)
         except Exception as e:
             logger.warning("NDP 防护: 无法创建 AF_PACKET IPv6 套接字 (%s)", e)
             return
@@ -803,7 +809,11 @@ class NDPProtection:
             elif icmp6_type == ICMPV6_TYPE_RA:
                 # RA: CurHopLimit = IPv6 header byte 7 (hop limit)
                 hop_limit = frame[21]  # IPv6 header 偏移 7
-                await self._check_ndp_raw_ra(raw_src_mac, src_ip, hop_limit)
+                # RA body 偏移: ICMPv6 header (4B) 后, M/O 标志在 byte 1
+                ra_body_offset = 54 + 4  # Ether(14) + IPv6(40) + ICMPv6(4)
+                m_flag = (frame[ra_body_offset + 1] >> 7) & 1 if len(frame) > ra_body_offset + 1 else 0
+                o_flag = (frame[ra_body_offset + 1] >> 6) & 1 if len(frame) > ra_body_offset + 1 else 0
+                await self._check_ndp_raw_ra(raw_src_mac, src_ip, hop_limit, m_flag=m_flag, o_flag=o_flag)
             elif icmp6_type == ICMPV6_TYPE_REDIRECT:
                 await self._check_ndp_raw_redirect(raw_src_mac, src_ip)
 
@@ -839,19 +849,19 @@ class NDPProtection:
             addr_key = ns_target
             now = time.time()
             # 清理过期记录
-            self._nud_tracker = {
+            self._dad_tracker = {
                 t: [ts for ts in times if now - ts < self._nud_window]
-                for t, times in self._nud_tracker.items()
+                for t, times in self._dad_tracker.items()
             }
-            if addr_key not in self._nud_tracker:
-                self._nud_tracker[addr_key] = []
-            self._nud_tracker[addr_key].append(now)
-            if len(self._nud_tracker[addr_key]) >= 3:
+            if addr_key not in self._dad_tracker:
+                self._dad_tracker[addr_key] = []
+            self._dad_tracker[addr_key].append(now)
+            if len(self._dad_tracker[addr_key]) >= 3:
                 logger.warning("NDP 防护 [T4/AF_PACKET]: DAD 攻击! %s 被重复检测 ≥3 次", addr_key)
-                self._nud_tracker[addr_key] = []
+                self._dad_tracker[addr_key] = []
 
-    async def _check_ndp_raw_ra(self, src_mac: str, src_ip: str, hop_limit: int):
-        """AF_PACKET RA 检测：未知 RA 源（T3）+ CurHopLimit 异常"""
+    async def _check_ndp_raw_ra(self, src_mac: str, src_ip: str, hop_limit: int, m_flag: int = 0, o_flag: int = 0):
+        """AF_PACKET RA 检测：未知 RA 源（T3）+ CurHopLimit + M/O 标志"""
         if not self._enabled:
             return
         known_gw_macs = {self._mac_normalize(mac) for _, mac, _ in self.gateway_pairs if mac}
@@ -876,6 +886,34 @@ class NDPProtection:
             })
             self._trim_threat_events()
             return
+
+        # AF_PACKET 路径也学习 RA 参数基线（与 scapy 路径共享基线条）
+        if not self._ra_baseline_learned:
+            self._ra_hoplimit_baseline = hop_limit
+            self._ra_m_flag_baseline = bool(m_flag)
+            self._ra_o_flag_baseline = bool(o_flag)
+            self._ra_baseline_learned = True
+            self._trusted_ra_sources.add(src_mac)
+            logger.info("NDP 防护 [AF_PACKET]: 学习 RA 基线 HopLimit=%d M=%d O=%d (源 %s)",
+                         hop_limit, m_flag, o_flag, src_mac)
+            return
+
+        # M/O 标志异常检测
+        if self._ra_baseline_learned:
+            if (self._ra_m_flag_baseline is not None and m_flag != self._ra_m_flag_baseline) or \
+               (self._ra_o_flag_baseline is not None and o_flag != self._ra_o_flag_baseline):
+                logger.warning("NDP 防护 [4.2.7/AF_PACKET]: M/O 标志异常 RA 源 %s (%s) "
+                               "M=%d O=%d (基线 M=%s O=%s)",
+                               src_ip, src_mac, m_flag, o_flag,
+                               self._ra_m_flag_baseline, self._ra_o_flag_baseline)
+                self._suspicious_ra_sources.add(src_mac)
+                self._threat_events.append({
+                    "type": "ra_param_spoof", "time": time.time(),
+                    "src_mac": src_mac, "src_ip": src_ip,
+                    "detail": f"M={m_flag} O={o_flag} (baseline M={self._ra_m_flag_baseline} O={self._ra_o_flag_baseline})",
+                })
+                self._trim_threat_events()
+                return
 
         # 未知 RA 源
         logger.warning("NDP 嗅探 [T3/AF_PACKET]: 未知 RA 源! %s (%s)", src_ip, src_mac)
@@ -930,7 +968,26 @@ class NDPProtection:
                     if is_poisoned:
                         logger.warning("NDP 防护 [T1/轮询]: 网关 %s MAC 异常! %s -> %s",
                                        gw_ip, expected_mac or "?", actual_mac)
-                        self._poison_detected.set()
+                        # 快速 ping -6 验证：临时 NDP 表波动 vs 真实投毒
+                        # 使用 1 秒超时避免多网关场景累积延迟超过轮询间隔
+                        ping_ok = await self._ping_ipv6(gw_ip, timeout_ms=1000)
+                        if ping_ok:
+                            logger.warning("NDP 防护 [T1/轮询]: 网关 %s MAC 异常但 ping 可达，"
+                                           "判定为临时波动，跳过投毒标志", gw_ip)
+                            # 记录可疑事件（MITM 攻击者可转发 ICMPv6 让 ping 成功）
+                            self._threat_events.append({
+                                "type": "ndp_table_anomaly_ping_ok", "time": time.time(),
+                                "gateway": gw_ip, "expected_mac": expected_mac, "actual_mac": actual_mac,
+                            })
+                            self._trim_threat_events()
+                            continue
+                        # 去重：如果嗅探器已就绪（scapy 可用），轮询路径不再设 _poison_detected，
+                        # 避免 network_monitor 中嗅探测到的投毒标志和轮询路径形成双重反制
+                        if self._ndp_sender_ready:
+                            logger.debug("NDP 防护 [T1/轮询]: 嗅探器已就绪，跳过投毒标志（由嗅探路径处理）")
+                            # 不设标志，但继续执行修复逻辑（无感补充）
+                        else:
+                            self._poison_detected.set()
                         # 无 Npcap 时主动修复：ping -6 触发邻居发现刷新路由器 NDP 表
                         if sys.platform == "win32":
                             try:
@@ -1044,6 +1101,38 @@ class NDPProtection:
                         self._trim_threat_events()
                         self._suspicious_ra_sources.add(src_mac)
 
+                # --- 4.2.5/4.2.6 虚假前缀检测 ---
+                if pkt.haslayer(ICMPv6NDOptPrefixInformation):
+                    try:
+                        pi = pkt[ICMPv6NDOptPrefixInformation]
+                        prefix = str(pi.prefix) if pi.prefix else ""
+                        prefix_len = pi.prefixlen if hasattr(pi, 'prefixlen') else 64
+                    except Exception:
+                        prefix = ""
+                        prefix_len = 64
+                    if prefix and prefix != "::":
+                        # 首次学习前缀
+                        if not self._known_prefixes:
+                            self._known_prefixes.add(prefix)
+                            logger.info("NDP 防护: 学习合法前缀 %s/%d (RA 源 %s)", prefix, prefix_len, src_mac)
+                        elif prefix not in self._known_prefixes:
+                            # 新前缀与已知前缀不一致 → 可能虚假前缀
+                            # 全局单播 IPv6 范围为 2000::/3（首 hex digit 为 2 或 3）
+                            first_hex = prefix.split(":")[0].lower() if ":" in prefix else ""
+                            is_global_unicast = first_hex and first_hex[0] in "23" and len(first_hex) <= 4
+                            if is_global_unicast and prefix_len == 64:
+                                self._known_prefixes.add(prefix)
+                                logger.info("NDP 防护: 学习新合法前缀 %s/%d (RA 源 %s)", prefix, prefix_len, src_mac)
+                            else:
+                                logger.warning("NDP 嗅探 [4.2.5/4.2.6]: 可疑前缀 %s/%d (非全局单播/非/64) RA 源 %s (%s)",
+                                               prefix, prefix_len, src_ip, src_mac)
+                                self._threat_events.append({
+                                    "type": "fake_prefix", "time": time.time(),
+                                    "src_mac": src_mac, "src_ip": src_ip,
+                                    "prefix": prefix, "prefix_len": prefix_len,
+                                })
+                                self._trim_threat_events()
+
                 # --- RA 源自动学习（替代 max_ra_routers）---
                 # 从手动配置的网关 MAC 或已确认的接口网关 MAC 发来的 RA = 信任
                 known_gw_macs = {self._mac_normalize(mac) for _, mac, _ in self.gateway_pairs if mac}
@@ -1092,6 +1181,7 @@ class NDPProtection:
                 })
                 self._trim_threat_events()
                 self._nud_tracker[ns_target] = []
+                self._recovery_trigger.set()  # 触发恢复 worker 确认网关状态
 
         # ==================== 基线兜底学习（嗅探器启动早于detect_gateway时，通过系统NDP表验证后学习）====================
         # 手动配置网关时不允许嗅探器覆盖基线（detect_gateway已锁定）
@@ -1272,6 +1362,8 @@ class NDPProtection:
     async def _on_poison_detected(self, attacker_mac: str = "", attacker_ip: str = ""):
         if not self._enabled:
             return
+        # 触发恢复 worker 确认网关状态
+        self._recovery_trigger.set()
         now = time.time()
         # 更新攻击统计（清理超300s + 60s窗口，同ARP逻辑）
         stale_macs = [m for m, s in self._ndp_attack_stats.items() if now - s.get("last_attack", 0) > 300.0]
@@ -1474,7 +1566,7 @@ class NDPProtection:
                 s.send(frame)
 
                 # 监听 NA 回复（timeout 内）
-                s.setblocking(True)
+                s.setblocking(False)
                 s.settimeout(timeout)
                 deadline = time.time() + timeout
                 while time.time() < deadline:
@@ -2000,12 +2092,24 @@ class NDPProtection:
         try:
             before = time.monotonic()
             cnt1 = await self._count_neighbors()
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(2.0)  # 从 0.5s 延长到 2s 采样
             cnt2 = await self._count_neighbors()
-            rate = (cnt2 - cnt1) / (time.monotonic() - before)
-            if rate > 50:
-                logger.warning("NDP 防护 [T7]: 泛洪! 邻居增长 %.0f 条/秒", rate)
+            elapsed = time.monotonic() - before
+            if elapsed <= 0:
+                return False
+            rate = (cnt2 - cnt1) / elapsed
+            if rate > self._ndp_flood_threshold:
+                logger.warning("NDP 防护 [T7]: 泛洪! 邻居增长 %.0f 条/秒 (阈值=%d)", rate, self._ndp_flood_threshold)
+                self._ndp_flood_suppress = True
+                # 泛洪缓解：清空已学习的可疑条目，抑制进一步学习
+                if hasattr(self, '_suspicious_ra_sources'):
+                    self._suspicious_ra_sources.clear()
+                if hasattr(self, '_ndp_attack_stats'):
+                    self._ndp_attack_stats.clear()
                 return True
+            else:
+                # 连续正常则解除抑制
+                self._ndp_flood_suppress = False
         except Exception:
             pass
         return False
@@ -2018,14 +2122,18 @@ class NDPProtection:
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 )
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-                return len(self._decode_win_output(stdout).splitlines())
+                lines = self._decode_win_output(stdout).splitlines()
+                # 跳过表头行（包含 -- 或 接口 的标题行）
+                return sum(1 for l in lines if l.strip() and "--" not in l and not l.strip().startswith("接口"))
             else:
                 proc = await asyncio.create_subprocess_exec(
                     "ip", "-6", "neigh", "show",
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 )
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-                return len(stdout.decode().splitlines())
+                lines = stdout.decode(errors="replace").splitlines()
+                # ip -6 neigh show 输出每行一条邻居条目，跳过空行
+                return sum(1 for l in lines if l.strip())
         except Exception:
             return 0
 

@@ -151,10 +151,12 @@ class Config:
         return self._data.get("server", {}).get("doh", {}).get("enabled", True)
     @property
     def doh_cert_path(self) -> str:
-        return os.path.join(os.path.dirname(self._path), self._data.get("server", {}).get("doh", {}).get("cert_path", "certs/localhost.crt"))
+        from pathlib import Path
+        return str(Path(__file__).parent / self._data.get("server", {}).get("doh", {}).get("cert_path", "certs/localhost.crt"))
     @property
     def doh_key_path(self) -> str:
-        return os.path.join(os.path.dirname(self._path), self._data.get("server", {}).get("doh", {}).get("key_path", "certs/localhost.key"))
+        from pathlib import Path
+        return str(Path(__file__).parent / self._data.get("server", {}).get("doh", {}).get("key_path", "certs/localhost.key"))
     @property
     def bootstrap_resolvers(self) -> List[str]:
         return self._data.get("upstream", {}).get("bootstrap_resolvers", ["223.5.5.5"]) or []
@@ -236,7 +238,8 @@ class Config:
         return self._data.get("logging", {}).get("flush_interval", 10)
     @property
     def logging_dir(self) -> str:
-        return os.path.join(os.path.dirname(self._path), self._data.get("logging", {}).get("log_dir", "logs"))
+        from pathlib import Path
+        return str(Path(__file__).parent / self._data.get("logging", {}).get("log_dir", "logs"))
     @property
     def logging_file(self) -> str:
         return self._data.get("logging", {}).get("log_file", "dns_queries.log")
@@ -320,10 +323,12 @@ class Config:
         return self._data.get("server", {}).get("dot", {}).get("domain", "")
     @property
     def local_dot_cert_path(self) -> str:
-        return os.path.join(os.path.dirname(self._path), self._data.get("server", {}).get("dot", {}).get("cert_path", "certs/localhost.crt"))
+        from pathlib import Path
+        return str(Path(__file__).parent / self._data.get("server", {}).get("dot", {}).get("cert_path", "certs/localhost.crt"))
     @property
     def local_dot_key_path(self) -> str:
-        return os.path.join(os.path.dirname(self._path), self._data.get("server", {}).get("dot", {}).get("key_path", "certs/localhost.key"))
+        from pathlib import Path
+        return str(Path(__file__).parent / self._data.get("server", {}).get("dot", {}).get("key_path", "certs/localhost.key"))
     @property
     def local_dot_ipv6_enabled(self) -> bool:
         return self._data.get("server", {}).get("dot", {}).get("ipv6", {}).get("enabled", False)
@@ -347,10 +352,12 @@ class Config:
         return self._data.get("server", {}).get("doq", {}).get("domain", "")
     @property
     def local_doq_cert_path(self) -> str:
-        return os.path.join(os.path.dirname(self._path), self._data.get("server", {}).get("doq", {}).get("cert_path", "certs/localhost.crt"))
+        from pathlib import Path
+        return str(Path(__file__).parent / self._data.get("server", {}).get("doq", {}).get("cert_path", "certs/localhost.crt"))
     @property
     def local_doq_key_path(self) -> str:
-        return os.path.join(os.path.dirname(self._path), self._data.get("server", {}).get("doq", {}).get("key_path", "certs/localhost.key"))
+        from pathlib import Path
+        return str(Path(__file__).parent / self._data.get("server", {}).get("doq", {}).get("key_path", "certs/localhost.key"))
     @property
     def local_doq_ipv6_enabled(self) -> bool:
         return self._data.get("server", {}).get("doq", {}).get("ipv6", {}).get("enabled", False)

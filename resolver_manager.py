@@ -882,7 +882,10 @@ class ResolverManager:
                 self._silent_mode = False
             return result
 
-        # === 全部失败 → 更新计数器，触发跨层回调，仅一个请求执行重试 ===
+        # === 全部失败 → 静默模式下直接返回，不更新计数器、不触发回调 ===
+        if self._silent_mode:
+            return None
+
         self._last_all_failed_time = asyncio.get_event_loop().time()
         self._consecutive_all_failed_counter += 1
         if self._consecutive_all_failed_counter == 1:
@@ -896,10 +899,6 @@ class ResolverManager:
                 await self._on_all_upstreams_failed(self._consecutive_all_failed_counter, elapsed)
             except Exception:
                 pass
-
-        # 静默模式：全部失败达到阈值，不执行重试、不打印任何日志
-        if self._silent_mode:
-            return None
 
         if self._retry_lock.locked():
             # 已有其他请求在重试，这个请求直接返回（避免重复日志）

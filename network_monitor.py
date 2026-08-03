@@ -80,6 +80,10 @@ class NetworkMonitor:
         self._recovery_check_count = nm.get("recovery_check_count", 2)  # 恢复需要连续成功次数
         self._recovery_successes = 0  # 恢复检测连续成功计数
 
+        # ========== Destination Unreachable 快速断网检测（可从配置关闭）==========
+        self._wan_detect_enabled = nm.get("detect_destination_unreachable", True)
+        self._wan_unreachable_codes = nm.get("unreachable_codes", [0, 1])
+
         # DNS 探测复用解析器缓存（避免每次探测创建新 UDP 套接字）
         self._dns_probe_resolvers: Dict[str, "PlainDNSResolver"] = {}
 
@@ -121,8 +125,6 @@ class NetworkMonitor:
         self._on_network_down: Optional[callable] = None
         self._on_network_up: Optional[callable] = None
 
-        # ========== Destination Unreachable 快速断网检测（硬编码，始终启用） ==========
-        self._wan_unreachable_codes = [0, 1]  # 0=Network Unreachable, 1=Host Unreachable
         # 缓存上次探测结果（避免每轮都重复分析）
         self._last_wan_probe_result: dict = None
         self._last_wan_probe_time: float = 0.0
@@ -252,19 +254,19 @@ class NetworkMonitor:
                         self._ext_results_v6.append(ext_v6_ok)
                         ext_v6_just_checked = True
 
-                                # ========== WAN 断连快速检测（Dest Unreachable） ==========
+                # ========== WAN 断连快速检测（Dest Unreachable） ==========
                 # 当光猫运行但光纤断开时，光猫会对外网 ping 回复 ICMP type=3
                 # (Destination Unreachable)。收到来自网关的 Dest Unreachable
                 # 立即判定为 WAN 断连，跳过滑动窗口等待。
                 if not ext_ok and ext_just_checked and not self._arp_network_down and not ext_v6_ok:
                     now = asyncio.get_event_loop().time()
-                    if now - self._last_wan_probe_time >= 1.0:
+                    if now - self._last_wan_probe_time >= 1.0 and self._wan_detect_enabled:
                         await self._check_wan_unreachable()
 
                 # ========== IPv6 WAN 断开快速检测 ==========
                 if not ext_v6_ok and ext_v6_just_checked and not self._ndp_network_down and ndp_gw is not None:
                     now = asyncio.get_event_loop().time()
-                    if now - self._last_wan_probe_time_v6 >= 1.0:
+                    if now - self._last_wan_probe_time_v6 >= 1.0 and self._wan_detect_enabled:
                         await self._check_wan_unreachable_v6(ndp_gw)
 
                 # ========== 1.5 ARP 投毒检测（反制已在 _on_arp_attack 中并行执行，不暂停 DNS） ==========
@@ -279,8 +281,8 @@ class NetworkMonitor:
                                 lambda: self._is_recovered()):
                             if await self._arp_protection._ping_gateway_fast(gw_ip):
                                 logger.info("ARP 防护: 投毒修复完成，网关已恢复")
-                                self._arp_protection._baseline_mac = (
-                                    self._arp_protection.gateway_mac or "").replace("-", ":").upper()
+                                # 注意：不重新赋值 _baseline_mac！基线在 detect_gateway 启动时一次性锁定，
+                                # 此处 gateway_mac 可能已被攻击者污染，覆盖基线将导致永久错误。
                                 self._arp_protection._last_alert_mac = ""
 
                 # ========== 1.6 NDP 投毒检测（IPv6，不暂停 DNS） ==========
@@ -293,6 +295,8 @@ class NetworkMonitor:
                         if await self._ndp_protection.refresh_router_ndp(
                                 lambda: self._is_recovered()):
                             logger.info("NDP 防护: 投毒修复完成，IPv6 网关已恢复")
+                            # 注意：不重新赋值 _baseline_mac_per_gw！基线在 detect_gateway 启动时一次性锁定，
+                            # refresh_router_ndp 只发 NA 不修改基线，此处应保持。
 
                 # ========== 2. 从滑动窗口计算丢包分级 ==========
                 # 始终调用 _classify_loss 让滑动窗口真实数据判断，不会因 wan_dead 永久卡在 network_down
@@ -406,6 +410,12 @@ class NetworkMonitor:
                         self._arp_network_down = True
                         self._ndp_network_down = True
                         self.resolver_manager.set_network_down(True)
+                        # 触发断网回调：停止所有本地加密 DNS 服务
+                        if self._on_network_down is not None:
+                            try:
+                                await self._on_network_down()
+                            except Exception:
+                                pass
                 elif ext_ok and ext_just_checked and self._degraded:
                     self._recovery_successes += 1
                     if self._recovery_successes >= self._recovery_check_count:
@@ -452,6 +462,7 @@ class NetworkMonitor:
                 target,
                 gateway_ip=gw_ip,
                 timeout_ms=int(self._ping_timeout * 1000),
+                unreachable_codes=self._wan_unreachable_codes,
             )
         except Exception as e:
             logger.debug("WAN 断连检测异常: %s", e)
@@ -475,6 +486,12 @@ class NetworkMonitor:
             if not ext_v6_alive:
                 self._ndp_network_down = True
             self.resolver_manager.set_network_down(True)
+            # 触发断网回调：停止所有本地加密 DNS 服务
+            if self._on_network_down is not None:
+                try:
+                    await self._on_network_down()
+                except Exception:
+                    pass
 
             # 取消可能还在跑的 ARP 防护任务
             if self._arp_task and not self._arp_task.done():
@@ -524,6 +541,12 @@ class NetworkMonitor:
             if not ext_v4_alive:
                 self._arp_network_down = True
             self.resolver_manager.set_network_down(True)
+            # 触发断网回调：停止所有本地加密 DNS 服务
+            if self._on_network_down is not None:
+                try:
+                    await self._on_network_down()
+                except Exception:
+                    pass
 
     # ======================== 滑动窗口丢包分级 ========================
 
@@ -558,7 +581,7 @@ class NetworkMonitor:
                 ndp_fails = ndp_len - sum(self._ndp_gw_results)
                 ndp_loss = int(ndp_fails / ndp_len * 100)
                 # IPv6 正常说明网关本身可达，问题在 IPv4 层
-                if ndp_loss < 50:
+                if ndp_loss < 30:
                     gw_loss = ndp_loss
                     gw_results = self._ndp_gw_results
 
@@ -578,17 +601,16 @@ class NetworkMonitor:
 
         if ext_loss == 100 and ext_v6_loss < 67 and gw_loss < 20:
             return (gw_loss, "recovered")
-        if ext_loss == 100 and ext_v6_loss < 67:
-            ext_loss = ext_v6_loss
 
-        # Bug #2 fix        # Bug #2 fix: 网关正常但外网全丢——可能是 ONT 静默丢包（不发 Dest Unreachable）
-        if gw_loss < 20 and ext_loss == 100:
+
+        # 网关正常但外网全丢——可能是 ONT 静默丢包（不发 Dest Unreachable）
+        if gw_loss < 20 and ext_loss == 100 and ext_v6_loss >= 67:
             return (gw_loss, "network_down")
         if gw_loss < 20 and ext_loss < 100:
             return (gw_loss, "recovered")
-        elif gw_loss >= 90 and ext_loss >= 67:
+        elif gw_loss >= 90 and ext_loss >= 67 and ext_v6_loss >= 67:
             return (gw_loss, "network_down")
-        elif gw_loss >= 20:
+        elif gw_loss >= 20 and ext_v6_loss >= 67:
             return (gw_loss, "arp_issue")
         return (gw_loss, "normal")
 
@@ -671,26 +693,54 @@ class NetworkMonitor:
                     iface_task.cancel()
 
             if result:
-                # ARP 防护成功 — 强制填充滑动窗口成功结果，加速恢复判定
-                # ARP fix - let sliding window recover naturally
-                if abort_check() or await self._arp_protection._ping_gateway_fast(gw_ip):
+                # ARP 防护成功 — 使用 ping + tcping 双重验证外网
+                async def _dual_verify():
+                    ext_ping_ok = any(
+                        await asyncio.gather(*[
+                            self._ping(t) for t in self._ping_targets_v4[:2]
+                        ], return_exceptions=True)
+                    ) if self._ping_targets_v4 else False
+                    ext_tcp_ok = await self._tcping_check_v4()
+                    return ext_ping_ok or ext_tcp_ok
+
+                gw_reachable = abort_check() or await self._arp_protection._ping_gateway_fast(gw_ip)
+                if gw_reachable:
                     logger.info("ARP 防护: 后台修复完成，网关已恢复")
-                    # 如果是从 network_down 恢复，触发常驻 recover worker
-                    if self.resolver_manager._network_down:
-                        self._run_recover.set()
+                    # 双重验证外网
+                    ext_verified = await _dual_verify()
+                    if ext_verified:
+                        logger.info("ARP 防护: 外网验证通过 (ping+tcping)")
+                        if self.resolver_manager._network_down:
+                            self._run_recover.set()
+                        else:
+                            self._arp_network_down = False
+                            self.resolver_manager.set_network_down(False)
                     else:
-                        # 未标记断网（波动中快速修复），直接恢复 DNS
-                        self._arp_network_down = False
-                        self.resolver_manager.set_network_down(False)
+                        # 网关通但外网不通 → 可能是更上层的问题
+                        logger.warning("ARP 防护: 网关已恢复但外网不可达 (ping+tcping均失败)")
+                        self._arp_network_down = True
+                        self.resolver_manager.set_network_down(True)
                 else:
                     # GARP 修复后 ping 网关超时：可能是刚广播完的临时波动，
-                    # 强制标记恢复，让主循环滑动窗口自行验证
-                    logger.info("ARP 防护: 修复完成但 ping 网关超时 (临时波动)，强制恢复 DNS")
-                    self._arp_network_down = False
-                    self.resolver_manager.set_network_down(False)
+                    # 用 tcping 验证外网作为二次确认
+                    ext_verified = await _dual_verify()
+                    if ext_verified:
+                        logger.info("ARP 防护: 修复完成但 ping 网关超时，tcping 外网可达 (临时波动)")
+                        self._arp_network_down = False
+                        self.resolver_manager.set_network_down(False)
+                    else:
+                        logger.warning("ARP 防护: 修复完成且 ping 网关超时，tcping 外网也不可达")
+                        self._arp_network_down = True
+                        self.resolver_manager.set_network_down(True)
             else:
-                # ARP 防护后网关仍不通 → 检查外网
-                ext_ok = abort_check() or ((len(self._ext_results) > 0 and sum(self._ext_results) > 0) or (len(self._ext_results_v6) > 0 and sum(self._ext_results_v6) > 0))
+                # ARP 防护后网关仍不通 → 使用 ping + tcping 双重验证外网
+                ext_ping_ok = any(
+                    await asyncio.gather(*[
+                        self._ping(t) for t in self._ping_targets_v4[:2]
+                    ], return_exceptions=True)
+                ) if self._ping_targets_v4 else False
+                ext_tcp_ok = await self._tcping_check_v4()
+                ext_ok = ext_ping_ok or ext_tcp_ok
                 if not ext_ok:
                     self._arp_network_down = True
                     # 注意：IPv4 ARP 修复失败时不标记 _ndp_network_down，
@@ -716,21 +766,49 @@ class NetworkMonitor:
         try:
             result = await self._ndp_protection.refresh_router_ndp(abort_check=abort_check)
             if result:
-                # NDP 防护成功 — 强制填充滑动窗口成功结果
-                # NDP fix - let sliding window recover naturally
+                # NDP 防护成功 — ping + tcping 双重验证外网
+                async def _dual_verify_v6():
+                    ext_ping_ok = any(
+                        await asyncio.gather(*[
+                            self._ping(t) for t in self._ping_targets_v6[:2]
+                        ], return_exceptions=True)
+                    ) if self._ping_targets_v6 else False
+                    ext_tcp_ok = await self._tcping_check_v6()
+                    return ext_ping_ok or ext_tcp_ok
+
                 ndp_gw = self._ndp_protection.gateway_ipv6
                 if abort_check() or (ndp_gw and await self._ndp_protection._ping_ipv6(ndp_gw)):
                     logger.info("NDP 防护: 后台修复完成，IPv6 网关已恢复")
-                    if self.resolver_manager._network_down and not self._arp_network_down:
-                        self.resolver_manager.set_network_down(False)
-                    self._ndp_network_down = False
+                    ext_verified = await _dual_verify_v6()
+                    if ext_verified:
+                        logger.info("NDP 防护: IPv6 外网验证通过 (ping+tcping)")
+                        if self.resolver_manager._network_down and not self._arp_network_down:
+                            self.resolver_manager.set_network_down(False)
+                        self._ndp_network_down = False
+                    else:
+                        logger.warning("NDP 防护: IPv6 网关已恢复但 IPv6 外网不可达")
+                        self._ndp_network_down = True
+                        self.resolver_manager.set_network_down(True)
                 else:
-                    logger.info("NDP 防护: 修复完成但 ping IPv6 网关超时 (临时波动)，强制恢复 DNS")
-                    self._ndp_network_down = False
-                    if self.resolver_manager._network_down and not self._arp_network_down:
-                        self.resolver_manager.set_network_down(False)
+                    ext_verified = await _dual_verify_v6()
+                    if ext_verified:
+                        logger.info("NDP 防护: 修复完成但 ping IPv6 网关超时，tcping 外网可达 (临时波动)")
+                        self._ndp_network_down = False
+                        if self.resolver_manager._network_down and not self._arp_network_down:
+                            self.resolver_manager.set_network_down(False)
+                    else:
+                        logger.warning("NDP 防护: 修复完成且 ping IPv6 网关超时，tcping 外网也不可达")
+                        self._ndp_network_down = True
+                        self.resolver_manager.set_network_down(True)
             else:
-                ext_ok = abort_check() or ((len(self._ext_results) > 0 and sum(self._ext_results) > 0) or (len(self._ext_results_v6) > 0 and sum(self._ext_results_v6) > 0))
+                # NDP 修复失败 → ping + tcping 双重验证外网
+                ext_ping_ok = any(
+                    await asyncio.gather(*[
+                        self._ping(t) for t in self._ping_targets_v6[:2]
+                    ], return_exceptions=True)
+                ) if self._ping_targets_v6 else False
+                ext_tcp_ok = await self._tcping_check_v6()
+                ext_ok = ext_ping_ok or ext_tcp_ok
                 if not ext_ok:
                     self._ndp_network_down = True
                     self.resolver_manager.set_network_down(True)
@@ -745,29 +823,6 @@ class NetworkMonitor:
             self._ndp_last_end_time = asyncio.get_event_loop().time()
 
     # ======================== 连通性检测 ========================
-
-    async def _check_connectivity(self) -> bool:
-        """
-        综合检测网络连通性
-        检测方式（任一成功即视为连通）：
-        1. ICMP ping 检测（IPv4 + IPv6 双栈）
-        2. DNS 探测（向公共 DNS 发送 A/AAAA 查询）
-        """
-        results = await asyncio.gather(
-            self._ping_check_v4(),
-            self._ping_check_v6(),
-            self._dns_probe_check(),
-            return_exceptions=True,
-        )
-
-        successes = sum(1 for r in results if r is True)
-        if successes > 0:
-            logger.debug("网络连通性检测: %d/3 成功 (ping4=%s, ping6=%s, dns=%s)",
-                         successes, results[0], results[1], results[2])
-            return True
-        else:
-            logger.debug("网络连通性检测: 全部失败")
-            return False
 
     async def _ping_check_v4(self) -> bool:
         """ICMP ping IPv4 目标"""
@@ -819,18 +874,55 @@ class NetworkMonitor:
         # ICMP 失败时尝试 TCP 连接兜底（端口 443/80）
         # Windows 上 scapy 的 L2pcapListenSocket 可能会拦截 ping.exe 的 ICMP Echo Reply，
         # 导致 ping.exe 超时返回非零退出码。TCP 兜底不受 scapy 原始套接字影响。
+        if await self._tcping(target, port=443):
+            return True
         if not is_ipv6:
-            for port in (443, 80):
-                try:
-                    _, writer = await asyncio.wait_for(
-                        asyncio.open_connection(target, port),
-                        timeout=min(self._ping_timeout + 2, 5.0),
-                    )
-                    writer.close()
-                    await writer.wait_closed()
-                    return True
-                except (asyncio.TimeoutError, OSError, ConnectionError):
-                    continue
+            if await self._tcping(target, port=80):
+                return True
+        return False
+
+    async def _tcping(self, target: str, port: int = 443, timeout_sec: float = 3.0) -> bool:
+        """
+        TCP 连接测试（tcping）：尝试与目标 IP:端口建立 TCP 连接。
+        用于验证外网是否正常通信，不受 ICMP 被拦截的影响。
+
+        Args:
+            target: 目标 IP（IPv4 或 IPv6）
+            port: TCP 端口，默认 443
+            timeout_sec: 连接超时秒数
+
+        Returns:
+            True 表示 TCP 连接成功（外网可达）
+        """
+        try:
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(target, port),
+                timeout=timeout_sec,
+            )
+            writer.close()
+            await writer.wait_closed()
+            return True
+        except (asyncio.TimeoutError, OSError, ConnectionError, ValueError):
+            return False
+
+    async def _tcping_check_v4(self) -> bool:
+        """TCP 连接测试 IPv4 外网目标"""
+        if not self._ping_targets_v4:
+            return False
+        for target in self._ping_targets_v4[:3]:  # 最多测试3个
+            if await self._tcping(target, port=443):
+                return True
+            if await self._tcping(target, port=80):
+                return True
+        return False
+
+    async def _tcping_check_v6(self) -> bool:
+        """TCP 连接测试 IPv6 外网目标"""
+        if not self._ping_targets_v6:
+            return False
+        for target in self._ping_targets_v6[:3]:
+            if await self._tcping(target, port=443):
+                return True
         return False
 
     async def _dns_probe_check(self) -> bool:
@@ -878,6 +970,32 @@ class NetworkMonitor:
                     logger.debug("网络监控 ping 异常: %s", e)
                     continue
         return False
+
+    async def _check_connectivity(self) -> bool:
+        """
+        综合检测网络连通性
+        检测方式（任一成功即视为连通）：
+        1. ICMP ping 检测（IPv4 + IPv6 双栈）
+        2. TCP 连接测试（tcping，IPv4 + IPv6）
+        3. DNS 探测（向公共 DNS 发送 A/AAAA 查询）
+        """
+        results = await asyncio.gather(
+            self._ping_check_v4(),
+            self._ping_check_v6(),
+            self._tcping_check_v4(),
+            self._tcping_check_v6(),
+            self._dns_probe_check(),
+            return_exceptions=True,
+        )
+
+        successes = sum(1 for r in results if r is True)
+        if successes > 0:
+            logger.debug("网络连通性检测: %d/5 成功 (ping4=%s, ping6=%s, tcp4=%s, tcp6=%s, dns=%s)",
+                         successes, results[0], results[1], results[2], results[3], results[4])
+            return True
+        else:
+            logger.debug("网络连通性检测: 全部失败")
+            return False
 
     # ======================== 自动恢复 ========================
 
