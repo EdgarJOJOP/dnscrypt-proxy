@@ -1818,7 +1818,11 @@ class NDPProtection:
                 from scapy.layers.dhcp6 import DHCP6_Advertise, DHCP6_Reply
 
                 def _capture():
-                    return sniff(filter="udp and (port 546 or port 547)", count=20, timeout=3.0,
+                    _iface = self._get_scapy_phys_iface()
+                    if not _iface:
+                        logger.debug("NDP 防护 [T9]: 无可用物理 NPF 接口，跳过 DHCPv6 嗅探")
+                        return []
+                    return sniff(iface=_iface, filter="udp and (port 546 or port 547)", count=20, timeout=3.0,
                                  lfilter=lambda p: p.haslayer(DHCP6_Advertise) or p.haslayer(DHCP6_Reply),
                                  quiet=True)
                 pkts = await loop.run_in_executor(None, _capture)
@@ -1863,12 +1867,23 @@ class NDPProtection:
                         ns = ICMPv6ND_NS(target=gw_ip)
                         src_lla = ICMPv6NDOptSrcLLAddr(lladdr=iface.mac)
                         ipv6 = IPv6(src=local_ll, dst=ns_dst_ipv6, hlim=255)
-                        sendp(eth / ipv6 / ns / src_lla, iface=iface.name, verbose=False)
-                    na_pkts = sniff(filter="icmp6", count=5, timeout=timeout,
-                                    lfilter=lambda p: p.haslayer(ICMPv6ND_NA) and
-                                                      p.haslayer(ICMPv6NDOptDstLLAddr) and
-                                                      str(p[ICMPv6ND_NA].tgt) == gw_ip,
-                                    quiet=True)
+                        # SF-5 整改：Windows 用 NPF 名解析（npcap 驱动停止、仅 Loopback 时为 "" → 跳过 sendp）；
+                        # 非 Windows 保留 iface.name（Linux/macOS 上 scapy 认接口名，不能走 NPF 解析）
+                        if sys.platform == "win32":
+                            _send_iface = self._resolve_npf_iface_name(iface.mac)
+                        else:
+                            _send_iface = iface.name
+                        if _send_iface:
+                            sendp(eth / ipv6 / ns / src_lla, iface=_send_iface, verbose=False)
+                    _iface = self._get_scapy_phys_iface()
+                    if _iface:
+                        na_pkts = sniff(iface=_iface, filter="icmp6", count=5, timeout=timeout,
+                                        lfilter=lambda p: p.haslayer(ICMPv6ND_NA) and
+                                                          p.haslayer(ICMPv6NDOptDstLLAddr) and
+                                                          str(p[ICMPv6ND_NA].tgt) == gw_ip,
+                                        quiet=True)
+                    else:
+                        na_pkts = []
                     for pkt in na_pkts:
                         na = pkt[ICMPv6ND_NA]
                         if na.haslayer(ICMPv6NDOptDstLLAddr):
@@ -2583,13 +2598,37 @@ class NDPProtection:
 
     # ======================== sniff 分发 ========================
 
+    def _get_scapy_phys_iface(self) -> str:
+        """返回 scapy 可打开/可发送的物理接口（get_if_list 首个非 Loopback NPF 设备）。
+
+        SF-5 修复（sniff 打开适配器失败）：npcap 内核驱动服务未运行时，物理网卡 NPF
+        设备不再枚举，get_if_list 仅剩 \\Device\\NPF_Loopback（本机该设备打开报
+        "Error opening adapter: 系统找不到指定的路径 (3)"）；若 sniff/sendp 不带
+        iface 使用 scapy 默认接口会踩中该错误。此辅助返回可用物理接口名，无物理
+        接口时返回 ""（调用方跳过 sniff，走系统 fallback，不再报错）。
+        """
+        try:
+            from scapy.all import get_if_list
+            for _i in get_if_list() or []:
+                _il = _i.lower()
+                # 排除 loopback 子串（Windows \\Device\\NPF_Loopback）与 Linux 回环口精确名 lo
+                if "loopback" not in _il and _il != "lo":
+                    return _i
+        except Exception:
+            pass
+        return ""
+
     async def _sniff_all(self) -> dict:
         if not self._scapy_available:
             return {"t2_ns": [], "t3_ra": [], "t4_dad": [], "t6_redirect": []}
         loop = asyncio.get_event_loop()
 
         def _capture():
-            return sniff(filter="icmp6", count=200, timeout=4.0,
+            _iface = self._get_scapy_phys_iface()
+            if not _iface:
+                logger.debug("NDP 防护: 无可用物理 NPF 接口（npcap 驱动可能未运行），跳过 sniff")
+                return []
+            return sniff(iface=_iface, filter="icmp6", count=200, timeout=4.0,
                          lfilter=lambda p: p.haslayer(Ether) and p.haslayer(IPv6) and (
                              p.haslayer(ICMPv6ND_NA) or p.haslayer(ICMPv6ND_NS) or
                              p.haslayer(ICMPv6ND_RA) or p.haslayer(ICMPv6ND_Redirect) or p.haslayer(ICMPv6Error)),
@@ -3094,34 +3133,50 @@ class NDPProtection:
         return iface_mac or ""
 
     def _resolve_npf_iface_name(self, iface_mac: str) -> str:
-        """按本机 MAC 匹配 get_windows_if_list 取 \\Device\\NPF_{GUID} 设备名。
+        """按本机 MAC 匹配 NPF 设备名（scapy sendp 可发送接口）。
 
         M2 修复：scapy sendp 的 iface 参数在 Windows 上只认 NPF 设备名/NPF 枚举序号，
         netsh 接口索引（iface.idx）与中文接口名均无效；按 MAC 匹配 NPF 设备名
         才能在 Npcap 正常接管物理网卡时精确发送。匹配失败返回 ""（scapy 默认接口）。
+
+        SF-4 修复（NA 发送不可用根因）：get_windows_if_list() 返回条目的 name 是
+        Windows 友好名（如 "以太网 2-Npcap Packet Driver (NPCAP)-0000"），并非
+        \\Device\\NPF_... 形式；其中 name 含 "NPCAP" 的条目是 Npcap 捕获过滤器
+        （filter）虚拟条目，其 guid 对应的 NPF 设备不可发包。原 "NPCAP" in name
+        优先匹配恰好选中该条目 → 返回无效 NPF 设备名 → sendp 抛异常被吞 →
+        future=False → NA 发送全部失败走系统 fallback。修复：跳过 filter 类条目，
+        候选 NPF 名必须与 scapy get_if_list()（实际可发送接口）交叉验证后才返回；
+        全部不匹配时返回 ""（scapy 默认接口，实测可正常发送）。
         """
         if sys.platform != "win32" or not iface_mac:
             return ""
         try:
             from scapy.arch.windows import get_windows_if_list
+            from scapy.all import get_if_list
             mac_n = str(iface_mac or "").lower().replace("-", ":")
             if not mac_n or mac_n == "00:00:00:00:00:00":
                 return ""
             wl = get_windows_if_list()
-            # 优先 Npcap Packet Driver 条目（hostcap/WFP 等过滤器的 NPF 设备不可发包）
+            try:
+                valid_npf = set(get_if_list() or [])
+            except Exception:
+                valid_npf = set()
+            # Npcap 捕获过滤器/虚拟条目（name 带这些标记的 guid 不可发包）
+            _filter_markers = ("filter", "hostcap", "qos", "npcap",
+                               "wfp", "ndis", "lightweight", "scheduler")
+            # 优先基础物理接口条目：MAC 匹配 + 非 filter 类 + NPF 名经 get_if_list 验证
             for w in wl:
                 wm = str(w.get("mac", "") or "").lower().replace("-", ":")
-                if wm == mac_n:
-                    guid = w.get("guid", "")
-                    if guid and "NPCAP" in str(w.get("name", "") or "").upper():
-                        return f"\\Device\\NPF_{guid}"
-            # 兜底：任一同 MAC 条目
-            for w in wl:
-                wm = str(w.get("mac", "") or "").lower().replace("-", ":")
-                if wm == mac_n:
-                    guid = w.get("guid", "")
-                    if guid:
-                        return f"\\Device\\NPF_{guid}"
+                if wm != mac_n:
+                    continue
+                guid = w.get("guid", "")
+                name = str(w.get("name", "") or "").lower()
+                if not guid or any(k in name for k in _filter_markers):
+                    continue
+                cand = f"\\Device\\NPF_{guid}"
+                # get_if_list 不可用时（valid_npf 空）退而接受首个非 filter 条目
+                if not valid_npf or cand in valid_npf:
+                    return cand
         except Exception:
             pass
         return ""
@@ -3173,54 +3228,6 @@ class NDPProtection:
         except Exception:
             pass
         return success
-
-    async def _send_rs(self):
-        """发送 Router Solicitation（ff02::2）。L6 修复：优先经 ARP 常驻发送器
-        （scapy 资源单进程独占），失败回退 NDP 自有 sendp/AF_PACKET 路径。"""
-        arp_sender = getattr(self, "_arp_sender", None)
-        arp_ok = (arp_sender is not None
-                  and getattr(arp_sender, "_scapy_sender_ready", False))
-        for iface in self.interfaces:
-            local = iface.ipv6_ll or iface.ipv6_global
-            if not local or not iface.mac:
-                continue
-            local = local.split("%")[0]
-            if arp_ok:
-                iface_arg = self._resolve_npf_iface_name(iface.mac) or ""
-                try:
-                    fut = arp_sender.enqueue_ndp_na(
-                        iface.mac, local, "", iface_arg, count=1,
-                        dst_mac="33:33:00:00:00:02", inter=0.02,
-                        vlan_id=self._manual_gateway_vlan, kind="RS",
-                    )
-                    if fut is not None:
-                        try:
-                            await asyncio.wait_for(fut, timeout=3.0)
-                        except asyncio.TimeoutError:
-                            pass
-                        continue
-                except Exception:
-                    pass
-            # 回退：NDP 自有 sendp（executor 包装，与旧行为一致）
-            if not self._scapy_available:
-                continue
-            loop = asyncio.get_event_loop()
-
-            def _send(iface=iface, local=local):
-                try:
-                    eth = Ether(dst="33:33:00:00:00:02", src=iface.mac)
-                    rs = ICMPv6ND_RS()
-                    lla = ICMPv6NDOptSrcLLAddr(lladdr=iface.mac)
-                    ipv6 = IPv6(src=local, dst="ff02::2", hlim=255)
-                    sendp(eth / ipv6 / rs / lla, iface=iface.name, verbose=False)
-                except Exception:
-                    pass
-
-            try:
-                await loop.run_in_executor(None, _send)
-            except Exception:
-                pass
-        logger.debug("NDP 防护: RS 发送完成（经 ARP 发送器=%s）", arp_ok)
 
     async def protect_ndp_entry(self) -> bool:
         success = True

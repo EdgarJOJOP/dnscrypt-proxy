@@ -162,6 +162,34 @@ class NetworkMonitor:
         logger.info("网络连通性监控已启动 (网关检测=%gs, ping目标=%s)",
                      self._interval, self._ping_targets_v4 + self._ping_targets_v6)
 
+        # Npcap 服务保障：ARP/NDP 的 scapy 二层收发依赖 npcap 内核驱动（npcap 服务停止时
+        # 物理网卡 NPF 设备不枚举，sendp/sniff 报 "Error opening adapter: 系统找不到指定的路径 (3)"）。
+        # main.py 以管理员权限运行，此处启动防护前尝试拉起服务；失败不阻断（走系统 fallback）。
+        if sys.platform == "win32" and (self._arp_protection.enabled or self._ndp_protection.enabled):
+            try:
+                _npcap_proc = await asyncio.create_subprocess_exec(
+                    "net", "start", "npcap",
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                )
+                try:
+                    _npcap_out, _npcap_err = await asyncio.wait_for(_npcap_proc.communicate(), timeout=5)
+                except asyncio.TimeoutError:
+                    # SF-6 整改：超时后显式 kill，避免残留孤儿 net.exe
+                    try:
+                        _npcap_proc.kill()
+                    except Exception:
+                        pass
+                    raise
+                _npcap_rc = _npcap_proc.returncode
+                _npcap_text = (_npcap_out + _npcap_err).decode("utf-8", errors="replace").strip()
+                if _npcap_rc == 0 or "RUNNING" in _npcap_text.upper() or "已经启动" in _npcap_text:
+                    logger.info("网络监控: npcap 服务已就绪（net start npcap rc=%s）", _npcap_rc)
+                else:
+                    logger.warning("网络监控: net start npcap 未成功（rc=%s %s），ARP/NDP 走系统 fallback",
+                                   _npcap_rc, _npcap_text)
+            except Exception as e:
+                logger.warning("网络监控: net start npcap 执行异常（不影响启动）: %s", e)
+
         # ScapyBridge：ARP/NDP 共享单一 Npcap 嗅探会话（审计合并，减少驱动会话占用）
         # 配置开关：仅当 ARP 或 NDP 防护 enabled 时才启动桥；两者都关则桥不启动
         try:

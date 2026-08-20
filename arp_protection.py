@@ -164,6 +164,36 @@ class ARPProtection:
         # ========== 反制 MAC 追踪（精确防环路，替代前缀过滤）==========
         self._counterstrike_sent_macs: set = set()  # 自身反制已发送过的随机MAC集合
 
+    def _resolve_sendp_iface(self) -> str:
+        """返回 scapy sendp 可发送接口（Windows 优先 NPF 设备名，回退 _interface_name → "" 默认接口）。
+
+        SF-6：self._interface_name 是 ipconfig 解析的 Windows 适配器名（如"以太网 2"），
+        scapy sendp 不认 → 按本机 MAC 匹配 \\Device\\NPF_{GUID}（与 get_if_list 交叉验证），
+        匹配失败回退 _interface_name（可能无效）→ ""（scapy 默认接口，实测可发送）。
+        """
+        if sys.platform == "win32" and self._local_mac:
+            try:
+                from scapy.arch.windows import get_windows_if_list
+                from scapy.all import get_if_list
+                mac_n = str(self._local_mac).lower().replace("-", ":")
+                valid_npf = set(get_if_list() or [])
+                _filter_markers = ("filter", "hostcap", "qos", "npcap",
+                                   "wfp", "ndis", "lightweight", "scheduler")
+                for w in get_windows_if_list() or []:
+                    wm = str(w.get("mac", "") or "").lower().replace("-", ":")
+                    if wm != mac_n:
+                        continue
+                    guid = w.get("guid", "")
+                    name = str(w.get("name", "") or "").lower()
+                    if not guid or any(k in name for k in _filter_markers):
+                        continue
+                    cand = f"\\Device\\NPF_{guid}"
+                    if not valid_npf or cand in valid_npf:
+                        return cand
+            except Exception:
+                pass
+        return self._interface_name or ""
+
     async def _scapy_sender_worker_loop(self):
         """常驻 scapy 发送器：一次性导入 scapy，从队列取任务发送，进程冻结"""
         if not _SCAPY_AVAILABLE:
@@ -293,7 +323,7 @@ class ARPProtection:
                 loop = asyncio.get_event_loop()
                 await loop.run_in_executor(
                     None,
-                    lambda p=spoof_pkt, i=self._interface_name or "": sendp(p, iface=i, verbose=False, count=count, inter=inter),
+                    lambda p=spoof_pkt, i=self._resolve_sendp_iface(): sendp(p, iface=i, verbose=False, count=count, inter=inter),
                 )
                 logger.warning("ARP 反制: 定向反击 %s (%s) -> %s x%d", src_ip, dst_mac, poison_mac, count)
             except Exception as e:
@@ -2704,7 +2734,7 @@ class ARPProtection:
                             )
                         except Exception:
                             pass
-                    sendp(garp_pkt, iface=self._interface_name or "",
+                    sendp(garp_pkt, iface=self._resolve_sendp_iface(),
                           verbose=False, count=1, inter=0)
                     return True
                 except Exception as e:
@@ -3080,7 +3110,7 @@ class ARPProtection:
                             )
                         except Exception:
                             pass
-                    sendp(garp_pkt, iface=self._interface_name or "",
+                    sendp(garp_pkt, iface=self._resolve_sendp_iface(),
                           verbose=False, count=1, inter=0)
                     if inter > 0:
                         await asyncio.sleep(inter)
