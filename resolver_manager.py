@@ -93,13 +93,16 @@ class UpstreamServer:
             "doh": self._SCORE_BONUS_DOH,
             "doq": self._SCORE_BONUS_DOQ,
             "dot": self._SCORE_BONUS_DOT,
+            "iterative": self._SCORE_BONUS_DOH,  # 迭代解析同 DoH 偏好（独立 DNSSEC 严格验证）
         }.get(self.server_type, 0)
         score += proto_bonus
         # 失败扣分
         score -= self.failures * self._SCORE_WEIGHT_FAILURES
         score -= self.consecutive_failures * self._SCORE_WEIGHT_FAILURES * 3
-        # 延迟扣分：每100ms扣分，平滑处理
-        score -= int(self.avg_response_time / 0.1) * self._SCORE_WEIGHT_LATENCY
+        # 延迟扣分：每100ms扣分，平滑处理。无历史数据（avg=999 默认值）时不扣分
+        #——否则迭代解析（首次参与、无延迟样本）会被初始 999 排除出首波优选
+        if self.avg_response_time < 999.0:
+            score -= int(self.avg_response_time / 0.1) * self._SCORE_WEIGHT_LATENCY
         return score
 
     def record_success(self, response_time: Optional[float] = None):
@@ -131,8 +134,10 @@ class ResolverManager:
 
     def __init__(self, config: Config, dnssec_wrapper: Optional[DNSSECQueryWrapper] = None,
                  consistency_verifier: Optional[ResponseConsistencyVerifier] = None,
-                 anomaly_detector: Optional[AnomalyDetector] = None):
+                 anomaly_detector: Optional[AnomalyDetector] = None,
+                 iterative_resolver: Optional["IterativeResolver"] = None):
         self.config = config
+        self._iterative_resolver = iterative_resolver  # 迭代解析上游（根→TLD→权威）
         self._upstream_servers: List[UpstreamServer] = []
         self._bootstrap_resolvers: List[UpstreamServer] = []
         self._bootstrap_cache: Dict[str, List[str]] = {}  # hostname -> [ips]
@@ -604,6 +609,18 @@ class ResolverManager:
                                    ca_path=ca_path or "")
             self._upstream_servers.append(UpstreamServer(resolver, "doq"))
 
+        # 迭代解析上游（根→TLD→权威）：与加密上游一起注册，参与并行优选，
+        # 供全部本地加密 DNS 服务（DoH/DoT/DoQ/plain）使用。
+        # DNSSEC 严格验证在迭代器内部完成（内置 IANA 根信任锚全链验证）。
+        if self._iterative_resolver is not None:
+            self._upstream_servers.append(
+                UpstreamServer(self._iterative_resolver, "iterative")
+            )
+            logger.info("迭代解析上游已注册（根→TLD→权威 + DNSSEC 严格验证，"
+                        "与 %d 个加密上游一起参与优选）",
+                        len(self.config.doh_servers) + len(self.config.dot_servers)
+                        + len(self.config.doq_servers))
+
     def _merge_local_server_certs(self, base_ca_path: str) -> Optional[str]:
         """
         将本地 DoH/DoT/DoQ 服务器的自签名证书合并到 CA 信任链。
@@ -719,6 +736,8 @@ class ResolverManager:
             bg_count = self.config.response_verification_max_background_servers
             if bg_count > 0 and preferred:
                 exclude_names = set(s.name for s in preferred)
+                # 后台一致性验证排除 iterative（security_review MEDIUM：避免
+                # 慢速迭代拖住后台对照；iterative 本身已有独立 DNSSEC 严格验证）
                 all_enabled = [
                     s for s in self._upstream_servers if s.enabled
                     and s.server_type in ("doh", "dot", "doq")
@@ -727,7 +746,8 @@ class ResolverManager:
                 import random
                 selected = random.sample(all_enabled, min(bg_count, len(all_enabled))) if all_enabled else []
             else:
-                selected = self._select_encrypted_upstreams(count=max(bg_count, 3))
+                selected = [s for s in self._select_encrypted_upstreams(count=max(bg_count, 3))
+                           if s.server_type != "iterative"]
             if selected:
                 asyncio.create_task(
                     self._background_consistency_check(
@@ -747,15 +767,17 @@ class ResolverManager:
         4. 异步刷新 bootstrap IP 缓存（失败不影响恢复）
         """
         logger.info("触发上游服务器自动恢复...")
-        # 重置所有持久连接
+        # 重置所有持久连接（迭代解析器无连接可重置，hasattr 跳过）
         for server in self._upstream_servers:
             try:
-                await server.resolver.reset_connections()
+                if hasattr(server.resolver, "reset_connections"):
+                    await server.resolver.reset_connections()
             except Exception as e:
                 logger.debug("解析管理器重置上游连接异常: %s", e)
         for server in self._bootstrap_resolvers:
             try:
-                await server.resolver.reset_connections()
+                if hasattr(server.resolver, "reset_connections"):
+                    await server.resolver.reset_connections()
             except Exception as e:
                 logger.debug("解析管理器重置 bootstrap 连接异常: %s", e)
         # 保存旧缓存作为后备，然后清除（刷新成功后会重新填充）
@@ -978,7 +1000,7 @@ class ResolverManager:
             return []
         encrypted = [
             s for s in self._upstream_servers
-            if s.enabled and s.server_type in ("doh", "dot", "doq")
+            if s.enabled and s.server_type in ("doh", "dot", "doq", "iterative")
         ]
         # 全类型按平均延迟升序排序（延迟数据已存在，无需额外测量）
         encrypted.sort(key=lambda s: s.avg_response_time)
@@ -1001,7 +1023,7 @@ class ResolverManager:
         """
         encrypted = [
             s for s in self._upstream_servers
-            if s.enabled and s.server_type in ("doh", "dot", "doq")
+            if s.enabled and s.server_type in ("doh", "dot", "doq", "iterative")
         ]
         # 按健康评分从高到低排序
         encrypted.sort(key=lambda s: s.health_score, reverse=True)
@@ -1047,7 +1069,16 @@ class ResolverManager:
 
         tasks = [asyncio.create_task(query_one(s)) for s in servers]
         remaining = set(tasks)
-        deadline = asyncio.get_event_loop().time() + remaining_timeout
+        # SF-1 修复：迭代解析（根→TLD→权威 + DNSSEC 链验证）单次查询需 15-52s，
+        # 远超 parallel_timeout（2s）——若波次含 iterative 上游，deadline 按其
+        # total_timeout 预算放大（加密上游成功仍由 FIRST_COMPLETED 提前返回，
+        # 不影响快速路径；加密上游全失败时 iterative 可完成迭代兜底，而非被 2s 截断）
+        _iter_budget = 0.0
+        if any(getattr(s, "server_type", "") == "iterative" for s in servers):
+            _iter_budget = float(getattr(
+                getattr(self, "_iterative_resolver", None), "total_timeout", 30.0,
+            ))
+        deadline = asyncio.get_event_loop().time() + max(remaining_timeout, _iter_budget)
         successful = []
 
         while remaining and not successful:
@@ -1094,7 +1125,11 @@ class ResolverManager:
         timeout = self.config.parallel_timeout
 
         # 第一波：按健康评分选最优的 3 个加密上游（DoH/DoT/DoQ）
-        first_wave = self._select_encrypted_upstreams(count=3)
+        # 首波：仅加密上游（DoH/DoT/DoQ）——iterative 迭代解析耗时 15-52s，
+        # 混入首波会在加密上游全失败时拖住全部本地 DNS 服务（security_review
+        # MEDIUM）；iterative 只进备用波作迭代兜底（deadline 按其 total_timeout 放大）
+        first_wave = [s for s in self._select_encrypted_upstreams(count=3)
+                      if s.server_type != "iterative"]
         if first_wave:
             logger.debug("首波查询: %d 个最优上游", len(first_wave))
             result = await self._try_upstream_wave(
@@ -1109,7 +1144,7 @@ class ResolverManager:
         remaining = [
             s for s in enabled
             if s not in first_wave
-            and s.server_type in ("doh", "dot", "doq")
+            and s.server_type in ("doh", "dot", "doq", "iterative")
         ]
         if remaining:
             logger.debug("备用查询: 尝试剩余 %d 个加密上游", len(remaining))

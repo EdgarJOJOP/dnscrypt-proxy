@@ -221,9 +221,17 @@ class DNSProxyApp:
 
         # 3b. 提前创建 ResolverManager 并启动 bootstrap DNS 解析（与 NTP、过滤规则并行）
         #     先不传 consistency_verifier/anomaly_detector（步骤 4.5 创建后再设）
+        #     迭代解析器（根→TLD→权威）作为独立上游注入 ResolverManager，
+        #     与 DoH/DoT/DoQ 一起参与并行优选，供全部本地加密 DNS 服务使用
+        self.iterative_resolver = None
+        if self.config.plain_dns_iterative_enabled:
+            from plain_dns_server import IterativeResolver
+            self.iterative_resolver = IterativeResolver(self.config)
+            logger.info("  迭代解析器已创建（根→TLD→权威 + DNSSEC 严格验证，作为上游参与优选）")
         self.resolver_manager = ResolverManager(
             self.config, dnssec_wrapper=self._dnssec_wrapper,
             consistency_verifier=None, anomaly_detector=None,
+            iterative_resolver=self.iterative_resolver,
         )
         self._bootstrap_init_task = asyncio.create_task(
             self.resolver_manager._init_bootstrap()
@@ -402,6 +410,7 @@ class DNSProxyApp:
             self.filter_engine,
             self.request_logger,
             dnssec_wrapper=self._dnssec_wrapper,
+            iterative_resolver=self.iterative_resolver,
         )
         if self.config.plain_dns_enabled:
             logger.info("  普通 DNS 服务器已启用（UDP 53）")

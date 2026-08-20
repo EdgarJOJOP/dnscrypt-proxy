@@ -190,6 +190,77 @@ class ARPProtection:
             if task is None:
                 break
             try:
+                # NDP 任务（复用本常驻发送器：NDP 侧不再重复 import scapy 直接 sendp，
+                # 避免 scapy/Npcap 发送资源在同一进程内被 ARP 常驻发送器独占导致 NDP sendp 永久降级）
+                # 任务元组: ("NDP_NA", iface_mac, src_ip, tgt_ip, dst_mac, iface, count, inter, vlan_id, kind, fut)
+                #   kind="NA"（Unsolicited/定向 NA）| "RS"（Router Solicitation）
+                #   dst_mac="ff:ff:ff:ff:ff:ff" 广播；定向=攻击者 MAC；RS=33:33:00:00:00:02
+                if isinstance(task, tuple) and task and task[0] == "NDP_NA":
+                    try:
+                        (_na_mac, _na_src_ip, _na_tgt_ip, _na_dst_mac,
+                         _na_iface, _na_count, _na_inter, _na_vlan, _na_kind, _na_fut) = task[1:]
+                        from scapy.all import (IPv6, ICMPv6ND_NA, ICMPv6NDOptDstLLAddr,
+                                               ICMPv6ND_RS, ICMPv6NDOptSrcLLAddr)
+                        _na_mac = (_na_mac or "00:00:00:00:00:00").replace("-", ":").upper()
+                        _na_dst_mac = str(_na_dst_mac or "ff:ff:ff:ff:ff:ff").replace("-", ":").upper()
+                        _na_count = int(_na_count or 5)
+                        _na_inter = float(_na_inter or 0.02)
+                        _na_loop = asyncio.get_event_loop()
+                        if _na_kind == "RS":
+                            _na_pkt = (
+                                Ether(dst="33:33:00:00:00:02", src=_na_mac)
+                                / IPv6(src=_na_src_ip, dst="ff02::2", hlim=255)
+                                / ICMPv6ND_RS()
+                                / ICMPv6NDOptSrcLLAddr(lladdr=_na_mac)
+                            )
+                            _na_ip_dst = "ff02::2"
+                        else:
+                            _na_tgt_ip = str(_na_tgt_ip or "ff02::1").split("%")[0]
+                            _na_ip_dst = "ff02::1" if _na_dst_mac == "FF:FF:FF:FF:FF:FF" else _na_tgt_ip
+                            _na_pkt = (
+                                Ether(dst=_na_dst_mac, src=_na_mac)
+                                / IPv6(src=_na_src_ip, dst=_na_ip_dst, hlim=255)
+                                / ICMPv6ND_NA(R=1, S=0, O=1, tgt=_na_tgt_ip)
+                                / ICMPv6NDOptDstLLAddr(lladdr=_na_mac)
+                            )
+                        # VLAN 802.1Q / VXLAN 封装（对称于 ARP 反制路径）
+                        if _na_vlan and not self._vxlan_enabled:
+                            try:
+                                from scapy.all import Dot1Q
+                                _na_pkt = (Ether(dst=_na_dst_mac, src=_na_mac)
+                                           / Dot1Q(vlan=int(_na_vlan))
+                                           / _na_pkt.payload)
+                            except Exception:
+                                pass
+                        elif _na_vlan and self._vxlan_enabled:
+                            try:
+                                from scapy.all import VXLAN, IP, UDP
+                                from scapy.all import IPv6 as ScapyIPv6
+                                inner_pkt = _na_pkt
+                                # SF-3 修复：NDP 为 IPv6 报文，VXLAN 外层必须用
+                                # IPv6 封装（原 IP(dst=IPv6地址) 必抛异常被吞 → 静默降级）
+                                _na_outer_dst = _na_ip_dst
+                                _na_pkt = (Ether(dst=_na_dst_mac, src=_na_mac)
+                                           / ScapyIPv6(src=_na_src_ip, dst=_na_outer_dst, hlim=64)
+                                           / UDP(sport=4789, dport=4789)
+                                           / VXLAN(vni=int(_na_vlan))
+                                           / inner_pkt)
+                            except Exception:
+                                logger.debug("ARP 反制: NDP VXLAN 封装失败，走无标签发送")
+                        await _na_loop.run_in_executor(
+                            None,
+                            lambda p=_na_pkt, i=_na_iface or "", n=_na_count, it=_na_inter: sendp(
+                                p, iface=i, verbose=False, count=n, inter=it),
+                        )
+                        if _na_fut is not None and not _na_fut.done():
+                            _na_fut.set_result(True)
+                        logger.info("ARP 反制: NDP %s %s -> %s x%d 已通过常驻发送器发出",
+                                    _na_kind or "NA", _na_src_ip, _na_ip_dst, _na_count)
+                    except Exception as e:
+                        if _na_fut is not None and not _na_fut.done():
+                            _na_fut.set_result(False)
+                        logger.debug("ARP 反制: NDP 发送失败 (%s)", e)
+                    continue
                 dst_mac, src_mac, src_ip, poison_mac, count, inter, vlan_id = task
                 # 帧源 MAC 用本机真实 MAC（原 _local_mac_win 从未赋值恒为 None → 全零源帧被交换机丢弃）
                 _frame_src = (src_mac or self._local_mac or "00:00:00:00:00:00").replace("-", ":").upper()
@@ -227,6 +298,35 @@ class ARPProtection:
                 logger.warning("ARP 反制: 定向反击 %s (%s) -> %s x%d", src_ip, dst_mac, poison_mac, count)
             except Exception as e:
                 logger.debug("ARP 反制: 定向发送失败 (%s)", e)
+
+    def enqueue_ndp_na(self, iface_mac: str, local_ip: str, target_ip: str,
+                       iface_arg=None, count: int = 5, dst_mac: str = None,
+                       inter: float = 0.02, vlan_id: str = None,
+                       kind: str = "NA") -> Optional[asyncio.Future]:
+        """复用常驻 scapy 发送器发送 NDP 报文（供 NDP 防护调用）。
+
+        scapy/Npcap 发送资源在同一进程内由本常驻 worker（队列 + run_in_executor）
+        独占，NDP 侧不再重复 import scapy 直接 sendp（否则永久降级系统 fallback）。
+        - kind="NA"：Unsolicited/定向 NA（tgt=target_ip，LLA=iface_mac）；
+          dst_mac="ff:ff:ff:ff:ff:ff" 广播宣告本机，定向=攻击者 MAC 毒化其邻居缓存
+        - kind="RS"：Router Solicitation（发往 ff02::2，忽略 target_ip）
+        返回 asyncio.Future：发送完成后 set_result(True/False)；
+        发送器未就绪或队列满时返回 None（调用方回退系统方法）。
+        """
+        if not _SCAPY_AVAILABLE or not getattr(self, "_scapy_sender_ready", False):
+            return None
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        try:
+            self._scapy_sender_queue.put_nowait(
+                ("NDP_NA", iface_mac, local_ip, target_ip,
+                 dst_mac, iface_arg, count, inter, vlan_id, kind, fut)
+            )
+            return fut
+        except asyncio.QueueFull:
+            logger.warning("ARP 反制: scapy sender queue full, dropping NDP %s", kind)
+            return None
+        except Exception:
+            return None
 
     def register_restart_hook(self, hook):
         """注册 IP 切换后的 TCP 监听器重启回调"""
@@ -279,6 +379,9 @@ class ARPProtection:
             self._scapy_sender_queue.put_nowait(None)
         except Exception:
             pass
+        # L1 修复：复位发送器就绪标志，防止停止后 NDP 仍入队导致 future 悬挂
+        # （enqueue_ndp_na 检查该标志返回 None → 调用方安全回退系统方法）
+        self._scapy_sender_ready = False
         # 嗅探 worker 不依赖 event，靠 _arp_running=False 和 socket.close 退出
         for w in self._arp_workers:
             w.cancel()

@@ -238,8 +238,10 @@ class DNSSECValidator:
             "rcode": dns.rcode.to_text(rcode),
         }
 
-        # 如果有 RRSIG，始终尝试本地验证（strict 模式下即使是 AD=1 也验证）
-        if has_rrsig:
+        # mode 语义（与 config.yaml 注释对齐）：
+        #   ad_check - 优先信任上游 AD 位（快速）；AD=0 时对 RRSIG 做本地验证
+        #   strict   - 始终本地验证 RRSIG 签名链（安全但较慢）
+        if has_rrsig and (self.mode == "strict" or not ad_bit):
             try:
                 is_valid = await self._validate_locally(response, question.name)
                 if is_valid:
@@ -266,6 +268,13 @@ class DNSSECValidator:
                     **result_info,
                     "detail": "本地验证不支持的算法",
                 }
+        elif has_rrsig and ad_bit and self.mode == "ad_check":
+            # ad_check + 上游已验证（AD=1）→ 直接信任，不做本地链验证
+            self._stats["validated"] += 1
+            return True, "secure", {
+                **result_info,
+                "detail": "AD 位已设置（上游已验证，ad_check 模式）",
+            }
 
         # 无 RRSIG 但有 AD 位 - 上游已验证但响应不含 RRSIG
         if ad_bit:
@@ -319,16 +328,18 @@ class DNSSECValidator:
                     self._verified_zone_cache[signer] = dnskey_rrset
 
         # 4. 用完整的 keys 验证 answer 中的所有 RRset
+        answer_validated = False
         for rrset in response.answer:
             if rrset.rdtype == dns.rdatatype.RRSIG:
                 continue
-            # 查找对应的 RRSIG
+            # 查找对应的 RRSIG（dnspython 2.x 需按 covers 匹配 RRSIG 类型）
             try:
                 rrsig_set = response.find_rrset(
                     response.answer,
                     rrset.name,
                     rrset.rdclass,
                     dns.rdatatype.RRSIG,
+                    covers=rrset.rdtype,
                     create=False,
                 )
             except KeyError:
@@ -336,24 +347,37 @@ class DNSSECValidator:
             if rrsig_set:
                 try:
                     dns.dnssec.validate(rrset, rrsig_set, keys)
+                    answer_validated = True
                 except (dns.dnssec.ValidationFailure, KeyError) as e:
                     logger.debug("DNSSEC 验证失败 (%s): %s", rrset.name, e)
                     continue
 
-        # 5. 如果 answer 段没有找到可验证的 RRset，检查 authority 段
+        # answer 段有签名且验证通过 → 链验证成功
+        if answer_validated:
+            return True
+
+        # 5. 如果 answer 段没有可验证的 RRset（如 NXDOMAIN/SOA 场景），检查 authority 段
         for rrset in response.authority:
             if rrset.rdtype == dns.rdatatype.RRSIG:
                 continue
-            rrsig_set = response.find_rrset(
-                response.authority,
-                rrset.name,
-                rrset.rdclass,
-                dns.rdatatype.RRSIG,
-                create=False,
-            )
+            try:
+                rrsig_set = response.find_rrset(
+                    response.authority,
+                    rrset.name,
+                    rrset.rdclass,
+                    dns.rdatatype.RRSIG,
+                    covers=rrset.rdtype,
+                    create=False,
+                )
+            except KeyError:
+                continue
             if rrsig_set:
-                dns.dnssec.validate(rrset, rrsig_set, keys)
-                return True
+                try:
+                    dns.dnssec.validate(rrset, rrsig_set, keys)
+                    return True
+                except (dns.dnssec.ValidationFailure, KeyError) as e:
+                    logger.debug("DNSSEC authority 段验证失败 (%s): %s", rrset.name, e)
+                    continue
 
         return False
 

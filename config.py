@@ -36,6 +36,27 @@ logger = logging.getLogger("dns-proxy.config")
 
 DEFAULT_CONFIG_PATH = Path(__file__).parent / "config.yaml"
 
+# ============================================================
+# IANA 根服务器列表（Root Servers，a–m.root-servers.net IPv4 地址）
+# 作为迭代解析（根→TLD→权威）的信任起点，硬编码避免 bootstrap 依赖
+# 来源: https://www.iana.org/domains/root/servers
+# ============================================================
+DEFAULT_ROOT_SERVERS = (
+    "198.41.0.4",      # a.root-servers.net
+    "170.247.170.2",   # b.root-servers.net
+    "192.33.4.12",     # c.root-servers.net
+    "199.7.91.13",     # d.root-servers.net
+    "192.203.230.10",  # e.root-servers.net
+    "192.5.5.241",     # f.root-servers.net
+    "192.112.36.4",    # g.root-servers.net
+    "198.97.190.53",   # h.root-servers.net
+    "192.36.148.17",   # i.root-servers.net
+    "192.58.128.30",   # j.root-servers.net
+    "193.0.14.129",    # k.root-servers.net
+    "199.7.83.42",     # l.root-servers.net
+    "202.12.27.33",    # m.root-servers.net
+)
+
 
 
 class Config:
@@ -382,6 +403,41 @@ class Config:
     @property
     def plain_dns_ipv6_host(self) -> str:
         return self._data.get("server", {}).get("plain_dns", {}).get("ipv6", {}).get("host", "::")
+
+    # ---------- plain DNS 迭代解析（根→TLD→权威，默认关闭） ----------
+    @property
+    def plain_dns_iterative_enabled(self) -> bool:
+        """plain DNS 是否启用本地迭代解析（默认 False，走加密上游递归）"""
+        return self._data.get("server", {}).get("plain_dns", {}).get("iterative", {}).get("enabled", False)
+
+    @property
+    def plain_dns_iterative_root_servers(self) -> List[str]:
+        """迭代解析起点：根服务器 IP 列表（默认 IANA 13 根，可覆盖）"""
+        raw = self._data.get("server", {}).get("plain_dns", {}).get("iterative", {}).get("root_servers")
+        if isinstance(raw, list) and raw:
+            return [str(x) for x in raw]
+        return list(DEFAULT_ROOT_SERVERS)
+
+    @property
+    def plain_dns_iterative_timeout_ms(self) -> float:
+        """单跳查询超时（毫秒），默认 2000ms"""
+        return float(self._data.get("server", {}).get("plain_dns", {}).get("iterative", {}).get("timeout_ms", 2000))
+
+    @property
+    def plain_dns_iterative_max_depth(self) -> int:
+        """迭代最大深度（跳数），默认 8"""
+        return int(self._data.get("server", {}).get("plain_dns", {}).get("iterative", {}).get("max_depth", 8))
+
+    @property
+    def plain_dns_iterative_strict_dnssec(self) -> bool:
+        """严格 DNSSEC：链验证失败（bogus）时丢弃响应返回 SERVFAIL（默认 True）"""
+        return self._data.get("server", {}).get("plain_dns", {}).get("iterative", {}).get("strict_dnssec", True)
+
+    @property
+    def plain_dns_iterative_cross_verify(self) -> bool:
+        """全局确认：迭代结果与加密上游结果做一致性交叉验证（默认 True）"""
+        return self._data.get("server", {}).get("plain_dns", {}).get("iterative", {}).get("cross_verify", True)
+
     @property
     def filter_rules_urls(self) -> List[str]:
         result = self._data.get("filter", {}).get("rules_urls")

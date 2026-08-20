@@ -100,6 +100,10 @@ class NetworkMonitor:
         # ARP 侧 IP 冲突反制联动 NDP：宣告本机 IPv6-MAC + 静态 NDP 绑定
         self._arp_protection._ndp_callback = self._ndp_announce_callback
 
+        # NDP 复用 ARP 常驻 scapy 发送器（scapy/Npcap 发送资源单进程独占：
+        # NDP 内部重复 import scapy 直接 sendp 会永久降级系统 fallback）
+        self._ndp_protection._arp_sender = self._arp_protection
+
         # 外网 ping 轮询索引（轮流 ping 多个 v4 目标，每轮一个）
         self._ext_ping_index = 0
         self._last_ext_check_time: float = 0.0  # 上次外网探测时间戳
