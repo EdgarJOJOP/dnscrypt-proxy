@@ -12,7 +12,30 @@
 
 新增自动提权为管理员和root，如果不给，可能只影响arp防护功能。
 
-## 1.支持ipv4的arp防护避免流量劫持的高危风险(ipv6是NDP防护)：
+## 1.默认开启根服务器进行迭代解析域名真实ip（根→TLD→权威 + DNSSEC 严格验证，与 "上游优选配置"一起参与优选）：
+
+优点：速度非常快(3-20ms)，拥有全供应链验证验证防止中间人进行投毒，优先使用ipv6北京主根服务器和其它地域根服务器，响应快的同时安全也完整保证。
+
+下方配置文件中的配置片段就是控制使用中国境内(包括台湾等)根服务器的配置项里面已经完整集成和说明使用方式和配置参数含义，开启状态下默认进行DNSSEC 供应链严格验证，其中在根服务器网址(root-servers.net)中可以完整使用优先最近泛播ip地址的dns解析，也就是使用ipv4和ipv6的根ip会被自动引导到中国境内最近的服务器上，也就是内网响应级别(3-20ms)，然后进行迭代解析出域名真实ip。
+
+
+配置文件config.yaml:
+```iterative:
+      enabled: true            # 默认关闭，设为 true 开启迭代解析
+      # 根服务器列表（默认 IANA 13 根，留空或省略则使用内置列表）
+      # 可自定义覆盖：- "198.41.0.4"
+      root_servers: ["2001:7fd::1","2001:500:2f::f","193.0.14.129","192.5.5.241"]
+      # 单跳查询超时（毫秒）
+      timeout_ms: 2000
+      # 迭代最大深度（根→TLD→权威的跳数上限）
+      max_depth: 8
+      # 严格 DNSSEC：链验证失败（bogus）时丢弃响应返回 SERVFAIL
+      strict_dnssec: true
+      # 全局确认：迭代结果与加密上游结果做一致性交叉验证，不一致返回 SERVFAIL
+      cross_verify: true
+```
+
+## 2.支持ipv4的arp防护避免流量劫持的高危风险(ipv6是NDP防护)：
 
 win安装npcap （https://npcap.com/#download ），linux不管有root就行。
 
@@ -31,7 +54,7 @@ win记得安装360杀毒(https://sd.360.cn/ )比360安全管家管用。
     8	Opcode=2 回复劫持	正常请求 谁有网关IP? 后被攻击者抢先用错误 MAC 回复
     9	ARP Flood/风暴	短时间内大量不同 MAC 声称是网关/本机
 
-## 2.支持ipv6的NDP防护避免流量劫持的高危风险：
+## 3.支持ipv6的NDP防护避免流量劫持的高危风险：
 
 1.里提到的npcap和360杀毒，这个功能默认开启。
 
@@ -52,7 +75,7 @@ win记得安装360杀毒(https://sd.360.cn/ )比360安全管家管用。
     4.3.2	远程 NDP DoS	  T7 邻居表增长率监控
 
 
-## 3.支持config.yaml自定义根目录证书集验证上游加密dns是否可靠：
+## 4.支持config.yaml自定义根目录证书集验证上游加密dns是否可靠：
 
       根目录证书集下载链接: https://curl.se/ca/cacert.pem
       
@@ -75,7 +98,7 @@ win记得安装360杀毒(https://sd.360.cn/ )比360安全管家管用。
       
       `openssl s_client -connect dns.alidns.com:443 -servername dns.alidns.com </dev/null | openssl x509 -outform PEM > alidns-cert.pem`
       
-## 4.config.yaml支持与划分vlan或vxlan的上层交换机或路由进行通信和修复：
+## 5.config.yaml支持与划分vlan或vxlan的上层交换机或路由进行通信和修复：
 
     设置在config.yaml下的arp_protection和ndp_protection配置项中，不支持自动嗅探vlan和vxlan(当然运行软件的机子上设置了vlan或vxlan后再配置文件中设置vlan或vxlan，是让软件与上层交换机或路由进行正常通信或存在的内网通信问题会自动修复)。
  
