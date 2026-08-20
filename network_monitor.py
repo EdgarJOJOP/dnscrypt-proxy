@@ -11,6 +11,7 @@ import sys
 import asyncio
 import logging
 import collections
+import locale
 from typing import Dict, List, Optional, Callable
 
 import dns.message
@@ -181,8 +182,19 @@ class NetworkMonitor:
                         pass
                     raise
                 _npcap_rc = _npcap_proc.returncode
-                _npcap_text = (_npcap_out + _npcap_err).decode("utf-8", errors="replace").strip()
-                if _npcap_rc == 0 or "RUNNING" in _npcap_text.upper() or "已经启动" in _npcap_text:
+                # SF-7：net.exe 输出为系统代码页（中文 Windows 为 GBK/CP936），不能硬编码 utf-8；
+                # 与 NDP _decode_win_output 一致采用多编码回退（preferred → utf-8 → gbk）
+                _npcap_raw = _npcap_out + _npcap_err
+                _npcap_text = ""
+                for _enc in (locale.getpreferredencoding(False), "utf-8", "gbk"):
+                    try:
+                        _npcap_text = _npcap_raw.decode(_enc)
+                        break
+                    except (UnicodeDecodeError, LookupError):
+                        continue
+                _npcap_text = _npcap_text.strip()
+                # rc=2 = ERROR_SERVICE_ALREADY_RUNNING（服务已在运行），等同成功
+                if _npcap_rc in (0, 2) or "RUNNING" in _npcap_text.upper() or "已经启动" in _npcap_text:
                     logger.info("网络监控: npcap 服务已就绪（net start npcap rc=%s）", _npcap_rc)
                 else:
                     logger.warning("网络监控: net start npcap 未成功（rc=%s %s），ARP/NDP 走系统 fallback",

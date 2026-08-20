@@ -15,13 +15,9 @@ import asyncio
 import socket
 import logging
 import random
-import locale
 from typing import Optional, Tuple
 
 logger = logging.getLogger("dns-proxy.arp")
-
-# 系统编码：Windows 中文为 gbk，Linux 为 utf-8
-_SYS_ENCODING = locale.getpreferredencoding()
 
 # ARP 嗅探：scapy 跨平台抓包（可选，需 libpcap/Npcap 驱动支持）
 # Suppress Scapy socket BPF filter warnings on Windows
@@ -1355,7 +1351,7 @@ class ARPProtection:
                 stderr=asyncio.subprocess.DEVNULL,
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-            text = stdout.decode(_SYS_ENCODING, errors="replace")
+            text = ARPProtection._decode_netsh_output(stdout)
             for line in text.splitlines():
                 parts = line.strip().split()
                 # 0.0.0.0  0.0.0.0  192.168.1.1  192.168.1.100  25
@@ -1402,7 +1398,7 @@ class ARPProtection:
                 stderr=asyncio.subprocess.DEVNULL,
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-            text = stdout.decode(_SYS_ENCODING, errors="replace")
+            text = ARPProtection._decode_netsh_output(stdout)
         except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
             logger.warning("ARP 防护: ipconfig 失败: %s", e)
             text = ""
@@ -1566,7 +1562,7 @@ class ARPProtection:
                 stderr=asyncio.subprocess.DEVNULL,
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-            text = stdout.decode(_SYS_ENCODING, errors="replace")
+            text = ARPProtection._decode_netsh_output(stdout)
             for line in text.splitlines():
                 # default via 192.168.1.1 dev eth0  metric 100
                 m = re.match(
@@ -1602,7 +1598,7 @@ class ARPProtection:
                 stderr=asyncio.subprocess.DEVNULL,
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-            text = stdout.decode(_SYS_ENCODING, errors="replace")
+            text = ARPProtection._decode_netsh_output(stdout)
             for line in text.splitlines():
                 m = re.search(r'inet\s+(\d+\.\d+\.\d+\.\d+)/(\d+)', line)
                 if m and not m.group(1).startswith("127."):
@@ -1644,7 +1640,7 @@ class ARPProtection:
                 stderr=asyncio.subprocess.DEVNULL,
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-            text = stdout.decode(_SYS_ENCODING, errors="replace")
+            text = ARPProtection._decode_netsh_output(stdout)
 
             # 解析 route print 输出中的默认网关
             # 匹配: 0.0.0.0          0.0.0.0         192.168.1.1      192.168.1.100    25
@@ -1670,7 +1666,7 @@ class ARPProtection:
                 stderr=asyncio.subprocess.DEVNULL,
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-            text = stdout.decode(_SYS_ENCODING, errors="replace")
+            text = ARPProtection._decode_netsh_output(stdout)
             # 匹配: default via 192.168.1.1 dev eth0
             for line in text.splitlines():
                 m = re.match(r'default\s+via\s+(\d+\.\d+\.\d+\.\d+)', line.strip())
@@ -1693,7 +1689,7 @@ class ARPProtection:
                 stderr=asyncio.subprocess.DEVNULL,
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-            text = stdout.decode(_SYS_ENCODING, errors="replace")
+            text = ARPProtection._decode_netsh_output(stdout)
 
             # 匹配: 192.168.1.1         00-11-22-33-44-55     dynamic
             # MAC 格式: xx-xx-xx-xx-xx-xx
@@ -1725,7 +1721,7 @@ class ARPProtection:
                 stderr=asyncio.subprocess.DEVNULL,
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-            text = stdout.decode(_SYS_ENCODING, errors="replace")
+            text = ARPProtection._decode_netsh_output(stdout)
             # 匹配: 192.168.1.1 dev eth0 lladdr 00:11:22:33:44:55 REACHABLE
             m = re.search(r'lladdr\s+(([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2})', text)
             if m:
@@ -1787,7 +1783,7 @@ class ARPProtection:
                 stderr=asyncio.subprocess.DEVNULL,
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-            text = stdout.decode(_SYS_ENCODING, errors="replace")
+            text = ARPProtection._decode_netsh_output(stdout)
             for line in text.splitlines():
                 s = line.strip()
                 if "IPv6" in s or "IPv6 地址" in s:
@@ -1809,7 +1805,7 @@ class ARPProtection:
                 stderr=asyncio.subprocess.DEVNULL,
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-            text = stdout.decode(_SYS_ENCODING, errors="replace")
+            text = ARPProtection._decode_netsh_output(stdout)
         except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
             return False, f"ipconfig 执行失败: {e}"
 
@@ -1904,7 +1900,7 @@ class ARPProtection:
                 stderr=asyncio.subprocess.DEVNULL,
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-            text = stdout.decode(_SYS_ENCODING, errors="replace")
+            text = ARPProtection._decode_netsh_output(stdout)
             for line in text.splitlines():
                 m = re.search(r'inet6\s+([0-9a-f:]+)', line.lower())
                 if m and m.group(1) != "::1":
@@ -1962,7 +1958,7 @@ class ARPProtection:
                     stderr=asyncio.subprocess.DEVNULL,
                 )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-            text = stdout.decode(_SYS_ENCODING, errors="replace")
+            text = ARPProtection._decode_netsh_output(stdout)
 
             # Windows: arp -a 输出中找本机 IP 的所有条目（排除本机 MAC 防误报）
             if sys.platform == "win32" and self._local_ipv4 in text:
@@ -2196,7 +2192,7 @@ class ARPProtection:
                 await self._flush_network_stack()
                 return True
             else:
-                err_text = stderr.decode(_SYS_ENCODING, errors="replace")[:200]
+                err_text = ARPProtection._decode_netsh_output(stderr)[:200]
                 if err_text:
                     logger.warning("ARP 防护: netsh 执行失败 (code=%d): %s",
                                    proc.returncode, err_text)
@@ -2291,7 +2287,7 @@ class ARPProtection:
             )
             _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
             if proc.returncode != 0:
-                err = stderr.decode(_SYS_ENCODING, errors="replace")[:200]
+                err = ARPProtection._decode_netsh_output(stderr)[:200]
                 logger.warning("ARP 防护: ip addr del 失败: %s", err)
 
             # 添加新 IP
@@ -2303,7 +2299,7 @@ class ARPProtection:
             )
             _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
             if proc.returncode != 0:
-                err = stderr.decode(_SYS_ENCODING, errors="replace")[:200]
+                err = ARPProtection._decode_netsh_output(stderr)[:200]
                 logger.warning("ARP 防护: ip addr add 失败: %s", err)
                 return False
 
@@ -3176,7 +3172,7 @@ class ARPProtection:
                 )
                 _, stderr = await asyncio.wait_for(proc.communicate(), timeout=8)
                 if proc.returncode != 0:
-                    err = stderr.decode(_SYS_ENCODING, errors="replace")[:200]
+                    err = ARPProtection._decode_netsh_output(stderr)[:200]
                     if err:
                         logger.warning("ARP 防护: netsh 切换 IP 失败 (code=%d): %s",
                                        proc.returncode, err)
@@ -3216,7 +3212,7 @@ class ARPProtection:
                 )
                 _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
                 if proc.returncode != 0:
-                    err = stderr.decode(_SYS_ENCODING, errors="replace")[:200]
+                    err = ARPProtection._decode_netsh_output(stderr)[:200]
                     logger.warning("ARP 防护: ip addr 切换 IP 失败: %s", err)
                     return False
                 # 网关路由
@@ -3259,7 +3255,7 @@ class ARPProtection:
                     # 等待 DHCP 获取地址
                     await asyncio.sleep(3)
                 else:
-                    err = stderr.decode(_SYS_ENCODING, errors="replace")[:200]
+                    err = ARPProtection._decode_netsh_output(stderr)[:200]
                     logger.error("ARP 防护: DHCP 切换失败 (code=%d): %s",
                                  proc.returncode, err or "(空)")
             except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
@@ -3585,12 +3581,8 @@ class ARPProtection:
 
     @staticmethod
     def _decode_netsh_output(data: bytes) -> str:
-        'Decode Windows cmd output: strict 探测系统编码/utf-8/gbk，全失败才 replace 兑底（修复 M6：原 errors=replace 使回退死分支）'
-        seen = set()
-        for enc in (locale.getpreferredencoding(False), 'utf-8', 'gbk'):
-            if enc in seen:
-                continue
-            seen.add(enc)
+        'Decode Windows cmd output: utf-8 strict 优先 + gbk 回退（SF-12，与 NDP _decode_win_output 策略一致；修复 M6：原 errors=replace 使回退死分支）'
+        for enc in ('utf-8', 'gbk'):
             try:
                 return data.decode(enc, errors='strict')
             except (LookupError, UnicodeDecodeError):
@@ -3660,7 +3652,7 @@ class ARPProtection:
                 stderr=asyncio.subprocess.DEVNULL,
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-            text = stdout.decode(_SYS_ENCODING, errors="replace")
+            text = ARPProtection._decode_netsh_output(stdout)
         except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
             logger.debug("ARP 防护: netsh show address 失败: %s", e)
             return None
@@ -3765,8 +3757,8 @@ class ARPProtection:
                         logger.info("ARP 防护: ✓ 静态 ARP 已绑定(idx=%d) %s → %s",
                                      idx, gw_ip, gw_mac)
                         return True
-                    err_text = stderr.decode(_SYS_ENCODING, errors="replace").strip()
-                    out_text = stdout.decode(_SYS_ENCODING, errors="replace").strip()
+                    err_text = ARPProtection._decode_netsh_output(stderr).strip()
+                    out_text = ARPProtection._decode_netsh_output(stdout).strip()
                     detail = err_text or out_text or "(空 — 可能需要管理员权限)"
                     logger.warning("ARP 防护: netsh set neighbors 索引失败 (idx=%d): %s",
                                    idx, detail)
@@ -3790,8 +3782,8 @@ class ARPProtection:
                     logger.info("ARP 防护: ✓ 静态 ARP 已绑定(命名参数) %s (%s → %s)",
                                  gw_ip, iface, gw_mac)
                     return True
-                err_text = stderr.decode(_SYS_ENCODING, errors="replace").strip()
-                out_text = stdout.decode(_SYS_ENCODING, errors="replace").strip()
+                err_text = ARPProtection._decode_netsh_output(stderr).strip()
+                out_text = ARPProtection._decode_netsh_output(stdout).strip()
                 detail = err_text or out_text or "(空)"
                 logger.warning("ARP 防护: netsh 命名参数格式失败: %s", detail)
             except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
@@ -3811,7 +3803,7 @@ class ARPProtection:
                     logger.info("ARP 防护: ✓ 静态 ARP 已绑定(位置参数) %s (%s → %s)",
                                  gw_ip, self._interface_name or idx, gw_mac)
                     return True
-                err3 = serr3.decode(_SYS_ENCODING, errors="replace").strip() or sout3.decode(_SYS_ENCODING, errors="replace").strip() or "(空)"
+                err3 = ARPProtection._decode_netsh_output(serr3).strip() or ARPProtection._decode_netsh_output(sout3).strip() or "(空)"
                 logger.warning("ARP 防护: netsh 位置参数也失败: %s", err3)
             except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
                 logger.warning("ARP 防护: netsh 位置参数异常: %s", e)
@@ -3834,7 +3826,7 @@ class ARPProtection:
                     logger.info("ARP 防护: ✓ 静态 ARP 已绑定 %s (%s → %s)",
                                  gw_ip, iface, gw_mac)
                     return True
-                err_text = stderr.decode(_SYS_ENCODING, errors="replace").strip()
+                err_text = ARPProtection._decode_netsh_output(stderr).strip()
                 logger.warning("ARP 防护: ip neigh replace 失败: %s",
                                 err_text or "(空)")
                 return False
@@ -3862,7 +3854,7 @@ class ARPProtection:
                     stderr=asyncio.subprocess.DEVNULL,
                 )
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-                text = stdout.decode(_SYS_ENCODING, errors="replace")
+                text = ARPProtection._decode_netsh_output(stdout)
                 for line in text.splitlines():
                     line = line.strip()
                     if not line:
@@ -3906,7 +3898,7 @@ class ARPProtection:
                     stderr=asyncio.subprocess.DEVNULL,
                 )
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-                mac = stdout.decode(_SYS_ENCODING, errors="replace").strip()
+                mac = ARPProtection._decode_netsh_output(stdout).strip()
                 if mac and len(mac.replace(":", "")) == 12:
                     return mac
         except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
@@ -3930,7 +3922,7 @@ class ARPProtection:
                     stderr=asyncio.subprocess.DEVNULL,
                 )
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=8)
-                text = stdout.decode(_SYS_ENCODING, errors="replace")
+                text = ARPProtection._decode_netsh_output(stdout)
                 raw_sections = re.split(
                     r'(?=^(?:以太网适配器 |Ethernet adapter |无线局域网适配器 |Wireless LAN adapter |WLAN 适配器 |WLAN adapter |本地连接|Local Area Connection))',
                     text, flags=re.MULTILINE)
@@ -3966,7 +3958,7 @@ class ARPProtection:
                 )
                 out_l, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
                 mac_of = {}
-                for line in out_l.decode(_SYS_ENCODING, errors="replace").splitlines():
+                for line in ARPProtection._decode_netsh_output(out_l).splitlines():
                     # ip -o link 输出 '2: eth0: <...>'——接口名带尾随冒号，捕获组排除冒号（review blocking-2）
                     m = re.search(r'^\d+:\s+([^:@\s]+).*link/ether\s+((?:[0-9a-f]{2}:){5}[0-9a-f]{2})', line)
                     if m:
@@ -3977,7 +3969,7 @@ class ARPProtection:
                     stderr=asyncio.subprocess.DEVNULL,
                 )
                 out_a, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-                for line in out_a.decode(_SYS_ENCODING, errors="replace").splitlines():
+                for line in ARPProtection._decode_netsh_output(out_a).splitlines():
                     m = re.search(r'^\d+:\s+(\S+).*inet\s+(\d+\.\d+\.\d+\.\d+)', line)
                     if m and m.group(1) in mac_of and not m.group(2).startswith("169.254."):
                         ip_map.setdefault(mac_of[m.group(1)], set()).add(m.group(2))
@@ -4003,7 +3995,7 @@ class ARPProtection:
                     stderr=asyncio.subprocess.DEVNULL,
                 )
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-                for line in stdout.decode(_SYS_ENCODING, errors="replace").splitlines():
+                for line in ARPProtection._decode_netsh_output(stdout).splitlines():
                     line = line.strip()
                     if not line:
                         continue
@@ -4026,7 +4018,7 @@ class ARPProtection:
                     stderr=asyncio.subprocess.DEVNULL,
                 )
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-                interfaces = stdout.decode(_SYS_ENCODING, errors="replace").split()
+                interfaces = ARPProtection._decode_netsh_output(stdout).split()
                 for iface in interfaces:
                     try:
                         proc2 = await asyncio.create_subprocess_exec(
@@ -4035,7 +4027,7 @@ class ARPProtection:
                             stderr=asyncio.subprocess.DEVNULL,
                         )
                         out2, _ = await asyncio.wait_for(proc2.communicate(), timeout=3)
-                        mac = out2.decode(_SYS_ENCODING, errors="replace").strip()
+                        mac = ARPProtection._decode_netsh_output(out2).strip()
                         # 与 Windows 分支一致：过滤全零/广播 MAC（security_review low-3）
                         if mac and len(mac.replace(":", "")) == 12 and \
                                 mac.replace(":", "").upper() not in ("000000000000", "FFFFFFFFFFFF"):
@@ -4063,7 +4055,7 @@ class ARPProtection:
                     stderr=asyncio.subprocess.DEVNULL,
                 )
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-                text = stdout.decode(_SYS_ENCODING, errors="replace")
+                text = ARPProtection._decode_netsh_output(stdout)
                 # 按适配器段切分（支持中英文段名；不依赖 interface_name 精确匹配）
                 raw_sections = re.split(
                     r'(?=^(?:以太网适配器 |Ethernet adapter |无线局域网适配器 |Wireless LAN adapter |WLAN 适配器 |WLAN adapter |本地连接|Local Area Connection))',
@@ -4116,7 +4108,7 @@ class ARPProtection:
                     stderr=asyncio.subprocess.DEVNULL,
                 )
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-                for line in stdout.decode(_SYS_ENCODING, errors="replace").splitlines():
+                for line in ARPProtection._decode_netsh_output(stdout).splitlines():
                     m = re.search(r'inet\s+(\d+\.\d+\.\d+\.\d+)', line)
                     if m:
                         ips.add(m.group(1))
@@ -4380,7 +4372,7 @@ class ARPProtection:
             )
             stdout_bytes, _ = await asyncio.wait_for(
                 proc.communicate(), timeout=(timeout_ms / 1000) + 5)
-            stdout_text = stdout_bytes.decode(_SYS_ENCODING, errors="replace")
+            stdout_text = ARPProtection._decode_netsh_output(stdout_bytes)
             lines = stdout_text.splitlines()
 
             # ping.exe exit code: 0=success, 1=unreachable/timeout
@@ -4531,7 +4523,7 @@ class ARPProtection:
             )
             stdout_bytes, _ = await asyncio.wait_for(
                 proc.communicate(), timeout=timeout_s + 3)
-            stdout_text = stdout_bytes.decode("utf-8", errors="replace")
+            stdout_text = ARPProtection._decode_netsh_output(stdout_bytes)
             lines = stdout_text.splitlines()
 
             reachable = (proc.returncode == 0)

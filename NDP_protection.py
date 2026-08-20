@@ -306,18 +306,33 @@ class NDPProtection:
 
     @staticmethod
     def _decode_win_output(data: bytes) -> str:
-        """Decode Windows cmd output: try system encoding, then utf-8/gbk.
-        Never depends on keyword validation — returns cleanly decoded text."""
-        seen = set()
-        for enc in (locale.getpreferredencoding(False), 'utf-8', 'gbk'):
-            if enc in seen:
-                continue
-            seen.add(enc)
+        """Decode Windows cmd output: UTF-8 strict 优先 + GBK 回退（SF-12）。
+
+        原实现 errors='replace' 且 preferred=utf-8 优先，GBK 中文被 replace 成乱码
+        永不回退。修复：utf-8 strict 优先（新版 netsh 等输出 UTF-8），失败回退 GBK
+        （中文系统默认代码页；GBK 字节几乎从不是合法 UTF-8，回退必然触发）；
+        均失败才用 replace 兜底。
+        """
+        if not data:
+            return ""
+        for enc in ("utf-8", "gbk"):
             try:
-                return data.decode(enc, errors='replace')
+                return data.decode(enc, errors="strict")
+            except (LookupError, UnicodeDecodeError):
+                continue
+        # 均 strict 失败 → replace 兜底（选可打印比例高的）
+        best = ""
+        best_score = -1.0
+        for enc in ("gbk", "utf-8"):
+            try:
+                s = data.decode(enc, errors="replace")
             except LookupError:
                 continue
-        return data.decode('utf-8', errors='replace')
+            printable = sum(1 for c in s if c.isprintable() or c in "\r\n\t")
+            score = printable / max(1, len(s))
+            if score > best_score:
+                best, best_score = s, score
+        return best or data.decode("utf-8", errors="replace")
 
     @staticmethod
     async def _build_local_ip_mac_map() -> dict:
@@ -336,8 +351,8 @@ class NDPProtection:
                     stderr=asyncio.subprocess.DEVNULL,
                 )
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=8)
-                # staticmethod 内不能用 self（review blocking-3）：直接按系统编码解码
-                text = stdout.decode(locale.getpreferredencoding(False), errors="replace")
+                # staticmethod 内不能用 self（review blocking-3）：用类名调双编码解码
+                text = NDPProtection._decode_win_output(stdout)
                 raw_sections = re.split(
                     r'(?=^(?:以太网适配器 |Ethernet adapter |无线局域网适配器 |Wireless LAN adapter |WLAN 适配器 |WLAN adapter |本地连接|Local Area Connection))',
                     text, flags=re.MULTILINE)
@@ -372,7 +387,7 @@ class NDPProtection:
                 )
                 out_l, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
                 mac_of = {}
-                for line in out_l.decode("utf-8", errors="replace").splitlines():
+                for line in NDPProtection._decode_win_output(out_l).splitlines():
                     # ip -o link 输出 '2: eth0: <...>'——接口名带尾随冒号，捕获组排除冒号（review blocking-2）
                     m = re.search(r'^\d+:\s+([^:@\s]+).*link/ether\s+((?:[0-9a-f]{2}:){5}[0-9a-f]{2})', line)
                     if m:
@@ -383,7 +398,7 @@ class NDPProtection:
                     stderr=asyncio.subprocess.DEVNULL,
                 )
                 out_a, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-                for line in out_a.decode("utf-8", errors="replace").splitlines():
+                for line in NDPProtection._decode_win_output(out_a).splitlines():
                     m = re.search(r'^\d+:\s+(\S+).*inet6\s+([0-9a-fA-F:]+)', line)
                     if m and m.group(1) in mac_of:
                         ip6 = m.group(2).split("%")[0]
@@ -411,7 +426,7 @@ class NDPProtection:
                     stderr=asyncio.subprocess.DEVNULL,
                 )
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-                for line in stdout.decode(locale.getpreferredencoding(False), errors="replace").splitlines():
+                for line in NDPProtection._decode_win_output(stdout).splitlines():
                     line = line.strip()
                     if not line:
                         continue
@@ -436,7 +451,7 @@ class NDPProtection:
                             stderr=asyncio.subprocess.DEVNULL,
                         )
                         out2, _ = await asyncio.wait_for(proc2.communicate(), timeout=5)
-                        for line2 in out2.decode("utf-8", errors="replace").splitlines():
+                        for line2 in NDPProtection._decode_win_output(out2).splitlines():
                             m = re.search(r'((?:[0-9A-Fa-f]{2}[-:]){5}[0-9A-Fa-f]{2})', line2)
                             if m:
                                 macs.add(m.group(1).replace("-", ":").upper())
@@ -480,7 +495,7 @@ class NDPProtection:
                     stderr=asyncio.subprocess.DEVNULL,
                 )
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-                interfaces = stdout.decode("utf-8", errors="replace").split()
+                interfaces = NDPProtection._decode_win_output(stdout).split()
                 for iface in interfaces:
                     try:
                         proc2 = await asyncio.create_subprocess_exec(
@@ -489,7 +504,7 @@ class NDPProtection:
                             stderr=asyncio.subprocess.DEVNULL,
                         )
                         out2, _ = await asyncio.wait_for(proc2.communicate(), timeout=3)
-                        mac = out2.decode("utf-8", errors="replace").strip()
+                        mac = NDPProtection._decode_win_output(out2).strip()
                         if mac and len(mac.replace(":", "")) == 12:
                             macs.add(mac.upper())
                     except Exception:
@@ -545,7 +560,7 @@ class NDPProtection:
                         stderr=asyncio.subprocess.DEVNULL,
                     )
                     out, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-                    for line in out.decode("utf-8", errors="replace").splitlines():
+                    for line in NDPProtection._decode_win_output(out).splitlines():
                         m = re.search(r'inet6?\s+([0-9a-fA-F:.]+)/\d+', line)
                         if m:
                             ip = m.group(1).split("%")[0]
@@ -623,7 +638,7 @@ class NDPProtection:
                 )
             stdout_bytes, _ = await asyncio.wait_for(
                 proc.communicate(), timeout=timeout_sec + 2)
-            stdout_text = stdout_bytes.decode("utf-8", errors="replace")
+            stdout_text = NDPProtection._decode_win_output(stdout_bytes)
             lines = stdout_text.splitlines()
 
             reachable = (proc.returncode == 0)
@@ -780,8 +795,16 @@ class NDPProtection:
                             results.setdefault("t2_ns", []).append((gw_ip, known_mac, actual_mac))
                 threat_count = sum(1 for v in results.values() if v)
                 if threat_count:
-                    logger.info("NDP 防护: 检测到 %d 类异常，触发修复", threat_count)
-                    asyncio.create_task(self.refresh_router_ndp())
+                    # SF-11 整改（security_review LOW）：NS 探测确认的投毒（t2_ns）即时修复，
+                    # 不参与 60s 冷却；冷却仅限周期检测误报源（t1_na/t7_flood 等）
+                    _periodic_only = any(k != "t2_ns" and v for k, v in results.items())
+                    _now_rep = time.time()
+                    if (not _periodic_only) or _now_rep - getattr(self, "_last_repair_time", 0.0) >= 60.0:
+                        self._last_repair_time = _now_rep
+                        logger.info("NDP 防护: 检测到 %d 类异常，触发修复", threat_count)
+                        asyncio.create_task(self.refresh_router_ndp())
+                    else:
+                        logger.info("NDP 防护: 检测到 %d 类异常，反制冷却中跳过本次修复", threat_count)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -1326,6 +1349,20 @@ class NDPProtection:
             return
         "Execute in event loop (via call_soon_threadsafe)"
         src_mac = self._mac_normalize(pkt[Ether].src)
+        src_ip = str(pkt[IPv6].src)
+        # SF-11：完全自包过滤——源 MAC 属于本机 且 源 IP 属于本机 IP 集合才跳过
+        # （防止修复动作发出的 NA/NS 被 sniff 捕获后干扰检测形成正反馈环路）。
+        # 注意：本机 MAC + 未知 IP = 本地 MAC 冒用攻击特征（见 test "本机 MAC 宣告
+        # 完全未知 IP"），必须保留检测；_local_all_ips 为空（未刷新）时不跳过。
+        if self._local_macs and any(src_mac == self._mac_normalize(m) for m in self._local_macs):
+            _src_ip_clean = src_ip.split("%")[0] if src_ip else ""
+            # SF-11 整改（security_review MEDIUM）：主机非路由器不会合法自发 RA/Redirect，
+            # 本机 MAC+IP 的 RA/Redirect 必为伪造（攻击者可伪造源发恶意 RA/Redirect 绕过
+            # T3/4.2.7/4.2.5/4.2.6/T6 检测），因此 RA/Redirect 不参与自包豁免；
+            # NA/NS 按“本机 MAC + 本机 IP”双条件豁免（防修复发包正反馈环路）
+            _is_ra_or_redirect = pkt.haslayer(ICMPv6ND_RA) or pkt.haslayer(ICMPv6ND_Redirect)
+            if not _is_ra_or_redirect and (not src_ip or (self._local_all_ips and _src_ip_clean in self._local_all_ips)):
+                return
         # 防环路：精确匹配自身反制已发送 MAC 集合（唯一防环路手段；02:00:00 前缀过滤已移除——
         # 攻击者可伪造本地管理单播 MAC 02:00:00:xx:xx:xx 完全豁免检测，审计 MEDIUM）
         if self._counterstrike_sent_macs and src_mac in self._counterstrike_sent_macs:
@@ -2302,7 +2339,7 @@ class NDPProtection:
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-            text = stdout.decode("utf-8", errors="replace")
+            text = NDPProtection._decode_win_output(stdout)
         except Exception as e:
             logger.debug("NDP 防护: Linux 接口检测失败: %s", e)
             return
@@ -2337,7 +2374,7 @@ class NDPProtection:
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-            for line in stdout.decode("utf-8", errors="replace").splitlines():
+            for line in NDPProtection._decode_win_output(stdout).splitlines():
                 if "default via" in line:
                     parts = line.split()
                     gw = ""
@@ -2388,7 +2425,7 @@ class NDPProtection:
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 )
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-                for line in stdout.decode("utf-8", errors="replace").splitlines():
+                for line in NDPProtection._decode_win_output(stdout).splitlines():
                     if ipv6.lower() in line.lower() and "lladdr" in line:
                         parts = line.split()
                         for i, p in enumerate(parts):
@@ -2443,7 +2480,7 @@ class NDPProtection:
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 )
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-                text = stdout.decode("utf-8", errors="replace")
+                text = NDPProtection._decode_win_output(stdout)
                 for line in text.splitlines():
                     s = line.strip()
                     if "inet6" in s:
@@ -2496,7 +2533,10 @@ class NDPProtection:
             elif v and isinstance(v, (list, dict)):
                 threat_count += len(v)
         if threat_count:
-            logger.warning("NDP 防护: 综合检测发现 %d 项异常", threat_count)
+            # SF-11：日志带具体异常项，便于定位误报来源（此前只报数量无法区分检测项）
+            logger.warning("NDP 防护: 综合检测发现 %d 项异常: %s", threat_count,
+                           {k: (len(v) if isinstance(v, (list, dict)) else v)
+                            for k, v in results.items() if v})
         return results
 
     @staticmethod

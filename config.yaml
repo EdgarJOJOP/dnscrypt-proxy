@@ -124,8 +124,8 @@ upstream:
 cache:
   enabled: true
   max_size: 10000           # 最大缓存条目数，超限 LRU 淘汰
-  default_ttl: 300          # 默认缓存时间（秒）
-  min_ttl: 30               # 最小缓存时间（秒）
+  default_ttl: 1000          # 默认缓存时间（秒）
+  min_ttl: 600               # 最小缓存时间（秒）
   max_ttl: 86400            # 最大缓存时间（秒）
   negative_ttl: 60          # 负面应答缓存时间（秒）
   cleanup_interval: 60      # 过期清理间隔（秒）

@@ -108,11 +108,44 @@ class ScapyBridge:
 
     # ======================== 内部 ========================
 
+    @staticmethod
+    def _clean_npcap_error(msg: str) -> str:
+        """清洗 Npcap/scapy 异常消息中的 GBK 乱码（SF-12/SF-13）。
+
+        实测（打开 NPF_Loopback）异常结构：
+          'Error opening adapter: 系统找不到指定的路径。  (3)\\x00緞銆�  (3)'
+        pcap 错误缓冲以 \\x00 结尾，其后为缓冲区残留/重复错误文本（乱码源）。
+        清洗：① NUL 截断（主要手段，剥离残留段）；② latin-1 扩展字符占比高
+        （GBK 字节被 latin-1 误存）时尝试 latin-1→gbk 还原；均失败原样返回。
+        """
+        if not msg:
+            return msg
+        # 1) NUL 截断：\\x00 后为 pcap 缓冲残留/重复错误段（緞銆� 等乱码来源）
+        if "\x00" in msg:
+            msg = msg.split("\x00", 1)[0]
+        # 2) latin-1 误存的 GBK 中文还原（ctypes 逐字节映射场景）
+        latin1_chars = [c for c in msg if "\u0080" <= c <= "\u00ff"]
+        if latin1_chars and len(latin1_chars) / max(1, len(msg)) >= 0.05:
+            try:
+                fixed = msg.encode("latin-1").decode("gbk", errors="replace")
+                if fixed.count("\ufffd") <= msg.count("\ufffd"):
+                    return fixed
+            except Exception:
+                pass
+        return msg
+
     def _sniff_loop(self, gen):
         """sniff 分段超时循环：静默网段也定期检查 _running/gen，确保 stop() 可干净退出
-        （review should-fix：stop_filter 仅在收包时评估，无 timeout 时静默网段 join 会超时残留）"""
-        try:
-            while self._running and gen == self._gen:
+        （review should-fix：stop_filter 仅在收包时评估，无 timeout 时静默网段 join 会超时残留）。
+
+        SF-14：适配器短暂失效（如迅游加速器创建/修改虚拟网卡时 Npcap 适配器引用失效，
+        sniff 抛 "Error opening adapter: 系统找不到指定的路径"）时自动指数退避重试，
+        而非一次性退出导致 ARP/NDP 永久回退轮询；连续 5 次失败或 Npcap 无物理网卡才退出。
+        """
+        fail_count = 0
+        import time as _time
+        while self._running and gen == self._gen:
+            try:
                 self._scapy.sniff(
                     filter="arp or icmp6",
                     prn=self._dispatch,
@@ -120,12 +153,34 @@ class ScapyBridge:
                     timeout=1.0,
                     stop_filter=lambda _p: not self._running or gen != self._gen,
                 )
-        except Exception as e:
-            logger.warning("ScapyBridge: sniff 退出: %s", e)
-        finally:
-            # 仅当本线程仍是当前代际时才复位 _running（防旧线程误杀新桥）
-            if gen == self._gen:
-                self._running = False
+                fail_count = 0  # 正常返回（含 1s 超时静默）即重置连续失败计数
+            except Exception as e:
+                clean = self._clean_npcap_error(str(e))
+                # SF-14 整改（review should-fix）：区分“确实无物理网卡”（枚举成功但仅 Loopback）
+                # 与“枚举瞬时失败”（get_if_list 抛异常 → 走退避重试），避免瞬态失效被误判退出
+                try:
+                    from scapy.all import get_if_list as _gif
+                    _ifaces = _gif()
+                    # SF-14 整改（security_review low）：空列表与仅 Loopback 均视为
+                    # “无可用物理网卡”→ 退出（与 is_ready 语义一致），避免多退避 15s
+                    if not _ifaces or all(("Loopback" in i or "loopback" in i) for i in _ifaces):
+                        logger.warning("ScapyBridge: Npcap 无可用物理网卡，sniff 退出: %s", clean)
+                        break
+                except Exception:
+                    pass  # Npcap 枚举瞬时失败 → 计入 fail_count 走退避重试
+                fail_count += 1
+                if fail_count >= 5:
+                    logger.warning("ScapyBridge: sniff 连续失败 %d 次，退出: %s", fail_count, clean)
+                    break
+                delay = min(2 ** (fail_count - 1), 30.0)  # 实际序列 1,2,4,8s（第 5 次在 sleep 前退出）
+                logger.debug("ScapyBridge: sniff 异常(第%d次)，%.0fs 后重试: %s",
+                             fail_count, delay, clean)
+                _time.sleep(delay)
+                # 注：stop() 时若线程恰在退避 sleep，join(3s) 可能超时；线程为 daemon，
+                # 醒来即退出，且 start_if_ready 递增 gen 防旧线程误杀新桥，可接受
+        # 仅当本线程仍是当前代际时才复位 _running（防旧线程误杀新桥）
+        if gen == self._gen:
+            self._running = False
 
     def _dispatch(self, pkt):
         """sniff 线程回调 → 分发到所有注册 prn（模块回调自行保证线程安全）"""

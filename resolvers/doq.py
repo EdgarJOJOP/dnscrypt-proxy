@@ -199,7 +199,11 @@ if HAS_AIOQUIC:
                     return
                 for data, addr in datagrams:
                     try:
-                        self._transport.sendto(data, addr)
+                        # SF-9：UDP transport 已 connect（remote_addr 创建），Windows 上
+                        # sendto(data, addr) 若 addr 与连接地址不一致报 "Invalid address:
+                        # must be None or (ip, port)"（aioquic 的 addr 可能是未解析 hostname）；
+                        # 不传 addr 时使用 socket 已连接的对端地址发送
+                        self._transport.sendto(data)
                     except Exception as e:
                         logger.debug("DoQ 解析器发送异常: %s", e)
 
@@ -285,6 +289,10 @@ if HAS_AIOQUIC:
                 configuration=config,
                 session_ticket_handler=self._session_ticket_callback,
             )
+            # SF-9 修复：必须调用 connect() 发起 QUIC 握手，否则无 Initial 包发出，
+            # datagrams_to_send/send_stream_data 抛 IndexError('list index out of range')，
+            # 握手永不完成 → DoQ 上游全部超时失败
+            quic.connect((self._target, self._port), now=time.monotonic())
             protocol = _PooledQuicProtocol(quic)
 
             connected_future = asyncio.get_running_loop().create_future()
@@ -303,6 +311,14 @@ if HAS_AIOQUIC:
 
             self._protocol = protocol
             self._last_used = time.monotonic()
+
+            # SF-9：quic.connect() 后 Initial 握手包排队在 datagrams_to_send，
+            # 必须立即 flush 发出，否则服务器收不到 Initial、握手永不完成
+            try:
+                protocol._flush_send(time.monotonic())
+            except Exception as e:
+                logger.debug("DoQ %s:%d 发送 Initial 握手包异常: %s",
+                             self._target, self._port, e)
 
             # 等待握手完成（超时则关闭连接）
             try:

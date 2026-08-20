@@ -111,6 +111,8 @@ class DoHResolver(BaseResolver):
         self._shared_session = shared_session
         self._shared_resolver = shared_resolver
         self._own_session: Optional[aiohttp.ClientSession] = None
+        # httpx 客户端（HTTP/2 优先；HTTP/3 条件启用），惰性创建并缓存
+        self._http_client = None
 
         if self._connect_ips:
             logger.info("DoH %s 使用 bootstrap IP: %s", url, ", ".join(self._connect_ips[:4]))
@@ -220,9 +222,95 @@ class DoHResolver(BaseResolver):
             )
         return self._own_session
 
+    def _get_http_client(self):
+        """返回缓存的 httpx AsyncClient（HTTP/2 强制；HTTP/3 条件启用）。
+
+        HTTP/3 仅在 httpx 支持 http3 参数（需 httpx[http3] extra + h3 库）时自动启用，
+        否则降级为 HTTP/2-only（当前环境即此情况）。
+
+        NOTE（实验性说明）：httpx 的 HTTP/3 支持目前为实验性——0.27.x 曾引入
+        `http3` 参数（需 `pip install httpx[http3]` + h3 库），0.28.0 已移除该参数
+        （`httpx 0.28.1 does not provide the extra 'http3'`），HTTP/3 预计在
+        httpx 1.0 正式应用。此处 try/except 的"条件启用"写法在未来 httpx 1.0
+        重新提供 http3 参数（或降级安装 httpx<0.28 + h3）时自动生效，无需改代码。
+        """
+        if self._http_client is not None and not self._http_client.is_closed:
+            return self._http_client
+        import httpx
+        verify = self._ssl_context if self._ssl_context is not None else True
+        try:
+            # HTTP/3 条件启用（实验性）：httpx[http3] extra + h3 库存在且 httpx
+            # 版本支持 http3 参数（0.27.x）时启用；httpx 0.28+ 移除该参数 →
+            # 抛 TypeError 落入 except 降级 HTTP/2；httpx 1.0 正式支持后此处自动启用
+            self._http_client = httpx.AsyncClient(
+                http2=True, http3=True, verify=verify, timeout=self.timeout,
+            )
+            logger.debug("DoH %s: HTTP/2+HTTP/3 客户端已创建", self.url)
+        except (TypeError, ImportError, ValueError):
+            self._http_client = httpx.AsyncClient(
+                http2=True, verify=verify, timeout=self.timeout,
+            )
+            logger.debug("DoH %s: HTTP/3 不可用（httpx 无 http3 支持），HTTP/2 客户端已创建", self.url)
+        return self._http_client
+
+    def _pin_bootstrap_url(self) -> tuple:
+        """bootstrap IP 直连 + sni_hostname extension（保留证书校验）。
+
+        与 aiohttp 主路径的 _MultiHostResolver IP pinning 语义对齐：避免回退路径走
+        系统 DNS（自引用 127.0.0.1 时递归环 / DNS 污染时绕过 pinning）。
+        无 bootstrap IP 时返回原 URL。
+        """
+        if not self._connect_ips:
+            return self.url, {}
+        hostname = self._get_hostname()
+        for ip in self._connect_ips:
+            if ":" in ip and not ip.startswith("["):
+                ip = f"[{ip}]"
+            url = self.url.replace(f"https://{hostname}", f"https://{ip}", 1)
+            if url != self.url:
+                return url, {"sni_hostname": hostname}
+        return self.url, {}
+
+    async def _resolve_http2_first(self, query_bytes: bytes) -> Optional[bytes]:
+        """HTTP/2 优先查询（httpx；HTTP/3 由 _get_http_client 条件启用）。
+
+        部分 DoH 服务器（如 doh.onedns.net）只支持 HTTP/2，aiohttp(HTTP/1.1) 会收到
+        空响应报 "Bad status line: Expected HTTP/, RTSP/ or ICE/: b''"。httpx http2=True
+        亦兼容 HTTP/1.1 服务器（ALPN 不协商 h2 时自动降级）。失败返回 None 走 HTTP/1.1 兜底。
+        """
+        try:
+            client = self._get_http_client()
+            url, ext = self._pin_bootstrap_url()
+            resp = await client.post(
+                url, content=query_bytes,
+                headers={"Content-Type": "application/dns-message"},
+                extensions=ext,
+            )
+            if resp.status_code != 200:
+                logger.debug("DoH %s HTTP/2 HTTP %d", self.url, resp.status_code)
+                return None
+            if len(resp.content) > 65536:
+                logger.debug("DoH %s HTTP/2 响应过大 %d 字节，丢弃", self.url, len(resp.content))
+                return None
+            return resp.content
+        except asyncio.TimeoutError:
+            logger.debug("DoH %s HTTP/2 超时 (timeout=%s)", self.url, self.timeout)
+            return None
+        except Exception as e:
+            logger.debug("DoH %s HTTP/2 优先路径失败: %s [%s]", self.url, e, type(e).__name__)
+            return None
+
     async def resolve(self, query_bytes: bytes) -> Optional[bytes]:
-        """通过 DoH (RFC 8484 Wire Format POST) 查询"""
+        """通过 DoH (RFC 8484 Wire Format POST) 查询。
+
+        策略（用户指定）：HTTP/2 优先（httpx）→ HTTP/3 条件启用 → HTTP/1.1 兜底（aiohttp）。
+        """
         async with self._semaphore:
+            # 1) HTTP/2 优先（HTTP/3 条件启用由 _get_http_client 处理）
+            ans = await self._resolve_http2_first(query_bytes)
+            if ans is not None:
+                return ans
+            # 2) HTTP/1.1 兜底：aiohttp 共享 session（保留连接池/ECH 架构）
             try:
                 session = self._get_session()
                 headers = {"Content-Type": "application/dns-message"}
@@ -234,17 +322,17 @@ class DoHResolver(BaseResolver):
                 ) as response:
                     if response.status != 200:
                         logger.debug(
-                            "DoH %s HTTP %d", self.url, response.status
+                            "DoH %s HTTP/1.1 HTTP %d", self.url, response.status
                         )
                         return None
                     return await response.read()
 
             except asyncio.TimeoutError:
-                logger.debug("DoH %s 超时 (timeout=%s)", self.url, self.timeout)
+                logger.debug("DoH %s HTTP/1.1 超时 (timeout=%s)", self.url, self.timeout)
                 return None
             except Exception as e:
                 logger.debug(
-                    "DoH %s 请求失败: %s [%s]",
+                    "DoH %s HTTP/1.1 请求失败: %s [%s]",
                     self.url, e, type(e).__name__,
                 )
                 return None
@@ -257,6 +345,13 @@ class DoHResolver(BaseResolver):
             except Exception as e:
                 logger.debug("DoH 解析器关闭会话异常: %s", e)
             self._own_session = None
+        # 关闭 httpx 客户端（HTTP/2/3 路径）
+        if self._http_client is not None and not self._http_client.is_closed:
+            try:
+                await self._http_client.aclose()
+            except Exception as e:
+                logger.debug("DoH 解析器关闭 httpx 客户端异常: %s", e)
+            self._http_client = None
 
     async def reset_connections(self):
         """
