@@ -373,7 +373,10 @@ class NDPProtection:
                             if cand != "00:00:00:00:00:00" and cand != "FF:FF:FF:FF:FF:FF":
                                 cur_mac = cand
                         if cur_mac and ("IPv6 地址" in s or "IPv6 Address" in s or "IPv6 地址." in s):
-                            ipm = re.search(r'((?:[0-9a-fA-F]{1,4}:){2,}[0-9a-fA-F:]+(?:%\d+)?)', s)
+                            # SF-15：IPv6 正则用 {0,4}（兼容 :: 压缩）——原 {1,4} 对 fe80::... 滑动匹配
+                            # 到残缺尾部（丢 fe80:: 前缀），startswith("fe80") 过滤失效，残缺 link-local
+                            # 误入 IP↔MAC 映射（与 _fetch_all_local_ips 的 {0,4} 正则一致）
+                            ipm = re.search(r'((?:[0-9a-fA-F]{0,4}:){2,}[0-9a-fA-F:]+(?:%\d+)?)', s)
                             if ipm:
                                 ip6 = ipm.group(1).split("%")[0]
                                 if not ip6.startswith("fe80") and ":" in ip6:
@@ -745,7 +748,8 @@ class NDPProtection:
         self._run_na_burst.set()
         self._na_burst_done.set()
         self._detect_done_event.set()
-        self._poison_detected.set()
+        # B1 修复：stop 时清空投毒标志（原 set 会在重启后残留，使 T1 实时反制永久门控）
+        self._poison_detected.clear()
         self._run_dhcpv6_check.set()
         try:
             self._ndp_sender_queue.put_nowait(None)
@@ -1502,6 +1506,21 @@ class NDPProtection:
                         })
                         self._trim_threat_events()
 
+        # ==================== T6 Redirect 欺骗（A3 修复：常驻路径补检测） ====================
+        # Redirect(type=137) 经 1350 行放行后原无消费分支，仅周期 _sniff_all 覆盖，
+        # 常驻窗口内非信任源 Redirect 静默漏检；对齐 AF_PACKET _check_ndp_raw_redirect
+        if pkt.haslayer(ICMPv6ND_Redirect):
+            _redir_mac = self._mac_normalize(src_mac)
+            _redir_gw_macs = {self._mac_normalize(mac) for _, mac, _ in self.gateway_pairs if mac}
+            if _redir_gw_macs and _redir_mac not in _redir_gw_macs:
+                self._threat_events.append({
+                    "type": "rogue_redirect", "time": time.time(),
+                    "src_mac": src_mac, "src_ip": src_ip,
+                })
+                self._trim_threat_events()
+                logger.warning("NDP 嗅探 [T6]: 非信任 Redirect! %s (%s)", src_ip, src_mac)
+            return  # Redirect 不参与后续 NA/NS/IP冲突/local_mac_spoof 判定
+
         # ==================== T5 NUD 追踪 / T4 DAD 检测 ====================
         if pkt.haslayer(ICMPv6ND_NS):
             ns = pkt[ICMPv6ND_NS]
@@ -1531,31 +1550,41 @@ class NDPProtection:
                     self._trim_threat_events()
                     self._dad_tracker[ns_target] = []
             else:
-                self._nud_tracker = {
-                    t: [ts for ts in times if now - ts < self._nud_window]
-                    for t, times in self._nud_tracker.items()
-                    if any(now - ts < self._nud_window for ts in times)
-                }
-                if len(self._nud_tracker) > 200:
-                    self._nud_tracker.clear()  # 防无界增长（CPU/内存 DoS）
-                if ns_target not in self._nud_tracker:
-                    self._nud_tracker[ns_target] = []
-                self._nud_tracker[ns_target].append(now)
-                if len(self._nud_tracker[ns_target]) >= self._nud_threshold:
-                    logger.warning("NDP 嗅探 [T5]: NUD 失败 %s! %d 次 NS 重传",
-                                   ns_target, len(self._nud_tracker[ns_target]))
-                    self._threat_events.append({
-                        "type": "nud_failure", "time": now,
-                        "target": ns_target, "count": len(self._nud_tracker[ns_target]),
-                    })
-                    self._trim_threat_events()
-                    self._nud_tracker[ns_target] = []
-                    # 触发恢复 worker 确认网关状态（同 target ≥10s 节流，防伪造 NS 放大 ping 风暴）
-                    if len(self._recovery_last_trigger) > 200:
-                        self._recovery_last_trigger.clear()  # 防无界增长
-                    if now - self._recovery_last_trigger.get(ns_target, 0.0) >= 10.0:
-                        self._recovery_last_trigger[ns_target] = now
-                        self._recovery_trigger.set()
+                # A2 修复：NUD 追踪仅限『目标=网关或本机地址』的 NS 重传——
+                # 原实现统计链路上所有主机的所有 NS（任意 target），正常 LAN 解析
+                # 流量即可触发 nud_failure 告警并驱动恢复 worker ping（误报放大）。
+                # 注：本机自包 NS（本机 MAC+IP）已被 1367 行自包豁免提前 return，
+                # 故此处按 target 过滤（网关∪本机地址），保留针对网关/本机地址的
+                # NS 重传风暴检测（RFC 3756 §4.2.3 NUD DoS），普通地址解析不计数。
+                _nud_tgt = (ns_target or "").split("%")[0]
+                _nud_gws = {gw.split("%")[0] for gw, _, _ in self.gateway_pairs if gw}
+                _nud_self = {ip.split("%")[0] for ip in self._local_all_ips}
+                if bool(_nud_tgt) and (_nud_tgt in _nud_gws or _nud_tgt in _nud_self):
+                    self._nud_tracker = {
+                        t: [ts for ts in times if now - ts < self._nud_window]
+                        for t, times in self._nud_tracker.items()
+                        if any(now - ts < self._nud_window for ts in times)
+                    }
+                    if len(self._nud_tracker) > 200:
+                        self._nud_tracker.clear()  # 防无界增长（CPU/内存 DoS）
+                    if ns_target not in self._nud_tracker:
+                        self._nud_tracker[ns_target] = []
+                    self._nud_tracker[ns_target].append(now)
+                    if len(self._nud_tracker[ns_target]) >= self._nud_threshold:
+                        logger.warning("NDP 嗅探 [T5]: NUD 失败 %s! %d 次 NS 重传",
+                                       ns_target, len(self._nud_tracker[ns_target]))
+                        self._threat_events.append({
+                            "type": "nud_failure", "time": now,
+                            "target": ns_target, "count": len(self._nud_tracker[ns_target]),
+                        })
+                        self._trim_threat_events()
+                        self._nud_tracker[ns_target] = []
+                        # 触发恢复 worker 确认网关状态（同 target ≥10s 节流，防伪造 NS 放大 ping 风暴）
+                        if len(self._recovery_last_trigger) > 200:
+                            self._recovery_last_trigger.clear()  # 防无界增长
+                        if now - self._recovery_last_trigger.get(ns_target, 0.0) >= 10.0:
+                            self._recovery_last_trigger[ns_target] = now
+                            self._recovery_trigger.set()
 
         # ==================== 基线兜底学习（嗅探器启动早于detect_gateway时，通过系统NDP表验证后学习）====================
         # 手动配置网关时不允许嗅探器覆盖基线（detect_gateway已锁定）
@@ -1638,8 +1667,11 @@ class NDPProtection:
                         break
                     if not self._poison_detected.is_set():
                         self._loop.call_soon_threadsafe(self._poison_detected.set)
+                        # B2 修复：attacker_ip 传被冒充的网关地址（src_ip/na_target 已确认 == gw_ip），
+                        # 原传 src_ip 在攻击形态 B（攻击者用自身真实 IP 作源、NA target=网关）时
+                        # 定向毒化的是攻击者自身 IP，网关邻居缓存条目未被破坏，反制无效
                         self._loop.call_soon_threadsafe(
-                            lambda _mac=src_mac, _ip=src_ip: asyncio.create_task(self._on_poison_detected(attacker_mac=_mac, attacker_ip=_ip)))
+                            lambda _mac=src_mac, _ip=gw_ip: asyncio.create_task(self._on_poison_detected(attacker_mac=_mac, attacker_ip=_ip)))
                     break
 
         # ==================== IP 冲突 ====================
@@ -1731,8 +1763,9 @@ class NDPProtection:
                 if _now_ipc - _last_time_ipc < _debounce_ipc:
                     break
                 self._poison_detected.set()
+                # B2 修复：IP 冲突反制传被宣告的本机地址（毒化攻击者缓存中『本机IP→随机MAC』条目）
                 self._loop.call_soon_threadsafe(
-                    lambda _mac=src_mac, _ip=src_ip: asyncio.create_task(self._on_poison_detected(attacker_mac=_mac, attacker_ip=_ip)))
+                    lambda _mac=src_mac, _ip=local_ip_clean: asyncio.create_task(self._on_poison_detected(attacker_mac=_mac, attacker_ip=_ip)))
                 break
 
         # ==================== 本地 MAC 冒用攻击 ====================
@@ -1816,6 +1849,10 @@ class NDPProtection:
         await self.refresh_router_ndp()
         # 投毒检测后立即触发 NA 反制（异步不阻塞）
         asyncio.create_task(self._ndp_counterstrike(attacker_mac=attacker_mac, attacker_ip=attacker_ip))
+        # B1 修复：反制触发后复位投毒标志，允许后续投毒再次触发实时反制
+        # （原实现依赖 network_monitor 在'网络恢复'时才 clear，持续攻击期间 T1
+        #   实时反制仅首次有效；防抖由 _ndp_attack_stats 3s 门控承担，不会反制风暴）
+        self._poison_detected.clear()
 
     async def refresh_router_ndp(self, abort_check=None) -> bool:
         """刷新路由器 NDP 表（当前无 IPv6 网络时跳过）"""
@@ -2706,8 +2743,31 @@ class NDPProtection:
                     dad_targets[target] += 1
                 # 审计 MEDIUM：原条件 all_trusted and src_mac not in all_trusted 在信任集合为空时恒 False，
                 # 启动初期/网关 MAC 未解析时 NS 可疑源静默漏检（对齐 1458 行常驻路径无此前置）
+                # SF-16：排除本机自身发出的 NS——NDP 主动 NS 探测（_probe_gateway_ns 每 30s，
+                # 源 IP 为链路本地 fe80::）与本机 NUD 的 src_mac 为本机 MAC，不在 all_trusted 中，
+                # 若不排除会被误判为可疑 NS → t2_ns 误报 → 触发无谓修复。
+                # 与常驻路径 _on_ndp_packet_sync 对齐的双条件豁免：本机 MAC 且 源 IP 属本机 IP
+                # 集合（两侧均剥离 %zone）；本机 MAC + 未知 IP = 本地 MAC 冒用特征，仍检测。
+                _tgt_clean = target.split("%")[0] if target else ""
+                _gw_set = {gw.split("%")[0] for gw, _, _ in self.gateway_pairs if gw}
                 if src_mac not in all_trusted:
-                    suspicious_ns.append((target, src_mac))
+                    _local_ns = False
+                    if self._local_macs and any(src_mac == self._mac_normalize(m) for m in self._local_macs):
+                        _src_ip_clean = src_ip.split("%")[0] if src_ip else ""
+                        _local_ip_set = {ip.split("%")[0] for ip in self._local_all_ips}
+                        # 本机主动探测 NS（_probe_gateway_ns：src=本机 IP，target=网关地址）
+                        _probe_ns = bool(_src_ip_clean) and _src_ip_clean in _local_ip_set \
+                            and bool(_tgt_clean) and _tgt_clean in _gw_set
+                        # 本机 DAD NS（RFC 4862：src=::，target=本机待检测地址）
+                        _dad_ns = (not src_ip or src_ip == "::") and bool(_tgt_clean) \
+                            and _tgt_clean in _local_ip_set
+                        # SF-16（security_review HIGH/MEDIUM 整改）：豁免必须同时校验 target
+                        # 属本机地址或网关——防止攻击者伪造本机 MAC+IP 宣告任意 target 绕过检测
+                        _local_ns = _probe_ns or _dad_ns
+                    # A1 修复：仅当 NS 目标为网关地址才视为可疑（NS 欺骗/干扰必须针对网关）；
+                    # 局域网内其它设备解析任意地址的正常 NS 不再误报（t2_ns 误报根因）
+                    if not _local_ns and _tgt_clean in _gw_set:
+                        suspicious_ns.append((target, src_mac))
             if pkt.haslayer(ICMPv6ND_Redirect):
                 # 修复：原条件 haslayer(ICMPv6Error) 仅匹配 type 1-4 错误类，对 Redirect(type 137) 恒 False
                 redirect_sources.append((src_mac, src_ip))
@@ -2725,7 +2785,14 @@ class NDPProtection:
 
     # ======================== 修复 ========================
 
-    async def send_unsolicited_na(self, target: str = "ff02::1"):
+    async def send_unsolicited_na(self, target: str = ""):
+        """发送 Unsolicited NA 通告本机地址，刷新链路上邻居（路由器）的 NDP 缓存。
+
+        target=""（默认）：对每个接口通告该接口自己的 IPv6 地址（global 或链路本地），
+        这才是 RFC 4861 §7.2.4 规定的 NA Target Address 语义——必须是本机单播地址，
+        不能是 ff02::1/ff02::2 组播地址（路由器不会为组播地址建立邻居缓存条目）。
+        显式传入 target 时（如定向通告），按原逻辑通告该地址。
+        """
         if self._scapy_available:
             result = await self._send_na_scapy_all(target)
             if result:
@@ -2844,10 +2911,13 @@ class NDPProtection:
                         self._counterstrike_sent_macs.clear()
                     vlan_id = self._manual_gateway_vlan
                     # M1 修复：定向毒化 + 广播反制 + 网关宣告均优先经 ARP 常驻发送器
+                    # B3 修复：定向毒化帧二层发往攻击者 MAC，IPv6 目的取攻击者源地址
+                    # （原 IPv6 dst=tgt=网关地址，标准协议栈主机因目的不匹配会丢弃该 NA）
                     if not self._enqueue_ndp_via_arp(
                             attacker_mac, local_ip, poison_mac,
                             attacker_ip or self.gateway_ipv6 or local_ip,
-                            na_rounds, inter, vlan_id, iface):
+                            na_rounds, inter, vlan_id, iface,
+                            ipv6_dst=attacker_ip or local_ip):
                         try:
                             self._ndp_sender_queue.put_nowait(
                                 (attacker_mac, local_ip, poison_mac, attacker_ip or self.gateway_ipv6 or local_ip, na_rounds, inter, vlan_id)
@@ -3080,7 +3150,7 @@ class NDPProtection:
             except Exception as e:
                 logger.debug("NDP 防护: NDP 发送失败 (%s)", e)
 
-    async def _send_na_scapy_all(self, target: str) -> bool:
+    async def _send_na_scapy_all(self, target: str = "") -> bool:
         """复用 ARP 防护的常驻 scapy 发送器发送 Unsolicited NA（scapy 发送资源单进程独占修复）。
 
         原实现每次调用重新 import scapy.all 并直接 sendp（Windows 用 netsh 数字接口索引），
@@ -3088,6 +3158,9 @@ class NDPProtection:
         任一接口 sendp 失败后 _scapy_sendp_ok 永久置 False → 日志"scapy sendp 不可用"并
         永远走系统 fallback。此处删除内部 scapy import/sendp 逻辑，统一交给
         ARPProtection.enqueue_ndp_na() 队列发送（worker 内一次性导入 scapy）。
+
+        target="" 时对每个接口通告其自身 IPv6 地址（RFC 4861 §7.2.4：NA Target
+        Address 必须是本机单播地址，不能是 ff02::1 组播）。
         """
         arp_sender = getattr(self, "_arp_sender", None)
         if arp_sender is None or not self._scapy_available:
@@ -3113,11 +3186,14 @@ class NDPProtection:
                 socket.inet_pton(socket.AF_INET6, local_ip)
             except Exception:
                 continue
+            # 修复：target 为空时通告本接口自己的地址（原默认 "ff02::1" 是组播地址，
+            # 路由器不会更新邻居缓存，'刷新路由器 NDP 表' 实际失效）
+            na_target = (target or local_ip).strip().split("%")[0]
             # M2 修复：scapy 不认 netsh 数字接口索引，优先用 NPF 设备名（按 MAC 匹配），
             # 取不到则传 ""（scapy 默认接口），与 ARP 常驻发送器行为一致
             iface_arg = self._resolve_npf_iface_name(iface_mac) or ""
             fut = arp_sender.enqueue_ndp_na(
-                iface_mac, local_ip, target, iface_arg, count=5,
+                iface_mac, local_ip, na_target, iface_arg, count=5,
             )
             if fut is not None:
                 fut_list.append((iface, fut))
@@ -3222,11 +3298,13 @@ class NDPProtection:
         return ""
 
     def _enqueue_ndp_via_arp(self, dst_mac, src_ip, src_mac, tgt_ip,
-                             count, inter, vlan_id, iface=None) -> bool:
+                             count, inter, vlan_id, iface=None,
+                             ipv6_dst=None) -> bool:
         """M1 修复：优先经 ARP 常驻发送器入队 NDP 报文（定向/广播/网关宣告统一）。
 
         返回 True 表示已成功入队（发送结果由 future 回执，异步）；返回 False
         时调用方应回退 NDP 自有队列（Linux AF_PACKET 兜底）或系统命令。
+        ipv6_dst：定向 NA 的 IPv6 目的地址（B3 修复，透传 enqueue_ndp_na）。
         """
         arp_sender = getattr(self, "_arp_sender", None)
         if arp_sender is None or not getattr(arp_sender, "_scapy_sender_ready", False):
@@ -3241,6 +3319,7 @@ class NDPProtection:
             fut = arp_sender.enqueue_ndp_na(
                 src_mac, src_ip, tgt_ip, iface_arg, count=count,
                 dst_mac=dst_mac, inter=inter, vlan_id=vlan_id,
+                ipv6_dst=ipv6_dst,
             )
             return fut is not None
         except Exception:

@@ -224,7 +224,8 @@ class ARPProtection:
                 if isinstance(task, tuple) and task and task[0] == "NDP_NA":
                     try:
                         (_na_mac, _na_src_ip, _na_tgt_ip, _na_dst_mac,
-                         _na_iface, _na_count, _na_inter, _na_vlan, _na_kind, _na_fut) = task[1:]
+                         _na_iface, _na_count, _na_inter, _na_vlan, _na_kind, _na_fut,
+                         _na_ipv6_dst) = task[1:]
                         from scapy.all import (IPv6, ICMPv6ND_NA, ICMPv6NDOptDstLLAddr,
                                                ICMPv6ND_RS, ICMPv6NDOptSrcLLAddr)
                         _na_mac = (_na_mac or "00:00:00:00:00:00").replace("-", ":").upper()
@@ -241,8 +242,17 @@ class ARPProtection:
                             )
                             _na_ip_dst = "ff02::2"
                         else:
-                            _na_tgt_ip = str(_na_tgt_ip or "ff02::1").split("%")[0]
-                            _na_ip_dst = "ff02::1" if _na_dst_mac == "FF:FF:FF:FF:FF:FF" else _na_tgt_ip
+                            _na_tgt_ip = str(_na_tgt_ip or "").split("%")[0]
+                            # 修复：NA Target Address 必须为本机单播地址（RFC 4861 §7.2.4）；
+                            # 原兜底 or "ff02::1" 会通告组播地址，路由器邻居缓存无此条目，
+                            # 刷新 NDP 表无效。tgt 缺失时跳过本次发送。
+                            if not _na_tgt_ip:
+                                logger.debug("ARP 反制: NDP NA 缺少通告目标地址，跳过发送")
+                                if _na_fut is not None and not _na_fut.done():
+                                    _na_fut.set_result(False)
+                                continue
+                            _na_ip_dst = "ff02::1" if _na_dst_mac == "FF:FF:FF:FF:FF:FF" \
+                                else str(_na_ipv6_dst or _na_tgt_ip).split("%")[0]
                             _na_pkt = (
                                 Ether(dst=_na_dst_mac, src=_na_mac)
                                 / IPv6(src=_na_src_ip, dst=_na_ip_dst, hlim=255)
@@ -328,7 +338,7 @@ class ARPProtection:
     def enqueue_ndp_na(self, iface_mac: str, local_ip: str, target_ip: str,
                        iface_arg=None, count: int = 5, dst_mac: str = None,
                        inter: float = 0.02, vlan_id: str = None,
-                       kind: str = "NA") -> Optional[asyncio.Future]:
+                       kind: str = "NA", ipv6_dst: str = None) -> Optional[asyncio.Future]:
         """复用常驻 scapy 发送器发送 NDP 报文（供 NDP 防护调用）。
 
         scapy/Npcap 发送资源在同一进程内由本常驻 worker（队列 + run_in_executor）
@@ -336,6 +346,8 @@ class ARPProtection:
         - kind="NA"：Unsolicited/定向 NA（tgt=target_ip，LLA=iface_mac）；
           dst_mac="ff:ff:ff:ff:ff:ff" 广播宣告本机，定向=攻击者 MAC 毒化其邻居缓存
         - kind="RS"：Router Solicitation（发往 ff02::2，忽略 target_ip）
+        - ipv6_dst：定向 NA 的 IPv6 目的地址（B3 修复：毒化帧二层发往攻击者 MAC，
+          IPv6 目的应取攻击者源地址；None 时回退 target_ip，广播时恒为 ff02::1）
         返回 asyncio.Future：发送完成后 set_result(True/False)；
         发送器未就绪或队列满时返回 None（调用方回退系统方法）。
         """
@@ -345,7 +357,7 @@ class ARPProtection:
         try:
             self._scapy_sender_queue.put_nowait(
                 ("NDP_NA", iface_mac, local_ip, target_ip,
-                 dst_mac, iface_arg, count, inter, vlan_id, kind, fut)
+                 dst_mac, iface_arg, count, inter, vlan_id, kind, fut, ipv6_dst)
             )
             return fut
         except asyncio.QueueFull:
