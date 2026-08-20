@@ -158,6 +158,17 @@ class NetworkMonitor:
         logger.info("网络连通性监控已启动 (网关检测=%gs, ping目标=%s)",
                      self._interval, self._ping_targets_v4 + self._ping_targets_v6)
 
+        # ScapyBridge：ARP/NDP 共享单一 Npcap 嗅探会话（审计合并，减少驱动会话占用）
+        # 配置开关：仅当 ARP 或 NDP 防护 enabled 时才启动桥；两者都关则桥不启动
+        try:
+            from scapy_bridge import get_scapy_bridge
+            _bridge = get_scapy_bridge()
+            _bridge.set_loop(asyncio.get_event_loop())
+            if (self._arp_protection.enabled or self._ndp_protection.enabled) and _bridge.start_if_ready():
+                logger.info("网络监控: ScapyBridge 共享嗅探已启动（ARP/NDP 单一 Npcap 会话）")
+        except Exception as e:
+            logger.warning("网络监控: ScapyBridge 启动异常: %s", e)
+
         # ARP 防护：自动探测网关，然后启动常驻 worker
         if self._arp_protection.enabled:
             if not self._arp_protection.is_manual:
@@ -180,6 +191,12 @@ class NetworkMonitor:
         self._running = False
         await self._arp_protection._stop_workers()
         await self._ndp_protection.stop()
+        # 停止共享 ScapyBridge（干净退出 sniff 线程，释放 Npcap 会话，防 STOP_PENDING）
+        try:
+            from scapy_bridge import get_scapy_bridge
+            get_scapy_bridge().stop()
+        except Exception:
+            pass
         # 停止常驻恢复 worker
         if self._recover_task:
             self._run_recover.set()

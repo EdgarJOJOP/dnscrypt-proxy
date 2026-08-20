@@ -724,12 +724,7 @@ class ARPProtection:
 
         # ==================== 路径 1: scapy 嗅探（跨平台，最快） ====================
         if _SCAPY_AVAILABLE:
-            from scapy.all import conf, ARP as ScapyARP
-            try:
-                if self._interface_name:
-                    conf.iface = self._interface_name
-            except Exception:
-                pass
+            from scapy.all import ARP as ScapyARP
 
             pkt_queue = asyncio.Queue()
             sniff_failed = False
@@ -746,38 +741,26 @@ class ARPProtection:
 
             loop = asyncio.get_event_loop()
 
-            sniffer_task = None
-            try:
-                sniffer_task = loop.run_in_executor(
-                    None,
-                    lambda: scapy.sniff(
-                        prn=_handle_pkt, store=False,
-                        filter="arp", timeout=None,
-                        stop_filter=lambda pkt: not self._arp_running,
-                    ),
-                )
-                logger.info("ARP 防护: scapy 嗅探已启动")
-            except Exception as e:
-                logger.warning("ARP 防护: scapy sniff 启动失败 (%s)，使用备用方案", e)
-                sniff_failed = True
+            # 审计合并：ARP/NDP 共享 ScapyBridge 单一 Npcap 会话，不再各自 sniff
+            from scapy_bridge import get_scapy_bridge
+            bridge = get_scapy_bridge()
+            bridge.set_loop(loop)
+            bridge.register_prn(_handle_pkt)
+            sniff_failed = True
+            if bridge.start_if_ready():
+                sniff_failed = False
+                logger.info("ARP 防护: scapy 嗅探已并入 ScapyBridge 单会话")
 
             if not sniff_failed:
                 while self._arp_running:
                     try:
                         pkt = await asyncio.wait_for(pkt_queue.get(), timeout=0.5)
                     except asyncio.TimeoutError:
-                        if sniffer_task and sniffer_task.done() and not sniffer_task.cancelled():
-                            try:
-                                sniffer_task.result()
-                            except Exception as e:
-                                logger.warning("ARP 防护: scapy sniff 已停止 (%s)，切换到 arp 轮询", e)
-                                sniff_failed = True
-                                break
-                            # sniff 正常结束但程序仍在运行（不应发生），重启嗅探
-                            if self._arp_running:
-                                logger.info("ARP 防护: 嗅探已结束，重新启动...")
-                                sniff_failed = True
-                                break
+                        # sniff 由 ScapyBridge 管理；桥退出时队列不再来包，此处仅保活并检测桥状态
+                        if not bridge.is_active():
+                            sniff_failed = True
+                            logger.warning("ARP 防护: ScapyBridge 嗅探不可用，切换到 arp 轮询")
+                            break
                         continue
                     except Exception:
                         break

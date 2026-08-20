@@ -894,44 +894,24 @@ class NDPProtection:
         logger.debug("NDP 防护: 本机全量 IP 白名单=%s",
                     sorted(self._local_all_ips) if self._local_all_ips else "(空!)")
 
-        # ==================== 路径 1: scapy 嗅探 ====================
+        # ==================== 路径 1: scapy 嗅探（并入 ScapyBridge 单会话） ====================
         if self._scapy_available:
-            loop = asyncio.get_event_loop()
-            # 快速 libpcap 预检
-            scapy_ok = True
-            try:
-                def _probe():
-                    # 显式指定接口：不依赖 scapy 全局 conf.iface（避免被 ARP 侧写入干扰——协程独立性）
-                    sniff(filter="icmp6", count=1, timeout=0.1, store=False, quiet=True,
-                          iface=self.interface_name or None)
-                await loop.run_in_executor(None, _probe)
-            except Exception:
-                logger.warning("NDP 防护: scapy 嗅探预检失败 (libpcap 不可用)")
-                scapy_ok = False
-
-            if scapy_ok:
-                def _sniff():
-                    while self._ndp_running:
-                        sniff(filter="icmp6",
-                              iface=self.interface_name or None,  # 显式接口：不读 ARP 写入的 conf.iface
-                            stop_filter=lambda pkt: not self._ndp_running,
-                        lfilter=lambda p: (
-                            p.haslayer(Ether) and p.haslayer(IPv6) and (
-                                p.haslayer(ICMPv6ND_NA) or
-                                p.haslayer(ICMPv6ND_NS) or
-                                p.haslayer(ICMPv6ND_RA) or
-                                p.haslayer(ICMPv6ND_Redirect) or
-                                p.haslayer(ICMPv6Error)
-                            )
-                        ),
-                        prn=self._on_ndp_packet,
-                        store=False, quiet=True,
-                    )
-                try:
-                    await loop.run_in_executor(None, _sniff)
+            from scapy_bridge import get_scapy_bridge
+            bridge = get_scapy_bridge()
+            bridge.set_loop(asyncio.get_event_loop())
+            bridge.register_prn(self._on_ndp_packet)
+            if bridge.start_if_ready():
+                logger.info("NDP 防护: scapy 嗅探已并入 ScapyBridge 单会话（不再自建 Npcap 会话）")
+                # 桥嗅探线程独立运行；本 worker 保持存活，桥失效时回退路径 2/3
+                while self._ndp_running:
+                    await asyncio.sleep(1.0)
+                    if not bridge.is_active():
+                        logger.warning("NDP 防护: ScapyBridge 嗅探不可用，尝试 AF_PACKET/轮询")
+                        break
+                else:
                     return
-                except Exception as e:
-                    logger.debug("NDP 防护: scapy sniff 退出 (%s)，尝试 AF_PACKET", e)
+            else:
+                logger.info("NDP 防护: ScapyBridge 不可用（Npcap 未接管物理网卡），走 fallback")
 
         # ==================== 路径 2: AF_PACKET 原始套接字（Linux） ====================
         if sys.platform != "win32":
@@ -2265,6 +2245,25 @@ class NDPProtection:
             if iface.ipv6_ll or iface.ipv6_global:
                 # 解析接口索引（供 sendp 使用数字索引替代中文接口名）
                 iface.idx = await self._resolve_iface_idx(iface.name)
+                # 审计修复：netsh 名称匹配失败（编码差异/多编码均失败）时用默认路由 zone_id 兜底——
+                # zone_id 即接口索引（链路本地 %9 中的 9）；仅当接口链路本地带 %zone 时交叉匹配
+                # 默认路由（多接口防错配，review should-fix）；无 %zone 信息时不乱兜底（保持 idx=0
+                # 回退字符串接口名，避免把绑定/sendp 指向错误接口）
+                if iface.idx <= 0:
+                    _zone_from_ll = None
+                    if iface.ipv6_ll and "%" in iface.ipv6_ll:
+                        try:
+                            _zone_from_ll = int(iface.ipv6_ll.split("%", 1)[1])
+                        except ValueError:
+                            _zone_from_ll = None
+                    if _zone_from_ll:
+                        for _gw, _zid in default_routes:
+                            if _zid and _zid > 0 and _zid == _zone_from_ll:
+                                iface.idx = _zid
+                                break
+                    if iface.idx <= 0:
+                        logger.warning("NDP 防护: 接口 %s idx 解析失败且无链路本地 zone 交叉匹配，保持 idx=0（回退字符串接口名）",
+                                       iface.name)
                 # 审计 MEDIUM：仅挂载本接口（zone_id 匹配 iface.idx）的默认路由；
                 # 原实现把全部默认路由加给每个接口——多接口场景 gateway_pairs 重复、基线/反制对象错乱
                 for gw, idx in default_routes:
@@ -2981,6 +2980,22 @@ class NDPProtection:
         if not self._scapy_available:
             return False
 
+        # 审计修复：Npcap 接口可用性探测——get_if_list 仅 loopback（Npcap 驱动未运行/未接管物理网卡）
+        # 时给出明确可操作提示（节流：每 300s 最多提示一次）
+        if sys.platform == "win32":
+            _now_p = time.time()
+            if _now_p - getattr(self, "_scapy_npcap_warn_ts", 0.0) >= 300.0:
+                try:
+                    from scapy.all import get_if_list
+                    _ifaces = get_if_list()
+                    if _ifaces and all(("Loopback" in i or "loopback" in i) for i in _ifaces):
+                        self._scapy_npcap_warn_ts = _now_p
+                        logger.warning("NDP 防护: Npcap 未枚举到物理网卡（仅 %s）。NA 反制将尝试 NPF 设备接口"
+                                       "或走系统 fallback；请以管理员运行 'sc start npcap' 或检查 Npcap 服务状态",
+                                       ", ".join(repr(i) for i in _ifaces))
+                except Exception:
+                    pass
+
         # 运行时 sendp 预检：Windows 无 Npcap 时 scapy 导入成功但发送失败
         if not self._scapy_sendp_ok and sys.platform == "win32":
             logger.info("NDP 防护: scapy sendp 不可用（需安装 Npcap），走系统 fallback 发送")
@@ -3042,13 +3057,72 @@ class NDPProtection:
                 pkt = eth / ipv6 / na / lla
                 iface_arg = iface.idx if iface.idx > 0 else iface.name
                 logger.info("NDP 防护: NA 发送中 接口=%s idx=%s IP=%s MAC=%s", iface.name, iface_arg, local_ip, iface_mac)
-                for _ in range(5):
-                    sendp(pkt, iface=iface_arg, verbose=False)
-                    time.sleep(0.02)
-                return 5
-            except Exception as e:
+                sent = 0
+                try:
+                    for _ in range(5):
+                        sendp(pkt, iface=iface_arg, verbose=False)
+                        time.sleep(0.02)
+                    sent = 5
+                except Exception as e1:
+                    # 审计修复：接口名/索引不可用（Npcap 驱动未运行或 get_if_list 枚举不全）时，
+                    # 按本机 MAC 匹配 get_windows_if_list 取 \Device\NPF_{GUID} 设备路径重试
+                    _npf_iface = None
+                    if sys.platform == "win32":
+                        try:
+                            from scapy.arch.windows import get_windows_if_list
+                            _mac_n = str(iface_mac or "").lower().replace("-", ":")
+                            _wl = get_windows_if_list()
+                        # 优先选择 Npcap Packet Driver 条目（hostcap/WFP 等过滤器的 NPF 设备不可发包）
+                            for _w in _wl:
+                                _wm = str(_w.get("mac", "") or "").lower().replace("-", ":")
+                                if _wm == _mac_n and _wm not in ("", "00:00:00:00:00:00"):
+                                    _guid = _w.get("guid", "")
+                                    if _guid and "NPCAP" in str(_w.get("name", "") or "").upper():
+                                        _npf_iface = f"\\Device\\NPF_{_guid}"
+                                        break
+                            if not _npf_iface:
+                                # 兜底：任一同 MAC 条目
+                                for _w in _wl:
+                                    _wm = str(_w.get("mac", "") or "").lower().replace("-", ":")
+                                    if _wm == _mac_n and _wm not in ("", "00:00:00:00:00:00"):
+                                        _guid = _w.get("guid", "")
+                                        if _guid:
+                                            _npf_iface = f"\\Device\\NPF_{_guid}"
+                                            break
+                        except Exception:
+                            _npf_iface = None
+                    if _npf_iface:
+                        try:
+                            for _ in range(5):
+                                sendp(pkt, iface=_npf_iface, verbose=False)
+                                time.sleep(0.02)
+                            sent = 5
+                            logger.info("NDP 防护: NA 改用 NPF 设备接口 %s 发送成功（接口名 %r 不可用）",
+                                        _npf_iface, iface_arg)
+                        except Exception as e2:
+                            self._scapy_sendp_ok = False
+                            logger.warning("NDP 防护: 接口 %s NA sendp 失败（接口名与 NPF 设备均不可用，"
+                                           "Npcap 驱动可能未运行）: %s / %s (idx=%s)",
+                                           iface.name, e1, e2, iface.idx)
+                            return 0
+                    else:
+                        self._scapy_sendp_ok = False
+                        if sys.platform == "win32":
+                            logger.warning("NDP 防护: 接口 %s NA sendp 失败（scapy 找不到接口 %r 且未能按 MAC 匹配 "
+                                           "NPF 设备，Npcap 驱动未运行或未接管该网卡）: %s (idx=%s)。"
+                                           "请以管理员运行 sc start npcap 或检查 Npcap 服务状态；将走系统 fallback"
+                                           "（ping 网关 + netsh 静态 NDP 绑定）",
+                                           iface.name, iface_arg, e1, iface.idx)
+                        else:
+                            # 非 Windows（Linux AF_PACKET 兑底）：不提示 sc start npcap（review should-fix）
+                            logger.warning("NDP 防护: 接口 %s NA sendp 失败: %s (idx=%s)，将走系统 fallback",
+                                           iface.name, e1, iface.idx)
+                        return 0
+                return sent
+            except Exception as e_outer:
+                # 外层兜底：构造阶段（inet_pton/import/包构造）异常（iface_arg 可能未定义，不引用）
                 self._scapy_sendp_ok = False
-                logger.warning("NDP 防护: 接口 %s NA sendp 失败: %s (idx=%s)", iface.name, e, iface.idx)
+                logger.warning("NDP 防护: 接口 %s NA 构造/发送异常: %s", iface.name, e_outer)
                 return 0
 
         try:
@@ -3145,13 +3219,26 @@ class NDPProtection:
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-            text = self._decode_win_output(stdout)
-            for line in text.splitlines():
-                parts = line.strip().split()
-                if len(parts) >= 5 and parts[0].isdigit():
-                    idx = int(parts[0])
-                    name = " ".join(parts[4:])
-                    self._iface_name_to_idx[name] = idx
+            # 审计修复：netsh 输出编码不固定（本机实测为 UTF-8，但 _decode_win_output 首选
+            # cp936 解码 UTF-8 字节产生乱码名称（'浠ュお缃 2'）→ 与 ipconfig 的 '以太网 2' 匹配失败、
+            # idx 返回 0。对 locale/utf-8/gbk/utf-16 全部尝试解析，所有名称键均入映射，正确名必命中。
+            encodings = []
+            pref = locale.getpreferredencoding(False)
+            for enc in (pref, 'utf-8', 'gbk', 'utf-16'):
+                if enc and enc not in encodings:
+                    encodings.append(enc)
+            for enc in encodings:
+                try:
+                    text = stdout.decode(enc, errors='replace')
+                except (LookupError, UnicodeDecodeError):
+                    continue
+                for line in text.splitlines():
+                    parts = line.strip().split()
+                    if len(parts) >= 5 and parts[0].isdigit():
+                        idx = int(parts[0])
+                        name = " ".join(parts[4:]).strip()
+                        if name:
+                            self._iface_name_to_idx[name] = idx
             return self._iface_name_to_idx.get(iface_name, 0)
         except Exception:
             return 0
@@ -3164,34 +3251,57 @@ class NDPProtection:
                 iface_name = iface or "以太网"
                 if vlan_id and not self._vxlan_enabled:
                     iface_name = f"{iface_name}.{vlan_id}"
-                # 尝试用接口索引优先（避免 name= 编码问题）
+                # 尝试用接口索引优先（避免 interface= 编码问题）
                 iface_idx = await self._resolve_iface_idx(iface_name)
+                # 审计修复：netsh set neighbors 统一用 interface= 语法（原 name= 是无效参数但
+                # netsh 报错时 rc 仍为 0 → 假成功）；并捕获 stdout（netsh 错误提示输出到 stdout，
+                # 如"请求的操作需要提升"），结合 rc 与输出文本判断真实成功
                 if iface_idx > 0:
-                    proc = await asyncio.create_subprocess_exec(
-                        "netsh", "interface", "ipv6", "set", "neighbors",
-                        str(iface_idx), gw.split(chr(37))[0], mac_fmt,
-                        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
-                    )
+                    args = ["netsh", "interface", "ipv6", "set", "neighbors",
+                            f"interface={iface_idx}",
+                            f"address={gw.split(chr(37))[0]}", f"neighbor={mac_fmt}"]
                 else:
-                    proc = await asyncio.create_subprocess_exec(
-                        "netsh", "interface", "ipv6", "set", "neighbors",
-                        f"name={iface_name}", f"address={gw.split(chr(37))[0]}", f"neighbor={mac_fmt}",
-                        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
-                    )
+                    args = ["netsh", "interface", "ipv6", "set", "neighbors",
+                            f"interface={iface_name}",
+                            f"address={gw.split(chr(37))[0]}", f"neighbor={mac_fmt}"]
+                proc = await asyncio.create_subprocess_exec(
+                    *args,
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                )
                 try:
-                    _, serr = await asyncio.wait_for(proc.communicate(), timeout=10)
+                    sout, serr = await asyncio.wait_for(proc.communicate(), timeout=10)
                 except asyncio.TimeoutError:
                     proc.kill()
                     await proc.wait()
                     logger.warning("NDP 防护: 静态 NDP 绑定超时 %s -> %s", gw, mac)
                     return False
-                if proc.returncode == 0:
+                # 审计修复：netsh 错误输出编码不固定（本机实测 UTF-8，_decode_win_output 首选 cp936 会乱码），
+                # 判定时拼接 utf-8/gbk 两种解码，任一含失败关键词即判失败（防 rc=0 假成功残留）；
+                # 日志显示 _decode_win_output 单版本
+                _chk = ""
+                for _b in (sout, serr):
+                    if not _b:
+                        continue
+                    for _enc in ('utf-8', 'gbk'):
+                        try:
+                            _chk += _b.decode(_enc, errors='replace')
+                        except Exception:
+                            pass
+                out_text = NDPProtection._decode_win_output(sout) if sout else ""
+                err_text = NDPProtection._decode_win_output(serr) if serr else ""
+                combined = _chk
+                # netsh 语法错误/权限不足：rc 可能为 0（name= 假成功）或 1，须结合输出文本判断
+                # 关键词覆盖：权限提升/语法错误/拒绝访问/找不到接口/参数无效（security_review MEDIUM 补全）
+                if proc.returncode == 0 and not any(k in combined for k in
+                        ("提升", "elevated", "语法", "有效参数", "不是这个指令",
+                         "拒绝", "denied", "找不到", "not found", "Access",
+                         "参数不正确", "无效参数", "incorrect", "invalid", "parameter")):
                     iface_log = iface_name if vlan_id else iface
                     logger.info("NDP 防护: 静态 NDP %s -> %s (%s)", gw, mac, iface_log)
                     return True
-                err_text = serr.decode("utf-8", errors="replace").strip() if serr else ""
-                logger.warning("NDP 防护: 静态 NDP 绑定失败 %s -> %s (code=%d, err=%s)",
-                              gw, mac, proc.returncode, err_text or "(无错误输出)")
+                logger.warning("NDP 防护: 静态 NDP 绑定失败 %s -> %s (code=%d, out=%s, err=%s)",
+                               gw, mac, proc.returncode,
+                               out_text.strip()[:100], err_text.strip()[:100])
                 return False
             except Exception:
                 return False
