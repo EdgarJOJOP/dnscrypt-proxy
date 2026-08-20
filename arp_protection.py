@@ -136,6 +136,11 @@ class ARPProtection:
         self._local_ips: set = set()               # 本机所有 IPv4 地址（嗅探用）
         self._local_macs: set = set()              # 本机所有网络接口的 MAC 地址（防自伤反制）
         self._local_macs_loaded: bool = False      # 本地 MAC 是否已加载
+        # 审计 MEDIUM：_local_ips 动态刷新（DHCP 换 IP 后防误判，对齐 NDP 侧 _local_all_ips 机制）
+        self._local_ips_ts: float = 0.0              # 本机 IPv4 集合最近刷新时间戳
+        self._local_ips_refreshing: bool = False     # 刷新中（防重入）
+        self._local_ips_refresh_attempt: float = 0.0  # 上次刷新尝试时间戳（节流）
+        self._local_refresh_interval: float = 30.0    # 刷新最小间隔（失败指数退避，上限 120s）
         self._last_alert_mac: str = ""             # 上次告警的攻击者 MAC（同 MAC <3s 不重复触发）
         self._last_alert_time: float = 0.0         # 上次告警时间戳
         self._baseline_learned: bool = False       # 基线 MAC 是否已通过多次确认学习
@@ -303,7 +308,9 @@ class ARPProtection:
                 continue
             # 轮次上限：外网 ICMP 被防火墙丢弃时 _recovery_detected 永不 set，
             # 若无上限 worker 将永久后台双 ping（修复 M1：无界循环）
-            max_rounds = max(30, int(30.0 / max(self._ping_interval, 0.01)))  # 约 30 秒上限
+            # 审计 MEDIUM：注释"约 30 秒上限"不准确——每轮含 ping 网关(≥500ms)+ping 外网+sleep，
+            # 实际上限约为 max_rounds × 单轮耗时（ping_interval=0.8s 时可达 90s+）；上限仍存在防无界
+            max_rounds = max(30, int(30.0 / max(self._ping_interval, 0.01)))
             round_no = 0
             while self._arp_running and not self._recovery_detected.is_set() and round_no < max_rounds:
                 round_no += 1
@@ -472,12 +479,10 @@ class ARPProtection:
             return ""
 
         # === 防环路：自身反制发送的随机 MAC 不触发检测 ===
-        # 优先使用已发送MAC集合精确过滤（比前缀过滤更安全）
+        # 已发送 MAC 集合精确过滤（唯一防环路手段；02:00:00 前缀过滤已移除——
+        # 攻击者可伪造本地管理单播 MAC 02:00:00:xx:xx:xx 完全豁免检测，审计 CRITICAL）
         if hasattr(self, '_counterstrike_sent_macs') and \
                 self._mac_normalize(sender_mac) in self._counterstrike_sent_macs:
-            return ""
-        # 兜底：02:00:00 前缀过滤（本地管理单播MAC范围）
-        if self._mac_normalize(sender_mac).startswith("020000"):
             return ""
 
         # === 基线与实际MAC完全匹配时直接跳过检测（正确MAC，包括反制发送的正确包）===
@@ -490,8 +495,28 @@ class ARPProtection:
             return ""
 
         # === IP 段过滤：只处理与本机/网关同网段的包，忽略 APIPA(169.254.x.x) 等 ===
-        if sender_ip.startswith("169.254.") or target_ip.startswith("169.254."):
+        # 修复审计 HIGH：0.0.0.0 源（本机 DAD/DHCP 地址探测，sender_ip=0.0.0.0）此前
+        # 不命中自包跳过（0.0.0.0 不在 _local_ips），落入 ⑤ 被误判"本地 MAC 冒用攻击"
+        if (sender_ip or "").startswith("169.254.") or (target_ip or "").startswith("169.254.") or \
+                (sender_ip or "").startswith("0.") or (target_ip or "").startswith("0."):
             return ""
+
+        # 审计 MEDIUM：本机 MAC + 白名单外 IP（DHCP 换 IP / 新地址，0.0.0.0 已在上方排除）——
+        # 白名单过期/刷新中先暂缓判定，白名单新鲜才走 ⑤ 判定（对齐 NDP 侧 _local_all_ips 动态刷新）
+        if self._local_macs and any(self._mac_normalize(sender_mac) == self._mac_normalize(m) for m in self._local_macs) \
+                and (sender_ip or "") not in (self._local_ips or set()):
+            _now_r = asyncio.get_event_loop().time()
+            if self._local_ips_refreshing or (_now_r - self._local_ips_ts >= 30.0):
+                if not self._local_ips_refreshing and \
+                        _now_r - self._local_ips_refresh_attempt >= self._local_refresh_interval:
+                    self._local_ips_refresh_attempt = _now_r
+                    self._local_ips_refreshing = True
+                    try:
+                        asyncio.create_task(self._refresh_local_ips_task())
+                    except Exception:
+                        self._local_ips_refreshing = False
+                return ""  # 暂缓判定；刷新成功后由后续包正常判定（真攻击者持续发包仍会被检测）
+            # 白名单新鲜且 sender_ip 不在其中：继续走 ⑤（真攻击判定）
 
         # === 本机自包提前跳过：本机 MAC 宣告本机 IP（自发的 GARP/ARP 探测）= 正常 ===
         # 修复：原仅 ② 分支排除，被排除后仍会落到 ③ 目标端伪装等分支产生误报
@@ -533,30 +558,30 @@ class ARPProtection:
                 logger.debug("ARP 嗅探: 信任设备 %s 发来可疑 ARP (target_mac=%s)，已信任跳过",
                              sender_mac, target_mac)
                 return ""
-            if norm_tmac == "000000000000":
-                # 全零 target_mac：可能是正常设备行为，需要多次确认
-                now_ts = asyncio.get_event_loop().time()
-                record = self._suspicious_zero_mac.setdefault(norm_smac, [])
-                record.append(now_ts)
-                # 只保留最近 10 秒的记录
-                cutoff = now_ts - 10.0
-                self._suspicious_zero_mac[norm_smac] = [t for t in record if t > cutoff]
-                count_10s = len(self._suspicious_zero_mac[norm_smac])
-                if count_10s >= 3:
-                    # 同一 MAC 在 10 秒内 ≥3 次全零 target → 确认为攻击
-                    poisoned = True
+            # 审计 MEDIUM：MITM 判定统一走"10s 内 ≥5 次"多次确认（全零与非全零 target 一致），
+            # 正常设备访问网关（登录管理页/频繁 ARP 请求）不再被原 3 次阈值误报
+            # （_suspicious_zero_mac 现同时记录非全零 target 的可疑计数，仅复用其存储结构）
+            now_ts = asyncio.get_event_loop().time()
+            record = self._suspicious_zero_mac.setdefault(norm_smac, [])
+            record.append(now_ts)
+            cutoff = now_ts - 10.0
+            self._suspicious_zero_mac[norm_smac] = [t for t in record if t > cutoff]
+            count_10s = len(self._suspicious_zero_mac[norm_smac])
+            if count_10s >= 5:
+                # 同一 MAC 在 10 秒内 ≥5 次向网关发送错误 target MAC → 确认为攻击
+                poisoned = True
+                if norm_tmac == "000000000000":
                     reason = (f"MITM 劫持！设备 {sender_ip}({sender_mac}) 重复向网关 {target_ip} "
                               f"发送全零 MAC 回复（10s内{count_10s}次），路由器 ARP 表被污染")
                 else:
-                    # 不足 3 次：仅记录可疑日志，不触发反制
-                    logger.warning("ARP 嗅探: 可疑 ARP 包 — %s 向网关 %s 发送全零 MAC 回复 "
-                                   "(10s内第%d次，≥3次才确认)，暂不反制",
-                                   sender_mac, target_ip, count_10s)
-                    return ""
+                    reason = (f"MITM 劫持！设备 {sender_ip}({sender_mac}) 重复向网关 {target_ip} "
+                              f"发送错误 MAC 回复 {target_mac}（10s内{count_10s}次），期望 {self._baseline_mac}")
             else:
-                # 非全零但不匹配基线 → 直接确认为攻击
-                poisoned = True
-                reason = f"MITM 劫持！回复目标 {target_ip} → 期望 MAC {self._baseline_mac} ≠ 实际 {target_mac}"
+                # 不足 5 次：仅记录可疑日志，不触发反制
+                logger.warning("ARP 嗅探: 可疑 ARP 包 — %s 向网关 %s 发送错误 target MAC "
+                               "(10s内第%d次，≥5次才确认)，暂不反制",
+                               sender_mac, target_ip, count_10s)
+                return ""
 
         # ④ GARP 宣告伪造（Opcode=2 且 Sender=Target=网关, MAC 不对）
         elif is_garp and opcode == 2 and sender_ip in gw_ips and self._baseline_mac and \
@@ -617,11 +642,44 @@ class ARPProtection:
                     logger.warning("ARP 风暴检测！10秒内 %d 个不同 MAC 宣告 %s：%s",
                                    len(distinct_macs), sender_ip, ", ".join(distinct_macs))
                     reason = "ARP 风暴！" + reason
-            # 异步触发即时反击
-            asyncio.create_task(self._on_arp_attack(sender_ip, sender_mac, reason))
+            # 异步触发即时反击（审计 HIGH：保存引用 + 异常回调，防 task 泄漏/静默异常）
+            try:
+                def _cs_done(_t):
+                    if _t.cancelled():
+                        return
+                    exc = _t.exception()
+                    if exc:
+                        logger.warning("ARP 反制任务异常: %r", exc)
+                _cs_task = asyncio.create_task(self._on_arp_attack(sender_ip, sender_mac, reason))
+                _cs_task.add_done_callback(_cs_done)
+            except Exception:
+                logger.debug("ARP 防护: 创建反制任务失败: %s", reason[:40])
             return reason
 
         return ""
+
+    async def _refresh_local_ips_task(self):
+        """审计 MEDIUM：动态刷新本机 IPv4 集合（DHCP 换 IP / 新地址后防误判"本地 MAC 冒用"，
+        对齐 NDP 侧 _refresh_local_all_ips_task；失败指数退避 30s→120s）"""
+        try:
+            fresh = await ARPProtection._fetch_local_ips(self._interface_name or "")
+            if self._local_ipv4 and not self._local_ipv4.startswith("169.254."):
+                fresh.add(self._local_ipv4)
+            if self._last_known_ip and not self._last_known_ip.startswith("169.254."):
+                fresh.add(self._last_known_ip)
+            for _mc, _ips in (self._local_ip_mac_map or {}).items():
+                fresh.update(_ips)
+            if fresh:
+                # 合并而非替换：单次 ipconfig 漏项不收缩白名单
+                self._local_ips = fresh | (self._local_ips or set())
+                self._local_ips_ts = asyncio.get_event_loop().time()
+                self._local_refresh_interval = 30.0
+                logger.debug("ARP 防护: 本机 IPv4 集合已刷新: %d 个", len(self._local_ips))
+        except Exception as e:
+            self._local_refresh_interval = min(self._local_refresh_interval * 2, 120.0)
+            logger.debug("ARP 防护: 本机 IPv4 集合刷新失败(%s)，退避间隔->%.0fs", e, self._local_refresh_interval)
+        finally:
+            self._local_ips_refreshing = False
 
     async def _arp_sniffer_worker_loop(self):
         """
@@ -635,6 +693,7 @@ class ARPProtection:
         gw_ip = self.gateway_ip
         # 收集本机所有 IPv4 地址（避免 _local_ipv4 单值残留旧临时 IP）
         self._local_ips = await ARPProtection._fetch_local_ips(self._interface_name or "")
+        self._local_ips_ts = asyncio.get_event_loop().time()  # 审计 MEDIUM：记录刷新时间戳供动态刷新判断
         # 兜底并入 detect_gateway 已解析的 _local_ipv4（自动/手动模式都可能被填充）
         if self._local_ipv4 and not self._local_ipv4.startswith("169.254."):
             self._local_ips.add(self._local_ipv4)
@@ -676,10 +735,12 @@ class ARPProtection:
             sniff_failed = False
 
             def _handle_pkt(pkt):
-                """scapy 回调（在 executor 线程中运行），收到 ARP 包就丢进 asyncio 队列"""
+                """scapy 回调（在 executor 线程中运行），收到 ARP 包就丢进 asyncio 队列
+                审计 HIGH：asyncio.Queue 非线程安全，必须经 loop.call_soon_threadsafe
+                转发（对齐 NDP_protection.py 同场景），否则存在丢失唤醒/竞态风险"""
                 if pkt.haslayer(ScapyARP):
                     try:
-                        pkt_queue.put_nowait(pkt)
+                        loop.call_soon_threadsafe(pkt_queue.put_nowait, pkt)
                     except Exception:
                         pass
 
@@ -2702,7 +2763,8 @@ class ARPProtection:
         elif attack_rate > 50:
             return (20, 15, 0.001, "L2")
         elif attack_rate > 30:
-            return (10, 8, 0.0015, "L1")
+            # 审计 MEDIUM：原与 >10 档完全相同（笔误），修正为中间强度
+            return (15, 10, 0.001, "L1")
         elif attack_rate > 10:
             return (10, 8, 0.0015, "L1")
         else:
@@ -2756,14 +2818,13 @@ class ARPProtection:
                     inter = 0.05
                     await self._garp_counterstrike(sender_ip, sender_mac, burst_size=burst_size,
                                                     directed_count=directed_count, inter=inter)
-                    if self._poison_detected.is_set():
-                        self._poison_detected.clear()
+                    # 审计 HIGH：不在此处 clear _poison_detected（由 network_monitor 独占消费清除）
                     return
 
         await self._garp_counterstrike(sender_ip, sender_mac, burst_size=burst_size, directed_count=directed_count, inter=inter)
-
-        if self._poison_detected.is_set():
-            self._poison_detected.clear()
+        # 审计 HIGH：_poison_detected 由 network_monitor（281 行）独占消费清除，此处不再 clear——
+        # 此前反制完成后立即 clear，若耗时 < monitor 0.8s 轮询间隔则 monitor 永远看不到置位，
+        # 无 scapy 场景的 fallback 全量修复分支实际不可达
 
     async def _garp_counterstrike(self, attacker_ip: str, attacker_mac: str, burst_size: int = 5, directed_count: int = 5, inter: float = 0.01):
         """增强 GARP 反制：定向反制（常驻 sender 并行）+ GARP 广播"""
@@ -3899,14 +3960,18 @@ class ARPProtection:
                     if not lines:
                         continue
                     name_line = lines[0].strip().lower()
-                    # 指定网卡时只收集匹配段；interface_name 为空时收集全部（兜底）
-                    if not interface_name or interface_name.lower() in name_line:
+                    _VIRTUAL_IFACE_KEYWORDS = ("vmware", "virtualbox", "loopback", "tap-", "npcap loopback",
+                                                "wsl", "vethernet", "hyper-v", "vpn", "tun", "teredo", "bluetooth")
+                    # 指定网卡时只收集匹配段；interface_name 为空（探测失败）时全量收集但过滤虚拟网卡
+                    # （审计 MEDIUM：原 interface_name 为空时不过滤虚拟网卡，VPN/虚拟机 IP 污染 _local_ips 白名单）
+                    if interface_name:
+                        if interface_name.lower() in name_line:
+                            sections.append((name_line, lines))
+                    elif not any(k in name_line for k in _VIRTUAL_IFACE_KEYWORDS):
                         sections.append((name_line, lines))
                 if interface_name and not sections:
                     # 指定网卡未匹配到任何段（如中文系统网卡名差异）→ 兑底全量收集（过滤虚拟网卡，
                     # 避免 VPN/虚拟机/回环网段内正常 ARP 被误判为 IP 冲突）
-                    _VIRTUAL_IFACE_KEYWORDS = ("vmware", "virtualbox", "loopback", "tap-", "npcap loopback",
-                                                "wsl", "vethernet", "hyper-v", "vpn", "tun", "teredo", "bluetooth")
                     for section in raw_sections:
                         lines = section.strip().splitlines()
                         if not lines:
@@ -4340,8 +4405,11 @@ class ARPProtection:
         """
         try:
             timeout_s = max(timeout_ms / 1000.0, 0.5)
+            # 修复审计 HIGH：int(0.5~0.8)=0，iputils -W 0 意为无限等待，
+            # 快速验证实际卡到外层 wait_for(timeout_s+3) 超时（约 3s/次）
+            ping_w = str(max(1, int(timeout_s)))
             proc = await asyncio.create_subprocess_exec(
-                "ping", "-c", "1", "-W", str(int(timeout_s)), ip,
+                "ping", "-c", "1", "-W", ping_w, ip,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )

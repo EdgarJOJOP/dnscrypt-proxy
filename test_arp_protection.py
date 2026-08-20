@@ -412,6 +412,49 @@ async def test_ip_mac_map_linux_parse():
 # 主入口
 # ============================================================
 
+async def test_020000_mac_no_exemption():
+    """审计 CRITICAL 回归：02:00:00 伪造 MAC 不再被前缀过滤豁免（仍检测网关投毒）"""
+    print("\n" + "=" * 60)
+    print("12. 02:00:00 伪造 MAC 不再豁免检测")
+    print("=" * 60)
+    config = _make_test_config()  # 网关 192.168.1.1 / aa-bb-cc-dd-ee-ff
+    arp = ARPProtection(config)
+    arp._local_ips = {"192.168.1.13"}
+    arp._local_mac = "00:E0:4C:68:00:AB"
+    arp._local_macs = {"00:E0:4C:68:00:AB"}
+    arp._baseline_mac = "AA:BB:CC:DD:EE:FF"
+    arp._local_ips_ts = time.time()
+
+    async def _noop(*a, **k):
+        pass
+    arp._on_arp_attack = _noop
+    # 攻击者伪造 02:00:00:aa:bb:cc 宣告网关 IP（原会被 02:00:00 前缀过滤直接豁免）
+    r = await arp._check_arp_packet(sender_ip="192.168.1.1", sender_mac="02:00:00:AA:BB:CC",
+                                    target_ip="192.168.1.13", target_mac="00:11:22:33:44:55", opcode=1)
+    check("投毒" in r, f"02:00:00 伪造 MAC 宣告网关仍被检测为投毒 (got {r!r})")
+
+
+async def test_zero_ip_source_no_false_positive():
+    """审计 HIGH 回归：0.0.0.0 源（本机 DAD/DHCP 探测）不误判本地 MAC 冒用"""
+    print("\n" + "=" * 60)
+    print("13. 0.0.0.0 源不误报")
+    print("=" * 60)
+    config = _make_test_config()
+    arp = ARPProtection(config)
+    arp._local_ips = {"192.168.1.13"}
+    arp._local_mac = "00:E0:4C:68:00:AB"
+    arp._local_macs = {"00:E0:4C:68:00:AB"}
+    arp._local_ips_ts = time.time()  # 白名单新鲜（动态刷新不触发）
+
+    async def _noop(*a, **k):
+        pass
+    arp._on_arp_attack = _noop
+    # 本机 MAC + sender_ip=0.0.0.0（DAD/DHCP 地址探测）——原会落入 ⑤ 误报本地 MAC 冒用
+    r = await arp._check_arp_packet(sender_ip="0.0.0.0", sender_mac="00:E0:4C:68:00:AB",
+                                    target_ip="255.255.255.255", target_mac="00:00:00:00:00:00", opcode=1)
+    check(r == "", f"0.0.0.0 源不误判本地 MAC 冒用 (got {r!r})")
+
+
 async def main():
     """运行所有 ARP 防护测试"""
     print("=" * 60)
@@ -428,6 +471,8 @@ async def main():
     await test_mac_normalize()
     await test_ip_mac_map_merge_self_packet()
     await test_ip_mac_map_linux_parse()
+    await test_020000_mac_no_exemption()
+    await test_zero_ip_source_no_false_positive()
 
     total = _pass_count + _fail_count
     print("\n" + "=" * 60)

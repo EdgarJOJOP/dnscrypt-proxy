@@ -1310,7 +1310,11 @@ class NetworkMonitor:
                                     current_mac = await ARPProtection._arp_get_mac_windows(gw_ip)
                                 else:
                                     current_mac = await ARPProtection._arp_get_mac_linux(gw_ip)
-                                if current_mac and current_mac.upper() != baseline_mac:
+                                # 审计（关联）：MAC 格式归一化后比较——current_mac 为横线格式（AA-BB-CC-...）、
+                                # baseline_mac 为冒号格式（AA:BB:CC:...），Windows 上直接 upper() 比较恒不等
+                                # → 无条件触发反制（向真实网关发送毒化包）
+                                if current_mac and ARPProtection._mac_normalize(current_mac) != \
+                                        ARPProtection._mac_normalize(baseline_mac):
                                     logger.warning("深度诊断 [反制]: 网关 %s MAC 变更 "
                                                    "(基线=%s, 当前=%s) — 可能 ARP 投毒，触发反制",
                                                    gw_ip, baseline_mac, current_mac)

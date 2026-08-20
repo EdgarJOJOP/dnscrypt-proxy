@@ -476,6 +476,80 @@ async def test_ip_mac_map_self_packet_ipv6():
           "本机 MAC 宣告本机 IPv6 不误判 IP 冲突")
 
 
+async def test_temp_ipv6_rotation_no_false_positive():
+    """临时 IPv6 地址轮换后本机自包不再误判为"本地 MAC 冒用攻击"（修复核心回归）"""
+    print("\n" + "=" * 60)
+    print("12. 临时 IPv6 轮换自包防误伤")
+    print("=" * 60)
+    config = _make_test_config()
+    from NDP_protection import InterfaceInfo
+    ndp = NDPProtection(config)
+    # interfaces 快照仅含旧地址（模拟启动后 Windows 临时 IPv6 已轮换，新临时地址不在快照）
+    ndp.interfaces = [InterfaceInfo(name="接口B", mac="00:E0:4C:68:00:AB",
+                                    ipv6_globals=["2408:826c:511:8860:82f5:df2:aa77:3477"],
+                                    ipv6_ll="fe80::e6f6:8103:6d9c:f1b3%9")]
+    ndp._local_macs = {"00:E0:4C:68:00:AB"}
+    # 动态全量集合包含运行期新轮换的临时 IPv6 地址（本次修复新增的本机全量 IP 白名单）
+    ndp._local_all_ips = {"2408:826c:511:8860:4c19:5245:9c9d:ed1b", "192.168.1.13"}
+    ndp._local_all_ips_ts = time.time()  # 刷新时间新鲜，避免触发异步刷新 task（防真实系统命令）
+    from scapy.all import Ether as _E, IPv6 as _V6, ICMPv6ND_NA as _NA
+    na_temp = _E(src="00:E0:4C:68:00:AB", dst="33:33:00:00:00:01") / \
+        _V6(src="2408:826c:511:8860:4c19:5245:9c9d:ed1b", dst="ff02::1", hlim=255) / \
+        _NA(tgt="2408:826c:511:8860:4c19:5245:9c9d:ed1b")
+    ndp._on_ndp_packet_sync(na_temp)
+    check(not [e for e in ndp._threat_events if e["type"] in ("local_mac_spoof", "ip_conflict")],
+          "本机 MAC 宣告轮换后的临时 IPv6 不误判本地 MAC 冒用/IP 冲突")
+
+
+async def test_local_mac_spoof_still_detected():
+    """真攻击：本机 MAC 宣告完全未知 IP 仍报本地 MAC 冒用攻击（保留检测能力）"""
+    print("\n" + "=" * 60)
+    print("13. 真攻击仍检测：本机 MAC + 未知 IP")
+    print("=" * 60)
+    config = _make_test_config()
+    from NDP_protection import InterfaceInfo
+    ndp = NDPProtection(config)
+    ndp.interfaces = [InterfaceInfo(name="接口B", mac="00:E0:4C:68:00:AB",
+                                    ipv6_globals=["2408:826c:511:8860:82f5:df2:aa77:3477"])]
+    ndp._local_macs = {"00:E0:4C:68:00:AB"}
+    ndp._local_all_ips = {"2408:826c:511:8860:4c19:5245:9c9d:ed1b"}
+    ndp._local_all_ips_ts = time.time()  # 新鲜，跳过刷新窗口（不触发真实系统命令）
+    ndp._loop = asyncio.get_event_loop()
+    # mock _on_poison_detected，避免事件循环中触发真实反制流程
+    ndp._on_poison_detected = lambda attacker_mac="", attacker_ip="": _async_true()
+    from scapy.all import Ether as _E, IPv6 as _V6, ICMPv6ND_NA as _NA
+    na_fake = _E(src="00:E0:4C:68:00:AB", dst="33:33:00:00:00:01") / \
+        _V6(src="2001:db8::99", dst="ff02::1", hlim=255) / \
+        _NA(tgt="2001:db8::99")
+    ndp._on_ndp_packet_sync(na_fake)
+    check(any(e["type"] == "local_mac_spoof" for e in ndp._threat_events),
+          "本机 MAC 宣告完全未知 IP 仍报本地 MAC 冒用攻击")
+
+
+async def test_dad_ns_not_false_positive():
+    """DAD NS（src_ip=::，RFC 4862）本机接口配置自包不误判本地 MAC 冒用"""
+    print("\n" + "=" * 60)
+    print("14. DAD NS（::）自包防误伤")
+    print("=" * 60)
+    config = _make_test_config()
+    from NDP_protection import InterfaceInfo
+    ndp = NDPProtection(config)
+    ndp.interfaces = [InterfaceInfo(name="接口B", mac="00:E0:4C:68:00:AB",
+                                    ipv6_globals=["2408:826c:511:8860:82f5:df2:aa77:3477"])]
+    ndp._local_macs = {"00:E0:4C:68:00:AB"}
+    ndp._local_all_ips = {"2408:826c:511:8860:4c19:5245:9c9d:ed1b"}
+    ndp._local_all_ips_ts = time.time()  # 新鲜，走正常判定路径（不触发刷新）
+    ndp._loop = asyncio.get_event_loop()
+    ndp._on_poison_detected = lambda attacker_mac="", attacker_ip="": _async_true()
+    from scapy.all import Ether as _E, IPv6 as _V6, ICMPv6ND_NS as _NS
+    ns_dad = _E(src="00:E0:4C:68:00:AB", dst="33:33:ff:00:00:01") / \
+        _V6(src="::", dst="ff02::1:ff00:1", hlim=255) / \
+        _NS(tgt="2408:826c:511:8860::1")
+    ndp._on_ndp_packet_sync(ns_dad)
+    check(not [e for e in ndp._threat_events if e["type"] == "local_mac_spoof"],
+          "DAD NS（::）不误判本地 MAC 冒用攻击")
+
+
 async def main():
     """运行所有 NDP 防护测试"""
     print("=" * 60)
@@ -493,6 +567,9 @@ async def main():
     await test_trusted_mac_skip()
     await test_trust_learning()
     await test_ip_mac_map_self_packet_ipv6()
+    await test_temp_ipv6_rotation_no_false_positive()
+    await test_local_mac_spoof_still_detected()
+    await test_dad_ns_not_false_positive()
 
     total = _pass_count + _fail_count
     print("\n" + "=" * 60)

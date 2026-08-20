@@ -295,7 +295,7 @@ network_monitor:
   # 需要安装 Npcap 以使用 scapy 发包（否则降级为 ping 等效方案）。
   # ============================================================
   ndp_protection:
-    enabled: false                 # 默认关闭，未检测到 IPv6 时自动关闭
+    enabled: true                 # 默认关闭，未检测到 IPv6 时自动关闭
     # 手动指定 IPv6 网关（自动探测的高优先级替代）
     # 格式: "网关IPv6,网关MAC,VLAN_ID" (英文逗号隔开), 留空则自动探测
     # VLAN_ID 默认为空（无 VLAN/VXLAN）；vxlan_enabled=true 时解释为 VXLAN VNI
