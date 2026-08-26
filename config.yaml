@@ -71,8 +71,8 @@ server:
       max_depth: 8
       # 严格 DNSSEC：链验证失败（bogus）时丢弃响应返回 SERVFAIL
       strict_dnssec: true
-      # 全局确认：迭代结果与加密上游结果做一致性交叉验证，不一致返回 SERVFAIL
-      cross_verify: true
+      # 全局确认：迭代结果与加密上游结果做一致性交叉验证，不一致返回 SERVFAIL，可在本地运行使用时启用，服务器部署建议不要开启(安全防护高但是及其容易判定不一致返回 SERVFAIL)
+      cross_verify: false
 
 # ============================================================
 # 上游 DNS 服务器
@@ -124,9 +124,9 @@ upstream:
 cache:
   enabled: true
   max_size: 10000           # 最大缓存条目数，超限 LRU 淘汰
-  default_ttl: 1000          # 默认缓存时间（秒）
-  min_ttl: 600               # 最小缓存时间（秒）
-  max_ttl: 86400            # 最大缓存时间（秒）
+  default_ttl: 300          # 默认缓存时间（秒）
+  min_ttl: 2               # 最小缓存时间（秒）
+  max_ttl: 600            # 最大缓存时间（秒）
   negative_ttl: 60          # 负面应答缓存时间（秒）
   cleanup_interval: 60      # 过期清理间隔（秒）
 
