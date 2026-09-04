@@ -1192,13 +1192,19 @@ class NDPProtection:
                 for gw_ip, expected_mac, _ in self.gateway_pairs:
                     if not gw_ip:
                         continue
+                    # RFC 4890 修复：期望 MAC 必须为合法单播（全零/广播/组播说明网关 MAC
+                    # 未正确学习——此时 NDP 条目不完整属正常现象，绝不据此判定投毒或反制）
+                    if not expected_mac or not NDPProtection._is_valid_mac(expected_mac):
+                        logger.debug("NDP 防护 [T1/轮询]: 网关 %s 期望 MAC 无效(%s)，跳过投毒检测",
+                                     gw_ip, expected_mac or "?")
+                        continue
                     actual_mac = await self._resolve_mac_single(gw_ip)
                     if not actual_mac:
                         continue
                     norm_actual = self._mac_normalize(actual_mac)
                     # 检测：MAC 变更 或 异常 MAC（广播/组播）
                     is_poisoned = False
-                    if expected_mac and norm_actual != self._mac_normalize(expected_mac):
+                    if norm_actual != self._mac_normalize(expected_mac):
                         # 全零 MAC：Windows 上对不完整 NDP 条目的正常行为，不立即反制
                         if norm_actual == "000000000000":
                             logger.debug("NDP 防护 [T1/轮询]: 网关 %s NDP 条目为全零（可能不完整），跳过", gw_ip)
@@ -1208,48 +1214,63 @@ class NDPProtection:
                         is_poisoned = True
                     if is_poisoned:
                         logger.warning("NDP 防护 [T1/轮询]: 网关 %s MAC 异常! %s -> %s",
-                                       gw_ip, expected_mac or "?", actual_mac)
-                        # 快速 ping -6 验证：临时 NDP 表波动 vs 真实投毒
-                        # 使用 1 秒超时避免多网关场景累积延迟超过轮询间隔
-                        ping_ok = await self._ping_ipv6(gw_ip, timeout_ms=1000)
-                        if ping_ok:
-                            logger.warning("NDP 防护 [T1/轮询]: 网关 %s MAC 异常但 ping 可达，"
-                                           "判定为临时波动，跳过投毒标志", gw_ip)
-                            # 记录可疑事件（MITM 攻击者可转发 ICMPv6 让 ping 成功）
-                            self._threat_events.append({
-                                "type": "ndp_table_anomaly_ping_ok", "time": time.time(),
-                                "gateway": gw_ip, "expected_mac": expected_mac, "actual_mac": actual_mac,
-                            })
-                            self._trim_threat_events()
-                            continue
-                        # 去重：如果嗅探器已就绪（scapy 可用），轮询路径不再设 _poison_detected，
-                        # 避免 network_monitor 中嗅探测到的投毒标志和轮询路径形成双重反制
-                        if self._ndp_sender_ready:
-                            logger.debug("NDP 防护 [T1/轮询]: 嗅探器已就绪，跳过投毒标志（由嗅探路径处理）")
-                            # 不设标志，但继续执行修复逻辑（无感补充）
-                        else:
+                                       gw_ip, expected_mac, actual_mac)
+                        # RFC 4890 修复：不再用 ICMPv6 Echo(ping) 判定投毒——网关设备可出于
+                        # 安全策略禁止对链路本地地址的 Echo 响应（ping 失败 ≠ 投毒），
+                        # 且 MITM 攻击者可转发 Echo 让 ping 成功。改为三级验证：
+                        # ① 已知网关 MAC 共享检查 → ② NS/NA 探测 → ③ 保守告警不反制
+                        # ① 合法单播且与其它已知网关 MAC 一致 → 路由器多地址共享同一网卡，正常波动
+                        if NDPProtection._is_valid_mac(actual_mac):
+                            known_gw_macs = {
+                                self._mac_normalize(m) for _, m, _ in self.gateway_pairs
+                                if m and NDPProtection._is_valid_mac(m)
+                            }
+                            if norm_actual in known_gw_macs:
+                                logger.info("NDP 防护 [T1/轮询]: 网关 %s MAC 与已知网关 MAC 一致(%s)，"
+                                            "判定为多地址共享正常波动，跳过", gw_ip, actual_mac)
+                                continue
+                        # ② NS/NA 探测验证网关真实 MAC（scapy 可用时；探测结果优先于系统 NDP 表）
+                        _probe_ok = False
+                        if self._scapy_available:
+                            try:
+                                probe_mac = await self._probe_gateway_ns(gw_ip, timeout=2.0)
+                                if probe_mac and NDPProtection._is_valid_mac(probe_mac):
+                                    _probe_ok = True
+                                    if self._mac_normalize(probe_mac) == self._mac_normalize(expected_mac):
+                                        logger.info("NDP 防护 [T1/轮询]: NS/NA 探测确认网关 MAC=%s，"
+                                                    "本地 NDP 表波动，跳过", probe_mac)
+                                        continue
+                                    logger.warning("NDP 防护 [T1/轮询]: NS/NA 探测 MAC=%s 与期望 %s 不符，"
+                                                   "确认投毒", probe_mac, expected_mac)
+                            except Exception as e:
+                                logger.debug("NDP 防护 [T1/轮询]: NS 探测异常: %s", e)
+                        # ③ 无法验证（无 scapy / 网关禁 Echo / 探测超时）：保守处理——
+                        #    不设 _poison_detected（避免无证据时触发 network_monitor 级联反制），
+                        #    仅用合法的期望 MAC 重绑静态条目（_protect_entry 内部拒绝非法 MAC）
+                        logger.warning("NDP 防护 [T1/轮询]: 网关 %s MAC 异常且无法经 NS/NA 验证(%s)，"
+                                       "重绑期望 MAC 并告警（不判定投毒）", gw_ip, actual_mac)
+                        try:
+                            await self.protect_ndp_entry()
+                        except Exception as e:
+                            logger.debug("NDP 防护 [T1/轮询]: 静态绑定异常: %s", e)
+                        # security_review MEDIUM-2：NS/NA 探测已确认 MAC 与期望不符（硬投毒证据），
+                        # 无条件设 _poison_detected 触发级联反制（sender 就绪时嗅探路径与轮询
+                        # 标志 set 幂等，不构成双重反制；避免无 Npcap 场景检测降级）
+                        if _probe_ok:
                             self._poison_detected.set()
-                        # 无 Npcap 时主动修复：ping -6 触发邻居发现刷新路由器 NDP 表
+                        # 触发 NDP 刷新（修复动作，不再是投毒判据）
                         if sys.platform == "win32":
                             try:
                                 proc = await asyncio.create_subprocess_exec(
-                                    "ping", "-6", "-n", "5", gw_ip,
+                                    "ping", "-6", "-n", "3", gw_ip,
                                     stdout=asyncio.subprocess.DEVNULL,
                                     stderr=asyncio.subprocess.DEVNULL,
                                 )
-                                await asyncio.wait_for(proc.wait(), timeout=15)
+                                await asyncio.wait_for(proc.wait(), timeout=8)
                                 await asyncio.sleep(0.1)
-                                # 检查学习到的 MAC 是否正确
-                                new_mac = await self._resolve_mac_single(gw_ip)
-                                if new_mac and expected_mac and \
-                                   self._mac_normalize(new_mac) != self._mac_normalize(expected_mac):
-                                    logger.warning("NDP 防护: ping -6 后网关 MAC 仍异常 (%s)，"
-                                                   "执行静态 NDP 绑定", new_mac)
-                                    await self.protect_ndp_entry()
-                            except Exception as e:
-                                logger.debug("NDP 防护: ping -6 修复异常: %s", e)
+                            except Exception:
+                                pass
                         else:
-                            # Linux: 删除 NDP 条目触发重新学习
                             try:
                                 proc = await asyncio.create_subprocess_exec(
                                     "ip", "-6", "neigh", "del", gw_ip, "dev",
@@ -1262,11 +1283,11 @@ class NDPProtection:
                                 pass
                             try:
                                 proc = await asyncio.create_subprocess_exec(
-                                    "ping", "-6", "-c", "5", gw_ip,
+                                    "ping", "-6", "-c", "3", gw_ip,
                                     stdout=asyncio.subprocess.DEVNULL,
                                     stderr=asyncio.subprocess.DEVNULL,
                                 )
-                                await asyncio.wait_for(proc.wait(), timeout=15)
+                                await asyncio.wait_for(proc.wait(), timeout=8)
                             except Exception:
                                 pass
                             await self.protect_ndp_entry()
@@ -2138,11 +2159,11 @@ class NDPProtection:
                     break
 
 
-        # 立即用已探测的 MAC 做静态 NDP 绑定
+        # 立即用已探测的 MAC 做静态 NDP 绑定（只绑定合法单播 MAC）
         if self.interfaces:
             for iface in self.interfaces:
                 for _, gw_mac, _ in iface.gateways:
-                    if gw_mac:
+                    if gw_mac and NDPProtection._is_valid_mac(gw_mac):
                         await self.protect_ndp_entry()
                         break
                 break
@@ -2435,7 +2456,9 @@ class NDPProtection:
                 if not gw_ip:
                     continue
                 mac = await self._resolve_mac_single(gw_ip)
-                if mac:
+                # 只接受合法单播 MAC（拒绝全零/广播/组播，防止把未正确解析的 NDP 条目
+                # 显示的全零 MAC 当作网关预期值 → 轮询误判投毒 → 反制写坏邻居表）
+                if mac and NDPProtection._is_valid_mac(mac):
                     iface.gateways[i] = (gw_ip, mac, "")
 
     async def _resolve_mac_single(self, ipv6: str) -> Optional[str]:
@@ -2447,11 +2470,17 @@ class NDPProtection:
                 )
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
                 for line in self._decode_win_output(stdout).splitlines():
-                    if ipv6.split('%')[0].lower() in line.lower().split():
+                    # 审计修复：netsh 输出链路本地条目可能带 %接口号（fe80::1%14），
+                    # 精确词匹配会失败（剥离 % 后与词 fe80::1%14 不相等）→ 逐词剥离 % 后比较
+                    _needle = ipv6.split('%')[0].lower()
+                    if any(_w.split('%')[0].lower() == _needle for _w in line.lower().split()):
                         parts = line.split()
                         if len(parts) >= 3:
                             mac = parts[1].strip().replace("-", ":").upper()
-                            if re.match(r'^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$', mac):
+                            # 只接受合法单播 MAC（拒绝全零/广播/组播：Windows 对不完整/停滞
+                            # NDP 条目可能显示全零 MAC，若作为网关预期值会导致误判投毒+写坏邻居表）
+                            if re.match(r'^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$', mac) \
+                                    and NDPProtection._is_valid_mac(mac):
                                 return mac
             except Exception:
                 pass
@@ -2468,7 +2497,9 @@ class NDPProtection:
                         for i, p in enumerate(parts):
                             if p == "lladdr" and i + 1 < len(parts):
                                 mac = parts[i + 1].strip().upper()
-                                if re.match(r'^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$', mac):
+                                # 只接受合法单播 MAC（拒绝全零/广播/组播）
+                                if re.match(r'^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$', mac) \
+                                        and NDPProtection._is_valid_mac(mac):
                                     return mac
             except Exception:
                 pass
@@ -3352,7 +3383,7 @@ class NDPProtection:
         success = True
         for iface in self.interfaces:
             for gw_ip, gw_mac, vlan_id in iface.gateways:
-                if not gw_ip or not gw_mac:
+                if not gw_ip or not gw_mac or not NDPProtection._is_valid_mac(gw_mac):
                     continue
                 ok = await self._protect_entry(iface.name, gw_ip, gw_mac, vlan_id)
                 if not ok:
@@ -3361,7 +3392,7 @@ class NDPProtection:
             ip = gw[0]
             mac = gw[1]
             vlan_id = gw[2] if len(gw) > 2 else ""
-            if ip and mac:
+            if ip and mac and NDPProtection._is_valid_mac(mac):
                 ok = await self._protect_entry("", ip, mac, vlan_id)
                 if not ok:
                     success = False
@@ -3402,6 +3433,10 @@ class NDPProtection:
             return 0
 
     async def _protect_entry(self, iface: str, gw: str, mac: str, vlan_id: str = "") -> bool:
+        # 兜底：拒绝把全零/广播/组播 MAC 写入邻居表（防止任何调用路径损坏 IPv6 邻居缓存）
+        if not NDPProtection._is_valid_mac(mac):
+            logger.warning("NDP 防护: 拒绝写入非法 MAC %s -> %s（全零/广播/组播）", gw, mac or "?")
+            return False
         if sys.platform == "win32":
             try:
                 mac_fmt = mac.replace(":", "-").upper()

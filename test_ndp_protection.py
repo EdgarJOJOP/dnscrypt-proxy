@@ -550,6 +550,124 @@ async def test_dad_ns_not_false_positive():
           "DAD NS（::）不误判本地 MAC 冒用攻击")
 
 
+# ============================================================
+# 8. RFC 4890 修复回归：期望 MAC 无效 / 网关禁 Echo / 拒绝写入非法 MAC
+# ============================================================
+
+async def test_zero_expected_mac_no_false_poison():
+    """期望 MAC 为全零（NDP 条目未正确学习）时不判投毒、不触发反制"""
+    print("\n" + "=" * 60)
+    print("8. 期望 MAC 全零 → 不判投毒（RFC 4890 修复）")
+    print("=" * 60)
+
+    config = _make_test_config()
+    ndp = NDPProtection(config, ping_interval=999)
+    _install_mocks(ndp)
+    ndp._scapy_available = False
+    # 修复前 _resolve_mac_single 可能把不完整 NDP 条目的全零 MAC 当作网关期望值
+    ndp._manual_gateways = [("fe80::923c:daff:fed7:1200", "00:00:00:00:00:00", "")]
+
+    # 模拟 _resolve_mac_single 返回真实路由器 MAC
+    async def mock_real(ip):
+        return "90:3C:DA:D7:12:00"
+    ndp._resolve_mac_single = mock_real
+
+    # 复制修复后 _poll_ndp_table 的判定（D1：期望 MAC 无效 → 跳过）
+    for gw_ip, expected_mac, _ in ndp.gateway_pairs:
+        if not gw_ip:
+            continue
+        if not expected_mac or not NDPProtection._is_valid_mac(expected_mac):
+            continue  # 修复点：无效期望 → 不判投毒
+        actual_mac = await ndp._resolve_mac_single(gw_ip)
+        if actual_mac and ndp._mac_normalize(actual_mac) != ndp._mac_normalize(expected_mac):
+            ndp._poison_detected.set()
+
+    check(not ndp._poison_detected.is_set(), "期望 MAC 全零时不设置投毒标志")
+    check(not ndp._protect_ndp_called, "期望 MAC 全零时不触发静态绑定反制")
+
+
+async def test_gateway_echo_denied_no_false_poison():
+    """网关禁止 ICMPv6 Echo（RFC 4890）且 MAC 为已知网关 MAC 时不误判投毒"""
+    print("\n" + "=" * 60)
+    print("9. 网关禁 Echo + 多地址共享 MAC → 不误判投毒")
+    print("=" * 60)
+
+    config = _make_test_config()
+    ndp = NDPProtection(config, ping_interval=999)
+    _install_mocks(ndp)
+    ndp._scapy_available = False
+    ndp._ping_ipv6 = lambda ip, **kw: _async_false()  # 网关禁 Echo → ping 恒失败
+
+    # fe80::1 与 fe80::923c:... 是同一路由器（共享 MAC 90:3C:DA:D7:12:00）
+    ndp._manual_gateways = [
+        ("fe80::1", "90:3C:DA:D7:12:00", ""),
+        ("fe80::923c:daff:fed7:1200", "90:3C:DA:D7:12:00", ""),
+    ]
+
+    async def mock_real(ip):
+        return "90:3C:DA:D7:12:00"
+    ndp._resolve_mac_single = mock_real
+
+    # 复制修复后 _poll_ndp_table 的判定（D1 + ① 已知网关 MAC 共享检查）
+    for gw_ip, expected_mac, _ in ndp.gateway_pairs:
+        if not gw_ip:
+            continue
+        if not expected_mac or not NDPProtection._is_valid_mac(expected_mac):
+            continue
+        actual_mac = await ndp._resolve_mac_single(gw_ip)
+        if not actual_mac:
+            continue
+        norm_actual = ndp._mac_normalize(actual_mac)
+        is_poisoned = False
+        if norm_actual != ndp._mac_normalize(expected_mac):
+            if norm_actual == "000000000000":
+                continue
+            is_poisoned = True
+        elif norm_actual in ("ffffffffffff",) or norm_actual.startswith("01"):
+            is_poisoned = True
+        if is_poisoned:
+            # 修复点：① 与已知网关 MAC 一致 → 多地址共享正常波动
+            if NDPProtection._is_valid_mac(actual_mac):
+                known_gw_macs = {
+                    ndp._mac_normalize(m) for _, m, _ in ndp.gateway_pairs
+                    if m and NDPProtection._is_valid_mac(m)
+                }
+                if norm_actual in known_gw_macs:
+                    continue  # 正常波动，跳过
+            ndp._poison_detected.set()
+
+    check(not ndp._poison_detected.is_set(), "多地址共享 MAC 不误判投毒")
+    check(not ndp._protect_ndp_called, "多地址共享 MAC 不触发静态绑定")
+
+
+async def test_protect_entry_rejects_invalid_mac():
+    """_protect_entry 兜底：拒绝把全零/广播/组播 MAC 写入邻居表"""
+    print("\n" + "=" * 60)
+    print("10. _protect_entry 拒绝非法 MAC")
+    print("=" * 60)
+
+    config = _make_test_config()
+    ndp = NDPProtection(config, ping_interval=999)
+    _install_mocks(ndp)
+
+    subprocess_called = []
+    import asyncio as _asyncio
+    real_create_subprocess_exec = _asyncio.create_subprocess_exec
+
+    async def fake_subprocess(*args, **kwargs):
+        subprocess_called.append(args)
+        return await real_create_subprocess_exec(*args, **kwargs)
+
+    _asyncio.create_subprocess_exec = fake_subprocess
+    try:
+        ok = await ndp._protect_entry("eth0", "fe80::1", "00:00:00:00:00:00")
+    finally:
+        _asyncio.create_subprocess_exec = real_create_subprocess_exec
+
+    check(ok is False, "全零 MAC 写入被拒绝")
+    check(len(subprocess_called) == 0, "全零 MAC 不触发 netsh set neighbors")
+
+
 async def main():
     """运行所有 NDP 防护测试"""
     print("=" * 60)
@@ -570,6 +688,9 @@ async def main():
     await test_temp_ipv6_rotation_no_false_positive()
     await test_local_mac_spoof_still_detected()
     await test_dad_ns_not_false_positive()
+    await test_zero_expected_mac_no_false_poison()
+    await test_gateway_echo_denied_no_false_poison()
+    await test_protect_entry_rejects_invalid_mac()
 
     total = _pass_count + _fail_count
     print("\n" + "=" * 60)

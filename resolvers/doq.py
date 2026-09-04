@@ -56,6 +56,15 @@ def force_dns_id_zero(query: bytes) -> bytes:
     return query
 
 
+class CertificateVerifyError(Exception):
+    """DoQ 上游 TLS 证书验证失败（证书与域名/IP 不匹配）。"""
+
+    def __init__(self, host: str, detail: str):
+        super().__init__("{} 证书验证失败: {}".format(host, detail))
+        self.host = host
+        self.detail = detail
+
+
 # 每次连接尝试的超时（单个 IP + 单个模式的尝试，非总超时）
 _ATTEMPT_TIMEOUT = 5.0
 
@@ -523,11 +532,20 @@ if HAS_AIOQUIC:
                     if old_handle:
                         await old_handle.close()
                     cert_err = str(e).lower()
-                    if "certificate" in cert_err or "hostname" in cert_err:
-                        logger.warning(
-                            "%s 证书验证失败，跳过", target
+                    # 仅当错误明确表示 TLS 证书验证失败时才判定为确定性错误并禁用上游：
+                    #   aioquic hostname 校验失败: "hostname 'x' doesn't match either of DNSPattern(...)..."
+                    #     （要求同时含 "doesn't match" 与 "dnspattern"，防止对端伪造 reason_phrase 触发误禁）
+                    #   aioquic 证书链校验失败: "certificate verify failed: ..."（客户端本地 OpenSSL 消息）
+                    # 避免将暂时性错误（对端 CONNECTION_CLOSE、域名解析失败等）误判为证书失败
+                    if (("doesn't match" in cert_err and "dnspattern" in cert_err)
+                            or "certificate verify failed" in cert_err):
+                        # 证书验证失败是确定性错误（证书与域名/IP 不匹配），
+                        # 直接抛出由 DoQResolver 捕获并禁用该上游，
+                        # 避免每次查询都重复尝试坏上游并刷屏日志
+                        raise CertificateVerifyError(
+                            self._host,
+                            str(e)[:300],
                         )
-                        break
                     continue
 
             if last_error:
@@ -606,6 +624,8 @@ if HAS_AIOQUIC:
             # 连接池
             self._pool: Optional[_QuicConnectionPool] = None
             self._pool_closed = False
+            # 证书验证失败标记：置位后该上游被直接禁用（避免每次查询重复重试）
+            self._cert_failed: Optional[str] = None
 
         def _get_config(self, alpn: str) -> Optional["QuicConfiguration"]:
             if not HAS_AIOQUIC:
@@ -657,6 +677,10 @@ if HAS_AIOQUIC:
             if not HAS_AIOQUIC:
                 return None
 
+            # 证书验证失败后该上游已被禁用，直接短路返回（不再发起任何连接）
+            if self._cert_failed:
+                return None
+
             # 延迟初始化连接池
             if self._pool is None or self._pool_closed:
                 self._pool = _QuicConnectionPool(
@@ -674,7 +698,18 @@ if HAS_AIOQUIC:
                     sem = asyncio.Semaphore(_DOQ_GLOBAL_CONCURRENCY)
                     _DOQ_GLOBAL_SEMAPHORE = sem
                 async with sem:
-                    return await self._pool.execute(query_bytes)
+                    try:
+                        return await self._pool.execute(query_bytes)
+                    except CertificateVerifyError as e:
+                        # 确定性证书失败 → 直接禁用该上游
+                        self._cert_failed = e.detail
+                        # repr() 转义控制字符，防止对端可控的 reason 注入换行/转义序列污染日志
+                        logger.warning(
+                            "DoQ 上游 %s 证书验证失败，已禁用该上游"
+                            "（证书与域名/IP 不匹配，可能为 DNS 劫持或服务器证书配置错误）: %s",
+                            self.host, repr(e.detail),
+                        )
+                        return None
 
         async def close(self):
             """关闭所有连接和缓存配置"""
@@ -688,6 +723,8 @@ if HAS_AIOQUIC:
         async def reset_connections(self):
             """重置连接状态（网络恢复时调用）"""
             self._pool_closed = True
+            # 网络恢复/重置时清除证书失败标记，允许重试（若上游已修复证书则可恢复）
+            self._cert_failed = None
             if self._pool:
                 await self._pool.close_all()
                 self._pool = None
@@ -711,6 +748,8 @@ else:
             super().__init__(address, timeout, concurrency=concurrency)
             self.host = address
             self.port = 853
+            # 与真实实现保持一致的属性，防止外部访问报错
+            self._cert_failed: Optional[str] = None
             logger.warning("aioquic未安装，DoQ %s不可用", self.host)
 
         async def resolve(self, query_bytes: bytes) -> Optional[bytes]:

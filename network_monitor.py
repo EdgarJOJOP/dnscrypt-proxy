@@ -67,6 +67,11 @@ class NetworkMonitor:
         self._ndp_last_end_time: float = 0.0  # 上次 NDP 防护结束时间，用于防抖
         # IPv6 网关 ping 滑动窗口
         self._ndp_gw_results: collections.deque = collections.deque(maxlen=10)
+        # plain DNS 恢复信号门控：network_down 期间每 2s 最多探测一次
+        # （修复：加密 DNS 失败 ≠ 断网，plain DNS 探活成功即恢复，避免窗口翻转 150s 卡死）
+        self._last_plain_dns_recovery_try: float = 0.0
+        # security_review MEDIUM-1：连续 2 次探活成功才解除断网防护（防伪造 UDP 响应误恢复）
+        self._plain_dns_recovery_streak: int = 0
 
         # 从配置读取
         nm = config.get_raw().get("network_monitor", {})
@@ -382,6 +387,52 @@ class NetworkMonitor:
                     elif diagnosis != "recovered":
                         diagnosis = "network_down"
                         loss_pct = 100
+                    # 收紧：断网恢复需最近外网探测连续成功（review should-fix——
+                    # 光猫通/光纤断场景窗口缓慢翻转时 classify 会周期性误判 recovered，
+                    # 若此处直接放行将产生 15~30s 的放行-压制振荡，直至窗口全 False）
+                    if diagnosis == "recovered":
+                        # 双栈窗口（审计修复）：v4 或 v6 任一最近 ≥2 条探测连续成功即视为外网可达；
+                        # 原仅看 v4 窗口，纯 v6/仅 v4 外网被封环境会永久压回 network_down
+                        _ext4 = list(self._ext_results)[-3:]
+                        _ext6 = list(self._ext_results_v6)[-3:]
+                        _v4_ok = len(_ext4) >= 2 and all(_ext4)
+                        _v6_ok = len(_ext6) >= 2 and all(_ext6)
+                        if not (_v4_ok or _v6_ok):
+                            diagnosis = "network_down"
+                            loss_pct = 100
+
+                # ========== 2.5 加密 DNS 失败 ≠ 断网：plain DNS 探活快速恢复 ==========
+                # 修复：network_down 期间若 plain DNS 探活成功（链路可达），立即恢复上游查询，
+                # 不再等待滑动窗口翻转（原清空窗口需 15s×10 轮才恢复，期间全部查询被拦截超时）
+                if self._arp_network_down or self._ndp_network_down:
+                    _pnow = asyncio.get_event_loop().time()
+                    if _pnow - self._last_plain_dns_recovery_try >= 2.0:
+                        self._last_plain_dns_recovery_try = _pnow
+                        try:
+                            _p_ok = await self._probe_plain_dns_canary()
+                        except Exception:
+                            _p_ok = False
+                        # security_review MEDIUM-1：连续 2 次探活成功才恢复，
+                        # 与断网"连续 2 轮确认"对称，降低伪造 UDP 响应误解除防护的风险
+                        if _p_ok:
+                            self._plain_dns_recovery_streak += 1
+                        else:
+                            self._plain_dns_recovery_streak = 0
+                        if _p_ok and self._plain_dns_recovery_streak >= 2:
+                            logger.warning("网络已恢复 (plain DNS 探活连续 2 次成功——"
+                                           "加密 DNS 失败≠断网)，恢复上游加密 DNS 查询")
+                            self._plain_dns_recovery_streak = 0
+                            self._wan_dead_confirmed_at = 0.0
+                            self._consecutive_network_down = 0
+                            self._arp_network_down = False
+                            self._ndp_network_down = False
+                            self.resolver_manager.set_network_down(False)
+                            self.resolver_manager.enter_recovery_mode()
+                            self.resolver_manager.reenable_all()
+                            # 审计修复：触发完整恢复 worker（重启本地加密 DNS 服务——
+                            # 断网时 _on_network_down 已 stop_local_servers，此处不触发则
+                            # 本地 DoH/DoT/DoQ/Plain 服务停摆不重启，用户仍无法访问）
+                            self._run_recover.set()
                 # ========== 3. 决策 ==========
                 if diagnosis == "recovered":
                     # 窗口内大部分成功 → 网络已正常
@@ -547,9 +598,9 @@ class NetworkMonitor:
                            result.get("from_ip", "?"), target,
                            result.get("unreachable_code", "?"))
             # Bug #1: 清空 ext_results 防止首轮误判恢复
-            self._ext_results.clear()
-            for _ in range(self._ext_results.maxlen):
-                self._ext_results.append(False)
+            # 修复：不强制清空填 False——已有 _wan_dead_confirmed_at + protect_window(15s)
+            # 防止断网瞬间误判恢复；清空填 False 会让窗口翻转需 15s×10 轮(150s)才恢复，
+            # 期间 network_down 标志拦截所有 DNS 查询导致长时间超时
             self._wan_dead_confirmed_at = self._last_wan_probe_time
             self._arp_network_down = True
             ext_v6_alive = len(self._ext_results_v6) > 0 and sum(self._ext_results_v6) > 0
@@ -603,9 +654,7 @@ class NetworkMonitor:
                            result.get("unreachable_code", "?"))
             # 清空 v6 外网窗口防止首轮误判恢复
             # （原实现误清 v4 窗口 _ext_results 并填 False → ext_v4_alive 恒 False → _arp_network_down 无条件置 True）
-            self._ext_results_v6.clear()
-            for _ in range(self._ext_results_v6.maxlen):
-                self._ext_results_v6.append(False)
+            # 修复：不强制清空填 False（同 v4 路径，protect_window 已防误恢复，清空致 150s 恢复卡死）
             self._wan_dead_confirmed_at = self._last_wan_probe_time_v6
             self._ndp_network_down = True
             ext_v4_alive = len(self._ext_results) > 0 and sum(self._ext_results) > 0
@@ -1306,13 +1355,8 @@ class NetworkMonitor:
                 if not self._arp_network_down and not self._ndp_network_down:
                     logger.warning("⚠️ 深度诊断: plain DNS 探活也失败 — "
                                    "确认网络中断，自动抑制 DNS 查询")
-                    # 清空滑动窗口强制进入 network_down 状态
-                    self._ext_results.clear()
-                    for _ in range(self._ext_results.maxlen):
-                        self._ext_results.append(False)
-                    self._ext_results_v6.clear()
-                    for _ in range(self._ext_results_v6.maxlen):
-                        self._ext_results_v6.append(False)
+                    # 修复：不再清空滑动窗口填 False（原清空导致恢复需 15s×10 轮才翻转，
+                    # 期间 network_down 拦截所有 DNS 查询；protect_window 已防瞬时误恢复）
                     self._wan_dead_confirmed_at = asyncio.get_event_loop().time()
                     self._arp_network_down = True
                     self._ndp_network_down = True

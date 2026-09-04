@@ -8,6 +8,7 @@
 
 import asyncio
 import collections
+import ipaddress
 import logging
 import os
 import time
@@ -313,6 +314,20 @@ class ResolverManager:
             else:
                 logger.warning("  无法解析 %s", hostname)
 
+    @staticmethod
+    def _is_suspicious_bootstrap_ip(ip: str) -> bool:
+        """过滤明显可疑的 bootstrap 应答 IP（DNS 劫持/污染特征）：
+        - 回环 127.0.0.0/8、::1（劫持者常把未知域名解析到本地）
+        - 未指定 0.0.0.0/::、私网 10/8、172.16/12、192.168/16、fc00::/7
+        - 链路本地 169.254/16、fe80::/10、组播 224/4、ff00::/8、保留地址
+        """
+        try:
+            ip_obj = ipaddress.ip_address(ip.split("%")[0])
+        except ValueError:
+            return True
+        return (ip_obj.is_loopback or ip_obj.is_unspecified or ip_obj.is_private
+                or ip_obj.is_link_local or ip_obj.is_multicast or ip_obj.is_reserved)
+
     async def _bootstrap_resolve(self, hostname: str) -> List[str]:
         """
         通过 bootstrap DNS 解析域名（A + AAAA 双栈独立查询）
@@ -356,6 +371,11 @@ class ResolverManager:
                     *[try_resolver(qbytes, bs, addr_family) for bs in suitable_bs],
                     return_exceptions=True,
                 )
+                # 审计修复：多 bootstrap 交叉验证 + 可疑 IP 过滤。日志实证污染特征——
+                # 劫持源把不同上游域名解析到同一批『公共 DNS』IP（94.140.14.14 等）或
+                # 127.0.0.1，导致 DoH 证书验证失败、DoT/DoQ 连错服务器。
+                _ok_sources = sum(1 for r in results if isinstance(r, bytes))
+                _ip_counts = {}
                 for result in results:
                     if isinstance(result, bytes):
                         try:
@@ -363,13 +383,34 @@ class ResolverManager:
                             for rrset in response.answer:
                                 for rd in rrset:
                                     if rd.rdtype == qtype:
-                                        ips.append(str(rd.address))
+                                        _ip = str(rd.address)
+                                        # 过滤可疑/保留 IP（127.0.0.1、私网、组播等污染特征）
+                                        if self._is_suspicious_bootstrap_ip(_ip):
+                                            logger.debug("bootstrap 解析 %s 过滤可疑 IP: %s", hostname, _ip)
+                                            continue
+                                        _ip_counts[_ip] = _ip_counts.get(_ip, 0) + 1
                         except (UnicodeError, ValueError) as e:
                             logger.debug("解析管理器 DNS 响应包含非法字符: %s", e)
                             continue
                         except Exception as e:
                             logger.debug("解析管理器 DNS 响应解析异常: %s", e)
                             continue
+                if _ip_counts:
+                    if _ok_sources >= 2:
+                        # 多源交叉验证：只采用至少 2 个 bootstrap 一致的 IP（劫持源通常
+                        # 返回不一致的伪造 IP，多源一致的真实 IP 才可信）
+                        _agreed = [ip for ip, c in _ip_counts.items() if c >= 2]
+                        if _agreed:
+                            ips.extend(_agreed)
+                            logger.debug("bootstrap 解析 %s 交叉验证通过 %d 个 IP: %s",
+                                         hostname, len(_agreed), ",".join(_agreed))
+                        else:
+                            # 多源均不一致：不可信，放弃本轮（触发外层重试）
+                            logger.debug("bootstrap 解析 %s 多源结果不一致(%s)，放弃本轮",
+                                         hostname, ",".join(_ip_counts.keys()))
+                    else:
+                        # 仅 1 个 bootstrap 应答：保留其合法 IP（避免单源/部分超时环境丢结果）
+                        ips.extend(_ip_counts.keys())
 
             if ips:
                 return ips

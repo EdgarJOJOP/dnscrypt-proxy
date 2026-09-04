@@ -1485,6 +1485,11 @@ class IterativeResolver:
         """上游名称（供 ResolverManager 作为 UpstreamServer 注册使用）"""
         return "iterative"
 
+    async def close(self):
+        """关闭迭代解析器（无外部连接/会话资源，占位保持与其它解析器接口一致，
+        避免 resolver_manager 关闭上游时抛 AttributeError）"""
+        pass
+
     async def resolve_with_stats(self, query_bytes: bytes) -> tuple:
         """上游统一接口（供 ResolverManager._try_upstream_wave 调用）。
 

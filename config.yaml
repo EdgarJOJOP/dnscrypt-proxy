@@ -64,14 +64,14 @@ server:
       enabled: true            # 默认关闭，设为 true 开启迭代解析
       # 根服务器列表（默认 IANA 13 根，留空或省略则使用内置列表）
       # 可自定义覆盖：- "198.41.0.4"
-      root_servers: ["2001:7fd::1","2001:500:2f::f","193.0.14.129","192.5.5.241"]
+      root_servers: ["2001:7fd::1","2001:500:2f::f","2001:503:c27::2:30","193.0.14.129","192.5.5.241","192.58.128.30"]
       # 单跳查询超时（毫秒）
-      timeout_ms: 2000
+      timeout_ms: 1500
       # 迭代最大深度（根→TLD→权威的跳数上限）
       max_depth: 8
       # 严格 DNSSEC：链验证失败（bogus）时丢弃响应返回 SERVFAIL
       strict_dnssec: true
-      # 全局确认：迭代结果与加密上游结果做一致性交叉验证，不一致返回 SERVFAIL，可在本地运行使用时启用，服务器部署建议不要开启(安全防护高但是及其容易判定不一致返回 SERVFAIL)
+      # 全局确认：迭代结果与加密上游结果做一致性交叉验证，不一致返回 SERVFAIL
       cross_verify: false
 
 # ============================================================
@@ -118,7 +118,6 @@ upstream:
     - 1dot1dot1dot1.cloudflare-dns.com
   doq:
     - quic://dns9.quad9.net:853
-    - quic://dns.caliph.dev:853
     - quic://dns.alidns.com:853
     - quic://dns-unfiltered.adguard.com:853
 cache:
@@ -315,7 +314,7 @@ network_monitor:
   # 需要安装 Npcap 以使用 scapy 发包（否则降级为 ping 等效方案）。
   # ============================================================
   ndp_protection:
-    enabled: true                 # 默认关闭，未检测到 IPv6 时自动关闭
+    enabled: false                 # 默认关闭，未检测到 IPv6 时自动关闭
     # 手动指定 IPv6 网关（自动探测的高优先级替代）
     # 格式: "网关IPv6,网关MAC,VLAN_ID" (英文逗号隔开), 留空则自动探测
     # VLAN_ID 默认为空（无 VLAN/VXLAN）；vxlan_enabled=true 时解释为 VXLAN VNI
