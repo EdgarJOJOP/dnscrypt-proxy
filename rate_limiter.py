@@ -21,10 +21,13 @@ class PerIPRateLimiter:
 
     def __init__(self, per_ip_limit: int = 50,
                  cleanup_interval: int = 300,
-                 idle_timeout: int = 600):
+                 idle_timeout: int = 600,
+                 max_entries: int = 10000):
         self._per_ip_limit = per_ip_limit
         self._cleanup_interval = cleanup_interval
         self._idle_timeout = idle_timeout
+        # 容量上限：UDP 源 IP 可伪造，无上限会让字典被海量不同源 IP 撑爆
+        self._max_entries = max_entries
         self._semaphores: Dict[str, Tuple[asyncio.Semaphore, float]] = {}
         self._lock = asyncio.Lock()
         self._cleanup_task: Optional[asyncio.Task] = None
@@ -56,9 +59,48 @@ class PerIPRateLimiter:
                 sem, _ = self._semaphores[client_ip]
                 self._semaphores[client_ip] = (sem, now)
                 return sem
+            if len(self._semaphores) >= self._max_entries:
+                self._evict_locked(now)
             sem = asyncio.Semaphore(self._per_ip_limit)
             self._semaphores[client_ip] = (sem, now)
             return sem
+
+    def _evict_locked(self, now: float) -> None:
+        """容量达上限时的淘汰：先清空闲超时条目，仍超限则淘汰最旧的一批
+
+        调用方必须已持有 self._lock。
+        """
+        stale = [
+            ip for ip, (_, ts) in self._semaphores.items()
+            if now - ts > self._idle_timeout
+        ]
+        for ip in stale:
+            self._semaphores.pop(ip, None)
+        overflow = len(self._semaphores) - int(self._max_entries * 0.9)
+        if overflow <= 0:
+            return
+        oldest = sorted(self._semaphores.items(), key=lambda kv: kv[1][1])[:overflow]
+        for ip, _ in oldest:
+            self._semaphores.pop(ip, None)
+        logger.warning(
+            "PerIPRateLimiter: 条目数达上限 %d，已淘汰 %d 个最旧条目",
+            self._max_entries, len(oldest),
+        )
+
+    def set_per_ip_limit(self, limit: int) -> None:
+        """更新每 IP 并发上限（供单例构造方同步配置）
+
+        已存在的信号量按旧限额创建，因此清空重建，使新限额对所有 IP 生效。
+        """
+        if not limit or limit == self._per_ip_limit:
+            return
+        self._per_ip_limit = limit
+        self._semaphores.clear()
+        logger.info("PerIPRateLimiter: 每 IP 并发上限更新为 %d", limit)
+
+    @property
+    def per_ip_limit(self) -> int:
+        return self._per_ip_limit
 
     async def _cleanup_loop(self):
         """定期清理过期 IP 条目"""
@@ -100,13 +142,21 @@ _per_ip_limiter_instance: Optional[PerIPRateLimiter] = None
 
 def get_per_ip_limiter(per_ip_limit: int = 50,
                        cleanup_interval: int = 300,
-                       idle_timeout: int = 600) -> PerIPRateLimiter:
-    """获取共享的 PerIPRateLimiter 单例"""
+                       idle_timeout: int = 600,
+                       max_entries: int = 10000) -> PerIPRateLimiter:
+    """获取共享的 PerIPRateLimiter 单例
+
+    单例首次创建后，后续调用若传入不同的 per_ip_limit，会同步更新限额
+    （此前参数被静默忽略，谁先初始化就定终身，与各服务端配置不符）。
+    """
     global _per_ip_limiter_instance
     if _per_ip_limiter_instance is None:
         _per_ip_limiter_instance = PerIPRateLimiter(
             per_ip_limit=per_ip_limit,
             cleanup_interval=cleanup_interval,
             idle_timeout=idle_timeout,
+            max_entries=max_entries,
         )
+    elif per_ip_limit is not None:
+        _per_ip_limiter_instance.set_per_ip_limit(per_ip_limit)
     return _per_ip_limiter_instance

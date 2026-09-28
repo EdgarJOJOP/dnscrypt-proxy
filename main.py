@@ -181,7 +181,9 @@ class DNSProxyApp:
         # 2. DNSSEC 验证器
         logger.info("[2/11] 初始化 DNSSEC 验证器...")
         self._dnssec_validator = DNSSECValidator(
-            enabled=self.config.dnssec_enabled, mode=self.config.dnssec_mode
+            enabled=self.config.dnssec_enabled,
+            mode=self.config.dnssec_mode,
+            require_rrsig=self.config.dnssec_require_rrsig,
         )
         self._dnssec_wrapper = DNSSECQueryWrapper(
             self._dnssec_validator, enabled=self.config.dnssec_enabled

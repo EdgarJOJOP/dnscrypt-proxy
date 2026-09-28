@@ -50,6 +50,10 @@ ROOT_SERVERS = DEFAULT_ROOT_SERVERS
 
 
 def answer_set_fingerprint(wire_bytes: bytes) -> str:
+    """响应答案集指纹（原用于 cross_verify 交叉验证）
+
+    注意：cross_verify 已随新架构废弃，当前全仓无调用方；保留实现以备需要。
+    """
     """归一化答案集指纹：仅提取 answer 段 (name, rdtype, rdata) 集合的 SHA-256。
 
     用于交叉验证的全局确认。与 consistency_verifier 的逐字节指纹不同，
@@ -212,6 +216,9 @@ class PlainDNSServer:
                                  client_ip: str):
         """DNS 查询处理核心逻辑（UDP 版：发送响应后返回 None）"""
         result = await self._resolve_and_respond(data, addr, client_ip)
+        if result:
+            # RFC 1035 §4.2.1 / RFC 6891：按客户端缓冲截断并置 TC，避免靠 IP 分片
+            result = self._fit_udp_response(data, result)
         if result is not None:
             self._send_raw_response(result, addr, transport)
 
@@ -232,7 +239,19 @@ class PlainDNSServer:
                     break
                 if length < 12:
                     logger.warning("TCP DNS 消息长度 %d 过短（最小 12）", length)
-                    break
+                    # 消费该帧并回 FORMERR，然后继续服务同一连接上的后续查询
+                    # （RFC 7766 允许连接复用，不应因单个坏帧丢弃后续查询）
+                    try:
+                        short_data = await asyncio.wait_for(
+                            reader.readexactly(length), timeout=30.0
+                        )
+                    except (asyncio.IncompleteReadError, asyncio.TimeoutError):
+                        break
+                    err = self._make_error_wire(short_data, dns.rcode.FORMERR)
+                    if err:
+                        writer.write(struct.pack('!H', len(err)) + err)
+                        await writer.drain()
+                    continue
                 data = await asyncio.wait_for(
                     reader.readexactly(length), timeout=30.0
                 )
@@ -251,6 +270,14 @@ class PlainDNSServer:
                     # TCP DNS 响应：2 字节长度前缀 + DNS 消息
                     writer.write(struct.pack('!H', len(result_wire)) + result_wire)
                     await writer.drain()
+                else:
+                    # 无响应（None/空）：回 FORMERR，避免客户端在已建立连接上挂起
+                    err = self._make_error_wire(data, dns.rcode.FORMERR)
+                    if err:
+                        writer.write(struct.pack('!H', len(err)) + err)
+                        await writer.drain()
+                    else:
+                        break
         except asyncio.TimeoutError:
             logger.debug("TCP DNS 读取超时，关闭连接")
         except asyncio.IncompleteReadError:
@@ -286,12 +313,17 @@ class PlainDNSServer:
             # 解析 DNS 查询
             query = dns.message.from_wire(data)
             if not query.question:
-                return b""
+                # RFC 1035：QDCOUNT=0 的查询应回 FORMERR，而非静默丢弃
+                #（静默丢弃会让 TCP 客户端在已建立连接上一直等）
+                response = dns.message.make_response(query)
+                response.set_rcode(dns.rcode.FORMERR)
+                return response.to_wire()
 
             question = query.question[0]
             qname = str(question.name).rstrip(".")
             qtype_str = dns.rdatatype.to_text(question.rdtype)
-            cache_key = (question.name, question.rdtype, question.rdclass)
+            # 缓存键含 DO/CD 维度：不同 DNSSEC 需求的查询不应互相命中
+            cache_key = self._make_cache_key(question, query)
 
             # 0. 检查自定义 hosts 映射（最高优先级）
             custom_ips = self.filter_engine.get_custom_hosts_ips(qname)
@@ -353,7 +385,10 @@ class PlainDNSServer:
                     else:
                         response.set_rcode(dns.rcode.NXDOMAIN)
                     if self.config.cache_enabled:
-                        await self.cache.set(cache_key, response)
+                        await self.cache.set(
+                            cache_key, response,
+                            response.rcode() == dns.rcode.NXDOMAIN,
+                        )
                     reorder_answer_aaaa_first(response)
                     result_wire = response.to_wire()
                     elapsed = asyncio.get_event_loop().time() - start_time
@@ -407,15 +442,12 @@ class PlainDNSServer:
                 else:
                     status = "resolved"
 
-                # 缓存结果
-                if self.config.cache_enabled and status in ("resolved", "iterative") and result_wire is not None:
+                # 缓存结果（status 已不再包含旧架构的 "iterative" 值）
+                if self.config.cache_enabled and status == "resolved" and result_wire is not None:
                     try:
                         response_msg = dns.message.from_wire(result_wire)
                         reorder_answer_aaaa_first(response_msg)
-                        is_negative = response_msg.rcode() in (
-                            dns.rcode.NXDOMAIN,
-                            dns.rcode.REFUSED,
-                        )
+                        is_negative = self._is_negative_response(response_msg)
                         await self.cache.set(cache_key, response_msg, is_negative)
                     except Exception as e:
                         logger.debug("Plain DNS 缓存写入异常: %s", e)
@@ -423,14 +455,122 @@ class PlainDNSServer:
             elapsed = asyncio.get_event_loop().time() - start_time
             await self._log_query(client_ip, qname, qtype_str, elapsed, status, block_reason)
             result_wire = sort_dns_response_wire(result_wire)
+            # 上游直连路径的响应 ID 可能与查询不一致：DoH（RFC 8484）与 DoQ
+            # （RFC 9250）上游按协议要求用 ID=0 发起查询，其响应 ID 会被原样
+            # 透传给客户端。若客户端校验 ID（dig、DoT/DoQ 前端），会丢弃该响应
+            # 并等待超时，表现为查询卡顿，故在返回前统一重写为查询 ID。
+            # 对 make_response(query) 生成的响应（ID 本已正确）是幂等的。
+            if result_wire:
+                try:
+                    _resp = dns.message.from_wire(result_wire)
+                    if _resp.id != query.id:
+                        _resp.id = query.id
+                        result_wire = _resp.to_wire()
+                except Exception as e:
+                    logger.debug("Plain DNS 响应 ID 重写异常: %s", e)
             return result_wire
 
         except dns.exception.DNSException as e:
             logger.debug("DNS 解析错误: %s", e)
-            return None
+            return self._make_error_wire(data, dns.rcode.FORMERR)
         except Exception as e:
             logger.error("处理 DNS 查询异常: %s", e)
+            return self._make_error_wire(data, dns.rcode.SERVFAIL)
+
+    @staticmethod
+    def _make_error_wire(data: bytes, rcode: int) -> Optional[bytes]:
+        """从原始查询报文尽力构造错误响应（保留 ID / RD / CD），失败返回 None
+
+        用于报文解析失败或无正常响应时，避免客户端（尤其 TCP）无限等待。
+        """
+        try:
+            if len(data) < 2:
+                return None
+            qid = int.from_bytes(data[:2], "big")
+            flags_in = int.from_bytes(data[2:4], "big") if len(data) >= 4 else 0
+            # QR=1；回显 RD(0x0100) / CD(0x0010)；rcode 放低 4 位
+            flags = 0x8000 | (flags_in & 0x0110) | (int(rcode) & 0x000F)
+            return struct.pack("!HHHHHH", qid, flags, 0, 0, 0, 0)
+        except Exception:
             return None
+
+    @staticmethod
+    def _make_cache_key(question, query) -> tuple:
+        """缓存键 = (name, rdtype, rdclass, DO 位, CD 位)
+
+        RFC 6891/4035：带 DO 的查询可能需要 RRSIG，CD=1 表示跳过校验，
+        响应形态不同；只用 (name,type,class) 会让它们互相命中。
+        """
+        try:
+            do_bit = bool(query.edns >= 0 and (query.ednsflags & dns.flags.DO))
+        except Exception:
+            do_bit = False
+        try:
+            cd_bit = bool(query.flags & dns.flags.CD)
+        except Exception:
+            cd_bit = False
+        return (question.name, question.rdtype, question.rdclass, do_bit, cd_bit)
+
+    @staticmethod
+    def _is_negative_response(msg) -> bool:
+        """RFC 2308：NXDOMAIN 或 NODATA（NOERROR 且无 answer）为负应答
+
+        原实现漏判 NODATA，使其按 default_ttl(300s) 缓存（配置 negative_ttl=60s）。
+        """
+        try:
+            rcode = msg.rcode()
+        except Exception:
+            return False
+        if rcode in (dns.rcode.NXDOMAIN, dns.rcode.REFUSED):
+            return True
+        return rcode == dns.rcode.NOERROR and not msg.answer
+
+    @staticmethod
+    def _udp_max_payload(query_wire: bytes) -> int:
+        """客户端可接受的最大 UDP 响应长度（RFC 1035 §4.2.1 / RFC 6891 §6.2.5）
+
+        无 EDNS0 的客户端一律 512 字节；有 EDNS0 时取声明值的下界 512、
+        上界 MAX_UDP_SIZE（1232，避免路径 MTU 分片）。
+        """
+        try:
+            query = dns.message.from_wire(query_wire)
+        except Exception:
+            return 512
+        if query.edns >= 0:
+            size = query.payload
+            if not size or size < 512:
+                size = 512
+            return min(size, MAX_UDP_SIZE)
+        return 512
+
+    def _fit_udp_response(self, query_wire: bytes, response_wire: bytes) -> bytes:
+        """UDP 响应超过客户端缓冲时截断并置 TC 位
+
+        未截断时超长响应只能依赖 IP 分片，NAT/防火墙常丢非首片 → 客户端超时；
+        截断后客户端会改用 TCP 重试（RFC 1035 §4.2.1）。
+        """
+        if not response_wire:
+            return response_wire
+        max_len = self._udp_max_payload(query_wire)
+        if len(response_wire) <= max_len:
+            return response_wire
+        try:
+            msg = dns.message.from_wire(response_wire)
+            msg.flags |= dns.flags.TC
+            for section in (msg.additional, msg.authority, msg.answer):
+                while section and len(msg.to_wire()) > max_len:
+                    section.pop()
+            wire = msg.to_wire()
+            if len(wire) <= max_len:
+                return wire
+        except Exception as e:
+            logger.debug("UDP 响应截断处理异常: %s", e)
+        try:
+            minimal = dns.message.make_response(dns.message.from_wire(query_wire))
+            minimal.flags |= dns.flags.TC
+            return minimal.to_wire()
+        except Exception:
+            return response_wire
 
     def _send_raw_response(self, data: bytes, addr: tuple,
                             transport: Optional[asyncio.DatagramTransport] = None):
@@ -531,6 +671,8 @@ class PlainDNSServer:
 
         loop = asyncio.get_running_loop()
 
+        started = False
+
         # ---------- UDP ----------
         try:
             sock_v4 = self._create_udp_socket(self.host, self.port, socket.AF_INET)
@@ -539,6 +681,7 @@ class PlainDNSServer:
                 sock=sock_v4,
             )
             self._transport_v4 = transport_v4
+            started = True
             logger.info("普通 DNS [UDP IPv4] udp://%s:%d", self.host, self.port)
         except OSError as e:
             logger.warning("普通 DNS [UDP IPv4] 启动失败: %s", e)
@@ -551,6 +694,7 @@ class PlainDNSServer:
                     sock=sock_v6,
                 )
                 self._transport_v6 = transport_v6
+                started = True
                 logger.info("普通 DNS [UDP IPv6] udp://[%s]:%d", self.ipv6_host, self.port)
             except OSError as e:
                 logger.warning("普通 DNS [UDP IPv6] 启动失败: %s", e)
@@ -561,21 +705,36 @@ class PlainDNSServer:
                 self._handle_tcp_connection, self.host, self.port,
                 backlog=self._tcp_backlog,
             )
+            started = True
             logger.info("普通 DNS [TCP IPv4] tcp://%s:%d", self.host, self.port)
         except OSError as e:
             logger.warning("普通 DNS [TCP IPv4] 启动失败: %s", e)
 
         if self.ipv6_enabled:
             try:
+                # 显式设置 IPV6_V6ONLY（与 UDP 侧 _create_udp_socket 一致）：
+                # Linux 默认 v6only=0 时，绑定 "::" 会与已绑定的 IPv4 0.0.0.0:53
+                # 冲突 → TCP IPv6 静默不可用。
+                sock6 = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+                try:
+                    sock6.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    sock6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                    sock6.bind((self.ipv6_host, self.port))
+                    sock6.listen(self._tcp_backlog)
+                except OSError:
+                    sock6.close()
+                    raise
                 self._tcp_server_v6 = await asyncio.start_server(
-                    self._handle_tcp_connection, self.ipv6_host, self.port,
-                    backlog=self._tcp_backlog,
+                    self._handle_tcp_connection, sock=sock6,
                 )
+                started = True
                 logger.info("普通 DNS [TCP IPv6] tcp://[%s]:%d", self.ipv6_host, self.port)
             except OSError as e:
                 logger.warning("普通 DNS [TCP IPv6] 启动失败: %s", e)
 
-        self._running = True
+        if not started:
+            logger.error("普通 DNS 未能监听任何地址（UDP/TCP 全部失败），服务未启动")
+        self._running = started
 
 
 
@@ -641,10 +800,10 @@ class IterativeResolver:
                 "迭代解析 strict_dnssec=False：未验证的迭代响应将被放行"
                 "（DNSSEC 剥离/投毒检测失效，建议开启 strict_dnssec）",
             )
-        # cross_verify：原“迭代 vs 加密上游交叉验证”语义——新架构下迭代解析
-        # 作为独立上游与加密上游并行竞争（最快响应胜出），不再需要独立交叉验证；
-        # 保留属性与配置读取以兼容（deprecated，无实际调用方）
-        self.cross_verify = bool(config.plain_dns_iterative_cross_verify)
+        # cross_verify：原“迭代 vs 加密上游交叉验证”语义已废弃——新架构下迭代解析
+        # 作为独立上游与加密上游并行竞争（最快响应胜出），无需独立交叉验证。
+        # 此前在此赋值 self.cross_verify 但全仓无任何读取方（config 项
+        # plain_dns_iterative_cross_verify 因此失效），已删除该死代码。
         root = config.plain_dns_iterative_root_servers
         self.root_servers = [str(x) for x in root] if root else list(ROOT_SERVERS)
         # A3 修复（IPv6 优先）：探测本机 IPv6 公网连通性（UDP connect 公共 IPv6 根，
@@ -871,7 +1030,7 @@ class IterativeResolver:
                 except Exception:
                     pass
                 return response
-            # 2. NXDOMAIN / 其他错误码 → 返回（负应答）
+            # 2. NXDOMAIN → 返回（负应答）
             if response.rcode() == dns.rcode.NXDOMAIN:
                 return response
             # 2b. 权威负应答（NODATA）：authority 段有 SOA（zone 权威的否定应答），
@@ -968,8 +1127,9 @@ class IterativeResolver:
           → DS digest 匹配 TLD DNSKEY → TLD ZSK 验证子域 DS → ... → zone DNSKEY
         中间人即使伪造 DNSKEY/DS 响应，没有父区私钥就无法通过签名验证。
         """
-        if zone_name == dns.name.root:
-            return None  # 根区 DNSKEY 由内置信任锚提供，不走此链
+        # 根区没有父区（DS 链为空），但仍需"用内置根锚验证根 DNSKEY"再返回，
+        # 因此不再提前返回 None；否则调用方拿不到根密钥，root 签名的 NSEC/
+        # RRset 无法验证 → 合法响应被误判 bogus。
         # 缓存命中：已验证过的 zone 直接返回（TTL 未过期），避免重复全链迭代流量
         cached = self._verified_zone_cache.get(str(zone_name).lower())
         if cached is not None:
@@ -1069,13 +1229,15 @@ class IterativeResolver:
             # 3e. 该级验证通过 → 信任整个 DNSKEY rrset（含 ZSK），作为下一级的信任来源
             trusted[cur_zone] = dnskey_rrset
 
+        # 结果：zone 自身的 DNSKEY rrset（zone==root 时即第 2 步用根锚验证过的根密钥）
+        result_rrset = trusted.get(zone_name) or root_dnskey_rrset
         # 缓存已验证 zone 的 DNSKEY（有界：超 512 条清空，避免内存膨胀；
         # 失效时间 = 当前时间 + DNSKEY rrset TTL，DNSKEY 轮换后自动重新验证）
         if len(self._verified_zone_cache) > 512:
             self._verified_zone_cache.clear()
-        ttl = getattr(dnskey_rrset, "ttl", 3600) or 3600
-        self._verified_zone_cache[str(zone_name).lower()] = (dnskey_rrset, time.time() + ttl)
-        return dnskey_rrset
+        ttl = getattr(result_rrset, "ttl", 3600) or 3600
+        self._verified_zone_cache[str(zone_name).lower()] = (result_rrset, time.time() + ttl)
+        return result_rrset
 
     async def _dnssec_query_callback(self, query_bytes: bytes) -> Optional[bytes]:
         """DNSSECValidator 的 DNSKEY 查询回调：迭代查询 DNSKEY 并做 DS 链验证。
@@ -1599,7 +1761,16 @@ class IterativeResolver:
             trusted_keys: Dict = {}
             for signer in signers:
                 if signer == dns.name.root:
-                    continue  # 根锚内置
+                    # 根区密钥来自内置信任锚（RFC 4033 §6）：用根锚验证根 DNSKEY 后
+                    # 才能验签 root 签名的 RRset。之前直接 continue 会让 trusted_keys
+                    # 缺 root → 验签 KeyError → 合法响应被误判 bogus（可用性缺陷）。
+                    root_rrset = await self._get_trusted_dnskey(dns.name.root)
+                    if root_rrset is None:
+                        self._stats["bogus"] += 1
+                        logger.warning("DNSSEC 根区 DNSKEY 验证失败，拒绝签名响应")
+                        return None
+                    trusted_keys[signer] = root_rrset
+                    continue
                 dnskey_rrset = await self._get_trusted_dnskey(signer)
                 if dnskey_rrset is None:
                     self._stats["bogus"] += 1
@@ -1932,13 +2103,15 @@ class IterativeResolver:
                                             # 属 NXDOMAIN 负应答语义，不适用于此）
                                             wildcard_proven = True
                                             break
-                    if not wildcard_proven:
-                        self._stats["bogus"] += 1
-                        logger.warning(
-                            "DNSSEC wildcard 响应缺 %s 无精确记录证明"
-                            "（重放替代精确应答）: %s", wc_target, qname,
-                        )
-                        return None
+                        # 关键：逐个 wildcard RRset 校验（循环内判定）——任一未证明即拒绝，
+                        # 否则含多个 wildcard RRset 时只有最后一个被校验（重放绕过）。
+                        if not wildcard_proven:
+                            self._stats["bogus"] += 1
+                            logger.warning(
+                                "DNSSEC wildcard 响应缺 %s 无精确记录证明"
+                                "（重放替代精确应答）: %s", wc_target, qname,
+                            )
+                            return None
                 # 关键安全约束：answer 含 CNAME 但无目标类型（A/AAAA）RRset 时，
                 # 目标 RRset 可能被整体删除（非"无签名"）——须有 NSEC/NSEC3
                 # 证明目标 NODATA 才放行，否则拒绝（防吞真实 A/AAAA）。

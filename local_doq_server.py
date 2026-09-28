@@ -10,6 +10,7 @@
 
 import os
 import ssl
+import socket
 import asyncio
 import struct
 import logging
@@ -39,8 +40,10 @@ logger = logging.getLogger("dns-proxy.local-doq")
 
 # aioquic 为可选依赖
 try:
+    from aioquic.buffer import Buffer
     from aioquic.quic.configuration import QuicConfiguration
     from aioquic.quic.connection import QuicConnection
+    from aioquic.quic.packet import pull_quic_header
     from aioquic.quic.events import (
         QuicEvent,
         StreamDataReceived,
@@ -64,49 +67,53 @@ class _DoQConnection:
         quic_config: QuicConfiguration,
         transport: asyncio.DatagramTransport,
         addr: tuple,
+        original_destination_connection_id: Optional[bytes] = None,
     ):
         self._server = server
         self._transport = transport
         self._addr = addr
-        self._quic = QuicConnection(configuration=quic_config)
+        # aioquic 1.x：服务端连接必须携带客户端选定的原始 DCID，否则构造即断言失败
+        try:
+            self._quic = QuicConnection(
+                configuration=quic_config,
+                original_destination_connection_id=original_destination_connection_id,
+            )
+        except TypeError:
+            # 兼容不支持该参数的旧版 aioquic
+            self._quic = QuicConnection(configuration=quic_config)
         self._stream_queries: dict = {}  # stream_id -> DNS query wire_data
 
     def receive_datagram(self, data: bytes):
         """接收 UDP 数据报并处理 QUIC 事件"""
-        now = asyncio.get_event_loop().time()
+        now = asyncio.get_running_loop().time()
         try:
             self._quic.receive_datagram(data, self._addr, now=now)
-            self._process_events(now)
         except Exception as e:
-            logger.debug("DoQ 处理数据报异常: %s", e)
+            logger.debug("DoQ 接收数据报异常: %s", e)
+            return
+        self._process_events(now)
 
     def _process_events(self, now: float):
-        """处理所有待处理的 QUIC 事件"""
-        for event in self._quic.next_send_events(now=now):
-            if isinstance(event, StreamDataReceived):
-                self._handle_stream_data(event)
-            elif isinstance(event, ConnectionTerminated):
-                logger.debug("DoQ 客户端 %s 断开连接", self._addr[0])
+        """处理所有待处理的 QUIC 事件，然后冲刷待发数据报
 
-        # 发送 QUIC 流控数据包
-        for data, addr in self._quic.send_flow_control_offered(now=now):
-            try:
-                self._transport.sendto(data, addr)
-            except Exception as e:
-                logger.debug("DoQ 流控发送异常: %s", e)
-
-        # 发送 QUIC 数据报
-        while True:
-            data = self._quic.send_datagram(now=now)
-            if data is None:
-                break
-            try:
-                self._transport.sendto(data, self._addr)
-            except Exception as e:
-                logger.debug("DoQ 数据报发送异常: %s", e)
+        aioquic 1.x 的取事件 API 是 next_event()（next_send_events 不存在），
+        发送 API 是 datagrams_to_send(now)（send_datagram/send_flow_control_offered
+        不存在）；用错会导致 QUIC 完全发不出包，客户端握手/响应全部超时。
+        """
+        try:
+            event = self._quic.next_event()
+            while event is not None:
+                if isinstance(event, StreamDataReceived):
+                    self._handle_stream_data(event)
+                elif isinstance(event, ConnectionTerminated):
+                    logger.debug("DoQ 客户端 %s 断开连接", self._addr[0])
+                event = self._quic.next_event()
+        except Exception as e:
+            logger.debug("DoQ 事件处理异常: %s", e)
+        self._flush(now)
 
     def _handle_stream_data(self, event: StreamDataReceived):
-        """处理 QUIC 流上的 DNS 查询"""
+        """处理 QUIC 流上的 DNS 查询（RFC 9250：2 字节长度前缀 + DNS 消息）"""
         payload = event.data
         if len(payload) < 2:
             return
@@ -115,46 +122,78 @@ class _DoQConnection:
         if len(payload) < 2 + msg_len:
             logger.warning("DoQ truncation: need %d, got %d", 2 + msg_len, len(payload))
             return
-        if len(payload) < 2 + msg_len:
-            logger.warning("DoQ truncation: need %d, got %d", 2 + msg_len, len(payload))
-            return
         dns_data = payload[2 : 2 + msg_len]
         if len(dns_data) < 12:
             return
 
         # 异步处理 DNS 查询
-        asyncio.create_task(self._respond(event.stream_id, dns_data))
+        self._server._track_task(
+            asyncio.ensure_future(self._respond(event.stream_id, dns_data))
+        )
 
     async def _respond(self, stream_id: int, dns_data: bytes):
         """执行 DNS 查询并通过 QUIC 流发送响应"""
         client_ip = self._addr[0]
-        response = await self._server._process_query(dns_data, client_ip)
-        if response is not None:
-            response_frame = struct.pack("!H", len(response)) + response
-            now = asyncio.get_event_loop().time()
+        try:
+            response = await self._server._process_query(dns_data, client_ip)
+        except Exception as e:
+            logger.debug("DoQ 查询处理异常: %s", e)
+            response = None
+        if response is None:
+            # 处理失败/被丢弃时回 SERVFAIL，避免 stream 悬空导致客户端挂起
+            response = self._server._make_servfail_wire(dns_data)
+            if response is None:
+                return
+        response_frame = struct.pack("!H", len(response)) + response
+        try:
             self._quic.send_stream_data(stream_id, response_frame, end_stream=True)
-            # 触发发送
-            self._flush()
+        except Exception as e:
+            logger.debug("DoQ 流写入异常: %s", e)
+            return
+        # 触发发送
+        self._flush()
 
-    def _flush(self):
-        """刷新发送缓冲区"""
-        now = asyncio.get_event_loop().time()
-        for data, addr in self._quic.send_flow_control_offered(now=now):
-            try:
-                self._transport.sendto(data, addr)
-            except Exception as e:
-                logger.debug("DoQ 刷新发送异常: %s", e)
+    def _flush(self, now: Optional[float] = None):
+        """把所有待发的 QUIC 数据报写回 UDP"""
+        if now is None:
+            now = asyncio.get_running_loop().time()
+        try:
+            for data, addr in self._quic.datagrams_to_send(now=now):
+                try:
+                    self._transport.sendto(data, addr)
+                except Exception as e:
+                    logger.debug("DoQ 数据报发送异常: %s", e)
+        except Exception as e:
+            logger.debug("DoQ 刷新发送异常: %s", e)
+
+    def handle_timer(self, now: Optional[float] = None):
+        """推进 QUIC 定时器（PTO 重传 / idle timeout / draining），然后冲刷
+
+        原先只定义了 get_timer 却从未调用 handle_timer，导致握手重传与
+        idle timeout 都不推进：半开连接不会被回收、连接槽位泄漏。
+        """
+        if now is None:
+            now = asyncio.get_running_loop().time()
+        try:
+            self._quic.handle_timer(now=now)
+        except Exception as e:
+            logger.debug("DoQ 定时器处理异常: %s", e)
+            return
+        self._flush(now)
 
     def get_timer(self) -> Optional[float]:
-        """获取下一个定时器到期时间"""
-        now = asyncio.get_event_loop().time()
-        timer = self._quic.get_timer(now=now)
-        if timer is not None:
-            return max(0, timer - now)
-        return None
+        """获取下一个 QUIC 定时器到期时间（绝对时间戳，aioquic get_timer() 无参数）"""
+        try:
+            return self._quic.get_timer()
+        except Exception:
+            return None
 
     def is_closed(self) -> bool:
-        return self._quic.is_closed()
+        """aioquic 1.x 的 QuicConnection 没有 is_closed()，改看内部状态机"""
+        state = getattr(self._quic, "_state", None)
+        if state is None:
+            return False
+        return getattr(state, "name", "") in ("CLOSING", "DRAINING", "TERMINATED")
 
     def close(self):
         """关闭 QUIC 连接"""
@@ -178,43 +217,50 @@ class _DoQUdpProtocol(asyncio.DatagramProtocol):
 
     def connection_made(self, transport: asyncio.DatagramTransport):
         self.transport = transport
+        self._loop = asyncio.get_running_loop()
+        self._timer_task = self._loop.create_task(self._timer_loop())
         logger.debug("DoQ UDP 监听已建立")
+
+    async def _timer_loop(self):
+        """周期推进各 QUIC 连接的定时器（PTO 重传 / idle timeout）"""
+        while not self._closed:
+            await asyncio.sleep(0.25)
+            now = asyncio.get_running_loop().time()
+            for conn in list(self._connections.values()):
+                timer = conn.get_timer()
+                if timer is not None and timer <= now:
+                    conn.handle_timer(now)
 
     def datagram_received(self, data: bytes, addr: tuple):
         if self._closed:
             return
-        # Support QUIC connection migration (CID lookup then addr fallback)
-        conn = None
-        for cid, c in list(self._connections.items()):
-            if hasattr(c, "_quic") and c._quic and hasattr(c._quic, "host"):
-                if c._quic.host == addr[0]:
+        # 先解析 QUIC 头拿到 DCID：服务端必须用它初始化/查找连接（aioquic 1.x 要求）
+        try:
+            header = pull_quic_header(
+                Buffer(data=data),
+                host_cid_length=self._quic_config.connection_id_length,
+            )
+        except Exception as e:
+            logger.debug("DoQ 无法解析 QUIC 头，丢弃 %s 的数据报: %s", addr[0], e)
+            return
+        dcid = header.destination_cid
+        conn = self._connections.get(dcid)
+        if conn is None:
+            # QUIC 连接迁移：源端口变化时按对端地址（host）回退查找
+            for c in list(self._connections.values()):
+                if getattr(c, "_addr", None) and c._addr[0] == addr[0]:
                     conn = c
                     break
-        if conn is None:
-            # Support QUIC connection migration (CID lookup then addr fallback)
-            conn = None
-            for cid, c in list(self._connections.items()):
-                if hasattr(c, "_quic") and c._quic and hasattr(c._quic, "host"):
-                    if c._quic.host == addr[0]:
-                        conn = c
-                        break
-            if conn is None:
-                # Support QUIC connection migration (CID lookup then addr fallback)
-                conn = None
-                for cid, c in list(self._connections.items()):
-                    if hasattr(c, "_quic") and c._quic and hasattr(c._quic, "host"):
-                        if c._quic.host == addr[0]:
-                            conn = c
-                            break
-                if conn is None:
-                    conn = self._connections.get(addr)
         if conn is None:
             # 最大 QUIC 连接数限制
             if len(self._connections) >= self._max_connections:
                 logger.warning("DoQ 超出最大连接数 %d，丢弃 %s 的数据报", self._max_connections, addr[0])
                 return
-            conn = _DoQConnection(self._server, self._quic_config, self.transport, addr)
-            self._connections[addr] = conn
+            conn = _DoQConnection(
+                self._server, self._quic_config, self.transport, addr,
+                original_destination_connection_id=dcid,
+            )
+            self._connections[dcid] = conn
         conn.receive_datagram(data)
 
     def error_received(self, exc):
@@ -223,6 +269,9 @@ class _DoQUdpProtocol(asyncio.DatagramProtocol):
     def connection_lost(self, exc):
         self._closed = True
         self._connections.clear()
+        task = getattr(self, "_timer_task", None)
+        if task is not None and not task.done():
+            task.cancel()
 
     def cleanup_stale_connections(self):
         """清理已关闭的连接"""
@@ -292,16 +341,71 @@ class LocalDoQServer:
         # QPS 限速（所有客户端包括 localhost）
         self._qps_limiter = QPSCounter(config.doq_qps_limit, "DoQ")
 
+        # 查询任务引用（防止 create_task 的异常无人回收）
+        self._tasks: set = set()
+
+    def _track_task(self, task: asyncio.Task):
+        """保存后台任务引用并在完成后清理，避免异常无人回收"""
+        self._tasks.add(task)
+
+        def _done(t: asyncio.Task):
+            self._tasks.discard(t)
+            if not t.cancelled():
+                exc = t.exception()
+                if exc is not None:
+                    logger.debug("DoQ 后台任务异常: %s", exc)
+
+        task.add_done_callback(_done)
+
+    @staticmethod
+    def _make_servfail_wire(wire_data: bytes) -> Optional[bytes]:
+        """构造带查询 ID 的 SERVFAIL 响应；无法解析时返回 None"""
+        try:
+            query = dns.message.from_wire(wire_data)
+            response = dns.message.make_response(query)
+            response.set_rcode(dns.rcode.SERVFAIL)
+            response.id = query.id
+            return response.to_wire()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _make_cache_key(question, query) -> tuple:
+        """缓存键 = (name, rdtype, rdclass, DO 位, CD 位)
+
+        RFC 6891/4035：带 DO 的查询可能需要 RRSIG，CD=1 表示跳过校验，
+        响应形态不同；只用 (name,type,class) 会让它们互相命中。
+        """
+        try:
+            do_bit = bool(query.edns >= 0 and (query.ednsflags & dns.flags.DO))
+        except Exception:
+            do_bit = False
+        try:
+            cd_bit = bool(query.flags & dns.flags.CD)
+        except Exception:
+            cd_bit = False
+        return (question.name, question.rdtype, question.rdclass, do_bit, cd_bit)
+
+    @staticmethod
+    def _is_negative_response(msg) -> bool:
+        """RFC 2308：NXDOMAIN 或 NODATA（NOERROR 且无 answer）为负应答
+
+        原实现漏判 NODATA，使其按 default_ttl(300s) 缓存（配置 negative_ttl=60s）。
+        """
+        try:
+            rcode = msg.rcode()
+        except Exception:
+            return False
+        if rcode in (dns.rcode.NXDOMAIN, dns.rcode.REFUSED):
+            return True
+        return rcode == dns.rcode.NOERROR and not msg.answer
+
     @staticmethod
     def _is_localhost(ip: str) -> bool:
         return ip in ("127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost")
 
     async def _get_per_ip_semaphore(self, client_ip: str) -> asyncio.Semaphore:
         return await self._per_ip_limiter.acquire(client_ip)
-
-    async def _cleanup_stale_per_ip_semaphores(self):
-        # 由共享 PerIPRateLimiter 后台管理
-        await asyncio.Event().wait()
 
     def _create_quic_config(self) -> Optional[QuicConfiguration]:
         """创建 QUIC 服务器配置（加载证书）"""
@@ -371,6 +475,8 @@ class LocalDoQServer:
 
         # 启动连接清理任务
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+        if self._transport_v4 is None and self._transport_v6 is None:
+            logger.error("本地 DoQ 未能监听任何地址（IPv4/IPv6 全部失败），服务不可用")
 
     async def stop(self):
         """停止 DoQ 服务器"""
@@ -434,7 +540,8 @@ class LocalDoQServer:
             question = query.question[0]
             qname = str(question.name).rstrip(".")
             qtype_name = QTYPE_NAMES.get(question.rdtype, str(question.rdtype))
-            cache_key = (question.name, question.rdtype, question.rdclass)
+            # 缓存键含 DO/CD 维度：不同 DNSSEC 需求的查询不应互相命中
+            cache_key = self._make_cache_key(question, query)
 
             # 0. 自定义 hosts 映射
             custom_ips = self.filter_engine.get_custom_hosts_ips(qname)
@@ -499,7 +606,10 @@ class LocalDoQServer:
                         response.set_rcode(dns.rcode.NXDOMAIN)
                     response_wire = response.to_wire()
                     if self.config.cache_enabled:
-                        await self.cache.set(cache_key, response)
+                        await self.cache.set(
+                            cache_key, response,
+                            response.rcode() == dns.rcode.NXDOMAIN,
+                        )
                     await self._log_query(client_ip, qname, qtype_name, status, block_reason)
                     return response_wire
 
@@ -544,7 +654,7 @@ class LocalDoQServer:
                         response_msg = dns.message.from_wire(result_wire)
                         # AAAA 优先于 A 排序（确保缓存中数据顺序一致）
                         reorder_answer_aaaa_first(response_msg)
-                        is_negative = response_msg.rcode() in (dns.rcode.NXDOMAIN, dns.rcode.REFUSED)
+                        is_negative = self._is_negative_response(response_msg)
                         await self.cache.set(cache_key, response_msg, is_negative)
                     except Exception as e:
                         logger.debug("DoQ 缓存写入异常: %s", e)
@@ -554,6 +664,20 @@ class LocalDoQServer:
             # AAAA 优先于 A 排序（仅对成功解析的上游响应）
             if response_wire is not None and status == "resolved":
                 response_wire = sort_dns_response_wire(response_wire)
+
+            # 上游直连路径的响应 ID 可能与查询不一致：DoH（RFC 8484）与 DoQ
+            # （RFC 9250）上游按协议要求用 ID=0 发起查询，其响应 ID 会被原样
+            # 透传给客户端。DoQ 客户端校验 ID，收到不一致的 ID 会丢弃响应并
+            # 等待超时（表现为查询卡顿），故在返回前统一重写为查询 ID。
+            # 对 make_response(query) 生成的响应（ID 本已正确）是幂等的。
+            if response_wire:
+                try:
+                    _resp = dns.message.from_wire(response_wire)
+                    if _resp.id != query.id:
+                        _resp.id = query.id
+                        response_wire = _resp.to_wire()
+                except Exception as e:
+                    logger.debug("DoQ 响应 ID 重写异常: %s", e)
 
             return response_wire
 

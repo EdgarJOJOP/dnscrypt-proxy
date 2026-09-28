@@ -91,6 +91,59 @@ class DoHServer:
         self._qps_limiter = QPSCounter(config.doh_qps_limit, "DoH")
 
     @staticmethod
+    def _make_cache_key(question, query, source=None) -> tuple:
+        """缓存键 = (name, rdtype, rdclass, DO 位, CD 位[, source])
+
+        RFC 6891/4035：带 DO 的查询可能需要 RRSIG，CD=1 表示跳过校验；
+        source 用于隔离同一域名的不同入口（wire / json）——两者对被拦截
+        域名的应答形态不同（wire 给 0.0.0.0/::，json 给 NXDOMAIN），
+        共用同一键会互相覆盖。
+        """
+        try:
+            do_bit = bool(query.edns >= 0 and (query.ednsflags & dns.flags.DO))
+        except Exception:
+            do_bit = False
+        try:
+            cd_bit = bool(query.flags & dns.flags.CD)
+        except Exception:
+            cd_bit = False
+        key = (question.name, question.rdtype, question.rdclass, do_bit, cd_bit)
+        return key + (source,) if source else key
+
+    @staticmethod
+    def _client_ip(request) -> str:
+        """取客户端 IP：直连来源是本机（反向代理）时才信任 X-Forwarded-For
+
+        否则反代场景下 request.remote 恒为 127.0.0.1，会命中 localhost 例外
+        使 per-IP 限速完全失效；而对外部来源不信任该头可避免伪造绕过。
+        """
+        remote = request.remote or "unknown"
+        if remote in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
+            try:
+                xff = request.headers.get("X-Forwarded-For", "")
+            except Exception:
+                xff = ""
+            if xff:
+                first = xff.split(",")[0].strip()
+                if first:
+                    return first
+        return remote
+
+    @staticmethod
+    def _is_negative_response(msg) -> bool:
+        """RFC 2308：NXDOMAIN 或 NODATA（NOERROR 且无 answer）为负应答
+
+        原实现漏判 NODATA，使其按 default_ttl(300s) 缓存（配置 negative_ttl=60s）。
+        """
+        try:
+            rcode = msg.rcode()
+        except Exception:
+            return False
+        if rcode in (dns.rcode.NXDOMAIN, dns.rcode.REFUSED):
+            return True
+        return rcode == dns.rcode.NOERROR and not msg.answer
+
+    @staticmethod
     def _is_localhost(ip: str) -> bool:
         """判断是否是本地地址（不限速）"""
         return ip in ("127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost")
@@ -100,10 +153,12 @@ class DoHServer:
         return await self._per_ip_limiter.acquire(client_ip)
 
     async def _cleanup_stale_per_ip_semaphores(self):
-        """定期清理过期 IP 条目（由共享 PerIPRateLimiter 管理）"""
-        # PerIPRateLimiter 有自身后台清理任务，此方法保持空占位
-        # 兼容 start() 中创建的循环
-        await asyncio.Event().wait()
+        """已废弃：过期条目由共享 PerIPRateLimiter 的后台循环统一清理
+
+        保留空方法仅为兼容旧调用点；不再阻塞等待（原 asyncio.Event().wait()
+        永不返回，会让该后台任务永久挂起）。
+        """
+        return
 
     def _setup_routes(self):
         """注册路由"""
@@ -205,7 +260,7 @@ class DoHServer:
                 {"Status": 2, "Comment": f"无效的域名: {name}"}
             )
 
-        client_ip = request.remote or "unknown"
+        client_ip = self._client_ip(request)
         await self._qps_limiter.acquire()  # QPS 限速（所有客户端）
         if not self._is_localhost(client_ip):
             sem = await self._get_per_ip_semaphore(client_ip)
@@ -273,7 +328,9 @@ class DoHServer:
             is_hosts_bypass = self.filter_engine.is_custom_hosts_bypass(qname)
 
             # 1. 检查域名过滤
-            cache_key = (question.name, question.rdtype, question.rdclass)
+            # 缓存键含 DO/CD 维度，并以 source="json" 与 wire 入口隔离
+            #（两者对被拦截域名的应答形态不同，共用键会互相污染）
+            cache_key = self._make_cache_key(question, query, source="json")
             if self.config.filter_enabled and not is_hosts_bypass:
                 blocked, reason = self.filter_engine.check_domain(qname)
                 if blocked:
@@ -283,7 +340,7 @@ class DoHServer:
                     if self.config.cache_enabled:
                         response = dns.message.make_response(query)
                         response.set_rcode(dns.rcode.NXDOMAIN)
-                        await self.cache.set(cache_key, response)
+                        await self.cache.set(cache_key, response, True)
                     return result
 
             # 2. 缓存检查
@@ -304,14 +361,14 @@ class DoHServer:
 
             # 4. 缓存
             if self.config.cache_enabled:
-                is_negative = response.rcode() in (dns.rcode.NXDOMAIN, dns.rcode.REFUSED)
+                is_negative = self._is_negative_response(response)
                 await self.cache.set(cache_key, response, is_negative)
 
             return self._dns_response_to_json(response, query)
 
         except Exception as e:
             logger.error("JSON 查询异常: %s", e)
-            result["Comment"] = f"内部错误: {str(e)[:100]}"
+            result["Comment"] = "内部错误"
             return result
 
     @staticmethod
@@ -404,7 +461,7 @@ class DoHServer:
         self, wire_data: bytes, request: web.Request, response_format: str = "wire"
     ) -> web.Response:
         """处理 DNS 查询（Wire Format）- 按 response_format 返回"""
-        client_ip = request.remote or "unknown"
+        client_ip = self._client_ip(request)
         await self._qps_limiter.acquire()  # QPS 限速（所有客户端）
         if not self._is_localhost(client_ip):
             sem = await self._get_per_ip_semaphore(client_ip)
@@ -416,24 +473,19 @@ class DoHServer:
 
     def _make_response(self, data: bytes, fmt: str = "wire",
                     query: Optional[dns.message.Message] = None) -> web.Response:
-        """根据格式创建响应"""
-        if fmt == "json":
-            try:
-                resp = dns.message.from_wire(data)
-                q = query if query is not None else resp
-                json_data = self._dns_response_to_json(resp, q)
-                return web.json_response(json_data)
-            except Exception:
-                return web.json_response(
-                    {"Status": 2, "Comment": "DNS 响应解析失败"}
-                )
+        """创建 wire 格式的 DoH 响应
+
+        注：JSON 响应由 _dns_response_to_json() 单独生成（_process_json_query
+        走的是那条路径），原本永远不会被触发的 fmt=="json" 分支已删除。
+        参数 fmt/query 保留以保持调用点兼容。
+        """
         return web.Response(body=data, content_type="application/dns-message")
 
     async def _process_query(
         self, wire_data: bytes, request: web.Request, response_format: str = "wire"
     ) -> web.Response:
         """DNS 查询处理（含缓存、过滤、DNSSEC 验证、自定义 hosts）"""
-        client_ip = request.remote or "unknown"
+        client_ip = self._client_ip(request)
         response_wire: Optional[bytes] = None
         upstream = ""
         block_reason = ""
@@ -450,7 +502,8 @@ class DoHServer:
             question = query.question[0]
             qname = str(question.name).rstrip(".")
             qtype = QTYPE_NAMES.get(question.rdtype, str(question.rdtype))
-            cache_key = (question.name, question.rdtype, question.rdclass)
+            # 缓存键含 DO/CD 维度：不同 DNSSEC 需求的查询不应互相命中
+            cache_key = self._make_cache_key(question, query)
 
             # 0. 检查自定义 hosts 映射（最高优先级）
             custom_ips = self.filter_engine.get_custom_hosts_ips(qname)
@@ -521,7 +574,10 @@ class DoHServer:
                     response_wire = response.to_wire()
                     # 缓存拦截结果
                     if self.config.cache_enabled:
-                        await self.cache.set(cache_key, response)
+                        await self.cache.set(
+                            cache_key, response,
+                            response.rcode() == dns.rcode.NXDOMAIN,
+                        )
                     elapsed = asyncio.get_event_loop().time() - start_time
                     await self._log_query(
                         client_ip, qname, QTYPE_NAMES.get(question.rdtype, str(question.rdtype)),
@@ -579,10 +635,7 @@ class DoHServer:
                                 response_msg = dns.message.from_wire(result_wire)
                                 # AAAA 优先于 A 排序（确保缓存中数据顺序一致）
                                 reorder_answer_aaaa_first(response_msg)
-                                is_negative = response_msg.rcode() in (
-                                    dns.rcode.NXDOMAIN,
-                                    dns.rcode.REFUSED,
-                                )
+                                is_negative = self._is_negative_response(response_msg)
                                 await self.cache.set(cache_key, response_msg, is_negative)
                             except Exception as e:
                                 logger.debug("DoH 缓存写入异常: %s", e)
@@ -595,10 +648,7 @@ class DoHServer:
                             response_msg = dns.message.from_wire(result_wire)
                             # AAAA 优先于 A 排序（确保缓存中数据顺序一致）
                             reorder_answer_aaaa_first(response_msg)
-                            is_negative = response_msg.rcode() in (
-                                dns.rcode.NXDOMAIN,
-                                dns.rcode.REFUSED,
-                            )
+                            is_negative = self._is_negative_response(response_msg)
                             await self.cache.set(cache_key, response_msg, is_negative)
                         except Exception as e:
                             logger.debug("DoH 缓存写入异常: %s", e)
@@ -612,11 +662,25 @@ class DoHServer:
             if response_wire is not None and status == "resolved":
                 response_wire = sort_dns_response_wire(response_wire)
 
+            # 上游直连路径的响应 ID 可能与查询不一致：DoH（RFC 8484）与 DoQ
+            # （RFC 9250）上游按协议要求用 ID=0 发起查询，其响应 ID 会被原样
+            # 透传给客户端，故在返回前统一重写为查询 ID。对 make_response(query)
+            # 生成的响应（ID 本已正确）是幂等的。
+            if response_wire:
+                try:
+                    _resp = dns.message.from_wire(response_wire)
+                    if _resp.id != query.id:
+                        _resp.id = query.id
+                        response_wire = _resp.to_wire()
+                except Exception as e:
+                    logger.debug("DoH 响应 ID 重写异常: %s", e)
+
             return self._make_response(response_wire, response_format, query=query)
 
         except dns.exception.DNSException as e:
             logger.warning("DNS 解析错误: %s", e)
-            return web.Response(status=400, text=f"DNS 解析错误: {e}")
+            # 不回显内部异常文本（避免信息泄露）
+            return web.Response(status=400, text="DNS 解析错误")
         except Exception as e:
             logger.error("处理 DNS 查询异常: %s", e)
             return web.Response(status=500, text="内部错误")
@@ -652,30 +716,33 @@ class DoHServer:
 
         if use_ssl:
             ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-            ssl_context.load_cert_chain(self.cert_path, self.key_path)
+            try:
+                ssl_context.load_cert_chain(self.cert_path, self.key_path)
+            except (ssl.SSLError, OSError) as e:
+                logger.error("DoH 证书加载失败，拒绝启动（避免明文监听）: %s", e)
+                return
             ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
             ssl_context.set_ciphers(
                 "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:"
                 "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384"
             )
         else:
-            logger.warning(
-                "SSL 证书不存在，请运行:\n"
+            # 安全：证书缺失时绝不静默降级为明文 HTTP，否则 DNS 查询明文外泄/可篡改
+            logger.error(
+                "SSL 证书不存在，DoH 拒绝启动（不再降级为明文）。请生成证书:\n"
                 "  cd %s\n"
                 "  openssl req -x509 -nodes -days 365 -newkey rsa:4096 "
                 "-keyout certs/localhost.key -out certs/localhost.crt "
                 "-config openssl.conf -extensions v3_req",
                 os.path.dirname(os.path.dirname(os.path.abspath(self.cert_path))),
             )
-            logger.warning("将在无 SSL 下启动（仅测试用）")
+            return
 
         self._runner = web.AppRunner(self.app)
         await self._runner.setup()
 
-        # 启动共享 PerIPRateLimiter（全局单例，清理过期 IP 条目）
+        # 启动共享 PerIPRateLimiter（全局单例，含自身后台清理循环）
         self._per_ip_limiter.start()
-        # 保持兼容性：占位清理任务
-        self._cleanup_task = asyncio.create_task(self._cleanup_stale_per_ip_semaphores())
 
         # IPv4 监听
         site_v4 = web.TCPSite(

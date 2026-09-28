@@ -1594,7 +1594,13 @@ class FilterEngine:
                 tasks.append(
                     loop.run_in_executor(pool, collect_badfilters, i, end)
                 )
-            await asyncio.gather(*tasks)
+            try:
+                await asyncio.gather(*tasks)
+            except (StopIteration, RuntimeError) as e:
+                # PEP 479：worker/协程内逸出的 StopIteration 会被 asyncio 转成
+                # RuntimeError("coroutine raised StopIteration")。baifilter 收集失败
+                # 只影响 $badfilter 生效范围，不应让整次规则加载失败。
+                logger.warning("规则解析阶段异常（已忽略该遍）: %r", e)
 
         # ===== 第 2 遍：索引规则（_index_rule 自动处理 pending/active）=====
         _index_rule = self._index_rule
@@ -1646,19 +1652,29 @@ class FilterEngine:
             完整文件字节内容，不支持 Range 或任何失败返回 None（触发回退）
         """
         try:
-            headers = {"User-Agent": "SecureDNS-Proxy/1.0"}
+            # Range 分片必须拿到未压缩的原始字节，否则分片边界无意义
+            # （aiohttp 默认会带 Accept-Encoding，CDN 可能回 br/gzip 导致
+            #   "Can not decode content-encoding" 而整体失败）
+            headers = {"User-Agent": "SecureDNS-Proxy/1.0",
+                       "Accept-Encoding": "identity"}
             connector = None
             if self._resolver_manager is not None:
                 resolver = _EncryptedDNSResolver(self._resolver_manager)
                 connector = aiohttp.TCPConnector(resolver=resolver)
 
-            # 1. HEAD 探测 Range 支持和文件大小
+            # 修复：HEAD 探测与分片下载必须共用同一个 session/connector。
+            # 原实现在 HEAD 的 `async with ClientSession(connector=...)` 退出时连带
+            # 关闭了 connector（session 默认拥有传入的 connector），随后分片复用
+            # 这个已关闭的 connector → "Session is closed"，分片下载整体失败。
             async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=15),
+                timeout=aiohttp.ClientTimeout(total=timeout),
                 headers=headers,
                 connector=connector,
             ) as session:
-                async with session.head(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                # 1. HEAD 探测 Range 支持和文件大小
+                async with session.head(
+                    url, timeout=aiohttp.ClientTimeout(total=15)
+                ) as resp:
                     if resp.status != 200:
                         return None
                     accept_ranges = (resp.headers.get("Accept-Ranges", "")
@@ -1672,27 +1688,23 @@ class FilterEngine:
                     if file_size < 65536:  # 小于 64KB 不值得分片
                         return None
 
-            logger.info("并行下载 %s (%d bytes, %d 片)", url, file_size, num_chunks)
+                logger.info("并行下载 %s (%d bytes, %d 片)", url, file_size, num_chunks)
 
-            # 2. 计算分片边界
-            chunk_size = (file_size + num_chunks - 1) // num_chunks
-            chunks = {}
-            lock = asyncio.Lock()
+                # 2. 计算分片边界
+                chunk_size = (file_size + num_chunks - 1) // num_chunks
+                chunks = {}
+                lock = asyncio.Lock()
 
-            async def download_chunk(idx: int, start: int, end: int):
-                """下载单个分片 [start, end]（闭区间）"""
-                range_hdr = f"bytes={start}-{end}"
-                chunk_headers = {
-                    "User-Agent": "SecureDNS-Proxy/1.0",
-                    "Range": range_hdr,
-                }
-                async with aiohttp.ClientSession(
-                    timeout=aiohttp.ClientTimeout(total=timeout),
-                    headers=chunk_headers,
-                    connector=connector,
-                ) as session:
+                async def download_chunk(idx: int, start: int, end: int):
+                    """下载单个分片 [start, end]（闭区间）"""
+                    range_hdr = f"bytes={start}-{end}"
+                    chunk_headers = {
+                        "User-Agent": "SecureDNS-Proxy/1.0",
+                        "Range": range_hdr,
+                    }
                     async with session.get(
-                        url, timeout=aiohttp.ClientTimeout(total=timeout)
+                        url, headers=chunk_headers,
+                        timeout=aiohttp.ClientTimeout(total=timeout),
                     ) as resp:
                         if resp.status not in (200, 206):
                             raise IOError(
@@ -1710,38 +1722,38 @@ class FilterEngine:
                         logger.debug("  分片 %d/%d: %d bytes [%d-%d]",
                                      idx + 1, num_chunks, len(data), start, end)
 
-            # 3. 并发下载所有分片
-            tasks = []
-            for i in range(num_chunks):
-                start = i * chunk_size
-                end = min(start + chunk_size, file_size) - 1
-                if start >= file_size:
-                    break
-                tasks.append(asyncio.create_task(download_chunk(i, start, end)))
+                # 3. 并发下载所有分片
+                tasks = []
+                for i in range(num_chunks):
+                    start = i * chunk_size
+                    end = min(start + chunk_size, file_size) - 1
+                    if start >= file_size:
+                        break
+                    tasks.append(asyncio.create_task(download_chunk(i, start, end)))
 
-            try:
-                await asyncio.gather(*tasks)
-            except Exception as e:
-                logger.warning("URL %s 分片下载异常: %s，回退到流式下载", url, e)
-                for t in tasks:
-                    t.cancel()
-                return None
-
-            # 4. 验证完整性并按序拼接
-            if len(chunks) != len(tasks):
-                return None
-
-            result = bytearray(file_size)
-            offset = 0
-            for i in range(len(tasks)):
-                data = chunks.get(i)
-                if data is None:
+                try:
+                    await asyncio.gather(*tasks)
+                except Exception as e:
+                    logger.warning("URL %s 分片下载异常: %s，回退到流式下载", url, e)
+                    for t in tasks:
+                        t.cancel()
                     return None
-                result[offset:offset + len(data)] = data
-                offset += len(data)
 
-            logger.info("  并行下载完成: %d bytes (%d 片)", offset, len(tasks))
-            return bytes(result)
+                # 4. 验证完整性并按序拼接
+                if len(chunks) != len(tasks):
+                    return None
+
+                result = bytearray(file_size)
+                offset = 0
+                for i in range(len(tasks)):
+                    data = chunks.get(i)
+                    if data is None:
+                        return None
+                    result[offset:offset + len(data)] = data
+                    offset += len(data)
+
+                logger.info("  并行下载完成: %d bytes (%d 片)", offset, len(tasks))
+                return bytes(result)
 
         except asyncio.TimeoutError:
             return None
@@ -1820,8 +1832,52 @@ class FilterEngine:
         except asyncio.TimeoutError:
             logger.error("从 URL %s 加载规则超时 (80s)", url)
             return False
+        except (RuntimeError, StopIteration) as e:
+            # PEP 479：协程内逸出的 StopIteration 会变成 RuntimeError
+            # （即日志里的 "coroutine raised StopIteration"）。这类异常多与
+            # 自定义加密解析器路径相关，改用系统解析器重试一次，
+            # 避免整条规则加载失败。
+            logger.warning("从 URL %s 加载异常（%s: %s），改用系统解析器重试",
+                           url, type(e).__name__, e)
+            return await self._load_url_without_encrypted_resolver(url)
         except Exception as e:
             logger.error("从 URL %s 加载规则失败: %s", url, e)
+            return False
+
+    async def _load_url_without_encrypted_resolver(self, url: str) -> bool:
+        """无自定义解析器的规则下载回退路径（使用系统 DNS）
+
+        用于加密解析器路径偶发异常（如 coroutine raised StopIteration）时重试。
+        """
+        headers = {"User-Agent": "SecureDNS-Proxy/1.0",
+                   "Accept-Encoding": "gzip, deflate"}
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=80),
+                headers=headers,
+            ) as session:
+                async with session.get(
+                    url, timeout=aiohttp.ClientTimeout(total=80)
+                ) as resp:
+                    if resp.status != 200:
+                        logger.error("获取 URL %s 失败: HTTP %d", url, resp.status)
+                        return False
+                    raw = await resp.read()
+                    if len(raw) > DEFAULT_MAX_SIZE:
+                        logger.error("URL %s 实际大小 %d 超过限制 %d",
+                                     url, len(raw), DEFAULT_MAX_SIZE)
+                        return False
+                    text = raw.decode("utf-8", errors="replace")
+                    if self._parser._looks_like_html(text):
+                        logger.error("URL %s 内容包含 HTML，跳过", url)
+                        return False
+                    has_binary, _line_no, desc = self._parser._has_binary_chars(text)
+                    if has_binary:
+                        logger.error("URL %s 包含二进制字符: %s", url, desc)
+                        return False
+                    return await self._process_rules_from_text(text, url)
+        except Exception as e:
+            logger.error("从 URL %s 加载规则失败（系统解析器回退）: %s", url, e)
             return False
 
     async def async_reload(self, files: List[str], urls: Optional[List[str]] = None):

@@ -9,6 +9,8 @@
 
 import os
 import ssl
+import socket
+import struct
 import asyncio
 import logging
 import time
@@ -87,6 +89,37 @@ class LocalDoTServer:
         self._active_connections = 0
 
     @staticmethod
+    def _make_cache_key(question, query) -> tuple:
+        """缓存键 = (name, rdtype, rdclass, DO 位, CD 位)
+
+        RFC 6891/4035：带 DO 的查询可能需要 RRSIG，CD=1 表示跳过校验，
+        响应形态不同；只用 (name,type,class) 会让它们互相命中。
+        """
+        try:
+            do_bit = bool(query.edns >= 0 and (query.ednsflags & dns.flags.DO))
+        except Exception:
+            do_bit = False
+        try:
+            cd_bit = bool(query.flags & dns.flags.CD)
+        except Exception:
+            cd_bit = False
+        return (question.name, question.rdtype, question.rdclass, do_bit, cd_bit)
+
+    @staticmethod
+    def _is_negative_response(msg) -> bool:
+        """RFC 2308：NXDOMAIN 或 NODATA（NOERROR 且无 answer）为负应答
+
+        原实现漏判 NODATA，使其按 default_ttl(300s) 缓存（配置 negative_ttl=60s）。
+        """
+        try:
+            rcode = msg.rcode()
+        except Exception:
+            return False
+        if rcode in (dns.rcode.NXDOMAIN, dns.rcode.REFUSED):
+            return True
+        return rcode == dns.rcode.NOERROR and not msg.answer
+
+    @staticmethod
     def _is_localhost(ip: str) -> bool:
         return ip in ("127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost")
 
@@ -94,8 +127,9 @@ class LocalDoTServer:
         return await self._per_ip_limiter.acquire(client_ip)
 
     async def _cleanup_stale_per_ip_semaphores(self):
-        # 由共享 PerIPRateLimiter 后台管理
-        await asyncio.Event().wait()
+        # 已废弃：过期条目由共享 PerIPRateLimiter 的后台循环统一清理。
+        # 保留空方法仅为兼容旧调用点；不再阻塞等待（原 asyncio.Event().wait() 永不返回）。
+        return
 
     def _create_ssl_context(self) -> Optional[ssl.SSLContext]:
         """创建 TLS 服务器端 SSL 上下文"""
@@ -109,7 +143,9 @@ class LocalDoTServer:
             "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:"
             "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384"
         )
-        # 如果配置了服务器域名，设置 SNI 回调，可针对不同域名返回不同证书
+        # 如果配置了服务器域名，记录日志（当前未设置 SNI 回调，
+        # 证书由 _create_ssl_context 统一加载；如需按域名分发证书，
+        # 需在此调用 ssl_context.set_servername_callback）
         if self.domain:
             logger.info("DoT 服务器域名: %s, 使用证书: %s", self.domain, self.cert_path)
         return ctx
@@ -166,8 +202,10 @@ class LocalDoTServer:
             except OSError as e:
                 logger.warning("DoT [IPv6] 启动失败（跳过）: %s", e)
 
-        # 启动单 IP 限速清理任务
+        # 启动单 IP 限速清理任务（空任务，仅保持接口兼容）
         self._ip_semaphore_task = asyncio.create_task(self._cleanup_stale_per_ip_semaphores())
+        if self._server_v4 is None and self._server_v6 is None:
+            logger.error("本地 DoT 未能监听任何地址（IPv4/IPv6 全部失败），服务不可用")
 
     async def stop(self):
         """停止 DoT 服务器"""
@@ -225,9 +263,21 @@ class LocalDoTServer:
                 if not raw_len or len(raw_len) < 2:
                     break
                 msg_len = int.from_bytes(raw_len, "big")
-                if msg_len < 12 or msg_len > 65535:
-                    logger.debug("DoT 客户端 %s 无效消息长度: %d", client_ip, msg_len)
-                    break
+                if msg_len < 12:
+                    logger.warning("DoT 客户端 %s 无效消息长度: %d", client_ip, msg_len)
+                    # 消费该帧并回 FORMERR，然后继续服务同一连接上的后续查询
+                    # （RFC 7766 连接复用：不应因单个坏帧断掉整条连接）
+                    try:
+                        short_data = await asyncio.wait_for(
+                            reader.readexactly(msg_len), timeout=30.0
+                        )
+                    except (asyncio.IncompleteReadError, asyncio.TimeoutError):
+                        break
+                    err = self._make_error_wire(short_data, dns.rcode.FORMERR)
+                    if err:
+                        writer.write(len(err).to_bytes(2, "big") + err)
+                        await asyncio.wait_for(writer.drain(), timeout=10.0)
+                    continue
 
                 # 读取 DNS 查询消息
                 wire_data = await asyncio.wait_for(
@@ -237,7 +287,10 @@ class LocalDoTServer:
                 # 处理 DNS 查询
                 response_data = await self._process_query(wire_data, client_ip)
                 if response_data is None:
-                    break
+                    # 无响应时回 FORMERR，避免客户端在长连接上挂起
+                    response_data = self._make_error_wire(wire_data, dns.rcode.FORMERR)
+                    if response_data is None:
+                        break
 
                 # 发送 2 字节长度前缀 + 响应
                 writer.write(len(response_data).to_bytes(2, "big") + response_data)
@@ -281,12 +334,16 @@ class LocalDoTServer:
         try:
             query = dns.message.from_wire(wire_data)
             if not query.question:
-                return None
+                # RFC 1035：QDCOUNT=0 回 FORMERR，而不是断连
+                response = dns.message.make_response(query)
+                response.set_rcode(dns.rcode.FORMERR)
+                return response.to_wire()
 
             question = query.question[0]
             qname = str(question.name).rstrip(".")
             qtype_name = QTYPE_NAMES.get(question.rdtype, str(question.rdtype))
-            cache_key = (question.name, question.rdtype, question.rdclass)
+            # 缓存键含 DO/CD 维度：不同 DNSSEC 需求的查询不应互相命中
+            cache_key = self._make_cache_key(question, query)
 
             # 0. 自定义 hosts 映射
             custom_ips = self.filter_engine.get_custom_hosts_ips(qname)
@@ -351,7 +408,10 @@ class LocalDoTServer:
                         response.set_rcode(dns.rcode.NXDOMAIN)
                     response_wire = response.to_wire()
                     if self.config.cache_enabled:
-                        await self.cache.set(cache_key, response)
+                        await self.cache.set(
+                            cache_key, response,
+                            response.rcode() == dns.rcode.NXDOMAIN,
+                        )
                     await self._log_query(client_ip, qname, qtype_name, status, block_reason)
                     return response_wire
 
@@ -398,7 +458,7 @@ class LocalDoTServer:
                         response_msg = dns.message.from_wire(result_wire)
                         # AAAA 优先于 A 排序（确保缓存中数据顺序一致）
                         reorder_answer_aaaa_first(response_msg)
-                        is_negative = response_msg.rcode() in (dns.rcode.NXDOMAIN, dns.rcode.REFUSED)
+                        is_negative = self._is_negative_response(response_msg)
                         await self.cache.set(cache_key, response_msg, is_negative)
                     except Exception as e:
                         logger.debug("DoT 缓存写入异常: %s", e)
@@ -409,12 +469,39 @@ class LocalDoTServer:
             if response_wire is not None and status == "resolved":
                 response_wire = sort_dns_response_wire(response_wire)
 
+            # 上游直连路径的响应 ID 可能与查询不一致：DoH（RFC 8484）与 DoQ
+            # （RFC 9250）上游按协议要求用 ID=0 发起查询，其响应 ID 会被原样
+            # 透传给客户端。DoT 客户端校验 ID，收到不一致的 ID 会丢弃响应并
+            # 等待超时（表现为查询卡顿），故在返回前统一重写为查询 ID。
+            # 对 make_response(query) 生成的响应（ID 本已正确）是幂等的。
+            if response_wire:
+                try:
+                    _resp = dns.message.from_wire(response_wire)
+                    if _resp.id != query.id:
+                        _resp.id = query.id
+                        response_wire = _resp.to_wire()
+                except Exception as e:
+                    logger.debug("DoT 响应 ID 重写异常: %s", e)
+
             return response_wire
 
         except dns.exception.DNSException:
-            return None
+            return self._make_error_wire(wire_data, dns.rcode.FORMERR)
         except Exception as e:
             logger.error("DoT 查询异常: %s", e)
+            return self._make_error_wire(wire_data, dns.rcode.SERVFAIL)
+
+    @staticmethod
+    def _make_error_wire(data: bytes, rcode: int) -> Optional[bytes]:
+        """从原始查询报文尽力构造错误响应（保留 ID / RD / CD），失败返回 None"""
+        try:
+            if len(data) < 2:
+                return None
+            qid = int.from_bytes(data[:2], "big")
+            flags_in = int.from_bytes(data[2:4], "big") if len(data) >= 4 else 0
+            flags = 0x8000 | (flags_in & 0x0110) | (int(rcode) & 0x000F)
+            return struct.pack("!HHHHHH", qid, flags, 0, 0, 0, 0)
+        except Exception:
             return None
 
     async def _log_query(self, client_ip, domain, qtype, status, block_reason):
