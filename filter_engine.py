@@ -41,6 +41,35 @@ logger = logging.getLogger("dns-proxy.filter")
 # 规则下载最大大小（50MB）
 DEFAULT_MAX_SIZE = 50 * 1024 * 1024
 
+# /regex/ 自由正则规则的防 ReDoS 限制
+MAX_FREE_REGEX_LEN = 256     # 单条自由正则最大长度
+MAX_FREE_REGEX_RULES = 500   # 自由正则规则总数上限（防线性遍历放大）
+
+
+def _is_redos_prone(regex_text: str) -> bool:
+    """静态预检：判断自由正则是否存在灾难性回溯（ReDoS）风险。
+
+    规则列表可能来自远程（半可信），而客户端可用构造域名触发匹配 →
+    单核 CPU 被灾难性回溯打满（放大 DoS）。这里只做保守的启发式拒绝：
+      1. 超长（> MAX_FREE_REGEX_LEN）——正常域名正则极短；
+      2. 叠加量词：分组内含无界量词（* / +）且分组本身又被 * / + / {n,m} 重复，
+         如 (a+)+、(ab*c)+、(x*)* —— 经典灾难性回溯形态；
+      3. 3 个及以上无界通配 .* / .+（重叠通配导致指数级回溯）。
+    宁可漏报（放过）也不误伤合法规则。
+    """
+    if len(regex_text) > MAX_FREE_REGEX_LEN:
+        return True
+    # 分组内含 * 或 +，且分组后紧跟 * 或 +：( ... [*+] ... )[*+]
+    if re.search(r"\([^()]*[*+][^()]*\)\s*[*+]", regex_text):
+        return True
+    # 分组内含 * 或 +，且分组后跟 {n,} / {n,m}
+    if re.search(r"\([^()]*[*+][^()]*\)\s*\{\d+,\d*\}", regex_text):
+        return True
+    # 重叠无界通配 .* / .+ 出现 3 次及以上
+    if len(re.findall(r"\.\*|\.\+", regex_text)) >= 3:
+        return True
+    return False
+
 # 默认规则缓冲区大小（类似 Go 的 DefaultRuleBufSize）
 DEFAULT_RULE_BUF_SIZE = 65536
 
@@ -398,7 +427,8 @@ class _MatchInfo:
 class FilterRule:
     """单条过滤规则（编译后的匹配规则）"""
 
-    __slots__ = ("pattern", "is_exception", "is_important", "is_regex", "raw", "_skip",
+    __slots__ = ("pattern", "is_exception", "is_important", "is_regex", "is_free_regex",
+                 "raw", "_skip",
                  "is_badfilter", "dnsrewrite",
                  # ★ Phase 1: 紧凑匹配字段
                  "_simple_match", "_simple_domain", "_match_subdomains")
@@ -408,6 +438,8 @@ class FilterRule:
         self.is_exception = False
         self.is_important = False
         self.is_regex = False
+        # /regex/ 自由正则规则（区别于 _pattern_to_regex 生成的受控正则）
+        self.is_free_regex = False
         self.pattern = rule_text
         self._skip = False
         self.is_badfilter = False
@@ -821,8 +853,18 @@ class FilterRule:
         # 8. /regex/ 规则
         if text.startswith("/") and text.endswith("/"):
             regex_text = text[1:-1]
+            # 防 ReDoS：拒绝可能灾难性回溯的自由正则（规则列表可能来自远程，
+            # 客户端可用匹配域名触发回溯造成 CPU 放大），见 _is_redos_prone
+            if _is_redos_prone(regex_text):
+                logger.warning(
+                    "过滤规则：拒绝疑似灾难性回溯（ReDoS）的 /regex/ 规则: %s",
+                    regex_text[:120],
+                )
+                self._skip = True
+                return
             try:
                 self.pattern = re.compile(regex_text, re.IGNORECASE)
+                self.is_free_regex = True
                 self.is_regex = True
             except re.error:
                 self._skip = True
@@ -974,7 +1016,10 @@ class DomainIndex:
     ★ Phase 2: 单规则域名直接用对象而非 List 包装。
     """
 
-    __slots__ = ('_trie', '_pattern_rules', '_count')
+    __slots__ = ('_trie', '_pattern_rules', '_count', '_free_regex_count')
+
+    # 自由正则规则数达到上限时的告警只提示一次（类级共享）
+    _warned_free_regex_full = False
 
     def __init__(self):
         # ★ Phase 1: 紧凑 Trie 替代 _by_domain Dict
@@ -982,6 +1027,8 @@ class DomainIndex:
         # 复杂正则/通配规则（无法用紧凑匹配的）
         self._pattern_rules: List[FilterRule] = []
         self._count = 0
+        # /regex/ 自由正则规则计数（用于上限控制，防线性遍历放大）
+        self._free_regex_count = 0
 
     def add_rule(self, rule: FilterRule, index_domain: Optional[str]):
         """
@@ -989,6 +1036,19 @@ class DomainIndex:
         
         ★ Phase 1: 简单规则 → Trie；复杂规则 → _pattern_rules
         """
+        # 自由正则（/regex/）规则数量上限：防止海量正则规则放大 match() 的
+        # 线性遍历（与静态 ReDoS 预检形成双重防护）
+        if rule.is_free_regex:
+            if self._free_regex_count >= MAX_FREE_REGEX_RULES:
+                if not DomainIndex._warned_free_regex_full:
+                    DomainIndex._warned_free_regex_full = True
+                    logger.warning(
+                        "过滤规则：自由正则规则数已达上限 %d，其余同类规则将被忽略",
+                        MAX_FREE_REGEX_RULES,
+                    )
+                return
+            self._free_regex_count += 1
+
         if index_domain and rule._simple_match:
             # 紧凑规则 → 存入 Trie
             if rule.is_exception:
@@ -1045,6 +1105,7 @@ class DomainIndex:
         self._trie.clear()
         self._pattern_rules.clear()
         self._count = 0
+        self._free_regex_count = 0
 
     @property
     def count(self) -> int:

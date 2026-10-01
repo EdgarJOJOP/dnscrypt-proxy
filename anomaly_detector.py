@@ -9,7 +9,10 @@
    - 检测异常的快响应（可能是伪造缓存的本地响应）
 
 2. 响应大小基线
-   - 每个上游 + 记录类型的 mean/stddev
+   - 按 (上游, 记录类型) 分组统计「整条响应字节数」的 mean/stddev。
+     注：基线值是 len(整个 DNS 响应报文)，不是单个 RRset 的字节数；
+     同一响应含多种记录类型时，该响应大小会分别计入各记录类型分组
+     （用途：发现“该上游/该类记录返回的响应整体变大或变小”）
    - 异常的过大响应可能夹带私货（劫持/投毒）
    - 异常的过小响应可能是伪造的 NXDOMAIN
 
@@ -20,14 +23,14 @@
 双阶段（每上游独立）：
   - learn 阶段：前 N 个样本仅收集，不告警（每个上游独立计数器）
   - detect 阶段：偏差超过 z_score_threshold 触发异常标记
+    （特殊：基线恒定即 std≈0 时 z-score 恒为 0，会漏报"从恒定值突变到
+      另一个固定值"；此类分组改用 OnlineStats.flat_anomaly_score 的
+      "绝对差值相对比例"判分，阈值由 flat_diff_ratio 控制）
 """
 
 import logging
-import time
 import math
-from typing import Dict, Optional, List, Tuple, Any
-from collections import defaultdict
-from dataclasses import dataclass, field
+from typing import Dict, Optional, Tuple, Any
 
 import dns.message
 import dns.rdatatype
@@ -73,10 +76,32 @@ class OnlineStats:
         return self.n
 
     def z_score(self, value: float) -> float:
-        """计算新值相对于基线偏差的标准差倍数。"""
+        """计算新值相对于基线偏差的标准差倍数。
+
+        注意：基线恒定（std≈0）时 z-score 数学上不可定义，此处返回 0；
+        调用方必须先用 is_flat() 判断并用 flat_anomaly_score() 兜底，
+        否则"从恒定值突变为另一个固定值"会漏报（详见 AnomalyDetector）。
+        """
         if self.n < 2 or self.std < 1e-9:
             return 0.0
         return (value - self.mean) / self.std
+
+    def is_flat(self, eps: float = 1e-9) -> bool:
+        """基线是否恒定（样本足够但标准差≈0）——此时 z_score 恒为 0。"""
+        return self.n >= 2 and self.std < eps
+
+    def flat_anomaly_score(self, value: float, ratio: float) -> float:
+        """恒定基线（std≈0）下的偏差分值，可直接与 z_score_threshold 比较。
+
+        以"相对偏离比例"折算：|value-mean| / |mean| 达到 ratio 记 1 分,
+        达到 z_score_threshold * ratio 时即触发告警（得分 = 相对偏离 / ratio）。
+        ratio=0.2 即偏离 20% 记 1σ、60% 达 3σ 告警。
+        分母用 max(|mean|, 1e-6) 防 mean≈0 时除零/爆表。
+        """
+        denom = max(abs(self.mean), 1e-6)
+        rel = abs(value - self.mean) / denom
+        r = ratio if ratio > 0 else 1e-6
+        return rel / r
 
 
 # ============================================================
@@ -86,9 +111,12 @@ class OnlineStats:
 
 def _extract_2ld(domain: str) -> str:
     """
-    从完整域名中提取二级域名（2LD）。
+    从完整域名中提取最后两级标签（用作 TTL 分组键）。
     例如：www.example.com -> example.com
-          sub.abc.co.uk -> abc.co.uk
+          a.b.example.com -> example.com
+          sub.abc.co.uk -> co.uk
+    注意：本函数不做公共后缀（PSL）识别，多级后缀（co.uk / com.cn 等）
+    会归并到同一分组——这是有意的粗粒度聚类，仅用于 TTL 基线相似性分组。
     """
     parts = domain.rstrip(".").split(".")
     if len(parts) <= 2:
@@ -110,27 +138,50 @@ class AnomalyDetector:
 
     def __init__(self, enabled: bool = True,
                  learning_samples: int = 200,
-                 z_score_threshold: float = 3.0):
+                 z_score_threshold: float = 3.0,
+                 flat_diff_ratio: float = 0.2,
+                 quasi_flat_rel_std: Optional[float] = None,
+                 ttl_min_ref: float = 2.0,
+                 ttl_default_ref: float = 300.0):
         """
         Args:
             enabled: 总开关
             learning_samples: 基线学习阶段的样本数
             z_score_threshold: z-score 超过此值视为异常
+            flat_diff_ratio: 基线恒定时"绝对差值"的相对阈值——相对偏离
+                达到该比例记 1 分（等价 1σ），达到 z_score_threshold 倍即告警。
+                0.2 = 偏离恒定均值 20% 记 1σ、60% 触发 3σ 告警。
+            quasi_flat_rel_std: "准恒定基线"判据 std/|mean| 的阈值。为 None
+                （默认）时**不写死**，而由配置的 TTL 粒度实时推导：
+                ttl_min_ref / ttl_default_ref（= 系统认为可忽略的 TTL 波动尺度）。
+                低于该阈值说明基线噪声太小、z-score 会被放大失真，改用相对
+                偏离判分（例：TTL mean=300、std=0.5 时，8% 的偏离会被
+                z 算成 50σ）。
+            ttl_min_ref: 配置 cache.min_ttl（仅用于推导阈值）。
+            ttl_default_ref: 配置 cache.default_ttl（仅用于推导阈值）。
         """
         self.enabled = enabled
         self.learning_samples = learning_samples
         self.z_score_threshold = z_score_threshold
+        self.flat_diff_ratio = flat_diff_ratio
+        # 准恒定判据阈值：默认由配置 TTL 粒度实时计算，而非预置常量。
+        if quasi_flat_rel_std is None:
+            denom = float(ttl_default_ref) if ttl_default_ref else 300.0
+            quasi_flat_rel_std = (float(ttl_min_ref) / denom) if denom > 0 else 1e-3
+        # 夹到合理区间，避免配置极端值使判据失效
+        self.quasi_flat_rel_std = max(1e-6, min(0.5, float(quasi_flat_rel_std)))
 
         # 每上游的 RTT 统计
         self._rtt_stats: Dict[str, OnlineStats] = {}
 
         # 每上游 + 记录类型的响应大小统计
+        # 值 = 整条响应字节数 len(response_bytes)（不是单个 RRset 字节数）
         self._size_stats: Dict[Tuple[str, int], OnlineStats] = {}
 
         # TTL 分布统计：按 (2LD, record_type) 分组
+        # （OnlineStats 已在线维护 mean/variance，无需另存观测值列表；
+        #   原先的 _ttl_observations 只写不读，会随运行时间无限增长）
         self._ttl_stats: Dict[Tuple[str, int], OnlineStats] = {}
-        # TTL 观测值暂存（用于 learn 阶段）
-        self._ttl_observations: Dict[Tuple[str, int], List[int]] = defaultdict(list)
 
         # 每上游独立学习计数器（替代全局单一学习阶段）
         self._server_learning_count: Dict[str, int] = {}
@@ -178,6 +229,49 @@ class AnomalyDetector:
     # ============================================================
     # 记录单条响应
     # ============================================================
+
+    # TTL 基线分组容量上限：分组键含 2LD（客户端可控域名）。若无上限，
+    # LAN 客户端可用随机域名（随机 2LD）无限撑大该表 → 内存耗尽（DoS）。
+    _MAX_TTL_BASELINE_KEYS = 4096
+
+    def _get_ttl_stats(self, ttl_key: Tuple[str, int]) -> OnlineStats:
+        """取（或创建）TTL 基线分组；超容量上限时按插入顺序 FIFO 淘汰最旧分组。"""
+        st = self._ttl_stats.get(ttl_key)
+        if st is None:
+            if len(self._ttl_stats) >= self._MAX_TTL_BASELINE_KEYS:
+                self._ttl_stats.pop(next(iter(self._ttl_stats)), None)
+            st = OnlineStats()
+            self._ttl_stats[ttl_key] = st
+        return st
+
+    def _is_noise_small(self, stats: OnlineStats) -> bool:
+        """基线噪声是否小到令 z-score 失真（含"准恒定"情形）。
+
+        判据（阈值随数据/配置实时计算，无预置比例常量）：
+          - std 绝对为 0 → 完全恒定；
+          - std/|mean| < self.quasi_flat_rel_std（默认 = cache.min_ttl /
+            cache.default_ttl）→ 噪声相对均值可忽略。
+        """
+        if stats.is_flat():
+            return True
+        m = abs(stats.mean)
+        if m <= 0.0:
+            return False
+        return (stats.std / m) < self.quasi_flat_rel_std
+
+    def _anomaly_score(self, stats: OnlineStats, value: float) -> float:
+        """统一的偏差分值（非负）。
+
+        统计 z-score 在基线噪声很小时会失真：std 只差一点点，z = 偏离/std
+        就会被放大成几十上百 σ（如 TTL 基线 mean=300、std=0.5 时，300→275
+        仅偏离 8% 却算出 50σ）。因此噪声过小时改用"相对偏离比例"判分；
+        基线完全恒定（std≈0）时 z 恒为 0 也会漏报，同样走此路径。
+        """
+        if stats.n < 2:
+            return 0.0
+        if self._is_noise_small(stats):
+            return abs(stats.flat_anomaly_score(value, self.flat_diff_ratio))
+        return abs(stats.z_score(value))
 
     def record_response(self, server_name: str, rtt: float,
                         response_bytes: bytes) -> Optional[float]:
@@ -232,16 +326,13 @@ class AnomalyDetector:
                     self._size_stats[key] = OnlineStats()
                 self._size_stats[key].update(response_size)
 
-                # 3. TTL 统计
-                for rd in rrset:
-                    ttl = getattr(rrset, 'ttl', None) or 0
-                    if ttl > 0:
-                        domain = str(rrset.name)
-                        ttl_key = (_extract_2ld(domain), rdtype)
-                        self._ttl_observations[ttl_key].append(ttl)
-                        if ttl_key not in self._ttl_stats:
-                            self._ttl_stats[ttl_key] = OnlineStats()
-                        self._ttl_stats[ttl_key].update(float(ttl))
+                # 3. TTL 统计（TTL 是 RRset 级属性：每个 RRset 只计入一次。
+                #    原先在 for rd 循环内更新会把同一 TTL 重复喂入 N 次，
+                #    使基线样本数虚高、方差被低估 → 检测阶段 z 值偏大而误报）
+                ttl = getattr(rrset, 'ttl', None) or 0
+                if ttl > 0:
+                    ttl_key = (_extract_2ld(str(rrset.name)), rdtype)
+                    self._get_ttl_stats(ttl_key).update(float(ttl))
             return 0.0
 
         # ========== 检测阶段：先检查异常，后更新统计 ==========
@@ -250,15 +341,16 @@ class AnomalyDetector:
             rdtypes_seen.add(rrset.rdtype)
 
         max_z = 0.0
-        anomaly_types = []
+        # 用 set 去重：同一响应可能有多个 RRset / 记录类型同时异常，
+        # 此前用 list 会在循环内重复 append（日志因此出现 "ttl/ttl"）
+        anomaly_types: set = set()
 
         # RTT 异常检测（在更新基线前检测偏差）
         if server_name in self._rtt_stats:
-            rtt_z = abs(self._rtt_stats[server_name].z_score(rtt))
+            rtt_z = self._anomaly_score(self._rtt_stats[server_name], rtt)
             if rtt_z > self.z_score_threshold:
                 max_z = max(max_z, rtt_z)
-                anomaly_types.append("rtt")
-                self._stats["rtt_anomalies"] += 1
+                anomaly_types.add("rtt")
 
         # 更新 RTT 基线（检测之后才更新）
         if server_name not in self._rtt_stats:
@@ -269,11 +361,10 @@ class AnomalyDetector:
         for rdtype in rdtypes_seen:
             key = (server_name, rdtype)
             if key in self._size_stats:
-                size_z = abs(self._size_stats[key].z_score(float(response_size)))
+                size_z = self._anomaly_score(self._size_stats[key], float(response_size))
                 if size_z > self.z_score_threshold:
                     max_z = max(max_z, size_z)
-                    anomaly_types.append("size")
-                    self._stats["size_anomalies"] += 1
+                    anomaly_types.add("size")
 
         # 更新响应大小基线
         for rrset in msg.answer:
@@ -291,25 +382,30 @@ class AnomalyDetector:
             if ttl > 0:
                 ttl_key = (_extract_2ld(domain), rdtype)
                 if ttl_key in self._ttl_stats:
-                    ttl_z = abs(self._ttl_stats[ttl_key].z_score(float(ttl)))
+                    ttl_z = self._anomaly_score(self._ttl_stats[ttl_key], float(ttl))
                     if ttl_z > self.z_score_threshold:
                         max_z = max(max_z, ttl_z)
-                        anomaly_types.append("ttl")
-                        self._stats["ttl_anomalies"] += 1
+                        anomaly_types.add("ttl")
 
-                # 更新 TTL 基线
-                self._ttl_observations[ttl_key].append(ttl)
-                if ttl_key not in self._ttl_stats:
-                    self._ttl_stats[ttl_key] = OnlineStats()
-                self._ttl_stats[ttl_key].update(float(ttl))
+                # 更新 TTL 基线（每个 RRset 一次；OnlineStats 自带 mean/variance）
+                self._get_ttl_stats(ttl_key).update(float(ttl))
 
         if max_z > self.z_score_threshold:
             self._stats["anomalies_detected"] += 1
             self._server_anomalies[server_name] = self._server_anomalies.get(server_name, 0) + 1
+            # 每响应每个维度最多计一次（与 anomalies_detected 语义对齐，
+            # 保证 rtt+size+ttl 三个计数之和不超过 anomalies_detected）
+            if "rtt" in anomaly_types:
+                self._stats["rtt_anomalies"] += 1
+            if "size" in anomaly_types:
+                self._stats["size_anomalies"] += 1
+            if "ttl" in anomaly_types:
+                self._stats["ttl_anomalies"] += 1
             logger.warning(
-                "DNS 异常检测 [RTT/大小/TTL]: 上游 %s 响应偏差 %.1fσ "
-                "(类型: %s, rtt=%.0fms, 大小=%d bytes)",
-                server_name, max_z, "/".join(anomaly_types), rtt * 1000, response_size,
+                "DNS 异常检测: 上游 %s 的 %s 维度偏差 %.1fσ"
+                "（本次观测: rtt=%.0fms, 响应=%d bytes；σ 只属于该维度）",
+                server_name, "/".join(sorted(anomaly_types)), max_z,
+                rtt * 1000, response_size,
             )
 
         return max_z

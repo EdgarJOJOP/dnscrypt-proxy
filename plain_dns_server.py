@@ -1193,7 +1193,7 @@ class IterativeResolver:
             try:
                 dns.dnssec.validate(ds_rrset, rrsig_set, trusted)
             except (dns.dnssec.ValidationFailure, KeyError) as e:
-                logger.warning("DNSSEC DS 验证失败 %s: %s", cur_zone, e)
+                logger.warning("DNSSEC DS 验证失败 %s: %s", _safe_qname(cur_zone), e)
                 return None
             # 3b. 查询 cur_zone 的 DNSKEY
             dnskey_resp = await self._iterate(str(cur_zone), dns.rdatatype.DNSKEY, 0)
@@ -1212,7 +1212,7 @@ class IterativeResolver:
                 if auth_ksk is not None:
                     break
             if auth_ksk is None:
-                logger.warning("DNSSEC DS/DNSKEY digest 不匹配: %s（伪造 DNSKEY 被拦截）", cur_zone)
+                logger.warning("DNSSEC DS/DNSKEY digest 不匹配: %s（伪造 DNSKEY 被拦截）", _safe_qname(cur_zone))
                 return None
             # 3d. 用父区授权的 KSK 验证 DNSKEY rrset 自身的 RRSIG（signer=cur_zone，
             #     ZSK 与 KSK 一起签名）→ 证明该 DNSKEY 集合完整可信（含 ZSK）
@@ -1224,7 +1224,7 @@ class IterativeResolver:
             try:
                 dns.dnssec.validate(dnskey_rrset, dnskey_rrsig, {cur_zone: ksk_rrset})
             except (dns.dnssec.ValidationFailure, KeyError) as e:
-                logger.warning("DNSSEC DNSKEY 自签验证失败 %s: %s", cur_zone, e)
+                logger.warning("DNSSEC DNSKEY 自签验证失败 %s: %s", _safe_qname(cur_zone), e)
                 return None
             # 3e. 该级验证通过 → 信任整个 DNSKEY rrset（含 ZSK），作为下一级的信任来源
             trusted[cur_zone] = dnskey_rrset
@@ -1251,7 +1251,7 @@ class IterativeResolver:
             # 链验证获取可信 DNSKEY（若已缓存直接命中）
             verified_rrset = await self._get_trusted_dnskey(zone)
             if verified_rrset is None:
-                logger.warning("DNSSEC 链验证失败，拒绝信任 %s 的 DNSKEY", zone)
+                logger.warning("DNSSEC 链验证失败，拒绝信任 %s 的 DNSKEY", _safe_qname(zone))
                 return None
             # 构造仅含已验证 DNSKEY 的响应返回
             resp = dns.message.make_response(msg)
@@ -1694,7 +1694,7 @@ class IterativeResolver:
                 timeout=self.total_timeout,
             )
         except asyncio.TimeoutError:
-            logger.debug("迭代解析总超时: %s", qname)
+            logger.debug("迭代解析总超时: %s", _safe_qname(qname))
             self._stats["fail"] += 1
             return None
         except Exception as e:
@@ -1743,7 +1743,7 @@ class IterativeResolver:
                 if zone_status == "secure":
                     self._stats["bogus"] += 1
                     logger.warning(
-                        "DNSSEC 剥离攻击: %s 属签名区却无 RRSIG — 丢弃", qname
+                        "DNSSEC 剥离攻击: %s 属签名区却无 RRSIG — 丢弃", _safe_qname(qname)
                     )
                     return None
                 if zone_status == "insecure":
@@ -1753,7 +1753,7 @@ class IterativeResolver:
                 # unknown：无法证明未签名，严格模式保守丢弃
                 self._stats["bogus"] += 1
                 logger.warning(
-                    "DNSSEC 无法证明 %s 未签名（无 RRSIG 且无 NSEC 证明）— 严格模式丢弃", qname
+                    "DNSSEC 无法证明 %s 未签名（无 RRSIG 且无 NSEC 证明）— 严格模式丢弃", _safe_qname(qname)
                 )
                 return None
 
@@ -1774,7 +1774,7 @@ class IterativeResolver:
                 dnskey_rrset = await self._get_trusted_dnskey(signer)
                 if dnskey_rrset is None:
                     self._stats["bogus"] += 1
-                    logger.warning("DNSSEC 链验证失败，拒绝 %s 的签名响应", signer)
+                    logger.warning("DNSSEC 链验证失败，拒绝 %s 的签名响应", _safe_qname(signer))
                     return None
                 trusted_keys[signer] = dnskey_rrset
 
@@ -1797,7 +1797,7 @@ class IterativeResolver:
                         if zs != "insecure":
                             self._stats["bogus"] += 1
                             logger.warning(
-                                "DNSSEC CNAME 链中间跳无签名（%s）: %s", zs, rrset.name)
+                                "DNSSEC CNAME 链中间跳无签名（%s）: %s", zs, _safe_qname(rrset.name))
                             return None
                         continue  # 未签名区 CNAME 无签名是合法的
                     try:
@@ -1805,7 +1805,7 @@ class IterativeResolver:
                     except (dns.dnssec.ValidationFailure, KeyError) as e:
                         self._stats["bogus"] += 1
                         logger.warning("DNSSEC CNAME 链中间跳签名验证失败 %s: %s",
-                                       rrset.name, e)
+                                       _safe_qname(rrset.name), e)
                         return None
                     # wildcard 检测（RFC 4035 §5.3.3）：该跳 CNAME RRset 的
                     # RRSIG labels < owner labels → wildcard 展开——需该跳响应
@@ -1891,7 +1891,7 @@ class IterativeResolver:
                             self._stats["bogus"] += 1
                             logger.warning(
                                 "DNSSEC CNAME 链中间跳 wildcard 展开缺 NSEC 否定"
-                                "证明: %s", rrset.name,
+                                "证明: %s", _safe_qname(rrset.name),
                             )
                             return None
 
@@ -1931,14 +1931,14 @@ class IterativeResolver:
                     self._stats["bogus"] += 1
                     logger.warning(
                         "DNSSEC answer owner 含字面 *（伪造 wildcard 记录）: %s",
-                        rrset.name,
+                        _safe_qname(rrset.name),
                     )
                     return None
                 if rrset.name not in legal_owners:
                     self._stats["bogus"] += 1
                     logger.warning(
                         "DNSSEC answer owner 不匹配（重放攻击）: %s 不属于 %s 的合法链",
-                        rrset.name, qname,
+                        _safe_qname(rrset.name), _safe_qname(qname),
                     )
                     return None
                 rrsig_set = self._find_rrsig_for(resp, rrset)
@@ -1951,7 +1951,7 @@ class IterativeResolver:
                 except (dns.dnssec.ValidationFailure, KeyError) as e:
                     self._stats["bogus"] += 1
                     logger.warning("DNSSEC answer 签名验证失败 %s (%s): %s",
-                                   rrset.name, rrset.rdtype, e)
+                                   _safe_qname(rrset.name), rrset.rdtype, e)
                     return None
 
             if answer_unsigned:
@@ -1960,7 +1960,7 @@ class IterativeResolver:
                 self._stats["bogus"] += 1
                 logger.warning(
                     "DNSSEC answer 段存在无签名 RRset（剥离攻击）: %s %s",
-                    qname, [str(r.name) for r in answer_unsigned][:3],
+                    _safe_qname(qname), [str(r.name) for r in answer_unsigned][:3],
                 )
                 return None
 
@@ -2109,7 +2109,7 @@ class IterativeResolver:
                             self._stats["bogus"] += 1
                             logger.warning(
                                 "DNSSEC wildcard 响应缺 %s 无精确记录证明"
-                                "（重放替代精确应答）: %s", wc_target, qname,
+                                "（重放替代精确应答）: %s", _safe_qname(wc_target), _safe_qname(qname),
                             )
                             return None
                 # 关键安全约束：answer 含 CNAME 但无目标类型（A/AAAA）RRset 时，
@@ -2245,7 +2245,7 @@ class IterativeResolver:
                         self._stats["bogus"] += 1
                         logger.warning(
                             "DNSSEC answer 含 CNAME 但目标类型 %s 缺失且无签名 "
-                            "NSEC NODATA 证明（删除攻击）: %s", qtype, qname,
+                            "NSEC NODATA 证明（删除攻击）: %s", qtype, _safe_qname(qname),
                         )
                         return None
                 self._stats["secure"] += 1
@@ -2285,7 +2285,7 @@ class IterativeResolver:
                         self._stats["bogus"] += 1
                         logger.warning(
                             "DNSSEC 负应答 answer CNAME 无签名（%s）: %s",
-                            zs_neg, rrset.name,
+                            zs_neg, _safe_qname(rrset.name),
                         )
                         return None
                     continue
@@ -2294,7 +2294,7 @@ class IterativeResolver:
                 except (dns.dnssec.ValidationFailure, KeyError) as e:
                     self._stats["bogus"] += 1
                     logger.warning("DNSSEC 负应答 answer CNAME 签名验证失败 %s: %s",
-                                   rrset.name, e)
+                                   _safe_qname(rrset.name), e)
                     return None
             for rrset in resp.authority:
                 if rrset.rdtype == dns.rdatatype.RRSIG:
@@ -2317,7 +2317,7 @@ class IterativeResolver:
                 except (dns.dnssec.ValidationFailure, KeyError) as e:
                     self._stats["bogus"] += 1
                     logger.warning("DNSSEC authority 签名验证失败 %s (%s): %s",
-                                   rrset.name, rrset.rdtype, e)
+                                   _safe_qname(rrset.name), rrset.rdtype, e)
                     return None
                 # NSEC/NSEC3 区间语义校验：证明的必须是被查名 qname
                 # NXDOMAIN → 区间覆盖（owner < qname < next）
@@ -2367,7 +2367,7 @@ class IterativeResolver:
                                         logger.debug(
                                             "DNSSEC NXDOMAIN NSEC owner %s 非 %s "
                                             "同 zone（跨区）— 拒绝",
-                                            rrset.name, soa_owner_zone,
+                                            _safe_qname(rrset.name), _safe_qname(soa_owner_zone),
                                         )
                                         continue
                                     owner_is_delegation = (
@@ -2386,7 +2386,7 @@ class IterativeResolver:
                                         if "*" in owner_txt or "*" in next_txt:
                                             logger.debug(
                                                 "DNSSEC NXDOMAIN NSEC 含 wildcard"
-                                                "（%s）— 保守拒绝", rrset.name,
+                                                "（%s）— 保守拒绝", _safe_qname(rrset.name),
                                             )
                                             continue
                                         # *.CE wildcard 否定：CE 是 qname 沿祖先链的
@@ -2418,7 +2418,7 @@ class IterativeResolver:
                                             # 否定，保守拒绝
                                             logger.debug(
                                                 "DNSSEC NXDOMAIN 缺 CE exact-match"
-                                                "（%s）— 保守拒绝", qname,
+                                                "（%s）— 保守拒绝", _safe_qname(qname),
                                             )
                                             continue
                                         try:
@@ -2460,7 +2460,7 @@ class IterativeResolver:
                                             logger.debug(
                                                 "DNSSEC NXDOMAIN 缺 *.CE wildcard "
                                                 "否定证明（%s）— 保守拒绝",
-                                                ce_nx,
+                                                _safe_qname(ce_nx),
                                             )
                                     else:
                                         # owner 是委托点：需检查 qname 与 owner 之间
@@ -2468,7 +2468,7 @@ class IterativeResolver:
                                         logger.debug(
                                             "DNSSEC NXDOMAIN NSEC owner %s 是委托点，"
                                             "qname %s 需更深 zone 证明 — 保守拒绝",
-                                            rrset.name, qname,
+                                            _safe_qname(rrset.name), _safe_qname(qname),
                                         )
                             else:
                                 # NODATA：owner==qname 且位图不含查询类型 qtype
@@ -2643,7 +2643,7 @@ class IterativeResolver:
                                         logger.debug(
                                             "DNSSEC NXDOMAIN NSEC3 owner %s 是委托点"
                                             "（opt-out），qname %s 需更深 zone 证明 "
-                                            "— 保守拒绝", rrset.name, qname,
+                                            "— 保守拒绝", _safe_qname(rrset.name), _safe_qname(qname),
                                         )
                             else:
                                 # NODATA（RFC 5155 §8.5）：exact-match（hash==owner
@@ -2705,7 +2705,7 @@ class IterativeResolver:
                 self._stats["bogus"] += 1
                 logger.warning(
                     "DNSSEC authority 段存在无签名 RRset（否定应答伪造）: %s %s",
-                    qname, [str(r.name) for r in auth_unsigned][:3],
+                    _safe_qname(qname), [str(r.name) for r in auth_unsigned][:3],
                 )
                 return None
 
@@ -2713,7 +2713,7 @@ class IterativeResolver:
                 # 有 NSEC/NSEC3 但区间语义不覆盖本次 qname → 重放攻击 → 拒绝
                 self._stats["bogus"] += 1
                 logger.warning(
-                    "DNSSEC 负应答 NSEC/NSEC3 区间不覆盖 %s（重放攻击）— 拒绝", qname,
+                    "DNSSEC 负应答 NSEC/NSEC3 区间不覆盖 %s（重放攻击）— 拒绝", _safe_qname(qname),
                 )
                 return None
 
@@ -2731,7 +2731,7 @@ class IterativeResolver:
                     self._stats["bogus"] += 1
                     logger.warning(
                         "DNSSEC 签名区负应答缺 NSEC 证明（SOA-only 重放伪造）— 拒绝: %s",
-                        qname,
+                        _safe_qname(qname),
                     )
                     return None
             else:
@@ -2739,14 +2739,14 @@ class IterativeResolver:
                     self._stats["bogus"] += 1
                     logger.warning(
                         "DNSSEC 负应答 SOA owner 不属于 %s 权威 zone（重放伪造）— 拒绝",
-                        qname,
+                        _safe_qname(qname),
                     )
                     return None
                 # 无 SOA 的负应答（仅 NSEC 证明）：NSEC 语义已校验，允许
                 if not has_nsec:
                     self._stats["bogus"] += 1
                     logger.warning(
-                        "DNSSEC 负应答无 SOA 且无 NSEC 证明（伪造）— 拒绝: %s", qname,
+                        "DNSSEC 负应答无 SOA 且无 NSEC 证明（伪造）— 拒绝: %s", _safe_qname(qname),
                     )
                     return None
 
@@ -2759,7 +2759,7 @@ class IterativeResolver:
 
             # 有 RRSIG 但 answer/authority 均无有效验证 → bogus
             self._stats["bogus"] += 1
-            logger.warning("DNSSEC 响应有 RRSIG 但无 RRset 验证通过: %s", qname)
+            logger.warning("DNSSEC 响应有 RRSIG 但无 RRset 验证通过: %s", _safe_qname(qname))
             return None
         except Exception as e:
             logger.debug("迭代解析异常: %s", e)

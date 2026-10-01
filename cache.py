@@ -12,8 +12,9 @@ import time
 import asyncio
 import copy
 import gc
+import heapq
 import logging
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 from collections import OrderedDict
 from functools import lru_cache
 
@@ -93,6 +94,21 @@ def evict_cold_query_templates():
     logger.debug("查询模板缓存已全量清空 (lru_cache maxsize=512)")
 
 
+def _has_block_placeholder(msg: "dns.message.Message") -> bool:
+    """应答是否含过滤拦截占位地址（A=0.0.0.0 / AAAA=::）。
+
+    这类条目是过滤引擎写入的拦截结果，不应被上游真实 IP 覆写，
+    预刷新时须跳过（改由规则重载时的 _sweep_cache_after_filter_load 处理）。
+    """
+    for rrset in msg.answer:
+        for rd in rrset:
+            if rd.rdtype == dns.rdatatype.A and str(rd.address) == "0.0.0.0":
+                return True
+            if rd.rdtype == dns.rdatatype.AAAA and str(rd.address) == "::":
+                return True
+    return False
+
+
 class CacheEntry:
     """缓存条目 — Wire-First 双轨存储
 
@@ -101,7 +117,8 @@ class CacheEntry:
     下次访问时通过 from_wire() 惰性水合。
     """
 
-    __slots__ = ("_wire", "_response_msg", "ttl", "created_at", "epoch", "_hit_count")
+    __slots__ = ("_wire", "_response_msg", "ttl", "created_at", "epoch",
+                 "_hit_count", "_seq")
 
     def __init__(self, response: dns.message.Message, ttl: int, epoch: int = 0):
         # 主存储：序列化为紧凑的 wire bytes
@@ -112,6 +129,7 @@ class CacheEntry:
         self.created_at: float = time.time()
         self.epoch: int = epoch  # 分配世代（用于 arena 生命周期追踪）
         self._hit_count: int = 0  # 命中次数（用于智能 Message 丢弃）
+        self._seq: int = 0        # 预刷新调度序号（0 = 未调度）
 
     @property
     def response_msg(self) -> dns.message.Message:
@@ -242,6 +260,8 @@ class DNSCache:
         max_ttl: int = 86400,
         negative_ttl: int = 60,
         cleanup_interval: int = 60,
+        prefetch_enabled: bool = True,
+        prefetch_advance_ratio: float = 0.5,
     ):
         self.max_size = max_size
         self.default_ttl = default_ttl
@@ -249,6 +269,12 @@ class DNSCache:
         self.max_ttl = max_ttl
         self.negative_ttl = negative_ttl
         self.cleanup_interval = cleanup_interval
+        # ===== 主动预刷新（最小堆动态调度）=====
+        # 开启后：正应答条目在 set() 时按「最终 TTL（经 min_ttl/max_ttl 钳制）
+        # 推导出的刷新时刻」入堆；后台循环休眠到堆顶时刻再成批刷新——
+        # 因此不存在固定扫描周期，刷新节奏由 TTL 参数与 advance_ratio 共同决定。
+        self.prefetch_enabled = bool(prefetch_enabled)
+        self._prefetch_ratio = max(0.0, min(1.0, float(prefetch_advance_ratio)))
 
         # LRU 缓存: {cache_key: CacheEntry}
         self._cache: OrderedDict[Tuple, "CacheEntry"] = OrderedDict()
@@ -266,6 +292,12 @@ class DNSCache:
 
         # ===== ★ 修复 P1: 插入计数器（用于 defrag 触发） =====
         self._insert_count: int = 0            # 自上次 defrag/重置以来的插入次数
+
+        # ===== 主动预刷新堆：[(next_refresh_at, seq, key)] =====
+        # 队列无长度上限、可随时插入；seq 用于惰性作废
+        # （同 key 被覆盖/淘汰后，堆中旧元素自动失效）。
+        self._prefetch_heap: List[Tuple[float, int, Tuple]] = []
+        self._seq_counter: int = 0
 
     def _bump_epoch(self):
         """递增世代编号（在 rebuild 时调用），标记 arena 代际边界"""
@@ -338,17 +370,36 @@ class DNSCache:
             self._stats["size"] = len(self._cache)
             # ★ P1: 记录一次插入（用于 defrag 触发计数）
             self._insert_count += 1
+            # 主动预刷新：仅正应答（有 answer 且非过滤拦截占位）入堆
+            if (self.prefetch_enabled and ttl > 0 and response.answer
+                    and not _has_block_placeholder(response)):
+                self._schedule_prefetch(key, entry)
 
     def _calculate_ttl(self, response: dns.message.Message) -> int:
-        """从 DNS 响应中计算合适 TTL"""
-        min_ttl = self.default_ttl
+        """从 DNS 响应中计算合适 TTL
+
+        语义（修复）：
+          - 取响应 answer 段中最小的有效 TTL 作为基线；
+          - 响应无有效 TTL 时才用 default_ttl 兜底：default_ttl 是「缺省基线」，
+            不再充当上限（旧实现从 default_ttl 起步只向下调，
+            导致 max_ttl 永远不会生效）；
+          - 最后统一 clamp 到 [min_ttl, max_ttl]，使 max_ttl 真正封顶；
+          - TTL <= 0 视为不可缓存（返回 0）。
+        """
+        resp_ttl: Optional[int] = None
         for rrset in response.answer:
-            if hasattr(rrset, 'ttl') and rrset.ttl is not None and rrset.ttl < min_ttl:
-                min_ttl = rrset.ttl
-        # 约束到配置范围
-        if min_ttl == 0:
+            t = getattr(rrset, 'ttl', None)
+            if t is None:
+                continue
+            if resp_ttl is None or t < resp_ttl:
+                resp_ttl = t
+        if resp_ttl is None:
+            # 无 answer 或无有效 TTL → 用 default_ttl 作为缺省基线
+            resp_ttl = self.default_ttl
+        if resp_ttl <= 0:
             return 0
-        return max(self.min_ttl, min(min_ttl, self.max_ttl))
+        # 真正 clamp 到配置区间：上游 TTL 大于 max_ttl 时被截断（max_ttl 生效）
+        return max(self.min_ttl, min(resp_ttl, self.max_ttl))
 
     async def evict_largest(self, ratio: float = 0.2) -> int:
         """按估算字节大小淘汰最大的 N% 条目（跳过已过期条目）。
@@ -395,6 +446,60 @@ class DNSCache:
             self._stats["size"] = len(self._cache)
             if expired_keys:
                 logger.debug("清理了 %d 个过期缓存条目", len(expired_keys))
+
+    # ==================== 主动预刷新（最小堆动态调度） ====================
+
+    def _schedule_prefetch(self, key: Tuple, entry: "CacheEntry"):
+        """把一条正应答条目排入预刷新堆（须在持锁状态下调用）。
+
+        刷新时刻 = created_at + 最终 TTL - 提前量，其中
+          提前量 = min(max(min_ttl, 最终 TTL * advance_ratio), 最终 TTL - 1)
+        —— 至少留 1 秒余量，避免 TTL 只有 min_ttl 时刚插入就到期而空转。
+        """
+        ttl = entry.ttl
+        if ttl <= 0:
+            return
+        advance = max(float(self.min_ttl), ttl * self._prefetch_ratio)
+        advance = min(advance, ttl - 1.0)
+        if advance < 0.0:
+            advance = 0.0
+        self._seq_counter += 1
+        entry._seq = self._seq_counter
+        heapq.heappush(self._prefetch_heap,
+                       (entry.created_at + ttl - advance, self._seq_counter, key))
+
+    async def pop_due_prefetch(self, limit: int = 1000) -> list:
+        """取出已到预刷新时刻的有效条目键（最多 limit 个）。
+
+        堆中可能存在幽灵元素（同 key 被覆盖/淘汰）——用 (存在性、seq、
+        未过期) 惰性校验后丢弃，无需主动删除。堆本身无长度上限。
+        """
+        now = time.time()
+        out: list = []
+        async with self._lock:
+            heap = self._prefetch_heap
+            while heap and len(out) < limit:
+                next_at, seq, key = heap[0]
+                if next_at > now:
+                    break
+                heapq.heappop(heap)
+                entry = self._cache.get(key)
+                if entry is None or entry._seq != seq:
+                    continue          # 已被 LRU 淘汰或被新的 set() 覆盖
+                if entry.ttl <= 0 or entry.is_expired(now):
+                    continue          # 已过期：交由 get() 的 miss 路径处理
+                out.append(key)
+        return out
+
+    async def peek_next_prefetch_at(self) -> Optional[float]:
+        """堆顶的下一预刷新时刻（供后台循环动态 sleep）；堆空返回 None。"""
+        async with self._lock:
+            return self._prefetch_heap[0][0] if self._prefetch_heap else None
+
+    @property
+    def prefetch_backlog(self) -> int:
+        """当前堆中待调度条目数（监控用）"""
+        return len(self._prefetch_heap)
 
     async def drop_messages_lru(self, ratio: float = 0.3) -> int:
         """丢弃 LRU 尾部 N% 条目的 Message 对象，仅保留 wire bytes。
@@ -484,6 +589,10 @@ class DNSCache:
                      for key, entry in list(self._cache.items())
                      if not entry.is_expired(now)]
             old_count = len(self._cache)
+            # 预刷新堆重建：记录旧堆中已调度的 key（缓存被整体重建后
+            # 原堆元素全部失效，需按新条目重新排入以保留调度）
+            old_scheduled = {k for _, _, k in self._prefetch_heap}
+            self._prefetch_heap = []
             self._cache.clear()
             # 提升世代，标记 arena 代际边界
             new_epoch = self._current_epoch + 1
@@ -513,7 +622,11 @@ class DNSCache:
                 entry.created_at = created_at
                 entry.epoch = new_epoch       # 标记新世代
                 entry._hit_count = 0          # 重置命中计数
+                entry._seq = 0                # 调度序号由 _schedule_prefetch 重分配
                 self._cache[key] = entry
+                # 保留原预刷新调度（刷新时刻基于 created_at，不受 rebuild 影响）
+                if key in old_scheduled and ttl > 0:
+                    self._schedule_prefetch(key, entry)
                 survived += 1
 
             self._stats["size"] = len(self._cache)
@@ -539,6 +652,8 @@ class DNSCache:
             items = [(key, entry._wire, entry.ttl, entry.created_at, entry._hit_count)
                      for key, entry in self._cache.items()
                      if not entry.is_expired(now)]
+            old_scheduled = {k for _, _, k in self._prefetch_heap}
+            self._prefetch_heap = []
             self._cache.clear()
             items.sort(key=lambda x: len(x[1]))
             for key, wire, ttl, created_at, hit_count in items:
@@ -549,7 +664,10 @@ class DNSCache:
                 entry.created_at = created_at
                 entry.epoch = self._current_epoch
                 entry._hit_count = hit_count
+                entry._seq = 0
                 self._cache[key] = entry
+                if key in old_scheduled and ttl > 0:
+                    self._schedule_prefetch(key, entry)
             self._stats["size"] = len(self._cache)
 
         # ★ P2: 锁外执行 3 轮全代 GC — 确保所有旧 arena 变为 fully-free → munmap
@@ -567,6 +685,8 @@ class DNSCache:
         """清空缓存"""
         async with self._lock:
             self._cache.clear()
+            self._prefetch_heap.clear()
+            self._seq_counter = 0
             self._stats["size"] = 0
             self._stats["evictions"] = 0
 

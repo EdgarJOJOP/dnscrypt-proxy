@@ -37,6 +37,7 @@ import dns.rdtypes.IN.A
 import dns.rdtypes.IN.AAAA
 import dns.rrset
 import dns.rcode
+import dns.flags
 
 # 确保项目根目录在 sys.path 中
 PROJECT_ROOT = Path(__file__).parent.absolute()
@@ -71,6 +72,36 @@ LOG_FORMAT = "[%(asctime)s] %(levelname)s [%(name)s] %(message)s"
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
+class _SanitizeLogFilter(logging.Filter):
+    """日志注入防护：清洗日志格式化参数中的不可见/控制字符。
+
+    客户端可控数据（DNS QNAME、上游响应名称等）虽已由 dnspython/struct
+    规范化而不含裸控制字符，这里仍作为纵深防御统一转义 CR/LF/TAB/ESC 等，
+    杜绝伪造日志行或用终端转义序列污染 proxy.log / 控制台。只处理
+    record.args（格式化参数），不改动格式串本身，不影响日志模板语义。
+    """
+
+    # 0x00-0x1F 控制字符 + DEL(0x7F) → 可见的 \xNN 文本
+    _CTRL = {i: "\\x%02x" % i for i in list(range(0x20)) + [0x7F]}
+
+    @classmethod
+    def _clean(cls, value):
+        if isinstance(value, str):
+            return value.translate(cls._CTRL)
+        return value
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, dict):
+            record.args = {k: self._clean(v) for k, v in args.items()}
+        elif isinstance(args, tuple):
+            record.args = tuple(self._clean(v) for v in args)
+        return True
+
+
+_SANITIZE_LOG_FILTER = _SanitizeLogFilter()
+
+
 def setup_logging(log_dir: str = "logs", max_log_size_mb: int = 100):
     """配置日志系统（所有文件日志均带自动裁剪功能）"""
     log_path = Path(PROJECT_ROOT) / log_dir
@@ -83,11 +114,13 @@ def setup_logging(log_dir: str = "logs", max_log_size_mb: int = 100):
     )
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(logging.Formatter(LOG_FORMAT, DATE_FORMAT))
+    file_handler.addFilter(_SANITIZE_LOG_FILTER)
 
     # 控制台日志
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(logging.Formatter(LOG_FORMAT, DATE_FORMAT))
+    console_handler.addFilter(_SANITIZE_LOG_FILTER)
 
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.DEBUG)
@@ -99,7 +132,13 @@ def setup_logging(log_dir: str = "logs", max_log_size_mb: int = 100):
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger("aiohttp").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
-    logging.getLogger("quic").setLevel(logging.WARNING)  # 抑制 aioquic 大量连接日志
+    # aioquic 在 QUIC 证书/握手失败时会由其内部 "quic" logger 直接打 WARNING
+    #（例如 "Error: 298, reason: hostname ... doesn't match ..." —— 298 即 TLS
+    # alert bad_certificate）。该记录先于异常抛出，无法在上层拦截，会随被污染
+    # 的上游反复刷屏。提到 ERROR：保留致命错误，正常运行不再刷屏（上游失败
+    # 由 DoQ 层单独提示一次）。
+    logging.getLogger("quic").setLevel(logging.ERROR)
+    logging.getLogger("aioquic").setLevel(logging.ERROR)
     logging.getLogger("scapy").setLevel(logging.ERROR)  # yi zhi scapy L2 socket guan bi jing gao
 
     return root_logger
@@ -131,6 +170,7 @@ class DNSProxyApp:
 
         self._config_reload_task: Optional[asyncio.Task] = None
         self._cache_cleanup_task: Optional[asyncio.Task] = None
+        self._cache_prefetch_task: Optional[asyncio.Task] = None  # 缓存主动预刷新
         self._filter_reload_task: Optional[asyncio.Task] = None  # 跟踪后台过滤规则重载
         self._filter_reload_gen = 0  # 递增 generation，防止过期重载覆盖
         self._ntp_freeze_event: asyncio.Event = asyncio.Event()  # NTP 冻结事件，set=暂停
@@ -176,6 +216,8 @@ class DNSProxyApp:
             max_ttl=self.config.cache_max_ttl,
             negative_ttl=self.config.cache_negative_ttl,
             cleanup_interval=self.config.cache_cleanup_interval,
+            prefetch_enabled=self.config.cache_prefetch_enabled,
+            prefetch_advance_ratio=self.config.cache_prefetch_advance_ratio,
         )
 
         # 2. DNSSEC 验证器
@@ -274,6 +316,10 @@ class DNSProxyApp:
                 enabled=self.config.anomaly_detection_enabled,
                 learning_samples=self.config.anomaly_detection_learning_samples,
                 z_score_threshold=self.config.anomaly_detection_z_score_threshold,
+                # 「准恒定基线」判据阈值由配置的 TTL 粒度实时推导
+                # （cache.min_ttl / cache.default_ttl），不写死常量
+                ttl_min_ref=self.config.cache_min_ttl,
+                ttl_default_ref=self.config.cache_default_ttl,
             )
             logger.info("  统计异常检测: 启用 (learning_samples=%d, z_score_threshold=%.1f)",
                          self.config.anomaly_detection_learning_samples,
@@ -507,7 +553,8 @@ class DNSProxyApp:
         async def _sweep_one(cache_key) -> bool:
             """处理单条缓存条目，返回 True=已覆写"""
             async with sem:
-                qname, qtype, qclass = cache_key
+                # 缓存键为 (name, rdtype, rdclass, DO, CD)[, source]，取前 3 项
+                qname, qtype, qclass = cache_key[:3]
                 domain = str(qname).rstrip(".")
                 blocked, _ = self.filter_engine.check_domain(domain)
                 if not blocked:
@@ -665,6 +712,88 @@ class DNSProxyApp:
             except Exception as e:
                 logging.getLogger("dns-proxy.app").debug("缓存清理循环异常: %s", e)
 
+    # ===== 缓存主动预刷新（最小堆动态调度，无固定扫描周期）=====
+    async def _cache_prefetch_loop(self):
+        """后台主动预刷新即将过期的正应答缓存条目。
+
+        调度由缓存内部的最小堆驱动（见 DNSCache._schedule_prefetch）：
+        每条正应答条目按「最终 TTL（经 min_ttl/max_ttl 钳制）推导出的
+        刷新时刻」入堆；本循环每次休眠到堆顶时刻（而非固定周期），到点后
+        成批取走已到期条目执行——上一批执行完再取下一批（批间串行），
+        批内按 cache_prefetch_concurrency 限流并发。堆空时以
+        cache_cleanup_interval 作兜底休眠（避免空转）。
+        """
+        log = logging.getLogger("dns-proxy.app")
+        while self._running:
+            try:
+                if (not self.cache or not self.config.cache_enabled
+                        or not self.config.cache_prefetch_enabled):
+                    await asyncio.sleep(self.config.cache_cleanup_interval)
+                    continue
+                batch = await self.cache.pop_due_prefetch(
+                    limit=self.config.cache_prefetch_batch_size)
+                if batch:
+                    await self._prefetch_batch(batch)
+                    continue          # 立即取下一批（可能仍有到期待刷条目）
+                nxt = await self.cache.peek_next_prefetch_at()
+                if nxt is None:
+                    delay = float(self.config.cache_cleanup_interval)
+                else:
+                    # 动态休眠到下一个刷新点；上限 cleanup_interval 只为兜底
+                    delay = max(0.05, min(nxt - time.time(),
+                                          float(self.config.cache_cleanup_interval)))
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.debug("缓存预刷新循环异常: %s", e)
+                await asyncio.sleep(1.0)
+
+    async def _prefetch_batch(self, keys):
+        """并发预刷新一批条目（批内并发上限 = cache_prefetch_concurrency）。"""
+        log = logging.getLogger("dns-proxy.app")
+        sem = asyncio.Semaphore(max(1, self.config.cache_prefetch_concurrency))
+
+        async def _refresh_one(cache_key) -> bool:
+            async with sem:
+                try:
+                    # 还原原始查询：name/type/class + DO 位（第 4 项）+ CD 位
+                    # （第 5 项），否则响应形态与源请求不一致；且 set 必须用
+                    # 原 key 才能覆写同一条目（否则会新增键、原键照旧过期）。
+                    qname, qtype, qclass = cache_key[:3]
+                    want_dnssec = bool(cache_key[3]) if len(cache_key) > 4 else False
+                    cd_bit = bool(cache_key[4]) if len(cache_key) > 4 else False
+                    q = dns.message.make_query(qname, qtype, qclass,
+                                               want_dnssec=want_dnssec)
+                    if cd_bit:
+                        q.flags |= dns.flags.CD
+                    if self.resolver_manager is None:
+                        return False
+                    result = await self.resolver_manager.resolve(q.to_wire())
+                    if result is None:
+                        return False
+                    resp = dns.message.from_wire(result)
+                    rcode = resp.rcode()
+                    is_neg = (rcode in (dns.rcode.NXDOMAIN, dns.rcode.REFUSED)
+                              or (rcode == dns.rcode.NOERROR and not resp.answer))
+                    if is_neg:
+                        # 负应答不预刷新：避免上游风暴，其 TTL 由上游自然控制
+                        return False
+                    # 与各 server 写入缓存时的处理保持一致（AAAA 优先排序）
+                    reorder_answer_aaaa_first(resp)
+                    # set() 会重算 TTL、重置 created_at 并重新排入堆
+                    await self.cache.set(cache_key, resp, is_negative=False)
+                    return True
+                except Exception:
+                    return False
+
+        results = await asyncio.gather(*[_refresh_one(k) for k in keys],
+                                       return_exceptions=True)
+        refreshed = sum(1 for r in results if r is True)
+        if refreshed:
+            log.debug("缓存预刷新: 本批 %d 条，刷新 %d 条，队列剩余 %d",
+                      len(keys), refreshed, self.cache.prefetch_backlog)
+
     async def _ntp_calibrate_loop(self):
         """定期 NTP 校时循环（异步并行 + 可冻结）
         每周期: 最小延迟筛选 + RLS 在线更新 (lambda=0.98) + 跳变保护 (MAX_JUMP=1.0)
@@ -741,6 +870,8 @@ class DNSProxyApp:
         # 启动后台任务
         self._config_reload_task = asyncio.create_task(self._config_reload_loop())
         self._cache_cleanup_task = asyncio.create_task(self._cache_cleanup_loop())
+        if self.config.cache_prefetch_enabled:
+            self._cache_prefetch_task = asyncio.create_task(self._cache_prefetch_loop())
         self._ntp_calibrate_task = asyncio.create_task(self._ntp_calibrate_loop())
         logger.info("  - NTP 定时校准: 每 %d 秒", DRIFT_SAMPLE_INTERVAL)
 
@@ -833,7 +964,8 @@ class DNSProxyApp:
 
         # 取消后台任务
         for task in [self._config_reload_task, self._cache_cleanup_task,
-                     self._ntp_calibrate_task, self._filter_reload_task]:
+                     self._cache_prefetch_task, self._ntp_calibrate_task,
+                     self._filter_reload_task]:
             if task:
                 task.cancel()
                 try:
