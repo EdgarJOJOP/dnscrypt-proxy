@@ -453,14 +453,26 @@ class DNSCache:
         """把一条正应答条目排入预刷新堆（须在持锁状态下调用）。
 
         刷新时刻 = created_at + 最终 TTL - 提前量，其中
-          提前量 = min(max(min_ttl, 最终 TTL * advance_ratio), 最终 TTL - 1)
-        —— 至少留 1 秒余量，避免 TTL 只有 min_ttl 时刚插入就到期而空转。
+          提前量 = min(最终 TTL * advance_ratio,
+                       最终 TTL - max(1 秒, 最终 TTL * advance_ratio))
+        —— 保底至少留 max(1 秒, advance_ratio*最终 TTL) 的等待，避免刚插入
+        就到期而空转。若上式右侧为负（TTL 极小、advance_ratio 很大时），
+        提前量取 0（即不提前，等条目自然到期），不会出现负提前量。
+
+        注意：min_ttl 是「缓存 TTL 下限」，不是「提前量下限」。旧实现用
+        max(min_ttl, TTL*advance_ratio) 作为提前量，会让所有最终 TTL <= min_ttl
+        的条目（_calculate_ttl 会把上游 TTL < min_ttl 的响应钳到 min_ttl）
+        提前量被夹到 TTL-1 → 刷新时刻 = 插入后 1 秒，形成「每秒重新查询
+        上游一次」的死循环（实测稳态每秒上百次上游查询）。
         """
         ttl = entry.ttl
         if ttl <= 0:
             return
-        advance = max(float(self.min_ttl), ttl * self._prefetch_ratio)
-        advance = min(advance, ttl - 1.0)
+        advance = ttl * self._prefetch_ratio
+        # 保底等待：至少 1 秒，且不少于 advance_ratio*TTL（advance_ratio>=1 时
+        # 提前量收敛为 0，即不提前刷新，而非插入即到期）
+        min_wait = max(1.0, ttl * self._prefetch_ratio)
+        advance = min(advance, ttl - min_wait)
         if advance < 0.0:
             advance = 0.0
         self._seq_counter += 1

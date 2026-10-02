@@ -1590,14 +1590,43 @@ class IterativeResolver:
                                         n, rdata.salt, rdata.iterations,
                                         rdata.algorithm)
                                     if oh3 and th3 and \
-                                       not self._nsec3_optout(rdata) and \
                                        self._nsec3_interval_check(
                                            th3, oh3, rdata.next) and \
                                        self._nsec_has_type(
-                                           rdata, dns.rdatatype.NS) and \
-                                       not self._nsec_has_type(
-                                           rdata, dns.rdatatype.DS):
-                                        nsec_valid = True
+                                           rdata, dns.rdatatype.NS):
+                                        # opt-out 覆盖（RFC 5155 §3.1.2.1 定义 opt-out 位；
+                                        # §8.6「无匹配 NSEC3 的 DS NODATA」允许用
+                                        # 「opt-out 覆盖 + 父区验签」判定 insecure；
+                                        # §9.2 要求此时 AD=0——迭代响应来自权威、AD 本就为 0）。
+                                        # 语义：opt-out 区间表示"本区间内存在被省略的
+                                        # （未签名）委托点"，故 DS 查询下覆盖即"该委托无 DS"
+                                        # → 未签名区（insecure）。
+                                        # 例：baidu.com / qq.com —— .com 用 opt-out NSEC3
+                                        # 覆盖其 hash；旧实现拒绝采纳该证明 → 逐级升到
+                                        # com.（有 DS）→ 误判"签名区却无 RRSIG"→ 合法响应
+                                        # 被当剥离攻击丢弃（实测 82 域名仅 4 个成功的根因）。
+                                        # 安全性（三道约束）：
+                                        #   1) 位于外层验签之下：无 RRSIG 时
+                                        #      `if rrsig_set is None: continue` 跳过；
+                                        #      验签抛异常由外层 except 终止本级检查，
+                                        #      nsec_valid 保持 False（不会因此放行）。
+                                        #   2) 必须通过父区已信任 DNSKEY 验签，伪造覆盖
+                                        #      无法通过（实测：删掉 RRSIG 的 opt-out
+                                        #      响应不会判 insecure，最终仍被丢弃）。
+                                        #   3) _nsec3_interval_check 在
+                                        #      target_hash == owner_hash 时返回 False →
+                                        #      签名委托（其 matching NSEC3 的 owner 即
+                                        #      H(n)）不会落入覆盖分支，二者互斥。
+                                        # 说明：此处未单独校验 RFC 5155 §8.6 的 closest
+                                        # provable encloser 链；本项目只在 DS 判定路径
+                                        # （本函数）使用覆盖证明——正是 BIND #5886 强调的
+                                        # "覆盖证明仅可用于 DS 查询"——并由 2)+3) 保证不会
+                                        # 把签名委托误判为 insecure。
+                                        if self._nsec3_optout(rdata):
+                                            nsec_valid = True
+                                        elif not self._nsec_has_type(
+                                                rdata, dns.rdatatype.DS):
+                                            nsec_valid = True
                 except Exception:
                     nsec_valid = False
                 if nsec_valid:

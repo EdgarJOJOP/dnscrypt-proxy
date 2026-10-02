@@ -52,36 +52,40 @@ server:
     ipv6:
       enabled: true
       host: ::1
-    # ============================================================
-    # 迭代解析模式（根→TLD→权威，默认关闭）
-    # 关闭时：plain DNS 走加密上游（DoH/DoT/DoQ）递归解析
-    # 开启时：plain DNS 自行从根服务器开始迭代查询，不依赖递归服务器
-    # 数学信任模型：每跳收集 RRSIG，最终用内置 IANA 根信任锚做 DNSSEC 全链验证；
-    #              同时与加密上游结果做一致性交叉验证（response_verification 全局确认）
-    # 任一验证失败（bogus/不一致）→ 丢弃响应返回 SERVFAIL（严格模式）
-    # ============================================================
-    iterative:
-      enabled: true            # 默认关闭，设为 true 开启迭代解析
-      # 根服务器列表（默认 IANA 13 根，留空或省略则使用内置列表）
-      # 可自定义覆盖：- "198.41.0.4"
-      root_servers: ["2001:7fd::1","2001:500:2f::f","2001:503:c27::2:30","193.0.14.129","192.5.5.241","192.58.128.30"]
-      # 单跳查询超时（毫秒）
-      timeout_ms: 1500
-      # 迭代最大深度（根→TLD→权威的跳数上限）
-      max_depth: 8
-      # 严格 DNSSEC：链验证失败（bogus）时丢弃响应返回 SERVFAIL
-      strict_dnssec: true
-      # 全局确认：迭代结果与加密上游结果做一致性交叉验证，不一致返回 SERVFAIL
-      cross_verify: false
+    # 迭代解析（根→TLD→权威）配置已提升为顶层 `iterative:` 段（与 upstream:
+    # 同级），见本文件后部"迭代解析上游"一节。
 
 # ============================================================
 # 上游 DNS 服务器
 # 并行查询所有启用的上游，取最快响应
 # ============================================================
 upstream:
+  # 加密上游总开关（DoH/DoT/DoQ）
+  #   true  = 按下面 doh/dot/doq 列表创建加密上游（默认）
+  #   false = 不创建、不运行任何加密上游：doh/dot/doq 列表按空处理 →
+  #           不建 DoH/DoT/DoQ 连接、不创建共享 DoH session、不启动 ECH
+  #           fetcher、不启动 DoQ 脏连接清理任务，也不做 bootstrap 域名解析
+  #           （bootstrap 解析器对象仍会创建，但不会发起任何查询）。
+  #           查询只走顶层 iterative:（根→TLD→权威）。
+  #           想"独立只用迭代解析作为上游"时设为 false；
+  #           若同时 iterative.enabled=false 则没有任何上游（全部 SERVFAIL，启动会告警）。
+  #   注意：本段下的 dnssec: 配置不受此开关影响，始终完整生效——
+  #         它就是 resolver 层统一验证链的配置，iterative 的响应同样经过它
+  #         （迭代器内部另有 strict_dnssec 全链自举验证）。
+  enabled: true
   # bootstrap DNS：仅用于解析 DoH/DoT/DoQ 服务器的 IP 地址
   # 包含 IPv4 + IPv6 双栈 DNS 服务器
-  # 权威服务器(根服务器)会在应用层校验查询源IP的身份，对非“可信递归DNS IP”白名单的终端直连请求，仅返回空应答（NODATA）而非拒绝（REFUSED），从而在协议层面将普通用户排除在权威解析链之外(除非你的ip为根服务器的白名单中)。
+  # （upstream.enabled=false 时不会发起任何 bootstrap 查询）
+  # 说明（实测修正，原注释称"权威服务器对非白名单终端仅返回空应答"不成立）：
+  #   实测根/TLD/权威对直连查询正常返回 referral 与 answer。国内域名迭代解析
+  #   此前失败的真实原因是本项目的判定逻辑，而非权威拒答：
+  #     a) 该区本身未签名（如 baidu.com / qq.com：父区 .com 用 opt-out NSEC3
+  #        区间覆盖证明其无 DS）。旧判定拒绝采纳 opt-out 覆盖 → 逐级升到 com.
+  #        碰到 DS → 误判为"签名区却无 RRSIG"→ 合法响应被当剥离攻击丢弃；
+  #        （已按 RFC 5155 §8.6 修正：DS 查询的无匹配 NSEC3 情形可用
+  #         opt-out 覆盖 + 父区验签证明 → insecure）
+  #     b) 少数上游即使收到 DO=1 也不返回 RRSIG（实测阿里 DoH 查 example.com
+  #        即无 RRSIG），这类响应按 insecure 放行（require_rrsig=false 时）。
   bootstrap_resolvers:
     - 52.80.66.66
     - 223.5.5.5
@@ -93,10 +97,16 @@ upstream:
 
   # ============================================================
   # 上游优选配置
+  # 实测核对（审计结论）：
+  #   * 首波候选 = _select_encrypted_upstreams(count=3)：按健康评分排序取前 3
+  #     （延迟扣分/失败扣分/协议加成），不读下面两项。
+  #   * preferred_count / suffix_dedup 只被 _select_preferred_servers 使用，
+  #     而它的唯一调用点是多上游一致性验证的后台对照抽样
+  #     （response_verification.consistency）——该功能当前 enabled: false，
+  #     因此这两项目前不产生任何实际效果（开启后即生效）。
   # ============================================================
-  preferred_count: 5          # 优选上游数量（全类型混排选最低延迟，后缀去重）
-  bootstrap_compare: true     # 是否对比 IPv4/IPv6 bootstrap 延迟后选择更快者
-  suffix_dedup: true          # 优选时是否避免选中相同后缀域名的上游
+  preferred_count: 5          # 一致性验证后台对照的优选上游数量（consistency 关闭时不生效）
+  suffix_dedup: true          # 上述优选是否避免同后缀域名（consistency 关闭时不生效）
 
   doh:
     - https://dns.alidns.com/dns-query
@@ -120,12 +130,64 @@ upstream:
     - quic://dns9.quad9.net:853
     - quic://dns.alidns.com:853
     - quic://dns-unfiltered.adguard.com:853
+
+  # ============================================================
+  # DNSSEC 验证配置（原顶层 dnssec: 段移入此处）
+  # 对全部上游完整生效——包括 iterative:；upstream.enabled=false 时照常生效。
+  # ============================================================
+  dnssec:
+    enabled: true                     # 全局 DNSSEC 验证开关
+    # 验证模式:
+    #   ad_check       - 仅检查 AD 位（快速，依赖上游验证）
+    #   strict         - 严格本地验证 RRSIG 签名链（安全但较慢）
+    mode: strict
+    # 是否丢弃验证失败的响应（bogus）
+    drop_bogus: true
+    # strict 模式下：响应不带 RRSIG（且父区有 DS）时是否判为 bogus 丢弃。
+    # 默认 false：多数国内 DoH 上游（阿里/腾讯等）即使客户端带 DO=1 也不返回
+    # RRSIG，开启后会导致几乎所有域名解析失败；仅在确认所有上游都支持
+    # DNSSEC 数据传输时再开启。
+    require_rrsig: false
+
+# ============================================================
+# 迭代解析上游（根 → TLD → 权威；与 upstream: 同级的独立上游）
+# ------------------------------------------------------------
+# 与 upstream: 的加密上游共用同一套「上游选择/调度」代码：
+#   * 健康评分排序选首波候选（_select_encrypted_upstreams：延迟扣分、
+#     失败扣分、协议加成；iterative 计为 DoH 同级加成）
+#   * 首波 → 备用波调度（_parallel_resolve_once / _try_upstream_wave）
+#   * 查询失败计数、连续失败 5 次自动禁用、_auto_recover()/reenable_all() 自动恢复
+#   * 波次含 iterative 时按迭代器 total_timeout 放大该波 deadline，避免被
+#     parallel_timeout 截断（total_timeout 由 iterative.timeout_ms、max_depth、
+#     根服务器数量共同推得：当前配置为 27s，见 plain_dns_server.IterativeResolver）
+# 说明（避免误解）：
+#   upstream.preferred_count / upstream.suffix_dedup 只作用于「多上游一致性
+#   验证」的后台对照抽样（_select_preferred_servers 的唯一调用点，
+#   response_verification.consistency 关闭时不执行）；
+#   两者都不参与首波候选的挑选（该处为健康评分 + 固定 count=3），
+#   而迭代解析用 IP 根列表、不涉及 bootstrap 域名解析。
+# upstream.enabled=false 时，它是唯一上游（想"独立只用迭代解析"就这样配）。
+# DNSSEC：每跳收集 RRSIG，最终用内置 IANA 根信任锚做全链验证（strict_dnssec）。
+# ============================================================
+iterative:
+  enabled: true            # 是否启用迭代解析上游（注册为上游参与优选）
+  # 根服务器列表（留空或省略则使用内置 IANA 根列表）
+  root_servers: ["2001:7fd::1","2001:500:2f::f","2001:503:c27::2:30","193.0.14.129","192.5.5.241","192.58.128.30"]
+  # 单跳查询超时（毫秒）
+  timeout_ms: 1500
+  # 迭代最大深度（根→TLD→权威的跳数上限）
+  max_depth: 8
+  # 严格 DNSSEC：签名链验证失败（bogus）时丢弃响应返回 SERVFAIL
+  strict_dnssec: true
+  # 全局确认：迭代结果与加密上游结果做一致性交叉验证（已废弃，仅保留兼容）
+  cross_verify: false
+
 cache:
   enabled: true
   max_size: 10000           # 最大缓存条目数，超限 LRU 淘汰
-  default_ttl: 300          # 默认缓存时间（秒）
-  min_ttl: 2               # 最小缓存时间（秒）
-  max_ttl: 600            # 最大缓存时间（秒）
+  default_ttl: 1500          # 默认缓存时间（秒）
+  min_ttl: 600               # 最小缓存时间（秒）
+  max_ttl: 3600            # 最大缓存时间（秒）
   negative_ttl: 60          # 负面应答缓存时间（秒）
   cleanup_interval: 60      # 过期清理间隔（秒）
   # ---- 主动预刷新（正应答条目在过期前自动重新解析）----
@@ -135,21 +197,9 @@ cache:
   #         队列无长度上限、可随时插入；每批处理 batch_size 条，上一批执行完再执行下一批。
   prefetch:
     enabled: true            # 主动预刷新正应答条目开关（false=关闭，退回"访问时惰性判过期"）
-    advance_ratio: 0.3       # 提前量比例：0.5=剩余一半 TTL 时预刷新（越大越早刷、上游压力越大）
+    advance_ratio: 0.1       # 提前量比例：0.5=剩余一半 TTL 时预刷新（越大越早刷、上游压力越大）
     batch_size: 1000         # 每批（每轮）最多处理的条目数；队列本身无限长，按批串行执行
     concurrency: 50          # 批内并发上游查询上限
-
-# ============================================================
-# DNSSEC 验证配置
-# ============================================================
-dnssec:
-  enabled: true                     # 全局 DNSSEC 验证开关
-  # 验证模式:
-  #   ad_check       - 仅检查 AD 位（快速，依赖上游验证）
-  #   strict         - 严格本地验证 RRSIG 签名链（安全但较慢）
-  mode: strict
-  # 是否丢弃验证失败的响应（bogus）
-  drop_bogus: true
 
 # ============================================================
 # 自定义域名映射（白名单功能，类似 Windows hosts 文件）

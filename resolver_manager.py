@@ -210,11 +210,21 @@ class ResolverManager:
             resolver = PlainDNSResolver(addr, timeout=5.0, concurrency=self.config.connection_pool_size)
             self._bootstrap_resolvers.append(UpstreamServer(resolver, "plain"))
 
-        # 检查是否有任何上游服务器
+        # 检查是否有任何上游服务器（加密上游 + 迭代解析上游）
         total_upstreams = (len(self.config.doh_servers) + len(self.config.dot_servers)
                            + len(self.config.doq_servers))
+        has_iterative = self._iterative_resolver is not None
+        if total_upstreams == 0 and not has_iterative:
+            logger.warning("未配置任何上游服务器（doh/dot/doq 均为空且 iterative 未启用），"
+                           "所有查询将返回 SERVFAIL")
+            self._bootstrap_ready.set()
+            return
         if total_upstreams == 0:
-            logger.warning("未配置任何上游服务器（doh/dot/doq 均为空），所有查询将返回 SERVFAIL")
+            # 纯迭代模式（upstream.enabled=false 或 doh/dot/doq 全空）：
+            # 迭代解析用 IP 根列表，不需要 bootstrap 解析上游域名（bootstrap 解析器
+            # 对象已在上面创建，但整个模式不会向它发起查询）；
+            # 上游注册在 main 调用的 _init_remaining() 中完成（此处只置就绪标志）
+            logger.info("未配置/未启用加密上游，仅使用迭代解析上游（根→TLD→权威）")
             self._bootstrap_ready.set()
             return
 
@@ -229,7 +239,22 @@ class ResolverManager:
         """
         total_upstreams = (len(self.config.doh_servers) + len(self.config.dot_servers)
                            + len(self.config.doq_servers))
+        if total_upstreams == 0 and self._iterative_resolver is None:
+            return
         if total_upstreams == 0:
+            # 纯迭代模式（upstream.enabled=false 或 doh/dot/doq 全空）：
+            # 跳过加密上游专用初始化（ECH fetchers、共享 DoH session、DoQ 全局
+            # 并发上限），只注册迭代解析上游；定期空闲连接清理仍启动
+            # （close_idle_connections 同时清理 bootstrap 解析器的空闲 UDP 套接字，
+            #  且对 iterative 无 close_idle/reset_connections 的情况用 hasattr 跳过）
+            await self._create_upstream_resolvers()
+            self._cleanup_idle_task = asyncio.create_task(self._periodic_idle_cleanup())
+            self._bootstrap_ready.set()
+            enabled_count = sum(1 for s in self._upstream_servers if s.enabled)
+            logger.info("解析器初始化完成（纯迭代模式）: %d 个上游可用 / %d 个总数",
+                        enabled_count, len(self._upstream_servers))
+            for s in self._upstream_servers:
+                logger.info("  上游: [%s] %s (启用=%s)", s.server_type, s.name, s.enabled)
             return
 
         # 3. 创建 ECH fetchers（每台上游一个，支持 TTL 缓存 + 后台刷新）
@@ -796,6 +821,14 @@ class ResolverManager:
                         exclude_servers=set(s.name for s in preferred) if preferred else None,
                     )
                 )
+            else:
+                # 一致性验证已开启但没有可用的后台对照上游：典型情况是
+                # preferred_count >= 加密上游总数（优选把全部加密上游都排除了）。
+                # 功能静默不生效，这里留一条可诊断日志。
+                logger.debug("一致性验证: 无可用的后台对照上游"
+                             "（preferred_count=%s 已排除全部加密上游，共 %d 个）",
+                             preferred_count,
+                             sum(1 for s in self._upstream_servers if s.enabled))
 
         return result
 
@@ -1024,7 +1057,15 @@ class ResolverManager:
 
     @staticmethod
     def _get_suffix(hostname: str) -> str:
-        """提取域名的注册后缀（如 alidns.com、cloudflare.com）"""
+        """提取域名的注册后缀（如 alidns.com、cloudflare.com）。
+
+        前提：传入的必须是 BaseResolver._extract_name 规范化后的**纯主机名**
+        （已去掉 scheme/路径/端口）——_get_suffix 只做"取最后两段"的粗粒度
+        判断，若直接传入 "https://x.example.com/dns-query" 会得到
+        "example.com/dns-query" 这种错误后缀，导致 suffix_dedup 失效。
+        （iterative 上游的名字是 "iterative"，单段 → 原样返回，不会与其他
+          上游的后缀冲突。）
+        """
         parts = hostname.lower().split(".")
         if len(parts) >= 2:
             return ".".join(parts[-2:])
@@ -1165,12 +1206,16 @@ class ResolverManager:
 
         timeout = self.config.parallel_timeout
 
-        # 第一波：按健康评分选最优的 3 个加密上游（DoH/DoT/DoQ）
-        # 首波：仅加密上游（DoH/DoT/DoQ）——iterative 迭代解析耗时 15-52s，
-        # 混入首波会在加密上游全失败时拖住全部本地 DNS 服务（security_review
-        # MEDIUM）；iterative 只进备用波作迭代兜底（deadline 按其 total_timeout 放大）
-        first_wave = [s for s in self._select_encrypted_upstreams(count=3)
-                      if s.server_type != "iterative"]
+        # 第一波：按健康评分选最优的 3 个上游（与 upstream: 共用同一套优选逻辑）。
+        # 混合模式：首波只用加密上游（DoH/DoT/DoQ）——iterative 迭代解析耗时可达
+        # 数十秒，混入首波会在加密上游全失败时拖住全部本地 DNS 服务
+        # （security_review MEDIUM）；iterative 只进备用波作迭代兜底。
+        # 纯迭代模式（upstream.enabled=false 或 doh/dot/doq 为空）：首波即 iterative
+        # ——此时它就是被优选的唯一上游，与其他上游同等对待。
+        wave_candidates = self._select_encrypted_upstreams(count=3)
+        first_wave = [s for s in wave_candidates if s.server_type != "iterative"]
+        if not first_wave:
+            first_wave = wave_candidates
         if first_wave:
             logger.debug("首波查询: %d 个最优上游", len(first_wave))
             result = await self._try_upstream_wave(
@@ -1215,11 +1260,25 @@ class ResolverManager:
         """
         后台一致性验证任务（不阻塞主响应返回）。
         收集其余上游的响应，执行多源交叉验证和异常检测。
+        调用方（resolve）传入的 enabled_servers 是「已排除优选上游后的随机抽样」，
+        本方法用其中第一个作为参考响应（fast_server），其余逐个查询对照。
         """
         if not self._consistency_verifier:
             return
 
-        # 用第一个 server 作为"最快"标识（调用方已通过健康评分预选）
+        # 可诊断性：collect_and_verify 在 len(all_servers) < min_responses 时会直接
+        # 返回且不计数（静默不验证）。常见成因是 max_background_servers 太小
+        # （对照上游数不足以构成 2 个以上指纹）——这里留一条 debug 便于排查。
+        if len(enabled_servers) < self._consistency_verifier.min_responses:
+            logger.debug("一致性验证: 后台对照上游不足（%d 个 < min_responses=%d），本轮跳过"
+                         "（可调大 response_verification.consistency.max_background_servers，"
+                         "并确保加密上游总数 > upstream.preferred_count）",
+                         len(enabled_servers), self._consistency_verifier.min_responses)
+            return
+
+        # 用抽样列表里的第一个作为参考响应（fast_server）——调用方 resolve()
+        # 传入的 selected 是「已排除优选上游后的随机抽样」，不是"最快的上游"；
+        # 其响应作为多数派基线，其余上游逐个查询比对指纹。
         fast_srv = enabled_servers[0] if enabled_servers else None
         if fast_srv is None:
             return

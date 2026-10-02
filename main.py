@@ -272,6 +272,12 @@ class DNSProxyApp:
             from plain_dns_server import IterativeResolver
             self.iterative_resolver = IterativeResolver(self.config)
             logger.info("  迭代解析器已创建（根→TLD→权威 + DNSSEC 严格验证，作为上游参与优选）")
+            if not self.config.upstream_enabled:
+                logger.info("  加密上游总开关 upstream.enabled=false → 不创建 DoH/DoT/DoQ，"
+                            "全部查询只走迭代解析上游（DNSSEC 验证链仍按 upstream.dnssec 完整生效）")
+        elif not self.config.upstream_enabled:
+            logger.warning("  upstream.enabled=false 且 iterative.enabled=false："
+                           "没有任何可用上游，所有查询将返回 SERVFAIL")
         self.resolver_manager = ResolverManager(
             self.config, dnssec_wrapper=self._dnssec_wrapper,
             consistency_verifier=None, anomaly_detector=None,
@@ -917,10 +923,14 @@ class DNSProxyApp:
                         self.config.local_doq_host if self.config.local_doq_host != "0.0.0.0" else "127.0.0.1",  # nosec B104 - display formatting
                         self.config.local_doq_port,
                         self.config.local_doq_domain or "未设置")
-        logger.info("  - 上游服务器: DoH x%d + DoT x%d + DoQ x%d",
+        _iter_state = ("启用（%d 台根）" % len(self.config.plain_dns_iterative_root_servers)
+                       if self.config.plain_dns_iterative_enabled else "禁用")
+        logger.info("  - 上游服务器: DoH x%d + DoT x%d + DoQ x%d (upstream.enabled=%s) | 迭代解析上游: %s",
                     len(self.config.doh_servers),
                     len(self.config.dot_servers),
-                    len(self.config.doq_servers))
+                    len(self.config.doq_servers),
+                    self.config.upstream_enabled,
+                    _iter_state)
         logger.info("  - DNSSEC:     %s (mode=%s)",
                      "启用" if self.config.dnssec_enabled else "禁用",
                      self.config.dnssec_mode)
