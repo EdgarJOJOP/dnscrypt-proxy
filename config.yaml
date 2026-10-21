@@ -244,8 +244,10 @@ filter:
   # 远程规则列表（定时自动更新）
   rules_urls:
     # 注释掉的全网收集的adguard拦截规则总和，容易误拦截
-    #- https://proxy.gitwarp.top/https://raw.githubusercontent.com/hululu1068/AdGuard-Rule/main/rule/all.txt
-    - https://cdn.jsdelivr.net/gh/hululu1068/AdGuard-Rule@main/rule/domain.txt
+    # 说明：以 # 开头的行就是 YAML 注释，程序不会下载/加载它；
+    #       日志里的「远程:N」只统计下面未注释的条目数量。
+    - https://gh-proxy.com/https://github.com/hululu1068/AdGuard-Rule/blob/main/rule/domain.txt
+    #- https://cdn.jsdelivr.net/gh/hululu1068/AdGuard-Rule@main/rule/domain.txt
     - https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/pro.txt
   update_interval: 24
   # 是否拦截后返回 NXDOMAIN

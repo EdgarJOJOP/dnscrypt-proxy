@@ -288,8 +288,30 @@ class Config:
         return self._data.get("filter", {}).get("enabled", True)
     @property
     def filter_rules_files(self) -> List[str]:
-        result = self._data.get("filter", {}).get("rules_files")
-        return result if isinstance(result, list) else []
+        return self._clean_rule_entries(self._data.get("filter", {}).get("rules_files"))
+
+    @staticmethod
+    def _clean_rule_entries(raw) -> List[str]:
+        """清洗规则列表（rules_files / rules_urls）。
+
+        YAML 中以 '#' 开头的整行本身就是注释，yaml.safe_load 不会把它解析成值，
+        因此被注释掉的规则文件/URL 根本不会出现在这里。此处还要挡掉两类残留：
+          * `- # https://...` 这类「列表项位置的行内注释」会被解析成 None；
+          * 空字符串、纯空白条目，以及以 '#' 开头的裸字符串。
+        统一丢弃，确保注释掉的 URL 绝不会被下载、注释掉的规则文件绝不会被加载。
+        """
+        if not isinstance(raw, list):
+            return []
+        cleaned: List[str] = []
+        for item in raw:
+            if not isinstance(item, str):
+                continue
+            value = item.strip()
+            if not value or value.startswith("#"):
+                continue
+            cleaned.append(value)
+        return cleaned
+
     @property
     def filter_block_nxdomain(self) -> bool:
         return self._data.get("filter", {}).get("block_nxdomain", True)
@@ -514,8 +536,7 @@ class Config:
 
     @property
     def filter_rules_urls(self) -> List[str]:
-        result = self._data.get("filter", {}).get("rules_urls")
-        return result if isinstance(result, list) else []
+        return self._clean_rule_entries(self._data.get("filter", {}).get("rules_urls"))
     @property
     def filter_update_interval(self) -> int:
         return self._data.get("filter", {}).get("update_interval", 0)
