@@ -31,6 +31,8 @@ import asyncio
 import logging
 from typing import Optional, Tuple
 
+from task_pool import run_ntp
+
 logger = logging.getLogger("dns-proxy.ntp")
 
 # 国家授时中心 NTP 服务器（IPv4 + IPv6 双栈）
@@ -968,10 +970,10 @@ def check_system_time_vs_ntp(min_delay: bool = True) -> Tuple[bool, float]:
 
 async def query_ntp_server_async(server: str, timeout: float = NTP_TIMEOUT,
                                   loop=None) -> Optional[Tuple[float, float, float]]:
-    """异步查询单个 NTP 服务器，通过线程池避免阻塞事件循环"""
+    """异步查询单个 NTP 服务器（走 NTP 专属线程池，不与 DNS 查询排队）"""
     if loop is None:
         loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _query_ntp_server, server, timeout)
+    return await run_ntp(_query_ntp_server, server, timeout)
 
 
 async def _query_server_best(
@@ -1118,11 +1120,11 @@ async def check_system_time_vs_ntp_async(freeze_event: asyncio.Event = None,
 
     loop = asyncio.get_event_loop()
     if sys.platform == "win32":
-        calibrated = await loop.run_in_executor(None, _set_system_time_windows, target)
+        calibrated = await run_ntp(_set_system_time_windows, target)
     elif sys.platform.startswith("linux"):
         # 校时按顺序执行外部命令并回读验证，可能耗时数十秒，必须放到线程池，
         # 否则会阻塞事件循环、导致本地 DNS 服务在此期间无响应
-        calibrated = await loop.run_in_executor(None, _set_system_time_linux, target)
+        calibrated = await run_ntp(_set_system_time_linux, target)
     else:
         calibrated = False
 

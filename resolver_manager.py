@@ -14,7 +14,7 @@ import os
 import time
 import tempfile
 import atexit
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 
 import dns.message
 import dns.name
@@ -185,6 +185,9 @@ class ResolverManager:
         # 最近一次成功解析的最快上游名称（用于后台一致性验证）
         self._last_fast_server: Optional[str] = None
         self._last_fast_server_obj: Optional[UpstreamServer] = None
+        # 进行中的查询（并发合并）：key=(qname, qtype, class, DO, CD) -> Future
+        # 客户端超时重发的同一查询会共享这次解析，不再重复跑迭代。
+        self._inflight_queries: Dict[Tuple, asyncio.Future] = {}
         # 后台一致性验证节流
         self._consistency_check_count = 0  # 1/10 采样计数器
         # 定期清理空闲连接的任务
@@ -747,6 +750,63 @@ class ResolverManager:
         return tmp_path
 
     async def resolve(self, query_bytes: bytes) -> Optional[bytes]:
+        """解析入口：对相同查询做「并发合并」，再交给 _resolve_impl
+
+        为什么要合并：DNS 协议没有"请稍等"的语义——服务端无法告诉客户端
+        "我还在解析，请再等几秒"。客户端超时后只会**重发同一个查询**
+        （Windows Dnscache 约 1s/2s/4s 递增，浏览器自带重试）。如果不去重，
+        每次重试都会重新跑一遍完整迭代（1.5-6s），既浪费线程和带宽，
+        又让整批查询更慢。这里把同一 (qname, qtype, class, DO, CD) 的
+        并发查询合并成一个，其余等待者共享结果。
+
+        响应 ID 由各前端负责回填（DoH / plain / DoT / DoQ 都有
+        ``resp.id = query.id``），所以共享同一份 wire 是安全的。
+        """
+        key = None
+        try:
+            msg = dns.message.from_wire(query_bytes)
+            if msg.question:
+                question = msg.question[0]
+                do_bit = bool(msg.edns >= 0 and (msg.ednsflags & dns.flags.DO))
+                cd_bit = bool(msg.flags & dns.flags.CD)
+                key = (question.name, question.rdtype, question.rdclass, do_bit, cd_bit)
+        except Exception:
+            key = None
+
+        if key is None:
+            return await self._resolve_impl(query_bytes)
+
+        existing = self._inflight_queries.get(key)
+        if existing is not None:
+            # 已有相同查询在跑：等它的结果。用 shield 避免等待者被取消时
+            # 误取消发起方的任务（发起方还要给其它等待者供结果）。
+            try:
+                return await asyncio.shield(existing)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return None
+
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._inflight_queries[key] = fut
+        try:
+            result = await self._resolve_impl(query_bytes)
+            if not fut.done():
+                fut.set_result(result)
+            return result
+        except asyncio.CancelledError:
+            if not fut.done():
+                fut.set_result(None)
+            raise
+        except Exception:
+            # 发起方仍按原语义抛异常；等待者视为解析失败（与"上游全失败"一致）
+            if not fut.done():
+                fut.set_result(None)
+            raise
+        finally:
+            self._inflight_queries.pop(key, None)
+
+    async def _resolve_impl(self, query_bytes: bytes) -> Optional[bytes]:
         """
         并行查询所有上游，返回最快响应。
         如果启用了 DNSSEC，自动添加 DO 位。
@@ -1107,17 +1167,27 @@ class ResolverManager:
             s for s in self._upstream_servers
             if s.enabled and s.server_type in ("doh", "dot", "doq", "iterative")
         ]
-        # 按健康评分从高到低排序
-        encrypted.sort(key=lambda s: s.health_score, reverse=True)
+        # 按健康评分从高到低排序；**连续失败过的排到最后**——否则被墙/超时的
+        # 上游（如境外 DoH）只要配置里靠前就会一直占据首波名额：FIRST_COMPLETED
+        # 虽能先返回快的结果，但首波里混着慢上游会让兜底路径多等一个
+        # parallel_timeout（实测首波含被墙上游时，冷查询会退化到 2s+）。
+        encrypted.sort(
+            key=lambda s: (s.consecutive_failures == 0, s.health_score),
+            reverse=True,
+        )
         return encrypted[:count]
 
     async def _try_upstream_wave(
         self, servers: List[UpstreamServer], query_bytes: bytes,
-        remaining_timeout: float,
+        remaining_timeout: float, cap_iterative_budget: bool = False,
     ) -> Optional[tuple]:
         """
         向一组上游并行查询，返回最快成功响应 (result, elapsed, server)。
         若全部失败或超时返回 None。
+
+        ``cap_iterative_budget=True``：即使波次含 iterative 也**不**把
+        deadline 放大到迭代的 total_timeout——用于「迭代优先」的首波，
+        让它按 6s 预算失败后尽快转加密上游兜底。
         """
         if not servers:
             return None
@@ -1156,7 +1226,8 @@ class ResolverManager:
         # total_timeout 预算放大（加密上游成功仍由 FIRST_COMPLETED 提前返回，
         # 不影响快速路径；加密上游全失败时 iterative 可完成迭代兜底，而非被 2s 截断）
         _iter_budget = 0.0
-        if any(getattr(s, "server_type", "") == "iterative" for s in servers):
+        if (not cap_iterative_budget
+                and any(getattr(s, "server_type", "") == "iterative" for s in servers)):
             _iter_budget = float(getattr(
                 getattr(self, "_iterative_resolver", None), "total_timeout", 30.0,
             ))
@@ -1206,20 +1277,42 @@ class ResolverManager:
 
         timeout = self.config.parallel_timeout
 
-        # 第一波：按健康评分选最优的 3 个上游（与 upstream: 共用同一套优选逻辑）。
-        # 混合模式：首波只用加密上游（DoH/DoT/DoQ）——iterative 迭代解析耗时可达
-        # 数十秒，混入首波会在加密上游全失败时拖住全部本地 DNS 服务
-        # （security_review MEDIUM）；iterative 只进备用波作迭代兜底。
-        # 纯迭代模式（upstream.enabled=false 或 doh/dot/doq 为空）：首波即 iterative
-        # ——此时它就是被优选的唯一上游，与其他上游同等对待。
-        wave_candidates = self._select_encrypted_upstreams(count=3)
-        first_wave = [s for s in wave_candidates if s.server_type != "iterative"]
-        if not first_wave:
-            first_wave = wave_candidates
+        # 首波选择：
+        #   iterative.prefer=true（默认）→ 首波直接用根服务器迭代，不依赖第三方 DoH；
+        #     首波预算 max(6s, 2*parallel_timeout)：常规迭代实测 1-5s 能跑完，
+        #     超过则立即转加密上游兜底（避免客户端 2-5s 重传时还在干等）。
+        #   iterative.prefer=false → 加密上游首波优先（25-100ms），
+        #     iterative 只进备用波作兜底（纯迭代模式下首波即 iterative）。
+        prefer_iterative = bool(
+            getattr(self.config, "plain_dns_iterative_prefer", True)
+        )
+        iterative_servers = [
+            s for s in enabled if s.server_type == "iterative"
+        ]
+        first_budget = timeout
+        cap_iterative_budget = False
+        if prefer_iterative and iterative_servers:
+            first_wave = iterative_servers
+            first_budget = max(6.0, timeout * 2)
+            cap_iterative_budget = True
+        else:
+            wave_candidates = self._select_encrypted_upstreams(count=3)
+            first_wave = [
+                s for s in wave_candidates if s.server_type != "iterative"
+            ]
+            if not first_wave:
+                first_wave = wave_candidates
+
         if first_wave:
-            logger.debug("首波查询: %d 个最优上游", len(first_wave))
+            logger.debug(
+                "首波查询: %d 个上游（%s，预算 %.1fs）",
+                len(first_wave),
+                "迭代优先" if cap_iterative_budget else "加密上游优先",
+                first_budget,
+            )
             result = await self._try_upstream_wave(
-                first_wave, query_bytes, timeout,
+                first_wave, query_bytes, first_budget,
+                cap_iterative_budget=cap_iterative_budget,
             )
             if result is not None:
                 self._last_fast_server = result[2].name

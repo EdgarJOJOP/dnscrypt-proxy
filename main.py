@@ -207,6 +207,19 @@ class DNSProxyApp:
 
         loop.set_exception_handler(_exc_handler)
 
+        # 0. 阻塞任务线程池（必须在任何阻塞调用之前配置）
+        #    线程数 = 可用核数 × 2；核数由 performance.cpu_core_limit 决定
+        #    （0 = 总核数-1），不再单独设置线程数开关。
+        from task_pool import configure_shared_pool, get_shared_pool
+        _cores = self.config.effective_cpu_cores
+        configure_shared_pool(_cores * 2)
+        _pool, _gate = get_shared_pool()
+        logger.info(
+            "阻塞任务线程池: 共享 %d 线程（CPU 预算 %d 核 × 2；DNS>NDP>ARP 按优先级）"
+            " + NTP 专属 2 + 日志专属 1",
+            _gate._limit, _cores,
+        )
+
         # 1. 缓存
         logger.info("[1/11] 初始化 DNS 缓存...")
         self.cache = DNSCache(
@@ -491,6 +504,12 @@ class DNSProxyApp:
         logger.info("=" * 60)
         logger.info("初始化完成！")
         logger.info("=" * 60)
+
+        # 迭代解析预热（后台任务，不阻塞启动）：预取根 DNSKEY 与常用 TLD 的
+        # DS/DNSKEY。首次解析任何域名都要现查这几项，其中 TLD 权威多在境外
+        # （RTT 200-300ms）；预热后用户第一次访问时这些已在缓存里。
+        if self.iterative_resolver is not None:
+            asyncio.create_task(self.iterative_resolver.warmup())
 
     async def _ntp_initialize_async(self):
         """异步 NTP 校时（启动时使用，不阻塞事件循环）"""

@@ -7,6 +7,7 @@
 """
 
 import asyncio
+import ipaddress
 import logging
 import socket
 import struct
@@ -31,12 +32,52 @@ from cache import DNSCache
 from filter_engine import FilterEngine
 from logger import RequestLogger
 from dnssec import DNSSECQueryWrapper, DNSSECValidator
+from task_pool import TaskLevel, run_blocking, get_pressure
 from rate_limiter import get_per_ip_limiter
 
 logger = logging.getLogger("dns-proxy.plain-dns")
 
 # DNS 最大 UDP 数据报大小（DNSSEC 建议 1232，传统 512）
 MAX_UDP_SIZE = 1232
+
+# Windows WSAIoctl：关闭 UDP socket 的 ICMP「端口不可达」通知
+#   SIO_UDP_CONNRESET = _WSAIOW(IOC_VENDOR, 12) = 0x9800000C
+# 注意（实测）：Python 的 socket 模块没有 SIO_UDP_CONNRESET 常量，而且
+# socket.ioctl() 只接受 SIO_RCVALL / SIO_KEEPALIVE_VALS / SIO_LOOPBACK_FAST_PATH
+# 等少数命令，传入其它命令会抛 ValueError("invalid ioctl command")。
+# 旧实现走的是 sock.ioctl(socket.SIO_UDP_CONNRESET, False) →
+# AttributeError → sock.ioctl(0x58000001, False)（常量为错值）→
+# ValueError 被 except 吞掉，抑制从未生效：UDP 53 每收到一次 ICMP Port
+# Unreachable 就触发 WSAECONNRESET(10054)，进而重建 transport，
+# 重建窗口内的查询被直接丢弃（日志里 10054 与 transport recovered 成对刷屏）。
+_SIO_UDP_CONNRESET = 0x9800000C
+
+
+def _disable_udp_connreset(sock: socket.socket) -> bool:
+    """Windows：让 UDP socket 忽略 ICMP 端口不可达（不再报 WSAECONNRESET）。
+
+    必须用 ctypes 调 WSAIoctl —— socket.ioctl() 不支持该命令。
+    成功返回 True；非 Windows 或失败返回 False。
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        ws2_32 = ctypes.WinDLL("ws2_32", use_last_error=True)
+        value = wintypes.DWORD(0)   # FALSE = 关闭该通知
+        returned = wintypes.DWORD(0)
+        rc = ws2_32.WSAIoctl(
+            ctypes.c_void_p(sock.fileno()),
+            _SIO_UDP_CONNRESET,
+            ctypes.byref(value), ctypes.sizeof(value),
+            None, 0,
+            ctypes.byref(returned), None, None,
+        )
+        return rc == 0
+    except Exception:
+        return False
 
 
 def _safe_qname(qname: str) -> str:
@@ -154,14 +195,11 @@ class PlainDNSServer:
             if family == socket.AF_INET6:
                 sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
             sock.bind((host, port))
-            if sys.platform == "win32":
-                try:
-                    sock.ioctl(socket.SIO_UDP_CONNRESET, False)
-                except (AttributeError, OSError, ValueError):
-                    try:
-                        sock.ioctl(0x58000001, False)
-                    except (AttributeError, OSError, ValueError):
-                        pass
+            if sys.platform == "win32" and not _disable_udp_connreset(sock):
+                logger.debug(
+                    "SIO_UDP_CONNRESET 抑制失败（%s:%d）：ICMP 端口不可达仍会"
+                    "触发 WSAECONNRESET，但已不再重建 transport", host, port,
+                )
             return sock
         except Exception:
             sock.close()
@@ -189,10 +227,19 @@ class PlainDNSServer:
             self.server._handle_query(data, addr, self.transport)
 
         def error_received(self, exc):
-            """UDP socket error callback - auto-recover on WSAECONNRESET."""
+            """UDP socket 错误回调。
+
+            WSAECONNRESET(10054) 只是「此前某次 sendto 收到 ICMP 端口不可达」
+            的回执通知，socket 本身仍可继续收发。旧实现在这里重建 transport，
+            重建窗口内到达的查询会被直接丢弃（日志里 10054 与
+            "transport recovered" 成对刷屏）。socket 层现已用
+            SIO_UDP_CONNRESET 抑制该通知；即便仍出现，也只降级为 debug 日志，
+            不再重建（重建只对真正损坏的 socket 有意义）。
+            """
+            if getattr(exc, "winerror", None) == 10054:
+                logger.debug("UDP ICMP 端口不可达（WSAECONNRESET），忽略: %s", exc)
+                return
             logger.warning("UDP 错误: %s", exc)
-            if sys.platform == "win32" and getattr(exc, 'winerror', None) == 10054:
-                asyncio.ensure_future(self.server._recover_udp_transport(self.transport))
 
     def _handle_query(self, data: bytes, addr: tuple, transport: asyncio.DatagramTransport):
         """处理 DNS 查询（异步执行，避免阻塞 UDP 接收）"""
@@ -852,14 +899,79 @@ class IterativeResolver:
             "queries": 0, "success": 0, "fail": 0,
             "bogus": 0, "insecure": 0, "secure": 0, "depth_exceeded": 0,
         }
+        # 「应答无签名且无法证明该域名未签名」告警的节流状态：
+        # 严格模式下这类丢弃可能每秒几十条，必须合并输出，否则日志被刷爆。
+        self._unknown_warn_last = 0.0
+        self._unknown_warn_merged = 0
         self._ns_ip_cache: Dict[str, List[str]] = {}
         # 已验证 zone 的 DNSKEY 缓存（避免每域名重复全链迭代流量）
         # 值: (rrset, 失效时间戳)，按缓存条目 TTL 失效，避免 DNSKEY 轮换后旧缓存致 bogus
         self._verified_zone_cache: Dict[str, tuple] = {}
+        # 区域权威服务器缓存：zone 名 -> (权威 IP 列表, 失效时间戳)
+        # 作用：CNAME 目标/同一 TLD 的后续查询不必再从根逐跳（实测一次
+        # www.baidu.com 会为 CNAME 目标重复走 root→com.→baidu.com）。
+        # 只缓存 referral 给出的 NS+glue（与解析器自身的 NS 缓存同源），TTL 取 NS TTL。
+        self._zone_ns_cache: Dict[str, tuple] = {}
+        # DS 响应缓存：zone 名 -> (响应, 失效时间戳)
+        # `_get_trusted_dnskey` 与 `_zone_signed_status` 会各查一次同一 zone 的 DS；
+        # 实测 www.baidu.com 的 DS(baidu.com) 被查了 3 次、每次 200ms+。
+        self._ds_cache: Dict[str, tuple] = {}
+        # 迭代查询是阻塞 socket 调用，统一交给 task_pool 的共享池 + 优先级闸门
+        # （等级 DNS > NDP > ARP），NTP/日志另有专属通道，互不排队。
 
     @property
     def stats(self) -> Dict[str, Any]:
         return dict(self._stats)
+
+    def _report_dnssec_drop(self, qname: str, reason: str, hint: str):
+        """节流输出「严格模式丢弃应答」告警
+
+        严格模式下这类丢弃可能每秒几十条：60 秒内只输出一条 warning，
+        其余同类事件降级为 debug；恢复输出时附带被合并的条数，避免刷爆日志。
+        """
+        now = time.monotonic()
+        if now - self._unknown_warn_last >= 60.0:
+            merged = self._unknown_warn_merged
+            self._unknown_warn_last = now
+            self._unknown_warn_merged = 0
+            suffix = f"（最近 60 秒同类共 {merged + 1} 次）" if merged else ""
+            logger.warning(
+                "DNSSEC 严格模式丢弃 %s%s：%s%s",
+                _safe_qname(qname), suffix, reason, hint,
+            )
+        else:
+            self._unknown_warn_merged += 1
+            logger.debug(
+                "DNSSEC 严格模式丢弃（已合并计数）: %s — %s",
+                _safe_qname(qname), reason,
+            )
+
+    def _report_unsigned_unknown(self, qname: str):
+        """应答既无签名、也无法证明「该域名本就未签名」→ 严格模式丢弃
+
+        用大白话说清楚：上游返回的应答既没有数字签名（RRSIG），也没有能证明
+        「这个域名本来就不在 DNSSEC 保护范围内」的否定证明（NSEC/NSEC3）。
+        既无法验证、也无法证明无需验证，严格模式就当作「可能被篡改」丢弃。
+        """
+        self._report_dnssec_drop(
+            qname,
+            reason=(
+                "应答没有签名(RRSIG)，也没有能证明「该域名本就未签名」的 "
+                "NSEC/NSEC3 记录，无法确认应答未被篡改。"
+            ),
+            hint="常见原因是所用上游不返回 DNSSEC 记录，可换用会下发 DNSSEC 记录的上游。",
+        )
+
+    def _report_dnssec_stripped(self, qname: str):
+        """该域名所在区已启用 DNSSEC，但应答完全没有签名 → 疑似签名被剥离"""
+        self._report_dnssec_drop(
+            qname,
+            reason=(
+                "该域名所在区域已启用 DNSSEC，但应答里完全没有数字签名(RRSIG)，"
+                "说明签名可能在传输途中被剥离，无法确认应答未被篡改。"
+            ),
+            hint="请检查链路是否存在 DNS 劫持/代理，或换用会下发 DNSSEC 记录的上游。",
+        )
 
     # ---------- 单跳查询（同步，to_thread 包装） ----------
 
@@ -878,27 +990,95 @@ class IterativeResolver:
 
     async def _query_servers(self, servers: List[str], qname: str, qtype: int,
                              rdclass: int = 1) -> Optional[dns.message.Message]:
-        """串行尝试服务器列表，返回第一个成功响应。"""
-        for ip in servers:
-            # A2（已降级 debug）：迭代过程日志——需查看时设 DEBUG 级
-            logger.debug("迭代查询: 向 %s 查询 %s type=%s",
-                         ip, _safe_qname(qname), dns.rdatatype.to_text(qtype))
-            try:
-                resp = await asyncio.wait_for(
-                    asyncio.to_thread(self._query_one, ip, qname, qtype, rdclass),
-                    timeout=self.timeout + 1.0,
+        """Hedged 查询：先发 1 台，STAGGER 秒内无响应再补发第 2 台
+
+        为什么不是固定并行 2 台：实测一次 www.baidu.com 解析发出 25 次查询，
+        几乎每条都打了两台（根/TLD/权威各 2 份），流量与线程占用直接翻倍，
+        而延迟没有收益（正常响应 30-250ms，取先回的那台即可）。
+
+        现在的策略：
+          - 先发第 1 台（同地址族优先）；
+          - 250ms 内没响应 → 补发第 2 台（Hedged，RFC 8305 风格）；
+          - 任一台失败 → 立即补发下一台；
+          - 任一台成功 → 取消其余，立即返回。
+        语义仍是「尝试到有响应为止」，只是常态下只发 1 份。
+        """
+        if not servers:
+            return None
+        # 地址族优先：本机 IPv6 可用时，先用同族的其它地址；同族耗尽才换另一族。
+        # （避免 referral/glue 的原始顺序导致 IPv6 可用时先打 IPv4 根或权威）
+        _prefer_v6 = bool(getattr(self, "_has_ipv6", False))
+        servers = sorted(
+            servers,
+            key=lambda ip: 0 if ((":" in str(ip)) == _prefer_v6) else 1,
+        )
+        # 共享池压力大时不再 hedge（只串行逐台），少占线程
+        stagger = 0.25 if get_pressure() < 0.5 else 3600.0
+        max_parallel = 2
+        tasks: Dict[asyncio.Task, str] = {}
+        idx = 0
+        try:
+            if idx < len(servers):
+                task = asyncio.ensure_future(
+                    self._query_one_async(servers[idx], qname, qtype, rdclass)
                 )
-                if resp is not None:
-                    logger.debug(
-                        "迭代查询: %s 响应 %s (rcode=%s, answer=%d, authority=%d)",
-                        ip, _safe_qname(qname), dns.rcode.to_text(resp.rcode()),
-                        len(resp.answer), len(resp.authority),
+                tasks[task] = servers[idx]
+                idx += 1
+
+            while tasks:
+                done, _ = await asyncio.wait(
+                    tasks.keys(), timeout=stagger,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in done:
+                    ip = tasks.pop(task)
+                    try:
+                        resp = task.result()
+                    except Exception:
+                        resp = None
+                    if resp is not None:
+                        logger.debug(
+                            "迭代查询: %s 响应 %s (rcode=%s, answer=%d, authority=%d)",
+                            ip, _safe_qname(qname), dns.rcode.to_text(resp.rcode()),
+                            len(resp.answer), len(resp.authority),
+                        )
+                        return resp
+                    logger.debug("迭代查询: %s 查询 %s 超时/失败，补发下一台",
+                                 ip, _safe_qname(qname))
+                    # 失败：立即补发下一台
+                    if idx < len(servers) and len(tasks) < max_parallel:
+                        nxt = asyncio.ensure_future(
+                            self._query_one_async(servers[idx], qname, qtype, rdclass)
+                        )
+                        tasks[nxt] = servers[idx]
+                        idx += 1
+                # STAGGER 超时且无完成：hedge 补发一台
+                if not done and idx < len(servers) and len(tasks) < max_parallel:
+                    logger.debug("迭代查询: %s 无响应 %.0fms，hedge 补发 %s",
+                                 _safe_qname(qname), stagger * 1000, servers[idx])
+                    nxt = asyncio.ensure_future(
+                        self._query_one_async(servers[idx], qname, qtype, rdclass)
                     )
-                    return resp
-            except Exception:
-                logger.debug("迭代查询: %s 查询 %s 超时/失败，尝试下一台", ip, _safe_qname(qname))
-                continue
-        return None
+                    tasks[nxt] = servers[idx]
+                    idx += 1
+            return None
+        finally:
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _query_one_async(self, ip: str, qname: str, qtype: int, rdclass: int):
+        """单台查询（带超时），供 _query_servers 并行调用
+
+        走 task_pool 的**共享池 + 优先级闸门**（等级 DNS，高于 NDP/ARP）：
+        迭代查询是阻塞 socket 调用，必须借线程执行；用优先级而不是默认
+        executor，避免缓存预刷新等大批并发把 NTP/日志等任务挤到队尾。
+        """
+        return await asyncio.wait_for(
+            run_blocking(TaskLevel.DNS, self._query_one, ip, qname, qtype, rdclass),
+            timeout=self.timeout + 1.0,
+        )
 
     # ---------- 下一跳服务器提取 ----------
 
@@ -916,18 +1096,42 @@ class IterativeResolver:
                 for rdata in rrset:
                     glue.setdefault(str(rrset.name).lower(), []).append(rdata.address)
         servers: List[str] = []
+        # 第一遍：有 glue / 有缓存的直接收集，缺 glue 的 NS 名单独列出
+        resolved: Dict[str, List[str]] = {}
+        missing: List[str] = []
         for ns in ns_names:
-            ips = glue.get(ns.lower())
+            lower = ns.lower()
+            ips = glue.get(lower)
             if not ips:
                 # M3 修复：读取带 TTL 的 NS IP 缓存（值 = (ips, expire_at)）
-                _cached = self._ns_ip_cache.get(ns.lower())
+                _cached = self._ns_ip_cache.get(lower)
                 if _cached:
                     _cached_ips, _expire_at = _cached
                     if time.time() < _expire_at:
                         ips = _cached_ips
-            if not ips:
-                ips = await self._resolve_ns_ip(ns)
-            servers.extend(ips)
+            if ips:
+                resolved[lower] = list(ips)
+            elif lower not in resolved and lower not in missing:
+                missing.append(lower)
+
+        # 第二遍：缺 glue 的 NS 并行解析（串行时每个 NS 都要独立跑一轮迭代，
+        # 实测 ns-open1/2/3.qq.com 各 ~350ms、合计 1s+；限并发避免查询风暴）
+        if missing:
+            _sem = asyncio.Semaphore(4)
+
+            async def _lookup(ns_name: str) -> tuple:
+                async with _sem:
+                    try:
+                        return ns_name, await self._resolve_ns_ip(ns_name)
+                    except Exception:
+                        return ns_name, []
+
+            for ns_name, ips in await asyncio.gather(*[_lookup(n) for n in missing]):
+                resolved[ns_name] = list(ips or [])
+
+        # 第三遍：按 ns_names 原始顺序组装（保持结果确定性）
+        for ns in ns_names:
+            servers.extend(resolved.get(ns.lower(), []))
         # 去重保序
         seen = set()
         uniq = []
@@ -1005,14 +1209,29 @@ class IterativeResolver:
             return None
         original_qname = qname  # CNAME 跟随会改变 qname，需在返回时复原 question
         servers: List[str] = list(self.root_servers)
+        # 优先从「最近已知区的权威」起跳：同一 TLD / CNAME 目标可省掉
+        # root→TLD 两跳（实测每次约 100-500ms）。DS 查询必须从父区起跳
+        # （DS 由父区权威持有），因此 _closest_zone_servers 对 DS 强制上移一级。
+        started_from_cache = False
+        _cached_start = self._closest_zone_servers(qname, qtype)
+        if _cached_start is not None:
+            servers, started_from_cache = _cached_start
         cname_targets: List[str] = []
         cname_chain: List[bytes] = []  # 中间跳 CNAME 响应 wire（供上层验签，防 target 篡改）
         for _hop in range(self.max_depth - depth):
             # A2（已降级 debug）：每跳过程日志——需查看时设 DEBUG 级
-            logger.debug("迭代解析 [跳%d/%d]: %s %s 候选服务器 %d 台",
+            logger.debug("迭代解析 [跳%d/%d]: %s %s 候选服务器 %d 台%s",
                          _hop + 1, self.max_depth, _safe_qname(qname),
-                         dns.rdatatype.to_text(qtype), len(servers))
+                         dns.rdatatype.to_text(qtype), len(servers),
+                         "（缓存区权威）" if started_from_cache else "")
             response = await self._query_servers(servers, qname, qtype, rdclass)
+            if response is None and started_from_cache:
+                # 缓存里的权威已失效/换 IP：回退到根重新走完整链路，功能不降级
+                logger.debug("缓存区权威不可达，回退根服务器重试: %s", _safe_qname(qname))
+                self._zone_ns_cache.clear()
+                servers = list(self.root_servers)
+                started_from_cache = False
+                response = await self._query_servers(servers, qname, qtype, rdclass)
             if response is None:
                 return None
             # 1. answer 段含目标类型 → 完成（返回前复原 question 为原始 qname）
@@ -1065,14 +1284,154 @@ class IterativeResolver:
                 if len(cname_targets) > 8:
                     return None
                 qname = str(cname)
-                servers = list(self.root_servers)
+                # CNAME 目标可能在别的 TLD：重新按目标名挑最近的已知区（可能没有）
+                started_from_cache = False
+                _cached = self._closest_zone_servers(qname, qtype)
+                if _cached is not None:
+                    servers, started_from_cache = _cached
+                else:
+                    servers = list(self.root_servers)
                 continue
             # 4. referral：authority NS → 下一级
             next_servers = await self._extract_next_servers(response)
             if not next_servers:
                 return None
+            # 缓存「子区 → 权威 IP」：同 TLD 的后续查询 / DS 查询可少走 1-2 跳。
+            # 只缓存「从根起跳」链路上的 referral——缓存起跳之后的更深 referral
+            # 未经完整链路，可信度更低，不写缓存。
+            if not started_from_cache:
+                self._cache_zone_servers(response, next_servers, qname)
             servers = next_servers
+            started_from_cache = False
         return None
+
+    def _closest_zone_servers(
+        self, qname: str, qtype: int,
+    ) -> Optional[tuple]:
+        """找 qname 最近已知区的权威服务器（用于跳过根/TLD 两跳）
+
+        安全约束：
+          - DS 查询必须由**父区**权威回答，因此从 qname.parent() 起找，
+            绝不能命中 qname 自身的区（否则会拿到 NODATA 而被误判 bogus）；
+          - 只使用 referral 缓存（带 TTL），过期即丢弃；命中后若该权威
+            不可达，_iterate 会清空缓存并回退到根，功能不降级。
+        """
+        try:
+            name = dns.name.from_text(qname)
+        except Exception:
+            return None
+        if qtype == dns.rdatatype.DS:
+            if name == dns.name.root:
+                return None
+            name = name.parent()
+        now = time.time()
+        while name != dns.name.root:
+            entry = self._zone_ns_cache.get(str(name).lower())
+            if entry is not None:
+                servers, expire_at = entry
+                if now < expire_at and servers:
+                    return list(servers), True
+                self._zone_ns_cache.pop(str(name).lower(), None)
+            name = name.parent()
+        return None
+
+    def _cache_zone_servers(self, response, servers: List[str], qname: str):
+        """把 referral 的「子区 → 权威 IP」写入缓存（TTL 取 NS rrset 的 TTL）
+
+        安全约束（防缓存投毒 —— 一条恶意 referral 不能污染无关区的缓存）：
+          1) 只接受 qname 的**祖先区**：否则查询 a.com 时伪造 bank.com 的
+             NS 就能把 bank.com 后续解析全部导向攻击者 IP（持续到 TTL 到期）；
+          2) TTL 上限 600s（缩短投毒窗口），下限 60s（避免频繁回根）；
+          3) 只缓存合法 IP（glue 可能含垃圾/畸形数据）。
+        """
+        try:
+            zone_name = None
+            best_ttl = 300.0
+            for rrset in response.authority:
+                if rrset.rdtype != dns.rdatatype.NS:
+                    continue
+                # referral 里可能有多个 NS owner，取最长的作为被委派的子区名
+                if zone_name is None or len(rrset.name) > len(zone_name):
+                    zone_name = rrset.name
+                    best_ttl = float(getattr(rrset, "ttl", 300) or 300)
+            if zone_name is None or zone_name == dns.name.root:
+                return
+            try:
+                if not dns.name.from_text(qname).is_subdomain(zone_name):
+                    logger.debug(
+                        "拒绝缓存非 qname 祖先区的 referral: %s（查询 %s）",
+                        _safe_qname(str(zone_name)), _safe_qname(qname),
+                    )
+                    return
+            except Exception:
+                return
+            clean_servers: List[str] = []
+            for ip in servers:
+                try:
+                    ipaddress.ip_address(str(ip).split("%")[0])
+                except ValueError:
+                    continue
+                clean_servers.append(str(ip))
+            if not clean_servers:
+                return
+            ttl = max(60.0, min(best_ttl, 600.0))
+            if len(self._zone_ns_cache) > 512:
+                self._zone_ns_cache.clear()
+            self._zone_ns_cache[str(zone_name).lower()] = (
+                clean_servers, time.time() + ttl,
+            )
+        except Exception:
+            pass
+
+    async def _iterate_ds_cached(self, zone_name) -> Optional[dns.message.Message]:
+        """DS 查询（带 zone 级缓存）
+
+        `_get_trusted_dnskey` 与 `_zone_signed_status` 会对同一 zone 各查一次
+        DS（实测 www.baidu.com 的 DS(baidu.com) 被查 3 次、每次 200ms+）。
+        这里按 zone 缓存响应：TTL 取响应里最小的 rrset TTL（60s-1h）；
+        失败也缓存 60s，避免对同一失败目标反复重试。
+        """
+        key = str(zone_name).lower()
+        entry = self._ds_cache.get(key)
+        if entry is not None:
+            resp, expire_at = entry
+            if time.time() < expire_at:
+                return resp
+            self._ds_cache.pop(key, None)
+        resp = await self._iterate(str(zone_name), dns.rdatatype.DS, 0)
+        ttl = 300.0
+        if resp is None:
+            ttl = 60.0
+        else:
+            try:
+                for rrset in list(resp.answer) + list(resp.authority):
+                    rttl = getattr(rrset, "ttl", None)
+                    if rttl:
+                        ttl = min(ttl, float(rttl))
+            except Exception:
+                pass
+        ttl = max(60.0, min(ttl, 3600.0))
+        if len(self._ds_cache) > 512:
+            self._ds_cache.clear()
+        self._ds_cache[key] = (resp, time.time() + ttl)
+        return resp
+
+    def _invalidate_zone_cache(self, qname: str):
+        """丢弃 qname 各级后缀的区域权威/DS 缓存
+
+        DNSSEC 判定异常（签名区无签名 / 无法证明未签名 / 链验证失败）时调用：
+        这条链路上拿到的 referral 与 DS 可能已被中间人操纵，不应再作为后续
+        查询的起跳点（否则错误会被缓存放大到 TTL 到期）。
+        """
+        try:
+            name = dns.name.from_text(qname)
+        except Exception:
+            return
+        while name != dns.name.root:
+            key = str(name).lower()
+            self._zone_ns_cache.pop(key, None)
+            self._ds_cache.pop(key, None)
+            name = name.parent()
 
     # ---------- DNSSEC 验证回调（全链自举） ----------
 
@@ -1166,6 +1525,16 @@ class IterativeResolver:
             logger.warning("DNSSEC 根区 DNSKEY 验证失败: %s", e)
             return None
         trusted[dns.name.root] = root_dnskey_rrset  # 含 ZSK，供后续验证子区 DS
+        # 根 DNSKEY 已验证：立即入缓存，避免每个新域名都重查一次 ". DNSKEY"
+        try:
+            if len(self._verified_zone_cache) > 512:
+                self._verified_zone_cache.clear()
+            self._verified_zone_cache["."] = (
+                root_dnskey_rrset,
+                time.time() + float(getattr(root_dnskey_rrset, "ttl", 3600) or 3600),
+            )
+        except Exception:
+            pass
 
         # 3. 逐级向下的祖先路径：TLD → ... → zone
         path = []
@@ -1176,8 +1545,13 @@ class IterativeResolver:
         path.reverse()
 
         for cur_zone in path:
-            # 3a. 查询 cur_zone 的 DS（由父区权威持有，父区 ZSK 签名）
-            ds_resp = await self._iterate(str(cur_zone), dns.rdatatype.DS, 0)
+            # 3a+3b 并行：DS 由父区权威持有、DNSKEY 由本区权威持有，两者互不依赖
+            # （3c 才用 DS 校验 DNSKEY），并发可以把这一级的两个 RTT 合成一个。
+            # 境内外 TLD 权威 RTT 常 200-300ms，这一项对首次解析很显著。
+            ds_resp, dnskey_resp = await asyncio.gather(
+                self._iterate_ds_cached(cur_zone),
+                self._iterate(str(cur_zone), dns.rdatatype.DNSKEY, 0),
+            )
             if ds_resp is None:
                 return None
             ds_rrset = None
@@ -1195,8 +1569,7 @@ class IterativeResolver:
             except (dns.dnssec.ValidationFailure, KeyError) as e:
                 logger.warning("DNSSEC DS 验证失败 %s: %s", _safe_qname(cur_zone), e)
                 return None
-            # 3b. 查询 cur_zone 的 DNSKEY
-            dnskey_resp = await self._iterate(str(cur_zone), dns.rdatatype.DNSKEY, 0)
+            # 3b. cur_zone 的 DNSKEY（已在上面的 gather 中并发取回）
             if dnskey_resp is None:
                 return None
             dnskey_rrset = self._extract_dnskey_rrset(dnskey_resp)
@@ -1228,10 +1601,20 @@ class IterativeResolver:
                 return None
             # 3e. 该级验证通过 → 信任整个 DNSKEY rrset（含 ZSK），作为下一级的信任来源
             trusted[cur_zone] = dnskey_rrset
+            # 同时缓存这一级：同一次查询里多个 signer（如 com. 与 baidu.com.）
+            # 会各自重做完整链条，逐级缓存后第二次直接命中（实测省 300-600ms）
+            try:
+                if len(self._verified_zone_cache) > 512:
+                    self._verified_zone_cache.clear()
+                self._verified_zone_cache[str(cur_zone).lower()] = (
+                    dnskey_rrset,
+                    time.time() + float(getattr(dnskey_rrset, "ttl", 3600) or 3600),
+                )
+            except Exception:
+                pass
 
         # 结果：zone 自身的 DNSKEY rrset（zone==root 时即第 2 步用根锚验证过的根密钥）
-        result_rrset = trusted.get(zone_name) or root_dnskey_rrset
-        # 缓存已验证 zone 的 DNSKEY（有界：超 512 条清空，避免内存膨胀；
+        result_rrset = trusted.get(zone_name) or root_dnskey_rrset        # 缓存已验证 zone 的 DNSKEY（有界：超 512 条清空，避免内存膨胀；
         # 失效时间 = 当前时间 + DNSKEY rrset TTL，DNSKEY 轮换后自动重新验证）
         if len(self._verified_zone_cache) > 512:
             self._verified_zone_cache.clear()
@@ -1481,7 +1864,7 @@ class IterativeResolver:
         visited: set = set()
         while n is not None and n != dns.name.root and n not in visited:
             visited.add(n)
-            ds_resp = await self._iterate(str(n), dns.rdatatype.DS, 0)
+            ds_resp = await self._iterate_ds_cached(n)
             if ds_resp is None:
                 return "unknown"
             # DS 存在 → 签名委托
@@ -1704,6 +2087,30 @@ class IterativeResolver:
         except Exception:
             return (None, time.monotonic() - t0)
 
+    async def warmup(self):
+        """启动预热：预取根 DNSKEY 与常用 TLD 的 DS/DNSKEY
+
+        首次解析任何域名都要现查 `. DNSKEY` + `<tld>. DS` + `<tld>. DNSKEY`；
+        TLD 权威多在境外（RTT 200-300ms），合计 400-600ms。
+        启动后在后台跑本方法，用户第一次访问时这些已在缓存里。
+        逐级串行执行（避免启动瞬间打出查询风暴）；失败只记 debug，不影响功能。
+        """
+        zones = [dns.name.root]
+        for tld in ("com.", "net.", "org.", "cn.", "io.", "co."):
+            try:
+                zones.append(dns.name.from_text(tld))
+            except Exception:
+                continue
+        for zone in zones:
+            try:
+                await self._get_trusted_dnskey(zone)
+            except Exception as e:
+                logger.debug("迭代预热 %s 失败: %s", zone, e)
+        logger.info(
+            "迭代解析预热完成: 已验证 zone %d 个（DNSKEY/DS 已缓存）",
+            len(self._verified_zone_cache),
+        )
+
     async def resolve(self, qname: str, qtype: int, rdclass: int = 1) -> Optional[dns.message.Message]:
         """迭代解析入口。返回最终响应 Message（含 RRSIG），失败返回 None。
 
@@ -1732,7 +2139,14 @@ class IterativeResolver:
             return None
 
     async def _resolve_verified(self, qname: str, qtype: int, rdclass: int) -> Optional[dns.message.Message]:
-        """resolve 的内部实现：迭代 + DNSSEC 严格验证（受外层 total_timeout 约束）。"""
+        """resolve 的内部实现：迭代 + DNSSEC 严格验证（受外层 total_timeout 约束）。
+
+        注：曾尝试"主链与 DNSSEC 链并行预取"（预取根/TLD/父区的 DS+DNSKEY），
+        实测反而更慢：baidu 1319→1498ms、qq 1852→2145ms。原因是预取与主链
+        访问同一批境外权威、共享同一个阻塞线程池，竞争成本大于重叠收益；
+        且 baidu.com/qq.com 这类未签名区预取是纯浪费。故保留串行（配合
+        DS/DNSKEY 并行 + DS 缓存 + 启动 warmup 已足够）。
+        """
         try:
             resp = await self._iterate(qname, qtype, 0, rdclass)
             if resp is None:
@@ -1771,19 +2185,17 @@ class IterativeResolver:
                 zone_status = await self._zone_signed_status(zone) if zone is not None else "unknown"
                 if zone_status == "secure":
                     self._stats["bogus"] += 1
-                    logger.warning(
-                        "DNSSEC 剥离攻击: %s 属签名区却无 RRSIG — 丢弃", _safe_qname(qname)
-                    )
+                    self._report_dnssec_stripped(qname)
+                    self._invalidate_zone_cache(qname)
                     return None
                 if zone_status == "insecure":
                     self._stats["insecure"] += 1
                     self._stats["success"] += 1
                     return resp
-                # unknown：无法证明未签名，严格模式保守丢弃
+                # unknown：既没有签名、也没有"该域名本就未签名"的证明 → 严格模式下丢弃
                 self._stats["bogus"] += 1
-                logger.warning(
-                    "DNSSEC 无法证明 %s 未签名（无 RRSIG 且无 NSEC 证明）— 严格模式丢弃", _safe_qname(qname)
-                )
+                self._report_unsigned_unknown(qname)
+                self._invalidate_zone_cache(qname)
                 return None
 
             # 对每个 signer 做链验证，收集可信 keys（{signer: DNSKEY RRset}）
@@ -1804,6 +2216,7 @@ class IterativeResolver:
                 if dnskey_rrset is None:
                     self._stats["bogus"] += 1
                     logger.warning("DNSSEC 链验证失败，拒绝 %s 的签名响应", _safe_qname(signer))
+                    self._invalidate_zone_cache(qname)
                     return None
                 trusted_keys[signer] = dnskey_rrset
 
@@ -1827,6 +2240,7 @@ class IterativeResolver:
                             self._stats["bogus"] += 1
                             logger.warning(
                                 "DNSSEC CNAME 链中间跳无签名（%s）: %s", zs, _safe_qname(rrset.name))
+                            self._invalidate_zone_cache(qname)
                             return None
                         continue  # 未签名区 CNAME 无签名是合法的
                     try:
@@ -1835,6 +2249,7 @@ class IterativeResolver:
                         self._stats["bogus"] += 1
                         logger.warning("DNSSEC CNAME 链中间跳签名验证失败 %s: %s",
                                        _safe_qname(rrset.name), e)
+                        self._invalidate_zone_cache(qname)
                         return None
                     # wildcard 检测（RFC 4035 §5.3.3）：该跳 CNAME RRset 的
                     # RRSIG labels < owner labels → wildcard 展开——需该跳响应

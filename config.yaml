@@ -8,15 +8,30 @@ server:
   doh:
     enabled: true
     host: 127.0.0.1              # IPv4 监听地址
-    port: 8443                  # DoH 端口
+    port: 443                  # DoH 端口
     path: /dns-query
     cert_path: certs/localhost.crt
     key_path: certs/localhost.key
+    # ------------------------------------------------------------
+    # 协议开关（降级链 h3 → h2 → h1.1；三者全关时回落 HTTP/1.1）
+    #   http1_1: HTTP/1.1 over TLS（ALPN=http/1.1）
+    #   http2  : HTTP/2 over TLS（ALPN=h2）
+    #            ⚠ Windows 11 原生"加密 DNS"客户端只支持 HTTP/2，
+    #              关闭此项会导致系统级 DoH 完全不可用（浏览器自带的
+    #              DoH 客户端不受影响）。
+    #   http3  : HTTP/3 over QUIC（UDP 与服务端口相同），需要 aioquic。
+    #            注意：Win11 原生客户端目前不支持 HTTP/3（Dnscache 没有
+    #            QUIC 实现），该开关只对支持 H3 的客户端生效。
+    # 客户端连接时按"它支持的最高协议"选择；服务端按上表广告能力。
+    protocols:
+      http1_1: true
+      http2: true
+      http3: true
     # IPv6 支持（同时监听 IPv6）
     ipv6:
       enabled: true
       host: ::1
-      port: 8443
+      port: 443
 
   # 本地 DoT 服务（DNS over TLS，RFC 7858）
   dot:
@@ -171,6 +186,10 @@ upstream:
 # ============================================================
 iterative:
   enabled: true            # 是否启用迭代解析上游（注册为上游参与优选）
+  # 迭代优先：true = 首波直接用根服务器迭代（完全不依赖第三方 DoH，
+  #   单查询通常 1-5s；超过首波预算 6s 后由加密上游兜底）；
+  #   false = 加密上游首波优先（25-100ms），迭代只做备用/兜底。
+  prefer: true
   # 根服务器列表（留空或省略则使用内置 IANA 根列表）
   root_servers: ["2001:7fd::1","2001:500:2f::f","2001:503:c27::2:30","193.0.14.129","192.5.5.241","192.58.128.30"]
   # 单跳查询超时（毫秒）
@@ -435,7 +454,9 @@ performance:
   max_concurrent_per_ip: 50 # 单 IP 最大并发查询数（127.0.0.1 和 ::1 除外）
   connection_pool_size: 1000 # 连接池大小（同时打开的上游连接数，每个 TCP 连接消耗 2-3 个句柄）
   memory_limit_mb: 768      # 内存软限制（MB）
-  cpu_core_limit: 0         # CPU 核心限制（0=自动=总核心数-1；手动设置如 4 表示最多用 4 核）
+  cpu_core_limit: 2         # CPU 核心限制（0=自动=总核心数-1；手动设置如 4 表示最多用 4 核）
+  # 说明：上面这行也决定「阻塞任务共享池」的线程数 = 核数 × 2
+  #   （DNS 迭代查询 / NDP / ARP 的阻塞调用共用）。想更省资源就把它调小。
   monitor_interval: 30      # 资源监控间隔（秒）
   aggressive_gc: true       # 低负载时主动 GC
   gc_interval: 60           # GC 触发间隔（秒）
@@ -451,3 +472,8 @@ performance:
   # ============================================================
   dot_max_connections: 200  # 本地DoT 最大并发 TCP 连接数
   doq_max_connections: 100  # 本地DoQ 最大 QUIC 连接数
+  # 本地DoH 最大并发客户端 TCP 连接数（HTTP/1.1 每连接串行复用，
+  # HTTP/2 每连接可承载多路请求；HTTP/3 走 QUIC/UDP，不受此项限制）。
+  # 注意与 max_concurrent 的区别：max_concurrent 限制「同时在处理的查询数」，
+  # 本项限制「客户端连接数」，防的是大量空连接/慢连接耗尽文件句柄。
+  doh_max_connections: 200

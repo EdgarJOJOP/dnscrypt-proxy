@@ -17,6 +17,7 @@ import logging
 import random
 from typing import Optional, Tuple
 
+from task_pool import TaskLevel, run_blocking
 logger = logging.getLogger("dns-proxy.arp")
 
 # ARP 嗅探：scapy 跨平台抓包（可选，需 libpcap/Npcap 驱动支持）
@@ -283,8 +284,8 @@ class ARPProtection:
                                            / inner_pkt)
                             except Exception:
                                 logger.debug("ARP 反制: NDP VXLAN 封装失败，走无标签发送")
-                        await _na_loop.run_in_executor(
-                            None,
+                        await run_blocking(
+                            TaskLevel.ARP,
                             lambda p=_na_pkt, i=_na_iface or "", n=_na_count, it=_na_inter: sendp(
                                 p, iface=i, verbose=False, count=n, inter=it),
                         )
@@ -324,11 +325,10 @@ class ARPProtection:
                         spoof_pkt = Ether(dst=dst_mac, src=_frame_src) / IP(dst=src_ip) / UDP(sport=4789, dport=4789) / VXLAN(vni=int(vlan_id)) / inner_pkt
                     except Exception:
                         pass
-                # sendp 外包 run_in_executor：scapy 的 inter 用 time.sleep 实现，
+                # sendp 外包线程池：scapy 的 inter 用 time.sleep 实现，
                 # 在事件循环内同步调用会阻塞 NDP 全部 task 与主循环（协程独立性修复）
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(
-                    None,
+                await run_blocking(
+                    TaskLevel.ARP,
                     lambda p=spoof_pkt, i=self._resolve_sendp_iface(): sendp(p, iface=i, verbose=False, count=count, inter=inter),
                 )
                 logger.warning("ARP 反制: 定向反击 %s (%s) -> %s x%d", src_ip, dst_mac, poison_mac, count)

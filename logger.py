@@ -13,6 +13,8 @@ from typing import Dict, Any, Optional
 from pathlib import Path
 from collections import deque
 
+from task_pool import run_log_io
+
 system_logger = logging.getLogger("dns-proxy.logger")
 
 
@@ -221,9 +223,10 @@ class RequestLogger:
             if size < self.max_log_size_bytes:
                 return
 
-            # 在 executor 中执行文件 IO，不阻塞事件循环
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, self._trim_file_sync, filepath)
+            # 日志裁剪走专属线程池：它在 DNS 查询的 await 链上
+            # （log → flush → trim），若与迭代查询共享优先级队列，
+            # 会形成「DNS 等日志、日志等线程」的死锁。
+            await run_log_io(self._trim_file_sync, filepath)
         except FileNotFoundError:
             pass
         except Exception as e:

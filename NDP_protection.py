@@ -40,6 +40,8 @@ from typing import Optional, List, Tuple, Dict, Callable, Any
 from collections import defaultdict
 from dataclasses import dataclass, field
 
+from task_pool import TaskLevel, run_blocking
+
 import socket
 
 logger = logging.getLogger("dns-proxy.ndp")
@@ -1920,7 +1922,7 @@ class NDPProtection:
                     return sniff(iface=_iface, filter="udp and (port 546 or port 547)", count=20, timeout=3.0,
                                  lfilter=lambda p: p.haslayer(DHCP6_Advertise) or p.haslayer(DHCP6_Reply),
                                  quiet=True)
-                pkts = await loop.run_in_executor(None, _capture)
+                pkts = await run_blocking(TaskLevel.NDP, _capture)
                 seen = set()
                 servers = []
                 for pkt in pkts:
@@ -1988,7 +1990,7 @@ class NDPProtection:
                     pass
 
             try:
-                await loop.run_in_executor(None, _send_ns_and_listen)
+                await run_blocking(TaskLevel.NDP, _send_ns_and_listen)
             except Exception as e:
                 logger.debug("NDP 防护 [T2]: scapy NS 探测异常: %s", e)
             if result:
@@ -2742,7 +2744,7 @@ class NDPProtection:
                              p.haslayer(ICMPv6ND_RA) or p.haslayer(ICMPv6ND_Redirect) or p.haslayer(ICMPv6Error)),
                          quiet=True)
         try:
-            pkts = await loop.run_in_executor(None, _capture)
+            pkts = await run_blocking(TaskLevel.NDP, _capture)
         except Exception as e:
             logger.debug("NDP 防护: sniff 失败: %s", e)
             return {"t2_ns": [], "t3_ra": [], "t4_dad": [], "t6_redirect": []}
@@ -3157,9 +3159,10 @@ class NDPProtection:
                             except Exception:
                                 pass
                         for _ in range(count):
-                            # sendp 外包 executor：scapy 构造/发送在事件循环内同步执行会阻塞 ARP 侧协程（对称加固）
-                            await asyncio.get_event_loop().run_in_executor(
-                                None, lambda p=pkt, i=send_iface: sendp(p, iface=i, verbose=False))
+                            # sendp 外包线程池：scapy 构造/发送在事件循环内同步执行会阻塞 ARP 侧协程（对称加固）
+                            await run_blocking(
+                                TaskLevel.NDP,
+                                lambda p=pkt, i=send_iface: sendp(p, iface=i, verbose=False))
                             if inter > 0:
                                 await asyncio.sleep(inter)
                         log_target = f"定向 {dst_mac}" if dst_mac != "ff:ff:ff:ff:ff:ff" else "广播"
