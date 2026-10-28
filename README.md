@@ -12,11 +12,11 @@
 
 新增自动提权为管理员和root，如果不给，可能只影响arp防护功能。
 
-服务器部署记得在配置文件中记得关闭arp_protection和ndp_protection(云服务器路由的arp表和ndp表有防火墙不支持密集毫秒ping)。
+**注意：** 服务器部署记得在配置文件中记得关闭arp_protection和ndp_protection(云服务器路由的arp表和ndp表有防火墙不支持密集毫秒ping)。
 
 ## 1.默认开启根服务器进行迭代解析域名真实ip（根→TLD→权威 + DNSSEC 严格验证，与 "上游优选配置"一起参与优选）：
 
-优点：速度非常快(3-20ms)，拥有全供应链验证验证防止中间人进行投毒，优先使用ipv6北京主根服务器和其它地域根服务器，响应快的同时安全也完整保证。
+优点：首次访问网站域名和所需的其它域名后使用缓存+主动预刷新缓存，获取速度非常快(3-20ms)，拥有全供应链验证验证防止中间人进行投毒，优先使用ipv6北京主根服务器和其它地域根服务器进行获取，响应快的同时安全也完整保证全访问链可能出现的供应链投毒问题。
 
 下方配置文件中的配置片段就是控制使用中国境内(包括台湾等)根服务器的配置项里面已经完整集成和说明使用方式和配置参数含义，开启状态下默认进行DNSSEC 供应链严格验证，其中在根服务器网址(root-servers.net)中可以完整使用优先最近任播ip地址的dns解析，也就是使用ipv4和ipv6的根ip会被自动引导到中国境内最近的服务器上，也就是内网响应级别(3-20ms)，然后进行迭代解析出域名真实ip。
 
@@ -161,6 +161,13 @@ linux上就简单了。。。。。。。
 
 
 <img width="833" height="457" alt="图片" src="https://github.com/user-attachments/assets/9aa0cbee-0e6c-4913-bb14-b7dac47b18ab" />
+
+第二步：
+<img width="525" height="358" alt="图片" src="https://github.com/user-attachments/assets/9571d242-ed12-417b-aaca-b60b7dcbd414" />
+
+第三步：
+<img width="522" height="389" alt="图片" src="https://github.com/user-attachments/assets/12079fd5-46e1-4f23-bd3f-4f788087cb7c" />
+
 
 为什么不用单个加密dns？
 答：单个加密dns不支持全链路tls加密非常容易被中间人攻击，网卡加载网页缓慢或直接加载不了都是因为被中间人攻击。
