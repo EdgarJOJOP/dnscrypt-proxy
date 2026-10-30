@@ -267,7 +267,10 @@ filter:
     #       日志里的「远程:N」只统计下面未注释的条目数量。
     - https://gh-proxy.com/https://github.com/hululu1068/AdGuard-Rule/blob/main/rule/domain.txt
     #- https://cdn.jsdelivr.net/gh/hululu1068/AdGuard-Rule@main/rule/domain.txt
-    - https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/pro.txt
+    # 这个最全但是玩某些游戏时容易卡界面所以注释掉
+    #- https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/pro.txt
+    # 这个很有用防止黑客攻击的，但是拦截规则很大
+    #- https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/tif.txt
   update_interval: 24
   # 是否拦截后返回 NXDOMAIN
   block_nxdomain: true
