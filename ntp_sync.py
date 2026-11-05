@@ -968,12 +968,98 @@ def check_system_time_vs_ntp(min_delay: bool = True) -> Tuple[bool, float]:
 
 # ======================== 异步接口 ========================
 
+class _NtpUdpProtocol(asyncio.DatagramProtocol):
+    """单次 NTP 查询的数据报协议：收到应答即完成 future
+
+    配合 ``_query_ntp_server_async``：纯 asyncio 收发，等待期间不占工作线程
+    （旧实现是同步 socket 包在 run_in_executor 里，线程被独占）。
+    """
+
+    __slots__ = ("future", "transport")
+
+    def __init__(self):
+        self.future: asyncio.Future = asyncio.get_running_loop().create_future()
+        self.transport = None
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def datagram_received(self, data: bytes, addr):
+        if not self.future.done():
+            self.future.set_result(data)
+
+    def error_received(self, exc):
+        if not self.future.done():
+            self.future.set_exception(exc)
+
+    def connection_lost(self, exc):
+        if not self.future.done():
+            self.future.set_exception(exc or ConnectionError("datagram closed"))
+
+
+async def _query_ntp_server_async(
+    server: str, timeout: float = NTP_TIMEOUT
+) -> Optional[Tuple[float, float, float]]:
+    """向单个 NTP 服务器发送查询（纯协程 UDP，不占线程）
+
+    返回值与同步版 ``_query_ntp_server`` 完全一致：
+    (UNIX 时间戳, 延迟秒数, 收到应答那一刻的本地墙钟时刻)。
+    NTP 报文与解析逻辑也保持一致（应答 transmit timestamp 在 40..48 字节）。
+    """
+    transport = None
+    protocol = None
+    try:
+        loop = asyncio.get_running_loop()
+        transport, protocol = await loop.create_datagram_endpoint(
+            _NtpUdpProtocol,
+            remote_addr=(server, NTP_PORT),
+        )
+        packet = bytearray(NTP_PACKET_SIZE)
+        packet[0] = NTP_LI_VN_MODE
+        t_send = time.monotonic()
+        transport.sendto(bytes(packet))
+        data = await asyncio.wait_for(protocol.future, timeout=timeout)
+        t_recv = time.monotonic()
+        t_recv_wall = time.time()   # 收到应答那一刻的本地墙钟时间（算偏差必须用它）
+        delay = t_recv - t_send
+
+        if len(data) < 48:
+            logger.debug("NTP 服务器 %s 返回数据过短: %d 字节", server, len(data))
+            return None
+        ntp_sec = struct.unpack("!I", data[40:44])[0]
+        ntp_frac = struct.unpack("!I", data[44:48])[0]
+        return _ntp_timestamp_to_unix(ntp_sec, ntp_frac), delay, t_recv_wall
+    except asyncio.TimeoutError:
+        logger.debug("NTP 服务器 %s 超时", server)
+        return None
+    except asyncio.CancelledError:
+        raise
+    except OSError as e:
+        logger.debug("NTP 服务器 %s 连接失败: %s", server, e)
+        return None
+    except Exception as e:
+        logger.debug("NTP 服务器 %s 解析失败: %s", server, e)
+        return None
+    finally:
+        if protocol is not None and not protocol.future.done():
+            protocol.future.cancel()
+        if transport is not None:
+            try:
+                transport.close()
+            except Exception:
+                pass
+
+
 async def query_ntp_server_async(server: str, timeout: float = NTP_TIMEOUT,
                                   loop=None) -> Optional[Tuple[float, float, float]]:
-    """异步查询单个 NTP 服务器（走 NTP 专属线程池，不与 DNS 查询排队）"""
-    if loop is None:
-        loop = asyncio.get_event_loop()
-    return await run_ntp(_query_ntp_server, server, timeout)
+    """异步查询单个 NTP 服务器（纯协程 UDP）
+
+    校时一次要查 4-9 台服务器，这是 NTP 链路上的高频部分；
+    改成原生 asyncio 后等待应答时既不占线程也不占 CPU。
+    （真正"设置系统时间"那一步仍走 run_ntp：它要跑 w32tm/chronyc 等
+     外部命令，属低频路径，且 Linux 侧有 7 种回退方式。）
+    """
+    return await _query_ntp_server_async(server, timeout)
 
 
 async def _query_server_best(

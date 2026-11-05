@@ -16,6 +16,43 @@ import asyncio
 import logging
 import time
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import parse_qsl, urlsplit
+
+# ---------------------------------------------------------------------------
+# sniffio 兜底（必须在 import httpx 之前）
+#
+# 本机没装 sniffio（anyio 的可选依赖），而 anyio 会在**请求热路径**上反复执行
+# `import sniffio`：失败不会写入 sys.modules，于是**每个请求**都要重新走
+# importlib._find_and_load → find_spec → 文件系统 stat。Windows 上每次约 0.3ms，
+# 且发生在持有 GIL 的同步代码里，无法与其它协程并发 —— 实测 3 秒压测触发
+# 7632 次失败 import、占 40% CPU，把 DoH 并发吞吐从 ~1500 压到 ~120。
+#
+# 这里注入一个最小实现到 sys.modules，让后续 `import sniffio` 直接命中缓存。
+# 一旦环境里真正装了 sniffio，本段自动跳过。
+try:  # pragma: no cover
+    import sniffio  # noqa: F401
+except ImportError:  # pragma: no cover
+    import sys as _sys
+    import types as _types
+
+    class _AsyncLibraryNotFoundError(RuntimeError):
+        """对应 sniffio.AsyncLibraryNotFoundError"""
+
+    def _current_async_library() -> str:
+        """本进程只跑 asyncio，直接返回 'asyncio'"""
+        import asyncio as _asyncio
+        try:
+            _asyncio.get_running_loop()
+        except RuntimeError:
+            raise _AsyncLibraryNotFoundError("no async library is running")
+        return "asyncio"
+
+    _sniffio_stub = _types.ModuleType("sniffio")
+    _sniffio_stub.__version__ = "0.0.0+stub"
+    _sniffio_stub.AsyncLibraryNotFoundError = _AsyncLibraryNotFoundError
+    _sniffio_stub.current_async_library = _current_async_library
+    _sys.modules.setdefault("sniffio", _sniffio_stub)
+# ---------------------------------------------------------------------------
 
 from aiohttp import web
 
@@ -183,6 +220,7 @@ class DoHFrontend:
         internal_token: str = "",
         forward_timeout: float = 30.0,
         max_connections: int = 200,
+        handler=None,
     ):
         self.host = host
         self.port = port
@@ -192,6 +230,9 @@ class DoHFrontend:
         self.cert_path = cert_path
         self.key_path = key_path
         self.doh_path = doh_path
+        # handler 是 DoHRequestHandler：前端直接把请求交给它处理，
+        # 不再经 httpx 转发到内部明文站点（省掉一次完整 HTTP 往返）。
+        self._handler = handler
         self.internal_host = internal_host
         self.internal_port = internal_port
         self.protocols = protocols
@@ -823,8 +864,20 @@ class DoHFrontend:
         body: bytes,
         peer_ip: str,
     ) -> Tuple[int, List[Tuple[str, str]], bytes]:
-        """把 DoH 请求转发给内部明文 aiohttp，返回 (状态码, 响应头, 响应体)"""
-        normalized_path = path or self.doh_path
+        """处理前端收到的请求，返回 (状态码, 响应头, 响应体)
+
+        原实现经 httpx 把请求转发到内部明文 aiohttp 站点：完整的一次 HTTP
+        请求/响应往返。cProfile 显示它占 DoH 请求总耗时约 74%（`forward` 的
+        cumtime 3.85s / 总 5.22s），是 DoH 并发吞吐的主要瓶颈。
+
+        现在直接调用 `DoHRequestHandler.process_http_request()`：跳过进程内的
+        HTTP 解析与连接池，返回值仍是 (status, headers, body)，
+        因此 `_serve_h11` / `_serve_h2` 的调用方**无需任何改动**。
+
+        handler 为空时回退到原 httpx 路径（用于内部站点自检/调试）。
+        """
+        split = urlsplit(path or self.doh_path)
+        normalized_path = split.path or self.doh_path
         # 只接受本服务配置的 DoH 路径（防止把目标拼成绝对 URL 或塞入控制字符）
         if (
             not normalized_path.startswith(self.doh_path)
@@ -836,6 +889,30 @@ class DoHFrontend:
         if len(body) > FRONTEND_MAX_BODY:
             return 413, [("content-type", "text/plain; charset=utf-8")], b"request body too large"
 
+        handler = self._handler
+        if handler is not None:
+            query: Dict[str, str] = {}
+            for k, v in parse_qsl(split.query, keep_blank_values=True):
+                query.setdefault(k, v)
+            hdrs: Dict[str, str] = {}
+            for key, value in headers:
+                hdrs.setdefault(key.lower(), value)
+            try:
+                resp = await handler.process_http_request(
+                    (method or "POST").upper(), normalized_path, query, hdrs,
+                    body, peer_ip)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.debug("DoH 前端处理异常（%s）: %s", peer_ip, e)
+                return 500, [("content-type", "text/plain; charset=utf-8")], b"internal error"
+            resp_headers = [
+                (k.lower(), v) for k, v in resp.headers.items()
+                if k.lower() in FORWARD_RESPONSE_HEADERS
+            ]
+            return resp.status, resp_headers, (resp.body or b"")
+
+        # ---- 回退：原有 httpx 转发（handler 未注入时） ----
         forward_headers: Dict[str, str] = {}
         for key, value in headers:
             lowered = key.lower()
@@ -1172,98 +1249,136 @@ class DoHServer:
             return web.Response(status=403, text="forbidden")
         return None
 
+    # ======================== 与传输无关的处理入口 ========================
+
+    async def process_http_request(
+        self,
+        method: str,
+        path: str,
+        query: Dict[str, str],
+        headers: Dict[str, str],
+        body: bytes,
+        client_ip: str,
+    ) -> web.Response:
+        """处理一个 DoH HTTP 请求（不依赖 ``web.Request``）
+
+        两个调用方：
+          - TLS/H3 前端（``DoHFrontend``）：直接调用，**跳过内部 HTTP 转发**
+            （省掉 httpx + 一次 aiohttp 请求/响应往返，实测占 DoH 总耗时 ~74%）
+          - 内部明文站点（``handle_get`` / ``handle_post``）：校验 token 后调用，
+            行为与前端路径完全一致
+
+        参数：
+            method: "GET" / "POST"（大写）
+            path: 请求路径（形如 ``/dns-query``）
+            query: 查询参数（已解码，同名取第一个）
+            headers: 请求头（键全小写）
+            body: POST 的 DNS wire 报文
+            client_ip: 客户端 IP（前端已知对端地址；内部站点经 X-Forwarded-For 还原）
+        """
+        if not path.startswith(self.doh_path) or any(
+                ch in path for ch in ("\r", "\n", "\0")):
+            return web.Response(status=400, text="invalid request target")
+
+        if method == "GET":
+            dns_param = query.get("dns")
+            if dns_param:
+                try:
+                    padding = 4 - (len(dns_param) % 4)
+                    if padding != 4:
+                        dns_param += "=" * padding
+                    wire_data = base64.urlsafe_b64decode(dns_param)
+                except Exception:
+                    return web.Response(status=400, text="无效的 base64url 编码")
+                if not wire_data or len(wire_data) < 12:
+                    return web.Response(status=400, text="DNS 消息长度不足")
+                return await self._handle_dns_query(wire_data, client_ip, "wire")
+
+            name_param = query.get("name")
+            if name_param:
+                return await self._handle_json_query(
+                    name_param,
+                    query.get("type", "A"),
+                    query.get("cd", "0") == "1",
+                    client_ip,
+                )
+
+            # 无法识别 → 根据 Accept 返回合适格式的帮助信息
+            accept = headers.get("accept", "")
+            if "application/dns-message" in accept:
+                return web.Response(status=400, text="缺少 dns 参数")
+            return web.Response(
+                status=400,
+                content_type="application/json",
+                text='{"error":"缺少参数","usage":{"wire_format":"?dns=<base64url>","json_api":"?name=<domain>&type=<record_type>"}}',
+            )
+
+        if method == "POST":
+            content_type = headers.get("content-type", "").split(";")[0].strip().lower()
+            if content_type not in ("application/dns-message", "application/octet-stream"):
+                accept = headers.get("accept", "")
+                if "application/dns-message" not in accept:
+                    return web.json_response(
+                        {"error": "不支持的 Content-Type",
+                         "supported": "application/dns-message"},
+                        status=415,
+                    )
+                return web.Response(status=415, text="需要 Content-Type: application/dns-message")
+            if not body or len(body) < 12:
+                return web.Response(status=400, text="空请求体或无效长度")
+            return await self._handle_dns_query(body, client_ip, "wire")
+
+        return web.Response(status=405, text="method not allowed")
+
     # ======================== GET 处理（双格式自适应） ========================
 
     async def handle_get(self, request: web.Request) -> web.Response:
-        """
-        GET 请求 — 自动适配两种 DoH 格式:
+        """GET（内部站点入口）— 只做 token 校验，随后交给统一入口
 
-        1. Wire Format (RFC 8484):
-           ?dns=<base64url 编码的 DNS 查询>
-
-        2. JSON API (Google DNS over HTTPS):
-           ?name=example.com&type=A&cd=0
+        真正的格式解析（?dns= / ?name=）在 process_http_request 里，前端直接
+        调用同一个函数，两条路径的行为因此完全一致。
         """
         rejected = self._check_internal_token(request)
         if rejected is not None:
             return rejected
-
-        dns_param = request.query.get("dns")
-        name_param = request.query.get("name")
-
-        # 格式1: Wire Format — ?dns=base64url
-        if dns_param:
-            try:
-                padding = 4 - (len(dns_param) % 4)
-                if padding != 4:
-                    dns_param += "=" * padding
-                wire_data = base64.urlsafe_b64decode(dns_param)
-            except Exception:
-                return web.Response(status=400, text="无效的 base64url 编码")
-            if not wire_data or len(wire_data) < 12:
-                return web.Response(status=400, text="DNS 消息长度不足")
-            return await self._handle_dns_query(wire_data, request, "wire")
-
-        # 格式2: JSON API — ?name=example.com&type=A
-        if name_param:
-            return await self._handle_json_query(request, name_param)
-
-        # 无法识别 → 根据 Accept 返回合适格式的帮助信息
-        accept = request.headers.get("Accept", "")
-        if "application/dns-message" in accept:
-            return web.Response(status=400, text="缺少 dns 参数")
-        return web.Response(
-            status=400,
-            content_type="application/json",
-            text='{"error":"缺少参数","usage":{"wire_format":"?dns=<base64url>","json_api":"?name=<domain>&type=<record_type>"}}',
-        )
+        query = {k: request.query.get(k) for k in ("dns", "name", "type", "cd")}
+        headers = {"accept": request.headers.get("Accept", "")}
+        return await self.process_http_request(
+            "GET", request.path, query, headers, b"", self._client_ip(request))
 
     # ======================== POST 处理（Wire Format 专有） ========================
 
     async def handle_post(self, request: web.Request) -> web.Response:
-        """
-        POST 请求 — Wire Format (RFC 8484):
-        body = application/dns-message
-        """
+        """POST（内部站点入口）— 只做 token 校验与读体，随后交给统一入口"""
         rejected = self._check_internal_token(request)
         if rejected is not None:
             return rejected
 
-        content_type = request.content_type or ""
-        if content_type not in (
-            "application/dns-message",
-            "application/octet-stream",
-        ):
-            # 如果 Accept 是 JSON，返回 JSON 错误
-            accept = request.headers.get("Accept", "")
-            if "application/dns-message" not in accept:
-                return web.json_response(
-                    {"error": "不支持的 Content-Type", "supported": "application/dns-message"},
-                    status=415,
-                )
-            return web.Response(status=415, text="需要 Content-Type: application/dns-message")
-
+        headers = {
+            "content-type": request.headers.get("Content-Type", ""),
+            "accept": request.headers.get("Accept", ""),
+        }
         try:
-            wire_data = await request.read()
+            body = await request.read()
         except (ConnectionResetError, ConnectionAbortedError,
                 BrokenPipeError, ConnectionError) as e:
             # 客户端在请求体发完前断开（浏览器重发/切页）：不是服务端错误，
             # 由中间件兜底会再收到一次，这里提前收尾避免多余的 ERROR+traceback。
             logger.debug("DoH POST 请求体读取中断（客户端断开）: %s", e)
             return web.Response(status=499)
-        if not wire_data or len(wire_data) < 12:
-            return web.Response(status=400, text="空请求体或无效长度")
-        return await self._handle_dns_query(wire_data, request, "wire")
+        return await self.process_http_request(
+            "POST", request.path, {}, headers, body, self._client_ip(request))
 
     # ======================== JSON API 查询 ========================
 
     async def _handle_json_query(
-        self, request: web.Request, name: str
+        self, name: str, qtype_str: str = "A", cd_flag: bool = False,
+        client_ip: str = "unknown",
     ) -> web.Response:
-        """处理 JSON API 格式的 DNS 查询"""
-        qtype_str = request.query.get("type", "A")
-        cd_flag = request.query.get("cd", "0") == "1"
+        """处理 JSON API 格式的 DNS 查询
 
+        参数化（不再依赖 web.Request）：前端（TLS/H3）与内部站点都调用它。
+        """
         try:
             qtype = dns.rdatatype.from_text(qtype_str)
         except Exception:
@@ -1282,21 +1397,20 @@ class DoHServer:
                 {"Status": 2, "Comment": f"无效的域名: {name}"}
             )
 
-        client_ip = self._client_ip(request)
         await self._qps_limiter.acquire()  # QPS 限速（所有客户端）
         if not self._is_localhost(client_ip):
             sem = await self._get_per_ip_semaphore(client_ip)
             async with sem:
                 async with self._concurrency_semaphore:
-                    json_result = await self._process_json_query(wire_data, request)
+                    json_result = await self._process_json_query(wire_data, client_ip)
         else:
             async with self._concurrency_semaphore:
-                json_result = await self._process_json_query(wire_data, request)
+                json_result = await self._process_json_query(wire_data, client_ip)
 
         return web.json_response(json_result)
 
     async def _process_json_query(
-        self, wire_data: bytes, request: web.Request
+        self, wire_data: bytes, client_ip: str = "unknown"
     ) -> dict:
         """处理 DNS 查询并返回 JSON 格式结果"""
         result = {
@@ -1537,18 +1651,20 @@ class DoHServer:
     # ======================== Wire Format 查询 ========================
 
     async def _handle_dns_query(
-        self, wire_data: bytes, request: web.Request, response_format: str = "wire"
+        self, wire_data: bytes, client_ip: str, response_format: str = "wire"
     ) -> web.Response:
-        """处理 DNS 查询（Wire Format）- 按 response_format 返回"""
-        client_ip = self._client_ip(request)
+        """处理 DNS 查询（Wire Format）- 按 response_format 返回
+
+        参数化（不再依赖 web.Request）：前端（TLS/H3）与内部站点都调用它。
+        """
         await self._qps_limiter.acquire()  # QPS 限速（所有客户端）
         if not self._is_localhost(client_ip):
             sem = await self._get_per_ip_semaphore(client_ip)
             async with sem:
                 async with self._concurrency_semaphore:
-                    return await self._process_query(wire_data, request, response_format)
+                    return await self._process_query(wire_data, client_ip, response_format)
         async with self._concurrency_semaphore:
-            return await self._process_query(wire_data, request, response_format)
+            return await self._process_query(wire_data, client_ip, response_format)
 
     def _make_response(self, data: bytes, fmt: str = "wire",
                     query: Optional[dns.message.Message] = None) -> web.Response:
@@ -1561,10 +1677,9 @@ class DoHServer:
         return web.Response(body=data, content_type="application/dns-message")
 
     async def _process_query(
-        self, wire_data: bytes, request: web.Request, response_format: str = "wire"
+        self, wire_data: bytes, client_ip: str, response_format: str = "wire"
     ) -> web.Response:
         """DNS 查询处理（含缓存、过滤、DNSSEC 验证、自定义 hosts）"""
-        client_ip = self._client_ip(request)
         response_wire: Optional[bytes] = None
         upstream = ""
         block_reason = ""
@@ -1893,6 +2008,9 @@ class DoHServer:
             max_connections=int(
                 getattr(self.config, "doh_max_connections", 200) or 200
             ),
+            # 把自身注入前端：前端直接调用 process_http_request()，
+            # 不再经 httpx 转发到内部明文站点（省掉一次完整 HTTP 往返）
+            handler=self,
         )
         try:
             await self._frontend.start()

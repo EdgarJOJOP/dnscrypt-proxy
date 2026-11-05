@@ -491,16 +491,6 @@ class ResourceOptimizer:
 
 
 
-        try:
-
-            await self.resolver_manager.close_idle_connections()
-
-        except Exception:
-
-            pass
-
-
-
         if self.config.aggressive_gc:
 
             gc.collect(generation=2)
@@ -511,13 +501,72 @@ class ResourceOptimizer:
 
         logger.info("内存降低操作完成")
 
+    def _dump_memory_profile(self, tag: str = "") -> None:
+        """内存超限时打印一次对象构成 —— 把"内存高"变成可定位的证据
+
+        用 ``gc.get_objects()`` 按类型统计「浅大小 + 对象数」，**并统计协程/Task
+        的来源**（``cr_code.co_qualname``）。只在触发激进优化时执行一次（约 1s）。
+        协程/Task 的数量与来源是泄漏的关键：浅大小只有几十 MB 而 RSS 到 GB 级时，
+        基本都是"大量挂起协程各自持有 socket/transport/buffer"。
+        """
+        try:
+            import sys as _sys
+            import types as _types
+            counts = {}
+            sizes = {}
+            coro_src = {}
+            task_src = {}
+            for obj in gc.get_objects():
+                tn = type(obj).__name__
+                counts[tn] = counts.get(tn, 0) + 1
+                try:
+                    sizes[tn] = sizes.get(tn, 0) + _sys.getsizeof(obj)
+                except Exception:
+                    pass
+                try:
+                    if isinstance(obj, _types.CoroutineType):
+                        qn = obj.cr_code.co_qualname
+                        coro_src[qn] = coro_src.get(qn, 0) + 1
+                    elif isinstance(obj, asyncio.Task):
+                        c = obj.get_coro()
+                        qn = getattr(getattr(c, "cr_code", None), "co_qualname", "?")
+                        task_src[qn] = task_src.get(qn, 0) + 1
+                except Exception:
+                    pass
+            total_mb = sum(sizes.values()) / 1048576.0
+            top = sorted(sizes.items(), key=lambda kv: kv[1], reverse=True)[:12]
+            logger.warning(
+                "内存构成%s：GC 对象 %d 个 / 浅大小合计 %.0fMB；Top: %s",
+                f"[{tag}]" if tag else "",
+                sum(counts.values()),
+                total_mb,
+                ", ".join(
+                    f"{n}={s / 1048576.0:.1f}MB×{counts.get(n, 0)}" for n, s in top
+                ),
+            )
+            top_coro = sorted(coro_src.items(), key=lambda kv: kv[1], reverse=True)[:6]
+            top_task = sorted(task_src.items(), key=lambda kv: kv[1], reverse=True)[:6]
+            logger.warning(
+                "  协程来源(coroutine=%d) Top: %s",
+                counts.get("coroutine", 0),
+                ", ".join(f"{n}={c}" for n, c in top_coro) or "无",
+            )
+            logger.warning(
+                "  Task来源(Task=%d) Top: %s",
+                counts.get("Task", 0),
+                ", ".join(f"{n}={c}" for n, c in top_task) or "无",
+            )
+        except Exception as e:
+            logger.debug("内存构成统计失败: %s", e)
+
     async def _critical_reduce_memory(self):
 
 
 
         """超过 97% 阈值时的激进内存压缩 — 含全量撤离+重建"""
 
-
+        # 内存超限时先打印一次「到底是谁占了内存」——把"内存高"变成可定位证据
+        self._dump_memory_profile("激进优化前")
 
         if self.config.cache_enabled:
 

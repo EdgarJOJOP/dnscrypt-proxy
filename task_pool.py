@@ -2,19 +2,24 @@
 
 背景
 ----
-迭代 DNS 查询（``dns.query.udp``）、NTP 校时（socket + 设置系统时间）、
-NDP/ARP 的 scapy 抓包发包、日志文件裁剪都是**阻塞调用**，必须借线程执行。
-CPython 的 asyncio 只有一个默认 executor（``min(32, cpu+4)`` 个线程），
-一旦迭代查询把它占满，其它任务只能在队列里排队（实测可延迟近 1 秒）。
+目前仍需要借线程执行的只剩：**设置系统时间的外部命令**（w32tm / chronyc /
+ntpdate 等，低频）、**NDP/ARP 的 scapy 抓包发包**（Windows Npcap 是同步
+API，物理上无法协程化）、**日志文件裁剪**（大量文件 IO）。
+
+已经改为纯协程、**不再进本模块**的：
+  - 迭代 DNS 查询（``create_datagram_endpoint``，见 plain_dns_server）
+  - NTP 查询（``_query_ntp_server_async``，见 ntp_sync）
+  - bootstrap 解析（``loop.sock_sendto/sock_recvfrom``，见 resolvers/plain.py）
+  - 本地 DoH / 53 / DoT / DoQ 服务端与加密上游（aiohttp / asyncio streams / aioquic）
 
 因此这里把阻塞任务分三类通道：
 
-    阻塞任务 ──┬── NTP 专属池（2 线程）：校时必须及时，不参与排队
+    阻塞任务 ──┬── NTP 专属池（2 线程）：设置系统时间的子进程，不参与排队
                ├── 日志裁剪专属池（1 线程）：它在 DNS 查询的 await 链上
                │   （log → flush → trim），若与 DNS 共享队列会形成
                │   「DNS 等日志、日志等线程」的死锁，故必须独立
                └── 共享池（``PriorityGate`` 排序）
-                   DNS 迭代查询（等级 1）> NDP 防护（等级 2）> ARP 防护（等级 3）
+                   NDP 防护（等级 2）> ARP 防护（等级 3）
                    等待超过 ``AGING_SECONDS`` 自动提级，防止低优先级饿死
 
 说明：优先级只能决定「谁先拿到空闲线程」，**不能抢占**正在执行的任务。

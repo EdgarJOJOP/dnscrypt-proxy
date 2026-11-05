@@ -216,8 +216,6 @@ class ResolverManager:
         self._inflight_queries: Dict[Tuple, asyncio.Future] = {}
         # 后台一致性验证节流
         self._consistency_check_count = 0  # 1/10 采样计数器
-        # 定期清理空闲连接的任务
-        self._cleanup_idle_task: Optional[asyncio.Task] = None
 
     async def initialize(self):
         """初始化所有解析器（先 bootstrap 再剩余部分，兼容旧接口）"""
@@ -273,11 +271,8 @@ class ResolverManager:
         if total_upstreams == 0:
             # 纯迭代模式（upstream.enabled=false 或 doh/dot/doq 全空）：
             # 跳过加密上游专用初始化（ECH fetchers、共享 DoH session、DoQ 全局
-            # 并发上限），只注册迭代解析上游；定期空闲连接清理仍启动
-            # （close_idle_connections 同时清理 bootstrap 解析器的空闲 UDP 套接字，
-            #  且对 iterative 无 close_idle/reset_connections 的情况用 hasattr 跳过）
+            # 并发上限），只注册迭代解析上游。
             await self._create_upstream_resolvers()
-            self._cleanup_idle_task = asyncio.create_task(self._periodic_idle_cleanup())
             self._bootstrap_ready.set()
             enabled_count = sum(1 for s in self._upstream_servers if s.enabled)
             logger.info("解析器初始化完成（纯迭代模式）: %d 个上游可用 / %d 个总数",
@@ -313,8 +308,6 @@ class ResolverManager:
         # 5. 将 connection_pool_size 注入 DoQ 全局并发限制
         from resolvers.doq import set_doq_global_concurrency
         set_doq_global_concurrency(self.config.connection_pool_size)
-        # 5b. 启动定期空闲连接清理（每 120 秒）
-        self._cleanup_idle_task = asyncio.create_task(self._periodic_idle_cleanup())
 
         self._bootstrap_ready.set()
         enabled_count = sum(1 for s in self._upstream_servers if s.enabled)
@@ -1742,24 +1735,6 @@ class ResolverManager:
             )
         except Exception as e:
             logger.debug("后台一致性验证异常: %s", e)
-        finally:
-            # 验证完成后释放临时连接
-            try:
-                await self.close_idle_connections()
-            except Exception:
-                pass
-
-    async def _periodic_idle_cleanup(self):
-        """定期清理空闲连接（每 120 秒），防止 UDP/TCP 连接积压。"""
-        while True:
-            try:
-                await asyncio.sleep(120)
-                logger.debug("定期清理：执行空闲连接关闭...")
-                await self.close_idle_connections()
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.debug("定期清理异常: %s", e)
 
     async def refresh_upstream_ips(self, hostname: str):
         """刷新特定上游服务器的 IP 地址"""
@@ -1879,10 +1854,6 @@ class ResolverManager:
 
     async def close_all(self):
         """关闭所有解析器"""
-        # 停止定期清理任务
-        if self._cleanup_idle_task:
-            self._cleanup_idle_task.cancel()
-            self._cleanup_idle_task = None
         # 停止自动重连任务
         if self._recovery_task:
             self._recovery_task.cancel()
@@ -1917,38 +1888,6 @@ class ResolverManager:
             except Exception as e:
                 logger.debug("解析管理器关闭共享 DoH session 异常: %s", e)
             self._shared_doh_session = None
-
-    async def close_idle_connections(self):
-        """关闭所有空闲持久连接（在内存紧张时调用），保留活跃连接不受影响
-        
-        区别于 reset_all_connections() 的暴力重置，此方法仅关闭可安全释放的空闲连接：
-        - DoT 连接池: 关闭空闲 TLS 连接
-        - DoQ 连接池: 关闭空闲 QUIC 连接
-        - bootstrap 解析器: 释放空闲 UDP 套接字
-        """
-        closed = 0
-        for server in self._upstream_servers:
-            try:
-                if hasattr(server.resolver, 'close_idle'):
-                    await server.resolver.close_idle()
-                    closed += 1
-                elif hasattr(server.resolver, 'reset_connections'):
-                    await server.resolver.reset_connections()
-                    closed += 1
-            except Exception as e:
-                logger.debug("关闭 %s 空闲连接失败: %s", server.name, e)
-        for server in self._bootstrap_resolvers:
-            try:
-                if hasattr(server.resolver, 'close_idle'):
-                    await server.resolver.close_idle()
-                    closed += 1
-                elif hasattr(server.resolver, 'reset_connections'):
-                    await server.resolver.reset_connections()
-                    closed += 1
-            except Exception as e:
-                logger.debug("关闭 bootstrap %s 空闲连接失败: %s", server.name, e)
-        if closed:
-            logger.debug("关闭了 %d 个解析器的空闲连接", closed)
 
     async def resolve_dnskey(self, query_bytes: bytes) -> Optional[bytes]:
         """
