@@ -30,6 +30,14 @@ Part B（迭代解析 DNSSEC 攻击向量，离线回放真实签名 wire）：
   13 NXDOMAIN(NSEC) 合法（回归：必须放行）
   14 NXDOMAIN(NSEC3 opt-out) 合法（回归：必须放行）
   15 独立参考判定差分（同源数据，判定必须一致）
+  16 CNAME 中间跳无签名 + 区未签名（cdn.jsdelivr.net 回归：必须放行）
+  17 CNAME 中间跳无签名 + 区状态 unknown（必须拒绝）
+  18 DS 查询不跟随 CNAME（RFC 4035 §2.4，离线）
+
+Part C（真实网络端到端，`--real-dnssec` 开启）：
+  cdn.jsdelivr.net / s.360.cn / opencdnkav6.jomodns.com / p.ssl.qhimg.com
+  必须判 insecure 且能解析；ietf.org 必须 secure 且带 RRSIG；
+  dnssec-failed.org 必须仍被丢弃。
 """
 import argparse
 import asyncio
@@ -440,11 +448,19 @@ def _make_engine(reply, keys, status_map, pds):
     eng._chain_unavailable = set()
     eng._last_release = ""
     eng._zone_ns_cache = {}
+    eng._delegation_cache = {}
+    eng._dnssec_crypto_ok = True
     eng._has_ipv6 = False
     eng._dropped = []
 
     async def fake_iterate(qname, qtype, depth=0, rdclass=1):
-        return dns.message.from_wire(reply.to_wire())
+        # 必须保留 _cname_chain / _cname_targets：旧实现 from_wire(reply.to_wire())
+        # 会把这两个动态属性丢掉，CNAME 中间跳用例因此**从未真正执行**
+        # （测试 7 之前只是命中了“无签名 owner”分支，不是链中间跳校验）。
+        out = dns.message.from_wire(reply.to_wire())
+        out._cname_chain = list(getattr(reply, "_cname_chain", []) or [])
+        out._cname_targets = list(getattr(reply, "_cname_targets", []) or [])
+        return out
 
     async def fake_trusted(zone_name):
         return keys.get(str(zone_name).lower())
@@ -604,6 +620,126 @@ async def run_part_b() -> bool:
     check("14 NXDOMAIN(NSEC3 opt-out) 合法响应被放行（回归）", out is not None,
           f"stats={ {k: v for k, v in dict(eng._stats).items() if v} }")
 
+    # 16) CNAME 中间跳无签名，但该跳所在区**未签名** → 必须放行
+    #     （生产日志：cdn.jsdelivr.net CNAME 中间跳被误判 unknown 后丢弃）
+    def _cname_hop(owner: str, target: str):
+        m = dns.message.make_response(
+            dns.message.make_query(owner, dns.rdatatype.A))
+        rr = dns.rrset.RRset(dns.name.from_text(owner),
+                             dns.rdataclass.IN, dns.rdatatype.CNAME)
+        rr.add(dns.rdtypes.ANY.CNAME.CNAME(
+            dns.rdataclass.IN, dns.rdatatype.CNAME,
+            dns.name.from_text(target)))
+        rr.ttl = 60
+        m.answer.append(rr)
+        return m
+
+    t16 = _clone(fwd)  # 最终 A + RRSIG（ietf.org，可验证；qname 必须是 owner）
+    t16._cname_chain = [_cname_hop("cdn.jsdelivr.net", "ietf.org").to_wire()]
+    eng = _make_engine(t16, keys,
+                       {"cdn.jsdelivr.net.": "insecure",
+                        "ietf.org.": "secure"}, pds)
+    out = await run(eng, "ietf.org")
+    check("16 CNAME 中间跳无签名但区未签名被放行（cdn.jsdelivr 回归）",
+          out is not None,
+          f"stats={ {k: v for k, v in dict(eng._stats).items() if v} }")
+
+    # 17) 同一中间跳，若无法证明该区未签名（unknown）→ 仍必须拒绝
+    t17 = _clone(fwd)
+    t17._cname_chain = [_cname_hop("cdn.jsdelivr.net", "ietf.org").to_wire()]
+    eng = _make_engine(t17, keys,
+                       {"cdn.jsdelivr.net.": "unknown",
+                        "ietf.org.": "secure"}, pds)
+    out = await run(eng, "ietf.org")
+    check("17 CNAME 中间跳无签名且区状态 unknown 仍被拒绝", out is None)
+
+    # 18) DS 查询不得跟随 CNAME（RFC 4035 §2.4）
+    #     cdn.jsdelivr.net 的 DS 查询若跟到 fastly/cloudflare，会把目标区的
+    #     NSEC3/SOA 当成自己的否定证明，父区 key 与 owner 错配 → unknown。
+    eng18 = object.__new__(pds.IterativeResolver)
+    eng18.qname_minimization = False
+    eng18.root_servers = ["192.0.2.1"]
+    eng18.max_depth = 8
+    eng18._zone_ns_cache = {}
+    eng18._stats = collections.Counter()
+    eng18._closest_zone_servers = lambda qname, qtype: None
+    _ds_cname = _cname_hop("cdn.jsdelivr.net",
+                           "cdn.jsdelivr.net.cdn.cloudflare.net")
+
+    async def fake_query_servers(servers, qname, qtype, rdclass=1):
+        return _ds_cname
+
+    eng18._query_servers = fake_query_servers
+    out18 = await eng18._iterate("cdn.jsdelivr.net", dns.rdatatype.DS)
+    check("18 DS 查询不跟随 CNAME（直接返回 CNAME 应答）",
+          out18 is not None
+          and any(rr.rdtype == dns.rdatatype.CNAME for rr in out18.answer),
+          f"answers={[(str(r.name), dns.rdatatype.to_text(r.rdtype)) for r in (out18.answer if out18 else [])]}")
+
+    # 19/20) RFC 4035 §5.3：签名区 RRset 缺 RRSIG 必须 bogus；
+    #        未签名区（如签名区 CNAME 到未签名 CDN）允许无 RRSIG。
+    from dnssec import DNSSECValidator
+
+    async def _local_unsigned_case(zone_signed: bool, owner: str):
+        val = DNSSECValidator(enabled=True, mode="strict")
+
+        async def fake_keys(_name):
+            return "secure", {
+                dns.name.from_text("ietf.org."): keys["ietf.org."],
+                dns.name.from_text("."): keys["."],
+            }
+
+        async def fake_zone(_name):
+            return zone_signed
+
+        val._get_verified_zone_keys = fake_keys
+        val._zone_has_ds = fake_zone
+        resp = _clone(fwd)
+        extra = dns.rrset.RRset(dns.name.from_text(owner),
+                                dns.rdataclass.IN, dns.rdatatype.A)
+        extra.add(dns.rdtypes.IN.A.A(dns.rdataclass.IN, dns.rdatatype.A,
+                                     "203.0.113.99"))
+        resp.answer.append(extra)
+        return await val._validate_locally(resp, dns.name.from_text("ietf.org"))
+
+    ok19 = await _local_unsigned_case(True, "unsigned.ietf.org.")
+    check("19 签名区 RRset 缺 RRSIG 判 bogus", ok19 is False)
+    ok20 = await _local_unsigned_case(False, "unsigned.example.")
+    check("20 未签名区 RRset 无 RRSIG 允许", ok20 is True)
+
+    # 23) RFC 5452 §9.2 bailiwick：referral 的 NS owner 必须是 qname 祖先；
+    #     旧实现只校验“写缓存”，仍会直接使用越界 referral 的服务器。
+    eng23 = object.__new__(pds.IterativeResolver)
+    eng23.qname_minimization = False
+    eng23.root_servers = ["192.0.2.1"]
+    eng23.max_depth = 8
+    eng23._zone_ns_cache = {}
+    eng23._stats = collections.Counter()
+    eng23._closest_zone_servers = lambda qname, qtype: None
+    bad_ref = dns.message.make_response(dns.message.make_query(
+        "victim.example", dns.rdatatype.A))
+    bad_ref.authority.append(dns.rrset.from_text(
+        "evil.example.", 300, "IN", "NS", "ns.evil.example."))
+    bad_ref.additional.append(dns.rrset.from_text(
+        "ns.evil.example.", 300, "IN", "A", "192.0.2.9"))
+    calls23 = []
+
+    async def fake_bad_referral(servers, qname, qtype, rdclass=1):
+        calls23.append(qname)
+        if len(calls23) == 1:
+            return bad_ref
+        good = dns.message.make_response(dns.message.make_query(
+            qname, dns.rdatatype.A))
+        good.answer.append(dns.rrset.from_text(
+            f"{qname}.", 60, "IN", "A", "203.0.113.5"))
+        return good
+
+    eng23._query_servers = fake_bad_referral
+    out23 = await eng23._iterate("victim.example", dns.rdatatype.A)
+    check("23 越界 referral 被拒绝（bailiwick）",
+          out23 is None and len(calls23) == 1,
+          f"out={out23 is not None} calls={len(calls23)}")
+
     # 15) 独立参考判定差分（正向 / 两种负应答 / CNAME）
     def _ref_find_sig(msg, rrset):
         for sec in (msg.answer, msg.authority):
@@ -661,11 +797,96 @@ async def run_part_b() -> bool:
     return all(ok for _, ok in RESULTS[start_ok:])
 
 
+# ============================================================
+# Part C：真实网络端到端 DNSSEC 回归（--real-dnssec）
+# ============================================================
+async def run_part_c() -> bool:
+    print("\n[Part C] 真实网络 DNSSEC 回归（日志误报域名 + 签名区 + bogus）")
+    try:
+        import plain_dns_server as pds
+        from config import Config
+    except Exception as e:      # pragma: no cover
+        print(f"  跳过：无法导入解析器（{e}）")
+        return True
+
+    pds.has_global_ipv6 = lambda: False
+    pds.probe_ipv6_path = lambda: (False, True)
+    cfg = Config(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "config.yaml"))
+    eng = pds.IterativeResolver(cfg)
+
+    class _Cap(logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.msgs = []
+
+        def emit(self, record):
+            self.msgs.append(record.getMessage())
+
+    cap = _Cap()
+    lg = logging.getLogger("dns-proxy.plain-dns")
+    lg.addHandler(cap)
+    lg.setLevel(logging.WARNING)
+    start_ok = len(RESULTS)
+
+    # 日志中“应通过却被拦截”的未签名域名
+    for domain in ("cdn.jsdelivr.net", "s.360.cn",
+                   "opencdnkav6.jomodns.com", "p.ssl.qhimg.com"):
+        try:
+            st = await asyncio.wait_for(
+                eng._zone_signed_status(dns.name.from_text(domain)), timeout=30)
+        except Exception as e:
+            st = f"EXC:{type(e).__name__}"
+        check(f"C1 {domain} 区域状态不是 secure", st != "secure",
+              f"status={st}")
+        cap.msgs.clear()
+        try:
+            resp = await asyncio.wait_for(
+                eng.resolve(domain, dns.rdatatype.A), timeout=40)
+        except Exception as e:
+            resp = None
+            print(f"     resolve 异常: {e!r}")
+        check(f"C2 {domain} 能解析（未被误拦）", resp is not None)
+        cname_warn = [m for m in cap.msgs
+                      if "CNAME 链中间跳无签名" in m]
+        check(f"C3 {domain} 无 CNAME 中间跳误报告警", not cname_warn,
+              f"warnings={len(cname_warn)}")
+
+    # 真签名区不能被误伤
+    cap.msgs.clear()
+    try:
+        st = await asyncio.wait_for(
+            eng._zone_signed_status(dns.name.from_text("ietf.org")), timeout=30)
+        resp = await asyncio.wait_for(
+            eng.resolve("ietf.org", dns.rdatatype.A), timeout=40)
+    except Exception as e:
+        st, resp = f"EXC:{type(e).__name__}", None
+    check("C4 ietf.org 仍为 secure", st == "secure", f"status={st}")
+    has_sig = bool(resp is not None and any(
+        rr.rdtype == dns.rdatatype.RRSIG for rr in resp.answer))
+    boot = bool(getattr(resp, "_bootstrap_fallback", False))
+    check("C5 ietf.org 应答含 RRSIG（bootstrap 兜底时允许上游不下发）",
+          has_sig or boot, f"rrsig={has_sig} bootstrap={boot}")
+
+    # 真实 bogus 仍必须被拒绝
+    try:
+        out = await asyncio.wait_for(
+            eng._resolve_verified("dnssec-failed.org", dns.rdatatype.A, 1),
+            timeout=40)
+    except Exception:
+        out = None
+    check("C6 dnssec-failed.org 仍被严格模式丢弃", out is None)
+
+    return all(ok for _, ok in RESULTS[start_ok:])
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=15353,
                     help="明文 DNS 测试端口（默认 15353，53 需要权限）")
     ap.add_argument("--skip-net", action="store_true", help="只跑离线 DNSSEC 用例")
+    ap.add_argument("--real-dnssec", action="store_true",
+                    help="额外跑真实网络 DNSSEC 回归（Part C，需要出网）")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.WARNING)
@@ -677,6 +898,8 @@ def main() -> int:
     if not args.skip_net:
         asyncio.run(run_part_a(args.port))
     asyncio.run(run_part_b())
+    if args.real_dnssec:
+        asyncio.run(run_part_c())
 
     total = len(RESULTS)
     failed = [n for n, ok in RESULTS if not ok]

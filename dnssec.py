@@ -133,6 +133,22 @@ class DNSSECValidator:
         self._zone_ds_cache: Dict[str, Tuple[Optional[bool], float]] = {}
         # 防刷屏：默认 fail-open 下的“上游响应不带 RRSIG”提示全局只打印一次
         self._warned_no_rrsig = False
+        # 「name 是否为父区委托点」缓存：name → (bool, expire_at)。
+        # 用于 DS NODATA 无否定证明时区分「委托点 apex」与「区内普通名」，
+        # 防止把父区自己的 DS 误当成子区已签名（详见 _zone_has_ds_uncached）。
+        self._delegation_cache: Dict[str, Tuple[Optional[bool], float]] = {}
+        # dnspython 的 dns.dnssec.validate() 需要 cryptography；缺失时验签会抛
+        # ImportError。这里显式检测，避免把“无法验签”静默当成“未签名/放行”。
+        self._crypto_ok = True
+        try:
+            import cryptography  # noqa: F401
+        except Exception as _crypto_err:
+            self._crypto_ok = False
+            logger.error(
+                "DNSSEC 验签后端不可用（缺少 cryptography：%s）。"
+                "本地 RRSIG/DS 链验证将无法进行，严格模式不会把结果判为 secure；"
+                "请执行 pip install cryptography", _crypto_err,
+            )
         self._zone_cache_lock = asyncio.Lock()
         self._stats: Dict[str, Any] = {
             "validated": 0,
@@ -235,9 +251,10 @@ class DNSSECValidator:
         ad_bit = bool(response.flags & dns.flags.AD)
         rcode = response.rcode()
 
-        # 检查响应中是否有 RRSIG 记录
+        # 检查响应中是否有 RRSIG 记录（只统计 answer/authority：
+        # additional 里的 RRSIG 不参与 RRset 验签，不能据此判定“已签名”）
         has_rrsig = False
-        for section in (response.answer, response.authority, response.additional):
+        for section in (response.answer, response.authority):
             for rrset in section:
                 for rd in rrset:
                     if rd.rdtype == dns.rdatatype.RRSIG:
@@ -288,8 +305,11 @@ class DNSSECValidator:
                 "detail": "AD 位已设置（上游已验证，ad_check 模式）",
             }
 
-        # 无 RRSIG 但有 AD 位 - 上游已验证但响应不含 RRSIG
-        if ad_bit:
+        # 无 RRSIG 但有 AD 位：**只有 ad_check 模式**才能信任上游 AD。
+        # strict 模式的语义是“始终本地验证 RRSIG 签名链”，不能凭 AD 位
+        # 就把无签名应答判 secure——否则攻击者只要设置 AD=1 就能绕过
+        # strict/require_rrsig（RFC 4035 §3.2.3：AD 只应由可信验证者设置）。
+        if ad_bit and self.mode == "ad_check":
             self._stats["validated"] += 1
             return True, "secure", {
                 **result_info,
@@ -451,27 +471,35 @@ class DNSSECValidator:
         except Exception:
             return False
 
-    def _ds_nodata_proves_insecure(self, resp, name: dns.name.Name) -> bool:
+    def _ds_nodata_proves_insecure(self, resp, name: dns.name.Name,
+                                   verified_ids=None) -> bool:
         """DS 查询的 NODATA 响应是否**数学上**证明 name 没有 DS
 
         RFC 4035 §5.2 要求：只有拿到父区签名的否定证明，才能把该名字判为
         insecure 委托。旧实现只看"响应里有没有 NSEC/NSEC3 记录"就认定未签名，
         任意 NSEC 响应都能把签名区降级。
 
+        `verified_ids`（可选）：已通过父区 DNSKEY 验签的 rrset 的 id() 集合。
+        传入时只采纳这些 rrset——攻击者不能在有效 NSEC 旁边混入一条伪造
+        NSEC 来让本函数采纳伪造证明。
+
         认可三种证明（与 `plain_dns_server._zone_signed_status` 语义一致）：
           1. NSEC owner == name 且位图**含 NS 但不含 DS**（未签名委托点）
           2. NSEC3 hash(name) == owner hash 且位图含 NS 不含 DS（未签名委托点）
-          3. NSEC3 opt-out 区间覆盖 name + 位图含 NS（RFC 5155 §8.6：
-             区间内可能存在被省略的未签名委托）
+          3. NSEC3 opt-out 区间覆盖 name（RFC 5155 §8.6：区间内可能存在被
+             省略的未签名委托；**不要求**覆盖记录位图含 NS——位图描述的是
+             owner 名，不是被覆盖的委托名）
 
-        ★ "含 NS"这个条件不能省：普通记录（如 www.ietf.org 在签名区 ietf.org
-          内）也有 NSEC3 且位图不含 DS，但它不是委托点，DS NODATA 不能据此
-          推断"所在区未签名"（实测漏掉该条件会把签名区里的普通名字判成
-          未签名，进而让 include_rrsig 严格模式放行被剥离签名的应答）。
+        ★ "含 NS"条件用于 1/2 和非 opt-out 的区间覆盖：普通记录（如
+          www.ietf.org 在签名区 ietf.org 内）也有 NSEC3 且位图不含 DS，
+          但它不是委托点，DS NODATA 不能据此推断"所在区未签名"。
+          opt-out 覆盖是 RFC 5155 §8.6 的例外，只看 Opt-Out 位。
         """
         rd_DS = dns.rdatatype.DS
         rd_NS = dns.rdatatype.NS
         for rrset in list(resp.answer) + list(resp.authority):
+            if verified_ids is not None and id(rrset) not in verified_ids:
+                continue
             if rrset.rdtype == dns.rdatatype.NSEC:
                 if rrset.name != name:
                     continue
@@ -491,9 +519,12 @@ class DNSSECValidator:
                             and self._nsec_has_type(rd, rd_NS)
                             and not self._nsec_has_type(rd, rd_DS)):
                         return True
+                    # RFC 5155 §8.6：opt-out 区间覆盖证明“区间内可能存在被
+                    # 省略的未签名委托”，不要求覆盖记录位图含 NS（位图描述
+                    # 的是 owner 名，不是被覆盖的委托名）。旧实现多要求 NS，
+                    # 会漏掉合法 opt-out 证明并误判 unknown。
                     if (self._hash_in_interval(th, owner_hash, rd.next)
-                            and self._nsec3_optout(rd)
-                            and self._nsec_has_type(rd, rd_NS)):
+                            and self._nsec3_optout(rd)):
                         return True
         return False
 
@@ -505,7 +536,13 @@ class DNSSECValidator:
           （如 com.）有 DS 就判"应有签名"——实测 `google.com`（未签名）因此
           被判 True，开启 `require_rrsig` 后合法应答会被当成"签名被剥离"丢弃。
         ★ 无 DS 时必须验证否定证明的语义（见 `_ds_nodata_proves_insecure`），
-          不能只看"响应里有没有 NSEC/NSEC3"。无证明时升父级继续找委托点。
+          不能只看"响应里有没有 NSEC/NSEC3"。
+        ★ 无证明时**不能**无条件升父级：对委托点（如 360.cn）来说，父区
+          （cn.）自己的 DS 只能证明 cn. 签名，不能证明 360.cn 签名；升上去
+          会把未签名的子区误判成 secure（生产日志“签名被剥离”假告警的根因）。
+          必须先判断 name 是「父区委托点」还是「区内普通名」：
+            - 委托点：无证明 → None（无法证明，停止）；
+            - 普通名：DS 本来就不存在 → 升父级找所在区 apex。
         """
         name = qname
         for _ in range(8):
@@ -522,12 +559,86 @@ class DNSSECValidator:
                 resp = dns.message.from_wire(resp_bytes)
             except Exception:
                 return None
-            if any(rr.rdtype == dns.rdatatype.DS for rr in resp.answer):
-                return True
-            if self._ds_nodata_proves_insecure(resp, name):
+            # 只采纳通过父区已信任 DNSKEY 验签的 DS/NSEC/NSEC3。
+            # 注意：name.parent() 可能是未签名区（如 s.360.cn 的父区
+            # 360.cn），此时拿不到 key，不能据此判 secure/bogus，只能按
+            # “无证明”继续判断委托点并升父级。
+            verified_ids = set()
+            try:
+                parent_status, parent_keys = await self._get_verified_zone_keys(
+                    name.parent())
+            except Exception:
+                parent_status, parent_keys = "indeterminate", {}
+            if parent_status == "secure":
+                verified_ids = self._verified_rrset_ids(resp, parent_keys)
+            ds_rrset = next((rr for rr in resp.answer
+                             if rr.rdtype == dns.rdatatype.DS), None)
+            if ds_rrset is not None:
+                # 有 DS 但没通过父区验签 → 无法证明（不能返回 True）
+                return True if id(ds_rrset) in verified_ids else None
+            if verified_ids and self._ds_nodata_proves_insecure(
+                    resp, name, verified_ids):
                 return False
-            name = name.parent()
+            # 无有效否定证明：区分委托点（停）与区内普通名（升父级）
+            is_del = await self._name_is_delegation(name)
+            if is_del is False:
+                name = name.parent()
+                continue
+            # 父区已证明未签名 → 本名字一定在未签名树下，无需 NSEC/NSEC3
+            # 证明（未签名区本来就没有这些记录）。
+            if await self._parent_is_insecure(name):
+                return False
+            return None
         return None
+
+    async def _parent_is_insecure(self, name: dns.name.Name) -> bool:
+        """父区是否已被证明为未签名（insecure）。
+
+        未签名父区不会发布 DS，也不会发布 NSEC/NSEC3；其子区/委托点因此
+        不可能有“父区签名证明无 DS”的记录。不能因为缺证明判 unknown。
+        """
+        try:
+            if name == dns.name.root:
+                return False
+            return await self._zone_has_ds(name.parent()) is False
+        except Exception:
+            return False
+
+    async def _name_is_delegation(self, name: dns.name.Name) -> Optional[bool]:
+        """name 是否是父区的委托点（父区存在 owner==name 的 NS 记录）
+
+        DS NODATA 响应无法单凭 SOA owner 区分“委托点”与“区内普通名”：
+        两者的 SOA owner 都等于 name.parent()。查一次 NS 即可区分：
+          - 委托点：NS owner == name（referral 或 apex NS）；
+          - 普通名：NODATA（没有 owner==name 的 NS）。
+        返回 True/False/None（查询失败/无回调）。
+        """
+        if self._dns_query_callback is None:
+            return None
+        key = str(name).lower()
+        cached = self._delegation_cache.get(key)
+        if cached is not None and time.time() < cached[1]:
+            return cached[0]
+        try:
+            q = dns.message.make_query(name, dns.rdatatype.NS)
+            q.use_edns(0, payload=1232, ednsflags=dns.flags.DO)
+            resp_bytes = await asyncio.wait_for(
+                self._dns_query_callback(q.to_wire()), timeout=2.0
+            )
+            if resp_bytes is None:
+                return None
+            resp = dns.message.from_wire(resp_bytes)
+        except Exception:
+            return None
+        result = any(
+            rrset.rdtype == dns.rdatatype.NS and rrset.name == name
+            for section in (resp.answer, resp.authority)
+            for rrset in section
+        )
+        if len(self._delegation_cache) > 2048:
+            self._delegation_cache.clear()
+        self._delegation_cache[key] = (result, time.time() + 300)
+        return result
 
     # ---------- DNSSEC 信任链（逐级 DS → DNSKEY 验证） ----------
 
@@ -560,6 +671,30 @@ class DNSSECValidator:
             )
         except Exception:
             return None
+
+    def _verified_rrset_ids(self, resp, keys) -> set:
+        """返回 resp 中已通过 keys 验签的 DS/NSEC/NSEC3 rrset 的 id() 集合
+
+        安全约束：DS 否定证明（“父区签名证明无 DS”）只能采纳验签通过的
+        NSEC/NSEC3。旧实现不验签，攻击者可用一条伪造 NSEC 把签名区降级为
+        insecure（进而放行被剥离签名的应答）。
+        """
+        verified = set()
+        for section in (resp.answer, resp.authority):
+            for rrset in section:
+                if rrset.rdtype not in (dns.rdatatype.DS,
+                                        dns.rdatatype.NSEC,
+                                        dns.rdatatype.NSEC3):
+                    continue
+                rrsig_set = self._find_rrsig_for(resp, section, rrset)
+                if rrsig_set is None:
+                    continue
+                try:
+                    dns.dnssec.validate(rrset, rrsig_set, keys)
+                except Exception:
+                    continue
+                verified.add(id(rrset))
+        return verified
 
     async def _query_rrset_ex(self, zone: dns.name.Name, rdtype: int):
         """查询 zone 的 RR 类型，返回 (rrset, rrsig_set, full_response)
@@ -665,8 +800,11 @@ class DNSSECValidator:
         ds_rrset, ds_sigs, ds_resp = await self._query_rrset_ex(
             zone, dns.rdatatype.DS)
         if ds_rrset is None:
-            if ds_resp is not None and self._ds_nodata_proves_insecure(ds_resp, zone):
-                return "insecure", {}
+            if ds_resp is not None:
+                verified_ids = self._verified_rrset_ids(ds_resp, parent_keys)
+                if verified_ids and self._ds_nodata_proves_insecure(
+                        ds_resp, zone, verified_ids):
+                    return "insecure", {}
             return "indeterminate", {}
         if ds_sigs is None:
             return "indeterminate", {}
@@ -769,10 +907,43 @@ class DNSSECValidator:
             for rrset in section:
                 if rrset.rdtype == dns.rdatatype.RRSIG:
                     continue
+                if (section is response.authority
+                        and rrset.rdtype == dns.rdatatype.NS):
+                    # RFC 4035 §3.1.4.1：delegation 的 NS RRset 由子区签名，
+                    # 父区 referral 里的 NS 本来就不带 RRSIG，不能要求。
+                    continue
                 rrsig_set = self._find_rrsig_for(response, section, rrset)
                 if rrsig_set is None:
-                    continue
+                    # RFC 4035 §5.3：签名区里的每个 RRset 都必须有 RRSIG。
+                    # 只有 owner 所在区被证明为未签名（insecure）时才允许
+                    # 无签名 RRset（例如签名区 CNAME 到未签名 CDN）。
+                    # 旧实现直接 continue，只要响应里任意一个 RRset 验签成功
+                    # 就返回 secure，攻击者可剥离其余 RRset 的签名。
+                    zone_signed = await self._zone_has_ds(rrset.name)
+                    if zone_signed is False:
+                        continue
+                    if zone_signed is None:
+                        indeterminate = True
+                        continue
+                    logger.debug(
+                        "DNSSEC: 签名区 RRset 缺 RRSIG（owner=%s，section=%s）",
+                        rrset.name, "answer" if section is response.answer else "authority")
+                    return False
+                if len(rrsig_set) == 0:
+                    return False
                 signer = rrsig_set[0].signer
+                # RFC 4035 §5.3.1：RRSIG.signer 必须是包含该 RRset owner 的
+                # zone apex。旧实现只按 signer 取 DNSKEY 验签，未检查 owner
+                # 是否在 signer 区之内；用祖先/无关区的 key 签别的名字会被
+                # 误接受。
+                try:
+                    if not rrset.name.is_subdomain(signer):
+                        logger.debug(
+                            "DNSSEC: RRSIG signer 不覆盖 RRset owner: owner=%s signer=%s",
+                            rrset.name, signer)
+                        return False
+                except Exception:
+                    return False
                 if signer == root_name and not root_dnskey_ok:
                     # 根 DNSKEY 没能取到（无查询回调 / 查询失败）：此时 keys[.] 还
                     # 只是**信任锚（KSK）**，而根区记录由 ZSK 签名——拿它验必然

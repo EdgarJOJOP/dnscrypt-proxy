@@ -1,4 +1,8 @@
 dnspython>=2.3.0
+# DNSSEC 数学验签后端：dnspython 的 dns.dnssec.validate() 没有它会在运行期抛
+# ImportError（旧代码把这个异常吞掉 → 所有 DS/DNSKEY 链验证返回 None →
+# 严格模式把“无法证明”误判成“签名被剥离”）。必须显式安装。
+cryptography>=41.0.0
 httpx>=0.24.0
 aiohttp>=3.8.0
 pyyaml>=6.0

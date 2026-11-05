@@ -1,4 +1,4 @@
-﻿"""
+"""
 域名过滤引擎 - 支持 AdGuard Home 规则语法
 拦截匹配规则的域名 DNS 请求
 
@@ -44,6 +44,29 @@ logger = logging.getLogger("dns-proxy.filter")
 
 # 规则下载最大大小（50MB）
 DEFAULT_MAX_SIZE = 50 * 1024 * 1024
+
+# 大文件规则下载超时：**不能设置 total 硬上限**。
+# 实测 tif.txt 约 35.9MB，而 cdn.jsdelivr.net 在该线路只有 ~0.07-0.46MB/s，
+# 80s total 必然在下载完成前触发 asyncio.TimeoutError（日志“加载规则超时 80s”）。
+# 这里改成“连接超时 + 读取空闲超时”：只要还在持续收数据就继续下载；
+# 真正卡住（60s 没有任何数据）才失败。大小上限仍由 DEFAULT_MAX_SIZE 控制。
+_LARGE_DOWNLOAD_TIMEOUT = aiohttp.ClientTimeout(
+    total=None, sock_connect=15, sock_read=60)
+
+
+async def _read_response_limited(resp, max_size: int = DEFAULT_MAX_SIZE):
+    """流式读取响应并限制最大字节数。
+
+    不能再用 `await resp.read()` 后检查大小：Content-Length 缺失（jsdelivr
+    是 chunked）时，恶意/异常服务器可以无限发送，内存会先被撑爆。
+    返回 bytes；超过 max_size 返回 None。
+    """
+    buf = bytearray()
+    async for chunk in resp.content.iter_chunked(1024 * 1024):
+        buf.extend(chunk)
+        if len(buf) > max_size:
+            return None
+    return bytes(buf)
 
 
 def _release_heap_to_os() -> None:
@@ -2559,22 +2582,42 @@ class FilterEngine:
                 headers=headers,
                 connector=connector,
             ) as session:
-                # 1. HEAD 探测 Range 支持和文件大小
-                async with session.head(
-                    url, timeout=aiohttp.ClientTimeout(total=15)
-                ) as resp:
-                    if resp.status != 200:
+                # 1. 只用 GET Range: 0-0 探测。
+                #    不能信 HEAD 的 Content-Length：jsdelivr 的 HEAD 返回的是
+                #    **压缩表示**的长度（实测 tif.txt HEAD=8,960,183，而
+                #    identity 的实际字节是 35,939,571）。用 HEAD 长度切分会
+                #    出现“尾片 0 字节 / 分片少 4 字节”，随后整体回退。
+                #    GET Range 的 Content-Range 才是本次 identity 表示的真实
+                #    总长度；若响应仍带 Content-Encoding（gzip/br），Range 边界
+                #    与解码后字节不对应，直接放弃并行、回退流式下载。
+                probe_headers = {
+                    "User-Agent": "SecureDNS-Proxy/1.0",
+                    "Range": "bytes=0-0",
+                    "Accept-Encoding": "identity",
+                }
+                async with session.get(
+                    url, headers=probe_headers,
+                    timeout=aiohttp.ClientTimeout(total=20),
+                ) as probe:
+                    if probe.status != 206:
                         return None
-                    accept_ranges = (resp.headers.get("Accept-Ranges", "")
-                                     .lower().strip())
-                    content_length = resp.headers.get("Content-Length")
-                    if "bytes" not in accept_ranges or not content_length:
+                    enc = (probe.headers.get("Content-Encoding", "")
+                           or "").lower().strip()
+                    if enc not in ("", "identity"):
+                        logger.debug(
+                            "URL %s Range 探测返回 Content-Encoding=%s，"
+                            "放弃并行分片", url, enc)
                         return None
-                    file_size = int(content_length)
-                    if file_size <= 0 or file_size > DEFAULT_MAX_SIZE:
+                    content_range = probe.headers.get("Content-Range", "")
+                    try:
+                        file_size = int(content_range.rsplit("/", 1)[1])
+                    except (ValueError, IndexError):
                         return None
-                    if file_size < 65536:  # 小于 64KB 不值得分片
-                        return None
+                if file_size is None or file_size <= 0 \
+                        or file_size > DEFAULT_MAX_SIZE:
+                    return None
+                if file_size < 65536:  # 小于 64KB 不值得分片
+                    return None
 
                 logger.info("并行下载 %s (%d bytes, %d 片)", url, file_size, num_chunks)
 
@@ -2589,22 +2632,47 @@ class FilterEngine:
                     chunk_headers = {
                         "User-Agent": "SecureDNS-Proxy/1.0",
                         "Range": range_hdr,
+                        "Accept-Encoding": "identity",
                     }
                     async with session.get(
                         url, headers=chunk_headers,
-                        timeout=aiohttp.ClientTimeout(total=timeout),
+                        timeout=_LARGE_DOWNLOAD_TIMEOUT,
                     ) as resp:
-                        if resp.status not in (200, 206):
+                        # 必须是 206。200 表示服务器忽略了 Range 返回整份文件，
+                        # 按分片长度校验会得到“最后一片任意长度都接受”的错误。
+                        if resp.status != 206:
                             raise IOError(
                                 f"分片 {idx} HTTP {resp.status}: {range_hdr}"
                             )
+                        enc = (resp.headers.get("Content-Encoding", "")
+                               or "").lower().strip()
+                        if enc not in ("", "identity"):
+                            raise IOError(
+                                f"分片 {idx} 返回 Content-Encoding={enc}，"
+                                "Range 边界与解码字节不对应"
+                            )
+                        content_range = resp.headers.get("Content-Range", "")
+                        try:
+                            _unit, _rest = content_range.split(" ", 1)
+                            _rng, _total = _rest.split("/", 1)
+                            _s, _e = _rng.split("-", 1)
+                            if (int(_s) != start or int(_e) != end
+                                    or int(_total) != file_size):
+                                raise ValueError(content_range)
+                        except (ValueError, IndexError):
+                            raise IOError(
+                                f"分片 {idx} Content-Range 不匹配: "
+                                f"{content_range!r}，期望 bytes {start}-{end}/{file_size}"
+                            )
                         data = await resp.read()
                         expected = end - start + 1
+                        # 所有分片（包括最后一片）都必须精确匹配；旧实现
+                        # 对最后一片放行任意长度，可能拼出尾部缺字节/多字节
+                        # 的损坏文件而不自知。
                         if len(data) != expected:
-                            if idx < num_chunks - 1 or len(data) == 0:
-                                raise IOError(
-                                    f"分片 {idx}: 期望 {expected} bytes, 收到 {len(data)}"
-                                )
+                            raise IOError(
+                                f"分片 {idx}: 期望 {expected} bytes, 收到 {len(data)}"
+                            )
                         async with lock:
                             chunks[idx] = data
                         logger.debug("  分片 %d/%d: %d bytes [%d-%d]",
@@ -2644,6 +2712,11 @@ class FilterEngine:
                     offset += len(data)
 
                 logger.info("  并行下载完成: %d bytes (%d 片)", offset, len(tasks))
+                if offset != file_size:
+                    logger.warning(
+                        "URL %s 分片拼接长度不符: %d/%d，回退到流式下载",
+                        url, offset, file_size)
+                    return None
                 return result
 
         except asyncio.TimeoutError:
@@ -2658,18 +2731,15 @@ class FilterEngine:
         逐行读取并解析，不将整个文件同时加载到内存。
         """
         try:
-            # 优先尝试并行分片下载（HTTP Range 8 路并发，类似迅雷）
-            parallel_data = await self._download_url_parallel(url)
-            if parallel_data is not None:
-                # 并行下载成功 → 字节直通解析（不再 decode 整份文本）
-                try:
-                    return await self._process_rules_from_bytes(parallel_data, url)
-                finally:
-                    # 尽快丢掉整份字节，别把它留到协程结束
-                    del parallel_data
-
-            # 并行下载不可用 → 回退到全文 gzip 下载（同样字节直通解析）
-            # 显式请求 gzip 压缩（自定义 headers 会覆盖 aiohttp 默认的 Accept-Encoding）
+            # 说明（2026-11）：不再默认走 HTTP Range 并行分片。
+            # jsdelivr 的 Range 行为不可靠：HEAD/Content-Range 可能返回压缩
+            # 表示的长度（tif.txt: 8,960,183 vs identity 35,939,571），尾片
+            # 可能返回 0 字节，或某片少 4 字节；每次都会打 WARNING 再回退，
+            # 反而更慢。这里直接用单连接流式下载 + 连接/读取空闲超时（见
+            # _LARGE_DOWNLOAD_TIMEOUT）；只要 CDN 还在发数据就不会超时。
+            # _download_url_parallel 保留供未来可选启用。
+            #
+            # 并行下载不可用 → 全文 gzip 下载（字节直通解析）
             headers = {"User-Agent": "SecureDNS-Proxy/1.0",
                        "Accept-Encoding": "gzip, deflate"}
             # 当加密上游就绪时，使用自定义 DNS 解析器（走 DoH/DoT/DoQ）
@@ -2679,11 +2749,13 @@ class FilterEngine:
                 connector = aiohttp.TCPConnector(resolver=resolver)
 
             async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=80),
+                timeout=_LARGE_DOWNLOAD_TIMEOUT,
                 headers=headers,
                 connector=connector,
             ) as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=80)) as resp:
+                async with session.get(
+                    url, timeout=_LARGE_DOWNLOAD_TIMEOUT
+                ) as resp:
                     if resp.status != 200:
                         logger.error("获取 URL %s 失败: HTTP %d", url, resp.status)
                         return False
@@ -2694,10 +2766,10 @@ class FilterEngine:
                                      url, content_length, DEFAULT_MAX_SIZE)
                         return False
 
-                    raw = await resp.read()
-                    if len(raw) > DEFAULT_MAX_SIZE:
-                        logger.error("URL %s 实际大小 %d 超过限制 %d",
-                                     url, len(raw), DEFAULT_MAX_SIZE)
+                    raw = await _read_response_limited(resp)
+                    if raw is None:
+                        logger.error("URL %s 实际大小超过限制 %d",
+                                     url, DEFAULT_MAX_SIZE)
                         return False
 
                     # 字节直通：不再把整份内容 decode 成 str（见
@@ -2708,7 +2780,9 @@ class FilterEngine:
                         del raw
 
         except asyncio.TimeoutError:
-            logger.error("从 URL %s 加载规则超时 (80s)", url)
+            logger.error(
+                "从 URL %s 加载规则超时（连接 15s / 读取空闲 60s；"
+                "大文件不再受 80s 总时长限制）", url)
             return False
         except (RuntimeError, StopIteration) as e:
             # PEP 479：协程内逸出的 StopIteration 会变成 RuntimeError
@@ -2731,19 +2805,19 @@ class FilterEngine:
                    "Accept-Encoding": "gzip, deflate"}
         try:
             async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=80),
+                timeout=_LARGE_DOWNLOAD_TIMEOUT,
                 headers=headers,
             ) as session:
                 async with session.get(
-                    url, timeout=aiohttp.ClientTimeout(total=80)
+                    url, timeout=_LARGE_DOWNLOAD_TIMEOUT
                 ) as resp:
                     if resp.status != 200:
                         logger.error("获取 URL %s 失败: HTTP %d", url, resp.status)
                         return False
-                    raw = await resp.read()
-                    if len(raw) > DEFAULT_MAX_SIZE:
-                        logger.error("URL %s 实际大小 %d 超过限制 %d",
-                                     url, len(raw), DEFAULT_MAX_SIZE)
+                    raw = await _read_response_limited(resp)
+                    if raw is None:
+                        logger.error("URL %s 实际大小超过限制 %d",
+                                     url, DEFAULT_MAX_SIZE)
                         return False
                     # 字节直通：不再把整份内容 decode 成 str
                     try:
