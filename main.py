@@ -273,6 +273,9 @@ class DNSProxyApp:
             cleanup_interval=self.config.cache_cleanup_interval,
             prefetch_enabled=self.config.cache_prefetch_enabled,
             prefetch_advance_ratio=self.config.cache_prefetch_advance_ratio,
+            # 非标准扩展（违反 RFC 2181 §5.1）：只对极短 TTL 抬升到 min_ttl，
+            # 0 = 关闭并回到纯 RFC 行为。详见 DNSCache._calculate_ttl。
+            ttl_floor_threshold=self.config.cache_ttl_floor_threshold,
         )
 
         # 2. DNSSEC 验证器
@@ -306,9 +309,10 @@ class DNSProxyApp:
             rule_files = self.config.filter_rules_files
             full_paths = [str(PROJECT_ROOT / f) for f in rule_files]
             rule_urls = self.config.filter_rules_urls
-            # 先加载本地规则（快速，不阻塞启动）
+            # 先加载本地规则（与远程 URL 同一套字节直通解析：按 2MB 分块、
+            # 让出事件循环，不再整份 read_text + parse_to_text 二次复制）
             for fp in full_paths:
-                self.filter_engine.load_rules_from_file(fp)
+                await self.filter_engine.load_rules_from_file_async(fp)
             # 保存规则路径，待加密上游就绪后再下载（步骤 5c）
             self._filter_full_paths = full_paths
             self._filter_rule_urls = rule_urls
@@ -645,7 +649,7 @@ class DNSProxyApp:
                     return 2 if removed else 0
                 # 命中拦截规则：缓存里若是规则更新前的**正向应答**，必须立即
                 # 覆写成拦截应答，否则客户端会继续拿到真实 IP 直到 TTL 到期
-                #（min_ttl 600 / max_ttl 3600 → 最长 1 小时规则形同无效）。
+                #（最长 max_ttl=3600 秒；min_ttl 只兜底无 TTL 的场景，不再抬升）。
                 # 覆写目标键与前端拦截分支一致：(name, type, class)（不含 DO/CD），
                 # 同时删掉旧的含 DO 条目，避免两套键并存。
                 already_blocked = await self.cache.is_blocked_entry(cache_key)
@@ -798,11 +802,11 @@ class DNSProxyApp:
         """后台主动预刷新即将过期的正应答缓存条目。
 
         调度由缓存内部的最小堆驱动（见 DNSCache._schedule_prefetch）：
-        每条正应答条目按「最终 TTL（经 min_ttl/max_ttl 钳制）推导出的
-        刷新时刻」入堆；本循环每次休眠到堆顶时刻（而非固定周期），到点后
-        成批取走已到期条目执行——上一批执行完再取下一批（批间串行），
-        批内按 cache_prefetch_concurrency 限流并发。堆空时以
-        cache_cleanup_interval 作兜底休眠（避免空转）。
+        每条正应答条目按「最终 TTL（权威 TTL 经 max_ttl 向下钳制；min_ttl
+        只在无 TTL 信息时兜底）推导出的刷新时刻」入堆；本循环每次休眠到堆顶
+        时刻（而非固定周期），到点后成批取走已到期条目执行——上一批执行完再
+        取下一批（批间串行），批内按 cache_prefetch_concurrency 限流并发。
+        堆空时以 cache_cleanup_interval 作兜底休眠（避免空转）。
         """
         log = logging.getLogger("dns-proxy.app")
         while self._running:

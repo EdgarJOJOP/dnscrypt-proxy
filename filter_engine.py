@@ -16,6 +16,7 @@
 
 import os
 import re
+import sys
 import time
 import zlib
 import codecs
@@ -43,6 +44,27 @@ logger = logging.getLogger("dns-proxy.filter")
 
 # 规则下载最大大小（50MB）
 DEFAULT_MAX_SIZE = 50 * 1024 * 1024
+
+
+def _release_heap_to_os() -> None:
+    """把已释放的空闲堆页归还内核（仅 Linux glibc；其它平台 no-op）
+
+    规则加载会在短时间内申请上百 MB 临时内存（整份下载字节、2MB 分块、
+    上百万次索引写入）。CPython 释放这些对象后，glibc 的 arena 默认保留
+    空闲页，进程 RSS 就停在加载峰值的高水位上——同一份规则集在 Windows 上
+    RSS 随 HeapFree 回落，Ubuntu 上却长期高出约 100MB。
+    `malloc_trim(0)` 会立即把空闲页 madvise(MADV_DONTNEED) 掉。
+
+    注意：`PYTHONMALLOC=mimalloc` 时分配器不是 glibc，本函数无效；那类
+    部署应使用 `MIMALLOC_PURGE_DELAY=0`（mimalloc 会立即 purge 空闲段）。
+    """
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception as e:  # 非 glibc（musl / 精简镜像）时静默跳过
+        logger.debug("malloc_trim 不可用，跳过堆归还: %s", e)
 
 # /regex/ 自由正则规则的防 ReDoS 限制
 MAX_FREE_REGEX_LEN = 256     # 单条自由正则最大长度
@@ -125,17 +147,45 @@ def is_html_filter_rule(line: str) -> bool:
 # 本程序对其中各修饰符的实际处理：
 #   important   —— 支持（优先级高于普通规则/普通例外）
 #   badfilter   —— 支持（禁用同 pattern 的其它规则）
-#   dnsrewrite  —— 支持（响应重写，见 FilterRule._parse_dnsrewrite）
+#   dnsrewrite  —— **整条跳过**（2026-10-31）：解析器能识别它，但四个 DNS 前端
+#                  都没有消费 get_last_dnsrewrite()——带该修饰符的规则只会退化成
+#                  "整域 NXDOMAIN"，即把本应返回 1.2.3.4 / REFUSED / 空应答的域名
+#                  直接拦死（误拦截）。在真正实现响应重写之前，宁可少拦不误拦。
 #   client      —— AdGuard Home/DNS 专用；本程序无客户端身份，无法评估 → 整条跳过
 #   ctag        —— 同上（客户端标签）→ 整条跳过
 #   respgeo     —— AdGuard DNS 专用（按响应 IP 国家/ASN）→ 无法评估 → 整条跳过
 #   denyallow   —— DNS 可评估，但本程序尚未实现 → 整条跳过（宁可少拦，不误拦）
 #   dnstype     —— 同上（按查询类型）→ 整条跳过
 _DNS_DOC_MODIFIERS = frozenset({
-    "important", "badfilter", "dnsrewrite",
+    "important", "badfilter",
     "client", "ctag", "respgeo",
     "denyallow", "dnstype",
 })
+
+
+def _free_regex_parts(line: str):
+    """把 `/regex/` 或 `/regex/$modifiers` 拆成 (正则部分, 修饰符部分)
+
+    不是自由正则规则时返回 None。
+
+    必须**在** `$` 修饰符切分之前识别：自由正则里的 `$` 是行尾锚点，
+    早期实现直接 `rsplit("$", 1)`，会把 `/^ads\\.example\\.com$/` 切成
+    正则 `/^ads\\.example\\.com` + 修饰符 `/`，然后因为 `/` 不是合法修饰符
+    而把整条规则丢弃——所有带行尾锚点的正则规则全部静默失效（漏拦截）。
+    """
+    text = line.strip()
+    if len(text) < 3 or not text.startswith("/"):
+        return None
+    last = text.rfind("/")
+    if last <= 0:
+        return None
+    regex_part = text[:last + 1]
+    rest = text[last + 1:]
+    if not rest:
+        return regex_part, None
+    if rest.startswith("$"):
+        return regex_part, rest[1:]
+    return None
 
 
 def has_non_dns_modifier(line: str) -> bool:
@@ -143,8 +193,16 @@ def has_non_dns_modifier(line: str) -> bool:
 
     不含 `$` → False（纯域名规则）。修饰符解析规则与 FilterRule._parse 一致：
     取最后一个 `$` 之后的部分、按逗号分隔、`name=value` 只取 name、`~` 前缀
-    去掉；纯下划线（noop）按规范忽略。
+    去掉；纯下划线（noop）按规范忽略。自由正则 `/regex/` 先整体识别，
+    其中的 `$` 属于正则语法而非修饰符。
     """
+    parts = _free_regex_parts(line)
+    if parts is not None:
+        line = parts[0]
+        if parts[1] is None:
+            return False
+        # 只校验正则之后的修饰符部分
+        line = "$" + parts[1]
     if "$" not in line:
         return False
     modifiers = line.rsplit("$", 1)[1]
@@ -887,8 +945,15 @@ class FilterRule:
             return
 
         # 3. 分离 $modifiers 并验证
+        #
+        # 自由正则 /regex/ 必须先整体识别：正则里的 `$` 是行尾锚点，不是修饰符。
+        # 早期实现无条件 rsplit("$", 1)，导致 `/^ads\.example\.com$/` 被切成
+        # 正则 `/^ads\.example\.com` + 修饰符 `/` → 判为未知修饰符 → 整条丢弃。
         modifiers_str = None
-        if "$" in text:
+        _regex_parts = _free_regex_parts(text)
+        if _regex_parts is not None:
+            text, modifiers_str = _regex_parts
+        elif "$" in text:
             parts = text.rsplit("$", 1)
             text = parts[0]
             modifiers_str = parts[1]
@@ -910,11 +975,14 @@ class FilterRule:
                     self.is_badfilter = True
                     break
 
-            # 检测 dnsrewrite 修饰符
+            # dnsrewrite：**当前整条跳过**（不再解析）
+            # 解析出来的 rewrite 值没有任何 DNS 前端消费，实际行为会退化成
+            # "整域 NXDOMAIN"——把本该返回 1.2.3.4 / REFUSED / 空应答的域名
+            # 直接拦死。整条跳过前，先把它记成跳过原因便于排障。
             for mod in modifiers_str.split(','):
                 if mod.strip().startswith('dnsrewrite'):
-                    self._parse_dnsrewrite(mod.strip())
-                    break
+                    self._skip = True
+                    return
 
             # 例外规则带有限制性修饰符（如 $domain=xxx、$third-party、$script 等）
             # 则跳过该规则。DNS 代理无法评估这些修饰符的条件，
@@ -2037,6 +2105,8 @@ class FilterEngine:
             if parse_res.title and not self._title:
                 self._title = parse_res.title
             self._finalize_indexes()
+            # 与文件/URL 路径一致：内存文本加载完也把空闲堆页还给内核
+            _release_heap_to_os()
             if parse_res.skipped_html or parse_res.skipped_non_dns:
                 logger.info(
                     "  %s: 解析阶段跳过 %d 条非 DNS 规则（HTML 过滤 %d 条 / "
@@ -2051,7 +2121,44 @@ class FilterEngine:
             return ParseResult()
 
     def load_rules_from_file(self, filepath: str) -> bool:
-        """从文件加载规则（带 mtime+size checksum 缓存）"""
+        """从文件加载规则（同步接口，仅用于没有事件循环的脚本/测试）
+
+        真正的实现是 `load_rules_from_file_async`（与远程 URL 共用同一套
+        字节直通 + 两遍扫描逻辑）。事件循环正在运行时无法同步等待协程，
+        这里会给出告警并返回 False —— 那种上下文请改用
+        `await engine.load_rules_from_file_async(path)`。
+        """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # 不能直接用 asyncio.run()：它结束时会 set_event_loop(None)，
+            # 破坏调用方随后 asyncio.get_event_loop() 的语义（3.12+ 会直接
+            # RuntimeError）。这里自建 loop 且不设置 current loop。
+            _loop = asyncio.new_event_loop()
+            try:
+                return _loop.run_until_complete(
+                    self.load_rules_from_file_async(filepath))
+            finally:
+                _loop.close()
+        logger.warning(
+            "事件循环正在运行，无法同步加载规则文件 %s；"
+            "请改用 await load_rules_from_file_async()", filepath)
+        return False
+
+    async def load_rules_from_file_async(self, filepath: str) -> bool:
+        """从文件加载规则（异步、字节直通、带 mtime+size checksum 缓存）
+
+        与远程 URL **完全同一套**解析/索引逻辑（`_process_rules_from_bytes`
+        → 2MB 分块 → 两遍扫描 → 入口预过滤 → trie 索引），因此本地
+        `rules_files:` 和 `rules_urls:` 的内存与 CPU 特征一致：
+
+        - 不再 `read_text()` 生成整份 str，也不再经 `parse_to_text` 的
+          StringIO 再复制一份（旧路径 38MB 文件峰值可达 2-3 份完整文本）；
+        - 大文件按块解析，不会一次性 splitlines 卡住事件循环；
+        - 加载完成后把空闲堆页归还内核（`_release_heap_to_os`）。
+
+        返回值语义与旧实现一致：索引到至少 1 条规则才为 True。
+        """
         path = Path(filepath)
         if not path.exists():
             logger.warning("规则文件不存在: %s", filepath)
@@ -2061,31 +2168,46 @@ class FilterEngine:
         try:
             stat = path.stat()
             file_key = (stat.st_mtime, stat.st_size)
-            cached = self._file_checksums.get(filepath)
-            if cached == file_key:
+            if self._file_checksums.get(filepath) == file_key:
                 logger.debug("Checksum 命中，跳过未变更文件: %s", filepath)
                 return True
         except OSError:
             pass
 
         try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-            parse_res = self.load_rules_from_text(text, source=filepath)
-            if self._pending_block_index is not None:
-                self._pending_loaded_files.append(filepath)
-            else:
-                self._loaded_files.append(filepath)
-            # 更新 checksum 缓存
-            try:
-                stat = path.stat()
-                self._file_checksums[filepath] = (stat.st_mtime, stat.st_size)
-            except OSError:
-                pass
-            logger.debug("Checksum 缓存已更新: %s (rules=%d)", filepath, parse_res.rules_count)
-            return parse_res.rules_count > 0
+            loop = asyncio.get_running_loop()
+            data = await loop.run_in_executor(None, path.read_bytes)
         except Exception as e:
             logger.error("读取规则文件 %s 失败: %s", filepath, e)
             return False
+
+        try:
+            if not self._title:
+                # 旧路径由 parse() 从 "! Title:" 提取标题，这里只看头部
+                # （标题永远在最前面几行），维持原有行为
+                self._title = self._parser._extract_title(
+                    self._head_text(data, 65_536)
+                )
+            ok = await self._process_rules_from_bytes(
+                data, filepath, kind="file")
+        except Exception as e:
+            logger.error("解析规则文件 %s 失败: %s", filepath, e)
+            return False
+        finally:
+            del data
+
+        # 更新 checksum 缓存（与旧实现一致：读取成功即缓存，即使 0 条规则，
+        # 这样同一份没变的文件不会被反复重解析）
+        try:
+            stat = path.stat()
+            self._file_checksums[filepath] = (stat.st_mtime, stat.st_size)
+        except OSError:
+            pass
+        logger.debug("规则文件加载完成并缓存 checksum: %s (rules=%s)",
+                     filepath, ok)
+        # 与远程 URL 路径一致：单个来源加载完成即归还空闲堆页
+        _release_heap_to_os()
+        return ok
 
     async def _fetch_url_async(self, url: str, max_size: int = DEFAULT_MAX_SIZE,
                                timeout: int = 30) -> Optional[str]:
@@ -2141,17 +2263,59 @@ class FilterEngine:
         parts.append(dec.decode(b"", True))
         return "".join(parts)
 
-    async def _process_rules_from_text(self, text: str, url: str) -> bool:
+    @staticmethod
+    def _head_text(data, limit: int = 262_144) -> str:
+        """只解码头部一小段（HTML 检测用）
+
+        旧实现为了看前 100 行，先把整份文本 decode 成 str——在字节直通路径
+        上这一份 38MB 级副本纯属浪费，而且会把 RSS 高水位顶上去。
+        """
+        head = data[:limit]
+        if isinstance(head, (bytes, bytearray, memoryview)):
+            return bytes(head).decode("utf-8", "replace")
+        return head
+
+    async def _process_rules_from_bytes(self, data, url: str,
+                                        kind: str = "url") -> bool:
+        """字节直通：直接从原始字节解析并索引，不生成整份 str。
+
+        为什么（2026-11）：远程大列表（hagezi tif 38MB / 185 万行）原先走
+        `bytes → 整份 str → 分块 splitlines`，加载期同时驻留「下载字节」+
+        「整份 str」+「join 出来的 str」三份完整文本。实测加载峰值比稳态高
+        ~93MB，而 Linux 的 glibc / mimalloc 在释放后不归还高水位——同一份
+        规则集在 Windows 上看起来正常，Ubuntu 上 RSS 却常年高出约 100MB。
+        这里改成按 2MB 块解码 + 索引，峰值只多一个块。
+
+        HTML 检测仍在写入索引之前做（只看头部，足以识别 CDN 错误页）；
+        二进制控制字符检测在 `_process_rules_from_text` 第 1 遍的分块里做。
+        """
+        if not data:
+            return False
+        if self._parser._looks_like_html(self._head_text(data)):
+            logger.error("规则来源 %s 内容包含 HTML，跳过", url)
+            return False
+        return await self._process_rules_from_text(data, url, kind=kind)
+
+    async def _process_rules_from_text(self, text, url: str,
+                                       kind: str = "url") -> bool:
         """
         两遍解析全文规则并索引（使用 ThreadPoolExecutor 多线程并行）。
         第 1 遍：收集 $badfilter 目标（确保顺序无关）
         第 2 遍：索引规则，跳过被 badfilter 禁用的
-        调用方须确保 text 已通过 HTML/二进制检测。
+        调用方须确保内容已通过 HTML 检测；二进制字符检测在下面第 1 遍
+        **分块**里做（发现即中止，此时尚未写入索引，中止是安全的）。
 
         ★ 与 `_compile_rules` 一致：HTML 过滤规则与带非 DNS 修饰符的规则在
         两遍扫描的入口就被丢弃（不构造 FilterRule、不入索引、不参与匹配）。
         远程列表（EasyList 之类）里这类规则占比可能很高，提前丢弃既省内存
         也省掉每行的正则编译成本。
+
+        ★ `text` 允许是 `str`，也允许是 `bytes` / `bytearray`（字节直通）。
+        远程列表 38MB 级时，若先整份 `bytes → str` 再分块 `"".join(parts)`
+        复制，加载期会同时驻留 2-3 份完整文本，实测 hagezi tif（185 万行）
+        峰值比稳态高 ~93MB；而 Linux 的 glibc / mimalloc 在释放后不归还
+        高水位，进程 RSS 就永久高出这一截（Windows 堆会归还，所以那边看不出）。
+        字节直通只按块解码，峰值只多一个 2MB 块。
         """
         loop = asyncio.get_running_loop()
         # **分块取行**（2026-10-30）：一次性 `text.splitlines()` 对 100-200 万行
@@ -2165,25 +2329,56 @@ class FilterEngine:
         _text = text
         _text_len = len(_text)
         _CHUNK_CHARS = 2_000_000
+        # 字节直通：`_text` 可能是 bytes/bytearray，块内再解码
+        _is_bytes = isinstance(_text, (bytes, bytearray))
+        _NL = b"\n" if _is_bytes else "\n"
+        # 已扫描行数（二进制字符报错时换算行号用）
+        _lines_seen = 0
+        # 本次列表收集到的 $badfilter 目标（校验通过后才合并进全局集合）
+        _local_badfilters: Set[str] = set()
 
         def _take_chunk(pos: int):
-            """切出下一块文本并 splitlines，返回 (lines, next_pos)
+            """切出下一块并 splitlines，返回 (lines, chunk_text, next_pos)
 
             边界处理：优先在块内**最后一个换行符**处切开，保证不把一行规则
             劈成两半。若块内没有换行（某条规则长度超过 _CHUNK_CHARS，理论上
             可能出现在畸形/被拼接的列表里），则**向后找该行的换行符**而不是
             硬切——硬切会让这一行变成两条无效规则（解析失败、规则丢失）。
+
+            `\\n`（0x0A）不会出现在 UTF-8 多字节序列内部，所以按字节切块
+            永远劈不开多字节字符。
             """
             end = min(pos + _CHUNK_CHARS, _text_len)
             if end < _text_len:
-                nl = _text.rfind("\n", pos, end)
+                nl = _text.rfind(_NL, pos, end)
                 if nl > pos:
                     end = nl + 1
                 else:
                     # 块内无换行：扩大到下一个换行（找不到就取到文本末尾）
-                    nxt = _text.find("\n", end)
+                    nxt = _text.find(_NL, end)
                     end = (_text_len if nxt < 0 else nxt + 1)
-            return _text[pos:end].splitlines(), end
+            _chunk = _text[pos:end]
+            if _is_bytes:
+                _chunk = _chunk.decode("utf-8", "replace")
+            return _chunk.splitlines(), _chunk, end
+
+        def _check_binary(chunk_text: str, lines_before: int):
+            """检测单个分块里的二进制控制字符，返回错误描述或 None
+
+            语义与 `AdGuardRuleParser._has_binary_chars` 完全一致（同一个 C
+            正则、同一批控制字符），只是改为**逐块**扫描：全文一次性检测需要
+            先有整份 str，而字节直通路径不能为了检测再复制一份完整文本。
+            """
+            m = AdGuardRuleParser._BINARY_CTRL_RE.search(chunk_text)
+            if m is None:
+                return None
+            pos = m.start()
+            line_no = lines_before + chunk_text.count("\n", 0, pos) + 1
+            col = pos - (chunk_text.rfind("\n", 0, pos) + 1)
+            return (
+                f"line {line_no}: character {col}: likely binary character "
+                f"'\\x{ord(m.group()):02x}'"
+            )
 
         if _text_len == 0:
             return False
@@ -2208,7 +2403,10 @@ class FilterEngine:
                 if rule.is_badfilter:
                     target = self._extract_badfilter_target(cleaned)
                     if target:
-                        with self._badfilter_lock: self._badfilter_patterns.add(target)
+                        # 先收进本次加载的**局部**集合，整份列表通过校验后才
+                        # 合并进全局：否则一个中途被判为二进制垃圾的列表会把
+                        # 半截 badfilter 留在全局集合里，误伤随后加载的列表。
+                        _local_badfilters.add(target)
 
         # 单 worker 串行：$badfilter 收集与索引都必须保持"按文件顺序"，且
         # `_index_rule` 写 `_pending_*` 索引，串行写入与原实现语义完全一致。
@@ -2216,16 +2414,33 @@ class FilterEngine:
             _pos = 0
             while _pos < _text_len:
                 try:
-                    _chunk_lines, _pos = await loop.run_in_executor(
+                    _chunk_lines, _chunk_text, _pos = await loop.run_in_executor(
                         pool, _take_chunk, _pos
                     )
+                    # 二进制字符检测：与旧实现同样覆盖全部内容，只是按块做。
+                    # 此时还在第 1 遍、尚未写入任何索引，中止是干净的。
+                    _bin_err = await loop.run_in_executor(
+                        pool, _check_binary, _chunk_text, _lines_seen
+                    )
+                    if _bin_err:
+                        logger.error("规则来源 %s 包含二进制字符: %s",
+                                     url, _bin_err)
+                        return False
+                    _lines_seen += len(_chunk_lines)
                     await loop.run_in_executor(pool, collect_badfilters, _chunk_lines)
                 except (StopIteration, RuntimeError) as e:
                     # PEP 479：worker 内逸出的 StopIteration 会被 asyncio 转成
                     # RuntimeError("coroutine raised StopIteration")。$badfilter
                     # 收集失败只影响 badfilter 生效范围，不应让整次加载失败。
                     logger.warning("规则解析阶段异常（已忽略该块）: %r", e)
+                    # 防死循环：异常发生在 _pos 推进之前，不前进会永远卡同一块
+                    _pos += _CHUNK_CHARS
                 await asyncio.sleep(0)
+
+        # 第 1 遍通过（含二进制检测）→ 本次列表的 $badfilter 才对外生效
+        if _local_badfilters:
+            with self._badfilter_lock:
+                self._badfilter_patterns.update(_local_badfilters)
 
         # ===== 第 2 遍：索引规则（_index_rule 自动处理 pending/active）=====
         _index_rule = self._index_rule
@@ -2267,7 +2482,7 @@ class FilterEngine:
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ipool:
             _pos = 0
             while _pos < _text_len:
-                _chunk_lines, _pos = await loop.run_in_executor(
+                _chunk_lines, _chunk_text, _pos = await loop.run_in_executor(
                     ipool, _take_chunk, _pos
                 )
                 if _chunk_lines:
@@ -2283,14 +2498,21 @@ class FilterEngine:
         self._skipped_html_rules += skipped_html
         self._skipped_modifier_rules += skipped_modifier
 
-        # 跟踪 URL（与流式路径一致）
+        # 记录来源：本地文件 → _loaded_files，远程 URL → _loaded_urls
+        # （配置热重载靠这两个列表判断 rules_files / rules_urls 是否变更）
         if self._pending_block_index is not None:
             self._pending_rule_count += total_rules
-            self._pending_loaded_urls.append(url)
+            if kind == "file":
+                self._pending_loaded_files.append(url)
+            else:
+                self._pending_loaded_urls.append(url)
             total = self._pending_rule_count
         else:
             self._rule_count += total_rules
-            self._loaded_urls.append(url)
+            if kind == "file":
+                self._loaded_files.append(url)
+            else:
+                self._loaded_urls.append(url)
             total = self._rule_count
 
         logger.info("从 %s 加载了 %d 条规则 (总: %d)", url, total_rules, total)
@@ -2304,7 +2526,7 @@ class FilterEngine:
         return total_rules > 0
 
     async def _download_url_parallel(self, url: str, num_chunks: int = 8,
-                                      timeout: int = 60) -> Optional[bytes]:
+                                      timeout: int = 60) -> Optional[bytearray]:
         """
         使用 HTTP Range 分片并行下载 URL 内容（类似迅雷多线程下载）。
 
@@ -2409,17 +2631,20 @@ class FilterEngine:
                 if len(chunks) != len(tasks):
                     return None
 
+                # 边拼接边释放分片：`chunks` 与 `result` 同时驻留会让峰值多出
+                # 一整份文件（38MB 级）；最后也不再复制成 bytes —— 调用方按
+                # 字节分块解析，bytearray 可以零拷贝切片。
                 result = bytearray(file_size)
                 offset = 0
                 for i in range(len(tasks)):
-                    data = chunks.get(i)
+                    data = chunks.pop(i, None)
                     if data is None:
                         return None
                     result[offset:offset + len(data)] = data
                     offset += len(data)
 
                 logger.info("  并行下载完成: %d bytes (%d 片)", offset, len(tasks))
-                return bytes(result)
+                return result
 
         except asyncio.TimeoutError:
             return None
@@ -2436,20 +2661,14 @@ class FilterEngine:
             # 优先尝试并行分片下载（HTTP Range 8 路并发，类似迅雷）
             parallel_data = await self._download_url_parallel(url)
             if parallel_data is not None:
-                # 并行下载成功 → 全量文本解析
-                text = await self._decode_utf8_incremental(parallel_data)
-                # HTML 检测
-                if self._parser._looks_like_html(text):
-                    logger.error("URL %s 内容包含 HTML，跳过", url)
-                    return False
-                # 二进制检测
-                has_binary, line_no, desc = self._parser._has_binary_chars(text)
-                if has_binary:
-                    logger.error("URL %s 包含二进制字符: %s", url, desc)
-                    return False
-                return await self._process_rules_from_text(text, url)
+                # 并行下载成功 → 字节直通解析（不再 decode 整份文本）
+                try:
+                    return await self._process_rules_from_bytes(parallel_data, url)
+                finally:
+                    # 尽快丢掉整份字节，别把它留到协程结束
+                    del parallel_data
 
-            # 并行下载不可用 → 回退到全文 gzip 下载（使用 _process_rules_from_text 多进程解析）
+            # 并行下载不可用 → 回退到全文 gzip 下载（同样字节直通解析）
             # 显式请求 gzip 压缩（自定义 headers 会覆盖 aiohttp 默认的 Accept-Encoding）
             headers = {"User-Agent": "SecureDNS-Proxy/1.0",
                        "Accept-Encoding": "gzip, deflate"}
@@ -2481,19 +2700,12 @@ class FilterEngine:
                                      url, len(raw), DEFAULT_MAX_SIZE)
                         return False
 
-                    text = await self._decode_utf8_incremental(raw)
-
-                    # HTML 检测
-                    if self._parser._looks_like_html(text):
-                        logger.error("URL %s 内容包含 HTML，跳过", url)
-                        return False
-                    # 二进制检测
-                    has_binary, line_no, desc = self._parser._has_binary_chars(text)
-                    if has_binary:
-                        logger.error("URL %s 包含二进制字符: %s", url, desc)
-                        return False
-
-                    return await self._process_rules_from_text(text, url)
+                    # 字节直通：不再把整份内容 decode 成 str（见
+                    # _process_rules_from_bytes 的内存说明）
+                    try:
+                        return await self._process_rules_from_bytes(raw, url)
+                    finally:
+                        del raw
 
         except asyncio.TimeoutError:
             logger.error("从 URL %s 加载规则超时 (80s)", url)
@@ -2533,15 +2745,11 @@ class FilterEngine:
                         logger.error("URL %s 实际大小 %d 超过限制 %d",
                                      url, len(raw), DEFAULT_MAX_SIZE)
                         return False
-                    text = await self._decode_utf8_incremental(raw)
-                    if self._parser._looks_like_html(text):
-                        logger.error("URL %s 内容包含 HTML，跳过", url)
-                        return False
-                    has_binary, _line_no, desc = self._parser._has_binary_chars(text)
-                    if has_binary:
-                        logger.error("URL %s 包含二进制字符: %s", url, desc)
-                        return False
-                    return await self._process_rules_from_text(text, url)
+                    # 字节直通：不再把整份内容 decode 成 str
+                    try:
+                        return await self._process_rules_from_bytes(raw, url)
+                    finally:
+                        del raw
         except Exception as e:
             logger.error("从 URL %s 加载规则失败（系统解析器回退）: %s", url, e)
             return False
@@ -2569,6 +2777,13 @@ class FilterEngine:
 
         # 2. 创建 pending 状态（不触碰活跃索引）
         gc.collect(generation=2)
+        # 重载会**重建**整份索引：此时 checksum 命中跳过解析＝把该文件的规则
+        # 直接丢掉（pending 里只剩远程 URL 的规则），因此重载路径必须清空
+        # checksum 缓存强制重解析；badfilter 集合同理，否则旧列表的
+        # $badfilter 会永久压制新列表里的同名规则。
+        self._file_checksums.clear()
+        with self._badfilter_lock:
+            self._badfilter_patterns.clear()
         self._pending_block_index = DomainIndex()
         self._pending_allow_index = DomainIndex()
         self._pending_plain_domains = set()
@@ -2583,13 +2798,27 @@ class FilterEngine:
         # 3. 加载到 pending 状态
         try:
             for filepath in files:
-                self.load_rules_from_file(filepath)
+                await self.load_rules_from_file_async(filepath)
 
             if urls:
-                await asyncio.gather(
-                    *[self.load_rules_from_url_async(url) for url in urls],
-                    return_exceptions=True,
-                )
+                # ★ 串行加载（2026-11）：原实现 `asyncio.gather` 并发加载全部
+                # URL，有两个副作用：
+                #   1) 内存峰值叠加——每个 URL 都要整份下载字节（tif 38MB 级）
+                #      与 2MB 分块同时驻留，Linux 下这笔高水位不回落；
+                #   2) 结果不确定——`_badfilter_patterns` 是全局集合，URL A 的
+                #      第 2 遍索引会看到 URL B 刚收集的 badfilter（反之亦然），
+                #      同一份规则集每次加载的域名数不同（实测
+                #      2160769 / 2160844 / 2160861 三次各异）。
+                # 逐个加载后两者都消失：每个 URL 结束即释放自己的临时缓冲，
+                # 且第 1 遍的 badfilter 收集与第 2 遍索引不再跨 URL 交错。
+                # 总耗时不变（并发下载只是让两个大文件互相抢带宽）。
+                for url in urls:
+                    try:
+                        await self.load_rules_from_url_async(url)
+                    except Exception as e:
+                        # 单个 URL 失败不影响其余列表（与原 gather 的
+                        # return_exceptions=True 语义一致）
+                        logger.error("从 %s 加载规则失败: %s", url, e)
 
             # 域名索引：把增量区归并进排序扁平表（释放临时 dict）
             self._finalize_indexes()
@@ -2628,6 +2857,8 @@ class FilterEngine:
         import gc as _gc_after_reload
         for _ in range(3):
             _gc_after_reload.collect(generation=2)
+        # 再把 glibc 手里的空闲页还给内核，避免 RSS 停在加载峰值
+        _release_heap_to_os()
 
         if self._update_callback:
             try:
@@ -2652,6 +2883,11 @@ class FilterEngine:
 
         # 2. 创建 pending 状态（不触碰活跃索引）
         gc.collect(generation=2)
+        # 与 async_reload 一致：重载重建索引，checksum 缓存必须失效强制重解析，
+        # 否则本地规则在重载后整体消失；badfilter 集合也随旧规则集作废。
+        self._file_checksums.clear()
+        with self._badfilter_lock:
+            self._badfilter_patterns.clear()
         self._pending_block_index = DomainIndex()
         self._pending_allow_index = DomainIndex()
         self._pending_plain_domains = set()
@@ -2715,6 +2951,9 @@ class FilterEngine:
             self._pending_loaded_files = []
             self._pending_loaded_urls = []
             self._loading = False
+
+        # 同步路径同样把空闲堆页还给内核（Linux glibc）
+        _release_heap_to_os()
 
         if self._update_callback:
             try:
