@@ -11,6 +11,9 @@ from typing import Optional
 
 import dns.message
 import dns.rdatatype
+import dns.flags
+import dns.rcode
+import dns.rrset
 
 # 本机是否存在全局 IPv6 地址（进程内缓存；网络变化后可 reset_ipv6_probe()）
 _HAS_GLOBAL_IPV6: Optional[bool] = None
@@ -188,3 +191,99 @@ def sort_dns_response_wire(wire_bytes):
         return msg.to_wire()
     except Exception:
         return wire_bytes
+
+
+# ============================================================
+# 拦截应答统一构造（NXDOMAIN + SOA）
+# ============================================================
+
+# 合成 SOA 使用的域：blocked.invalid. 按 RFC 6761 保留，不会被误解析到真实域。
+BLOCK_SOA_MNAME = "blocked.invalid."
+BLOCK_SOA_RNAME = "hostmaster.blocked.invalid."
+DEFAULT_BLOCK_NEGATIVE_TTL = 60
+# SOA 的 refresh / retry / expire 与 AdGuard Home 的负应答字段一致。
+BLOCK_SOA_REFRESH = 3600
+BLOCK_SOA_RETRY = 600
+BLOCK_SOA_EXPIRE = 86400
+_MAX_TTL = 0xFFFFFFFF
+
+
+def normalize_block_negative_ttl(value, default=DEFAULT_BLOCK_NEGATIVE_TTL):
+    """把配置里的 cache_negative_ttl 归一化为合法的 SOA TTL/MINIMUM。
+
+    - None / 0 / 负数 / 非整数 / 超出 32 位 → default（60）；
+    - 合法值原样返回（字符串数字也接受，兼容 YAML 里写成 "60"）。
+
+    为什么不在调用点各自 `int(... or 60)`：原实现里负数会让
+    `dns.rrset.from_text` 抛异常并被静默吞掉，结果是“配置写了负数时
+    所有入口都悄悄丢掉 SOA、客户端立刻重试”，而且各入口难以保持一致。
+    """
+    try:
+        ttl = int(value)
+    except (TypeError, ValueError):
+        return default
+    if ttl <= 0 or ttl > _MAX_TTL:
+        return default
+    return ttl
+
+
+def make_block_response(query, config=None, *, negative_ttl=None):
+    """构造“被过滤规则拦截”的统一 DNS 应答：NXDOMAIN + 合成 SOA。
+
+    四个前端（plain / DoH / DoT / DoQ）以及 main 的缓存清扫必须返回完全
+    相同的拦截形态；此前这段代码在 5 处各自复制了一份，改一处漏三处会
+    直接导致“某个入口返回空 NXDOMAIN、客户端立刻重试”的重试风暴。
+
+    形态与 AdGuard Home 的 ``blocking_mode=nxdomain`` 对齐：
+
+    - ``rcode = NXDOMAIN``；
+    - ``RA=1``（本机是递归服务端，RFC 1035 §4.1.1）；
+    - authority 附一条 SOA：owner=查询名，MNAME=blocked.invalid.，
+      RNAME=hostmaster.blocked.invalid.，``MINIMUM=TTL=cache_negative_ttl``。
+      RFC 2308 §5 规定客户端按 ``min(SOA.TTL, SOA.MINIMUM)`` 缓存负应答；
+      没有 SOA 时客户端（浏览器 / B 站客户端）会立刻重试。
+
+    与 0.0.0.0/:: 方案的区别：不返回任何地址，客户端按“域名不存在”处理，
+    不会去连 0.0.0.0 反复重试（实测 0.0.0.0 会让 data.bilibili.com 一次
+    会话被拦 1.8 万次）。
+
+    Args:
+        query: 原始查询 ``dns.message.Message``（可以是无 question 的畸形包）。
+        config: 可选配置对象；读取 ``cache_negative_ttl``。
+        negative_ttl: 显式 TTL，优先于 config（主要供测试 / 调用方覆盖）。
+
+    Returns:
+        新的 ``dns.message.Message``；调用方可直接 ``to_wire()`` 或写缓存。
+    """
+    response = dns.message.make_response(query)
+    response.set_rcode(dns.rcode.NXDOMAIN)
+    response.flags |= dns.flags.RA
+
+    if negative_ttl is None:
+        raw = (getattr(config, "cache_negative_ttl", None)
+               if config is not None else None)
+        negative_ttl = raw
+    ttl = normalize_block_negative_ttl(negative_ttl)
+
+    # 没有 question 的畸形查询（QTYPE 缺失 / 头部损坏）仍返回 NXDOMAIN，
+    # 只是不附 SOA——绝不在这里抛异常，否则前端会把它变成 SERVFAIL，
+    # 反而让客户端重试。
+    try:
+        question = query.question[0]
+    except (IndexError, AttributeError):
+        return response
+
+    try:
+        response.authority.append(dns.rrset.from_text(
+            question.name, ttl, "IN", "SOA",
+            "%s %s 1 %d %d %d %d" % (
+                BLOCK_SOA_MNAME, BLOCK_SOA_RNAME,
+                BLOCK_SOA_REFRESH, BLOCK_SOA_RETRY,
+                BLOCK_SOA_EXPIRE, ttl,
+            ),
+        ))
+    except Exception:
+        # 极端情况下（owner 名非法）退化为“只有 NXDOMAIN 无 SOA”，
+        # 保证拦截本身不失败。
+        pass
+    return response

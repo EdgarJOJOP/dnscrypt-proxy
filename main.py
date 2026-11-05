@@ -47,7 +47,11 @@ if str(PROJECT_ROOT) not in sys.path:
 
 # ----- DNS 响应排序工具（放在 import 之前，供各 server 模块循环导入使用）-----
 
-from dns_utils import reorder_answer_aaaa_first, sort_dns_response_wire
+from dns_utils import (
+    reorder_answer_aaaa_first,
+    sort_dns_response_wire,
+    make_block_response,
+)
 
 from config import Config
 from cache import DNSCache
@@ -656,18 +660,9 @@ class DNSProxyApp:
                 if already_blocked:
                     return 0
                 q_msg = dns.message.make_query(qname, qtype, qclass)
-                new_resp = dns.message.make_response(q_msg)
-                new_resp.set_rcode(dns.rcode.NXDOMAIN)
-                new_resp.flags |= dns.flags.RA          # RFC 1035：递归服务端
-                try:
-                    _neg_ttl = int(self.config.cache_negative_ttl or 60)
-                    new_resp.authority.append(dns.rrset.from_text(
-                        qname, _neg_ttl, "IN", "SOA",
-                        "blocked.invalid. hostmaster.blocked.invalid. 1 "
-                        "3600 600 86400 %d" % _neg_ttl,
-                    ))
-                except Exception:
-                    pass
+                # 与四个前端共用同一构造函数，保证清扫写回的拦截应答
+                # 与线上实时拦截的报文完全一致（NXDOMAIN + SOA）。
+                new_resp = make_block_response(q_msg, self.config)
                 await self.cache.discard(cache_key)
                 await self.cache.set(
                     (qname, qtype, qclass), new_resp,

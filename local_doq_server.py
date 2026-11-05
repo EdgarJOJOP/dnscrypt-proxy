@@ -34,7 +34,11 @@ from qps_limiter import QPSCounter
 from rate_limiter import get_per_ip_limiter
 
 # DNS 响应 Answer section 排序：AAAA (IPv6) 优先于 A (IPv4)
-from dns_utils import reorder_answer_aaaa_first, sort_dns_response_wire
+from dns_utils import (
+    reorder_answer_aaaa_first,
+    sort_dns_response_wire,
+    make_block_response,
+)
 
 logger = logging.getLogger("dns-proxy.local-doq")
 
@@ -626,20 +630,9 @@ class LocalDoQServer:
                             await self._log_query(
                                 client_ip, qname, qtype_name, "cached", block_reason)
                             return _hit.to_wire()
-                    # 拦截统一返回 NXDOMAIN（2026-10-30，详见 plain_dns_server 注释）
-                    response = dns.message.make_response(query)
-                    response.set_rcode(dns.rcode.NXDOMAIN)
-                    response.flags |= dns.flags.RA   # RFC 1035：递归服务端
-                    # RFC 2308：补 SOA 让客户端能缓存负应答（详见 plain_dns_server 注释）
-                    try:
-                        _neg_ttl = int(getattr(self.config, "cache_negative_ttl", 60) or 60)
-                        response.authority.append(dns.rrset.from_text(
-                            question.name, _neg_ttl, "IN", "SOA",
-                            "blocked.invalid. hostmaster.blocked.invalid. 1 "
-                            "3600 600 86400 %d" % _neg_ttl,
-                        ))
-                    except Exception:
-                        pass
+                    # 拦截统一返回 NXDOMAIN + 合成 SOA（2026-10-30，
+                    # 详见 dns_utils.make_block_response 文档）
+                    response = make_block_response(query, self.config)
                     response_wire = response.to_wire()
                     # 拦截占位打标（blocked=True）：规则放宽后由
                     # _sweep_cache_after_filter_load 反向清理，避免旧拦截缓存

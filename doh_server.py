@@ -86,7 +86,11 @@ from qps_limiter import QPSCounter
 from rate_limiter import get_per_ip_limiter
 
 # DNS 响应 Answer section 排序：AAAA (IPv6) 优先于 A (IPv4)
-from dns_utils import reorder_answer_aaaa_first, sort_dns_response_wire
+from dns_utils import (
+    reorder_answer_aaaa_first,
+    sort_dns_response_wire,
+    make_block_response,
+)
 
 logger = logging.getLogger("dns-proxy.doh-server")
 
@@ -1481,19 +1485,9 @@ class DoHServer:
                         _hit = await self.cache.get(_block_key)
                         if _hit is not None:
                             return self._dns_response_to_json(_hit, query)
-                    response = dns.message.make_response(query)
-                    response.set_rcode(dns.rcode.NXDOMAIN)
-                    response.flags |= dns.flags.RA   # RFC 1035：递归服务端
-                    # RFC 2308：补 SOA 让客户端能缓存负应答（详见 plain_dns_server 注释）
-                    try:
-                        _neg_ttl = int(getattr(self.config, "cache_negative_ttl", 60) or 60)
-                        response.authority.append(dns.rrset.from_text(
-                            question.name, _neg_ttl, "IN", "SOA",
-                            "blocked.invalid. hostmaster.blocked.invalid. 1 "
-                            "3600 600 86400 %d" % _neg_ttl,
-                        ))
-                    except Exception:
-                        pass
+                    # 统一由 dns_utils.make_block_response 构造 NXDOMAIN + SOA：
+                    # 四个前端必须完全一致，详见该函数文档。
+                    response = make_block_response(query, self.config)
                     if self.config.cache_enabled:
                         await self.cache.set(_block_key, response, True, blocked=True)
                     # 修复：早期这里 `return result` 返回的是只填了 Status/Comment
@@ -1767,19 +1761,9 @@ class DoHServer:
                                 _hit.to_wire(), response_format, query=query)
                     # 拦截统一返回 NXDOMAIN（2026-10-30，详见 plain_dns_server 注释）：
                     # block_ip / block_nxdomain 已废弃，不再重写 0.0.0.0 / ::
-                    response = dns.message.make_response(query)
-                    response.set_rcode(dns.rcode.NXDOMAIN)
-                    response.flags |= dns.flags.RA   # RFC 1035：递归服务端
-                    # RFC 2308：补 SOA 让客户端能缓存负应答（详见 plain_dns_server 注释）
-                    try:
-                        _neg_ttl = int(getattr(self.config, "cache_negative_ttl", 60) or 60)
-                        response.authority.append(dns.rrset.from_text(
-                            question.name, _neg_ttl, "IN", "SOA",
-                            "blocked.invalid. hostmaster.blocked.invalid. 1 "
-                            "3600 600 86400 %d" % _neg_ttl,
-                        ))
-                    except Exception:
-                        pass
+                    # 统一由 dns_utils.make_block_response 构造 NXDOMAIN + SOA：
+                    # 四个前端必须完全一致，详见该函数文档。
+                    response = make_block_response(query, self.config)
                     response_wire = response.to_wire()
                     # 缓存拦截结果（blocked=True 打标，供规则放宽后反向清理）
                     if self.config.cache_enabled:

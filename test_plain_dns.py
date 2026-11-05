@@ -34,6 +34,21 @@ Part B（迭代解析 DNSSEC 攻击向量，离线回放真实签名 wire）：
   17 CNAME 中间跳无签名 + 区状态 unknown（必须拒绝）
   18 DS 查询不跟随 CNAME（RFC 4035 §2.4，离线）
 
+Part B2（DNSSEC 链状态/重试逐分支穷举，离线）：
+  B2.1  parent_keys 取不到 + 父区 secure → error（链不可用，放行；修复前 unknown）
+  B2.2  parent_keys 取不到 + 父区 insecure → insecure
+  B2.3  精确 NSEC3 + parent_keys 取不到 → error
+  B2.4  NSEC3 验签失败 + keys 可用 → unknown（保守）
+  B2.5  NODATA 无 NSEC + 委托点 + 父区 secure → unknown
+  B2.6  NODATA 无 NSEC + 委托点 + 父区 insecure → insecure
+  B2.7  DS NXDOMAIN + is_del=True → unknown
+  B2.8  DS NXDOMAIN + is_del=False 升父级 → insecure
+  B2.13 DS NXDOMAIN + is_del=True + 父区 insecure → insecure（CDN 随机子域回归）
+  B2.9  链查询首次 RRL 失败、退避重试后成功
+  B2.10 连续失败 → None + 15s 负缓存（第二次不重查权威）
+  B2.11 同 zone 10 并发只构建一次链（single-flight）
+  B2.12 不同 zone 并发受 semaphore=4 限制
+
 Part C（真实网络端到端，`--real-dnssec` 开启）：
   cdn.jsdelivr.net / s.360.cn / opencdnkav6.jomodns.com / p.ssl.qhimg.com
   必须判 insecure 且能解析；ietf.org 必须 secure 且带 RRSIG；
@@ -54,6 +69,7 @@ import dns.dnssec
 import dns.flags
 import dns.message
 import dns.name
+import dns.rdata
 import dns.rcode
 import dns.rdataclass
 import dns.rdatatype
@@ -798,6 +814,285 @@ async def run_part_b() -> bool:
 
 
 # ============================================================
+# Part B2：DNSSEC 链状态逐分支穷举（离线）
+#
+# 覆盖两类历史问题：
+#   1. _zone_signed_status 的“链不可用 ≠ 可丢弃”：父区 DNSKEY 取不到时
+#      旧代码返回 unknown（调用方按可丢弃），修复后返回 error（可用性放行）；
+#   2. _get_trusted_dnskey 的重试/负缓存/single-flight/并发闸门：冷启动
+#      根/TLD DNSKEY 被 RRL 限速时，退避重试后仍失败才放行，且 15s 内
+#      不重复打爆同一权威。
+# ============================================================
+
+def _chain_resp(name, rcode=dns.rcode.NOERROR, authority=None):
+    q = dns.message.make_query(name, dns.rdatatype.DS)
+    r = dns.message.make_response(q)
+    r.set_rcode(rcode)
+    for rr in authority or []:
+        r.authority.append(rr)
+    return r
+
+
+def _chain_soa(zone="cn."):
+    return dns.rrset.from_text(
+        zone, 300, "IN", "SOA",
+        "a.root-servers.net. nstld.verisign-grs.com. 1 1800 900 604800 86400")
+
+
+def _chain_nsec3(owner_label=None, flags=0,
+                 bitmap="NS SOA RRSIG DNSKEY NSEC3PARAM"):
+    if owner_label is None:
+        owner_label = base64.b32hexencode(b"\x01" * 20).decode().lower()
+    owner = dns.name.from_text(owner_label + ".cn.")
+    nxt = base64.b32hexencode(b"\x02" * 20).decode().lower()
+    rd = dns.rdata.from_text(
+        "IN", "NSEC3", "1 %d 10 aef123ab %s %s" % (flags, nxt, bitmap))
+    return dns.rrset.from_rdata(owner, 300, rd)
+
+
+def _chain_rrsig_for(rrset, signer="cn."):
+    sig = dns.rdata.from_text(
+        "IN", "RRSIG",
+        "NSEC3 8 3 300 20300101000000 20200101000000 12345 %s AAAA" % signer)
+    return dns.rrset.from_rdata(rrset.name, 300, sig)
+
+
+def _make_chain_resolver(ds_map, del_map, parent_insecure, trusted_keys, pds):
+    """构造只跑 _zone_signed_status 的 resolver（全部依赖 mock）。"""
+    r = object.__new__(pds.IterativeResolver)
+    r._ds_cache = {}
+    r._ds_inflight = {}
+    r._delegation_cache = {}
+    r._zone_ns_cache = {}
+    r._verified_zone_cache = {}
+    r._dnssec_crypto_ok = True
+    r._chain_unavailable = set()
+
+    async def _iterate_ds_cached(name):
+        return ds_map.get(str(name).lower())
+
+    async def _is_delegation(name):
+        return del_map.get(str(name).lower())
+
+    async def _parent_is_insecure(name):
+        return parent_insecure.get(str(name).lower(), False)
+
+    async def _get_trusted_dnskey(name):
+        return trusted_keys.get(str(name).lower())
+
+    async def _retry_ds_once(name):
+        return ds_map.get(str(name).lower())
+
+    r._iterate_ds_cached = _iterate_ds_cached
+    r._is_delegation = _is_delegation
+    r._parent_is_insecure = _parent_is_insecure
+    r._get_trusted_dnskey = _get_trusted_dnskey
+    r._retry_ds_once = _retry_ds_once
+    return r
+
+
+def _build_chain(target, mt_resp, pds, del_map=None,
+                 parent_insecure=None, keys=None):
+    """target 的 DS 为 NXDOMAIN，edge 为 NODATA 无 NSEC，mountaintoys.cn 为给定响应。"""
+    name = dns.name.from_text(target)
+    edge = "edge.mountaintoys.cn."
+    mt = "mountaintoys.cn."
+    ds_map = {
+        str(name).lower(): _chain_resp(target, dns.rcode.NXDOMAIN),
+        edge: _chain_resp(edge, dns.rcode.NOERROR, [_chain_soa()]),
+        mt: mt_resp,
+    }
+    return _make_chain_resolver(
+        ds_map, del_map or {}, parent_insecure or {}, keys or {}, pds)
+
+
+def _make_trusted_resolver(pds, delays=(0.0, 0.0, 0.0)):
+    """构造只跑 _get_trusted_dnskey 的 resolver（retry/负缓存/并发测试）。"""
+    r = object.__new__(pds.IterativeResolver)
+    r._dnssec_crypto_ok = True
+    r._stats = collections.Counter()
+    r._verified_zone_cache = {}
+    r._dnskey_inflight = {}
+    r._ds_cache = {}
+    r._ds_inflight = {}
+    r._dnskey_retry_after = {}
+    r._dnskey_semaphore = None
+    r._dnskey_retry_delays = delays
+    r._chain_unavailable = set()
+    return r
+
+
+async def run_part_b_chain() -> bool:
+    print("\n[Part B2] DNSSEC 链状态/重试逐分支穷举（离线）")
+    try:
+        import plain_dns_server as pds
+    except Exception as e:      # pragma: no cover
+        print(f"  跳过：无法导入 plain_dns_server（{e}）")
+        return True
+
+    start_ok = len(RESULTS)
+    target = "v9e169o.edge.mountaintoys.cn"
+    mt = dns.name.from_text("mountaintoys.cn.")
+    del_map = {
+        "v9e169o.edge.mountaintoys.cn.": False,
+        "edge.mountaintoys.cn.": False,
+        "mountaintoys.cn.": True,
+    }
+
+    # 1) parent_keys 取不到 + 父区未证明未签名 → error（修复前 unknown）
+    edge_nsec3 = _chain_nsec3(flags=1)
+    resp = _chain_resp("mountaintoys.cn", dns.rcode.NOERROR,
+                       [_chain_soa(), edge_nsec3])
+    r = _build_chain(target, resp, pds, del_map=del_map)
+    got = await r._zone_signed_status(dns.name.from_text(target))
+    check("B2.1 parent_keys=None + 父区 secure → error（链不可用，放行）",
+          got == "error", f"got={got!r}")
+
+    # 2) parent_keys 取不到 + 父区已证明未签名 → insecure（优先）
+    r = _build_chain(target, resp, pds, del_map=del_map,
+                     parent_insecure={"mountaintoys.cn.": True})
+    got = await r._zone_signed_status(dns.name.from_text(target))
+    check("B2.2 parent_keys=None + 父区 insecure → insecure",
+          got == "insecure", f"got={got!r}")
+
+    # 3) 精确 NSEC3 owner（is_apex=True）同样走 parent_keys=None → error
+    h = pds.IterativeResolver._nsec3_hash(mt, b"\xae\xf1\x23\xab", 10, 1)
+    label = base64.b32hexencode(h).decode().lower().rstrip("=")
+    exact = _chain_nsec3(owner_label=label, flags=0,
+                         bitmap="NS SOA RRSIG DNSKEY NSEC3PARAM")
+    resp_exact = _chain_resp("mountaintoys.cn", dns.rcode.NOERROR,
+                             [_chain_soa(), exact])
+    r = _build_chain(target, resp_exact, pds, del_map=del_map)
+    got = await r._zone_signed_status(dns.name.from_text(target))
+    check("B2.3 精确 NSEC3 + parent_keys=None → error",
+          got == "error", f"got={got!r}")
+
+    # 4) parent_keys 可用但 NSEC3 验签失败 → unknown（保守，可能是伪造）
+    fake_key = dns.rrset.RRset(dns.name.from_text("cn."), dns.rdataclass.IN,
+                               dns.rdatatype.DNSKEY)
+    resp_sig = _chain_resp("mountaintoys.cn", dns.rcode.NOERROR,
+                           [_chain_soa(), edge_nsec3,
+                            _chain_rrsig_for(edge_nsec3)])
+    r = _build_chain(target, resp_sig, pds, del_map=del_map,
+                     keys={"cn.": fake_key})
+    got = await r._zone_signed_status(dns.name.from_text(target))
+    check("B2.4 NSEC3 验签失败 + keys 可用 → unknown（保守）",
+          got == "unknown", f"got={got!r}")
+
+    # 5) NODATA 无 NSEC + is_del=True + 父区 secure → unknown（保持）
+    resp_nodata = _chain_resp("mountaintoys.cn", dns.rcode.NOERROR,
+                              [_chain_soa()])
+    r = _build_chain(target, resp_nodata, pds, del_map=del_map)
+    got = await r._zone_signed_status(dns.name.from_text(target))
+    check("B2.5 NODATA 无 NSEC + 委托点 + 父区 secure → unknown",
+          got == "unknown", f"got={got!r}")
+
+    # 6) NODATA 无 NSEC + is_del=True + 父区 insecure → insecure（保持）
+    r = _build_chain(target, resp_nodata, pds, del_map=del_map,
+                     parent_insecure={"mountaintoys.cn.": True})
+    got = await r._zone_signed_status(dns.name.from_text(target))
+    check("B2.6 NODATA 无 NSEC + 委托点 + 父区 insecure → insecure",
+          got == "insecure", f"got={got!r}")
+
+    # 7) DS NXDOMAIN + is_del=True → unknown（名字不存在且是委托点）
+    r = _build_chain(target, resp_nodata, pds, del_map={
+        "v9e169o.edge.mountaintoys.cn.": True,
+    })
+    got = await r._zone_signed_status(dns.name.from_text(target))
+    check("B2.7 DS NXDOMAIN + is_del=True → unknown",
+          got == "unknown", f"got={got!r}")
+
+    # 8) DS NXDOMAIN + is_del=False → 升父级，最终 insecure
+    r = _build_chain(target, resp_nodata, pds, del_map=del_map,
+                     parent_insecure={"mountaintoys.cn.": True})
+    got = await r._zone_signed_status(dns.name.from_text(target))
+    check("B2.8 DS NXDOMAIN + is_del=False 升父级 → insecure",
+          got == "insecure", f"got={got!r}")
+
+    # 13) DS NXDOMAIN + is_del=True + 父区已 insecure → insecure
+    #     （实测 v9e169o.edge.mountaintoys.cn：_is_delegation 缓存命中为 True，
+    #      父区 mountaintoys.cn 已未签名；旧代码在这里直接 unknown → 丢弃）
+    r = _build_chain(target, resp_nodata, pds, del_map={
+        "v9e169o.edge.mountaintoys.cn.": True,
+    }, parent_insecure={"v9e169o.edge.mountaintoys.cn.": True})
+    got = await r._zone_signed_status(dns.name.from_text(target))
+    check("B2.13 DS NXDOMAIN + is_del=True + 父区 insecure → insecure",
+          got == "insecure", f"got={got!r}")
+
+    # 9) 链查询首次 RRL 失败、退避后重试成功 → 不应被当成不可用
+    r = _make_trusted_resolver(pds)
+    calls = {"n": 0}
+
+    async def flaky(zone):
+        calls["n"] += 1
+        if calls["n"] < 2:
+            raise pds._ChainUnavailable("simulated RRL")
+        return "TRUSTED"
+
+    r._get_trusted_dnskey_uncached = flaky
+    out = await r._get_trusted_dnskey(dns.name.from_text("cn."))
+    check("B2.9 链查询首次失败、退避重试后成功",
+          out == "TRUSTED" and calls["n"] == 2,
+          f"out={out!r} calls={calls['n']}")
+
+    # 10) 连续失败 → None + 15s 负缓存，第二次不再打权威
+    r = _make_trusted_resolver(pds)
+    calls = {"n": 0}
+
+    async def always_fail(zone):
+        calls["n"] += 1
+        raise pds._ChainUnavailable("simulated RRL")
+
+    r._get_trusted_dnskey_uncached = always_fail
+    out1 = await r._get_trusted_dnskey(dns.name.from_text("cn."))
+    first_calls = calls["n"]
+    out2 = await r._get_trusted_dnskey(dns.name.from_text("cn."))
+    check("B2.10 连续失败 → None + 15s 负缓存（第二次不重查）",
+          out1 is None and out2 is None
+          and first_calls == 4 and calls["n"] == first_calls,
+          f"out1={out1!r} out2={out2!r} calls={calls['n']} first={first_calls}")
+
+    # 11) 同 zone 10 并发只构建一次链（single-flight）
+    r = _make_trusted_resolver(pds)
+    calls = {"n": 0}
+
+    async def slow(zone):
+        calls["n"] += 1
+        await asyncio.sleep(0.05)
+        return "TRUSTED"
+
+    r._get_trusted_dnskey_uncached = slow
+    outs = await asyncio.gather(*[
+        r._get_trusted_dnskey(dns.name.from_text("cn.")) for _ in range(10)
+    ])
+    check("B2.11 同 zone 10 并发只构建一次链（single-flight）",
+          calls["n"] == 1 and all(o == "TRUSTED" for o in outs),
+          f"calls={calls['n']}")
+
+    # 12) 不同 zone 并发受 semaphore=4 限制（不把根/TLD 一次打爆）
+    r = _make_trusted_resolver(pds)
+    r._dnskey_semaphore = asyncio.Semaphore(4)
+    active = {"now": 0, "peak": 0}
+
+    async def tracked(zone):
+        active["now"] += 1
+        active["peak"] = max(active["peak"], active["now"])
+        await asyncio.sleep(0.02)
+        active["now"] -= 1
+        return "TRUSTED"
+
+    r._get_trusted_dnskey_uncached = tracked
+    await asyncio.gather(*[
+        r._get_trusted_dnskey(dns.name.from_text("z%d.example." % i))
+        for i in range(12)
+    ])
+    check("B2.12 不同 zone 并发被 semaphore 限制在 4",
+          active["peak"] <= 4, f"peak={active['peak']}")
+
+    return all(ok for _, ok in RESULTS[start_ok:])
+
+
+# ============================================================
 # Part C：真实网络端到端 DNSSEC 回归（--real-dnssec）
 # ============================================================
 async def run_part_c() -> bool:
@@ -898,6 +1193,7 @@ def main() -> int:
     if not args.skip_net:
         asyncio.run(run_part_a(args.port))
     asyncio.run(run_part_b())
+    asyncio.run(run_part_b_chain())
     if args.real_dnssec:
         asyncio.run(run_part_c())
 

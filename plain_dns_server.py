@@ -11,6 +11,7 @@ import contextvars
 import ipaddress
 import logging
 import os
+import random
 import socket
 import struct
 import sys
@@ -34,6 +35,7 @@ from dns_utils import (
     sort_dns_response_wire,
     has_global_ipv6,
     probe_ipv6_path,
+    make_block_response,
 )
 
 from config import Config, DEFAULT_ROOT_SERVERS
@@ -260,6 +262,8 @@ class PlainDNSServer:
         # plain DNS 自身统一走 resolver_manager.resolve()，不再单独迭代。
         self.iterative_enabled = config.plain_dns_iterative_enabled
         self.iterative_resolver = iterative_resolver  # Optional[IterativeResolver]
+        # 后台预热根区 DNSKEY 的任务句柄（stop 时取消，避免悬挂任务）
+        self._dnssec_warmup_task = None
         if self.iterative_resolver is not None:
             logger.info("普通 DNS 迭代解析上游已注入（根→TLD→权威 + DNSSEC 严格验证）")
 
@@ -596,8 +600,7 @@ class PlainDNSServer:
                                 "cached", block_reason,
                             )
                             return _hit.to_wire()
-                    response = dns.message.make_response(query)
-                    # 拦截统一返回 NXDOMAIN（2026-10-30）：
+                    # 拦截统一返回 NXDOMAIN + 合成 SOA（2026-10-30）：
                     # 原先 A/AAAA 被重写成 0.0.0.0 / ::（block_ip 机制），客户端会去连
                     # 这个假地址、连不上就无限重试——实测 data.bilibili.com 一次会话
                     # 被拦 1.8 万次、单分钟 299 次，重试挤占前端与事件循环，叠加
@@ -605,27 +608,9 @@ class PlainDNSServer:
                     # 连带其它客户端（游戏/加速器）解析超时。
                     # NXDOMAIN 让客户端按"域名不存在"处理，不再重连重试。
                     # block_ip / block_nxdomain 两个配置项随之废弃。
-                    response.set_rcode(dns.rcode.NXDOMAIN)
-                    # RFC 1035 §4.1.1：本机是递归服务端，拦截应答也必须置 RA=1，
-                    # 否则客户端（glibc res_send / 部分游戏解析器）会认为这台
-                    # DNS 不提供递归而弃用。
-                    response.flags |= dns.flags.RA
-                    # **附 SOA 让客户端缓存负应答**（2026-10-30，关键）：
-                    # RFC 2308 §5：NXDOMAIN 的客户端缓存时长由 authority 段
-                    # SOA 的 MINIMUM 字段决定。原来拦截响应只有 rcode、没有 SOA，
-                    # 客户端（浏览器/B 站客户端/系统解析器）无从判断能缓存多久，
-                    # 于是**立刻重试**——实测同一 (client_ip,qtype) 在 3 分钟内被
-                    # 重复拦 264 次。AdGuard Home 拦截时会附带 SOA，所以
-                    # 「拦一次就不再问」。这里补齐，让客户端按 TTL 缓存。
-                    try:
-                        _neg_ttl = int(getattr(self.config, "cache_negative_ttl", 60) or 60)
-                        response.authority.append(dns.rrset.from_text(
-                            question.name, _neg_ttl, "IN", "SOA",
-                            "blocked.invalid. hostmaster.blocked.invalid. 1 "
-                            "3600 600 86400 %d" % _neg_ttl,
-                        ))
-                    except Exception:
-                        pass
+                    # 报文构造集中在 dns_utils.make_block_response，
+                    # plain/DoH/DoT/DoQ 与 main 的缓存清扫必须完全一致。
+                    response = make_block_response(query, self.config)
                     if self.config.cache_enabled:
                         await self.cache.set(
                             _block_key, response,
@@ -997,11 +982,28 @@ class PlainDNSServer:
             logger.error("普通 DNS 未能监听任何地址（UDP/TCP 全部失败），服务未启动")
         self._running = started
 
+        # 后台预热根区 DNSKEY：不阻塞监听启动，只在该进程启用迭代解析时做。
+        # 冷启动首个查询最容易在“根 DNSKEY 还没验证并缓存”时超时，预热
+        # 可以把这一级的失败率降到最低；失败也不影响服务（查询路径会重试）。
+        if started and self.iterative_enabled and self.iterative_resolver is not None:
+            try:
+                self._dnssec_warmup_task = asyncio.create_task(
+                    self.iterative_resolver.warmup_dnssec_chain())
+            except Exception as e:
+                self._dnssec_warmup_task = None
+                logger.debug("DNSSEC 根区预热任务创建失败: %s", e)
+
 
 
     async def stop(self):
         """停止 DNS 服务器（UDP + TCP）"""
         self._running = False
+
+        # 取消后台根区 DNSKEY 预热任务（避免 stop 后还挂着网络任务）
+        warmup_task = getattr(self, "_dnssec_warmup_task", None)
+        if warmup_task is not None and not warmup_task.done():
+            warmup_task.cancel()
+        self._dnssec_warmup_task = None
 
         # 停止 UDP worker 池（先停生产侧 transport，再取消 worker）
         for transport in [self._transport_v4, self._transport_v6]:
@@ -1211,6 +1213,19 @@ class IterativeResolver:
         # 根/TLD 权威会因 RRL 限速而大面积超时（表现为「解析卡 3s+ 后失败」）。
         self._dnskey_inflight: Dict[str, asyncio.Future] = {}
         self._ds_inflight: Dict[str, asyncio.Future] = {}
+        # DNSSEC 链构建的并发闸门：single-flight 只合并同一 zone；冷启动时
+        # root/cn/com/... 等不同 zone 的链构建仍会并发访问权威，同一源 IP
+        # 的突发查询容易被 RRL 限速。这里把同时进行的链构建限制在 4 个，
+        # 其余在 semaphore 上排队（惰性创建，避免绑定错误的 event loop）。
+        self._dnskey_semaphore: Optional[asyncio.Semaphore] = None
+        # 链构建失败后的短负缓存：zone -> 可再次尝试的时间戳。
+        # 一次限速/超时后若每个新查询都立刻重试同一权威，只会把限速窗口
+        # 无限拉长；15s 内直接复用“暂时不可用”结论（按 error 放行），
+        # 到期后自动重新尝试，避免既误杀又持续打爆权威。
+        self._dnskey_retry_after: Dict[str, float] = {}
+        # 失败重试退避（秒）：初始 + 3 次重试，覆盖权威瞬时超时/RRL。
+        # 每次附加 0~50ms 抖动，避免多个并发链同步重试再次撞限速。
+        self._dnskey_retry_delays = (0.15, 0.4, 0.9)
         # DNSSEC 告警去重：{(tag, zone)} 已告警过。
         # 同一 zone 的链验证失败是**持续状态**（KSK 轮换、上游剥离 RRSIG、
         # 权威配置错误…），每次查询都打一条 WARNING 只会刷屏把真问题淹掉
@@ -2343,12 +2358,32 @@ class IterativeResolver:
             return out
         return None
 
+    def _clear_ds_cache_for_chain(self, zone_name: dns.name.Name) -> None:
+        """只清理 zone 及其父级链的 DS 缓存，保留其它 zone 的有效缓存。
+
+        旧实现失败时 `_ds_cache.clear()` 会把其它 zone 刚建立的有效缓存
+        一起扔掉，下一批查询又全部重查，反而放大权威限速。
+        """
+        n = zone_name
+        while n != dns.name.root:
+            k = str(n).lower()
+            self._ds_cache.pop(k, None)
+            self._ds_inflight.pop(k, None)
+            n = n.parent()
+
     async def _get_trusted_dnskey(self, zone_name: dns.name.Name) -> Optional[dns.rrset.RRset]:
-        """DNSSEC 链验证入口（带缓存 + single-flight）
+        """DNSSEC 链验证入口（缓存 + single-flight + 失败重试/负缓存）
 
         冷启动并发时（浏览器一次打开几十个站点），每个域名都要验证根/TLD 的
         DNSKEY；若各查一遍，同一 zone 会被并发查几十次，根/TLD 权威因 RRL
-        限速而大面积超时。这里把同一 zone 的并发请求合并成一次，其余等待结果。
+        限速而大面积超时。这里把同一 zone 的并发请求合并成一次；不同 zone
+        再通过 semaphore 限制同时进行的链构建数，避免同一源 IP 的突发查询
+        触发 RRL。
+
+        失败处理（2026-11-06）：一次 DNSKEY/DS 超时或 RRL 不代表签名被剥离，
+        所以按 0.15/0.4/0.9s 退避重试；仍失败才记 15s 负缓存并按 error
+        （链不可用）放行，15s 后自动重新尝试。负缓存只避免“每个新查询都
+        立刻重打同一权威”，不会把暂时故障永久固化为放行。
         """
         key = str(zone_name).lower()
         if not self._dnssec_crypto_ok:
@@ -2358,6 +2393,16 @@ class IterativeResolver:
         cached = self._verified_zone_cache.get(key)
         if cached is not None and time.time() < cached[1]:
             return cached[0]
+        retry_after = getattr(self, "_dnskey_retry_after", None)
+        if retry_after is None:
+            retry_after = {}
+            self._dnskey_retry_after = retry_after
+        if time.time() < retry_after.get(key, 0.0):
+            # 负缓存期内：不再打同一 zone 的权威，调用方按 error 放行；
+            # 到期后这里会自动重新走完整重试。
+            self._stats["chain_unavailable"] = (
+                self._stats.get("chain_unavailable", 0) + 1)
+            return None
         inflight = self._dnskey_inflight.get(key)
         if inflight is not None:
             try:
@@ -2368,29 +2413,50 @@ class IterativeResolver:
                 return None
         fut = asyncio.get_running_loop().create_future()
         self._dnskey_inflight[key] = fut
+        sem = getattr(self, "_dnskey_semaphore", None)
+        if sem is None:
+            sem = asyncio.Semaphore(4)
+            self._dnskey_semaphore = sem
+        result = None
         try:
-            try:
-                result = await self._get_trusted_dnskey_uncached(zone_name)
-            except _ChainUnavailable as e:
-                # 查询失败（超时 / 权威不可达 / 响应不完整）≠ 伪造：清掉这一轮
-                # 的 DS 负缓存后重试一次，避免一次 DNS 抖动就把合法域名判 bogus
-                # （实测 verisign.com / nic.se 会随机 SERVFAIL）。
-                logger.debug("DNSSEC 链暂时不可用，重试一次: %s: %s",
-                             _safe_qname(zone_name), e)
-                self._ds_cache.clear()
-                result = await self._get_trusted_dnskey_uncached(zone_name)
-            # 成功（或确定性地 insecure）→ 清掉可能残留的「暂时不可用」标记
-            self._chain_unavailable.discard(key)
-        except _ChainUnavailable as e:
-            # 重试仍失败 → 标记「暂时不可用」，调用方按 error 语义放行，
-            # 不判 bogus、不告警（安全上与 _zone_signed_status 的 error 同级：
-            # 攻击者同样可以通过阻断 DS 查询触发那条放行路径）
-            if len(self._chain_unavailable) > 512:
-                self._chain_unavailable.clear()
-            self._chain_unavailable.add(key)
-            logger.debug("DNSSEC 链暂时不可用（查询失败，非 bogus）: %s: %s",
-                         _safe_qname(zone_name), e)
-            result = None
+            async with sem:
+                delays = tuple(getattr(
+                    self, "_dnskey_retry_delays", (0.15, 0.4, 0.9)))
+                last_error = None
+                for attempt, delay in enumerate((0.0,) + delays):
+                    if delay:
+                        # 抖动：多个并发链/实例不会在同一毫秒重试而再次撞 RRL。
+                        await asyncio.sleep(delay + random.uniform(0.0, 0.05))
+                    try:
+                        result = await self._get_trusted_dnskey_uncached(zone_name)
+                        last_error = None
+                        break
+                    except _ChainUnavailable as e:
+                        last_error = e
+                        self._clear_ds_cache_for_chain(zone_name)
+                        logger.debug(
+                            "DNSSEC 链暂时不可用（attempt=%d/%d），退避后重试: "
+                            "%s: %s", attempt + 1, len(delays) + 1,
+                            _safe_qname(zone_name), e,
+                        )
+                if last_error is not None:
+                    if len(retry_after) > 512:
+                        retry_after.clear()
+                    retry_after[key] = time.time() + 15.0
+                    if len(self._chain_unavailable) > 512:
+                        self._chain_unavailable.clear()
+                    self._chain_unavailable.add(key)
+                    self._stats["chain_unavailable"] = (
+                        self._stats.get("chain_unavailable", 0) + 1)
+                    logger.debug(
+                        "DNSSEC 链暂时不可用（15s 负缓存，非 bogus）: %s: %s",
+                        _safe_qname(zone_name), last_error,
+                    )
+                    result = None
+                else:
+                    # 成功（或确定性地 insecure / 验证失败）→ 清掉失败标记
+                    retry_after.pop(key, None)
+                    self._chain_unavailable.discard(key)
         except asyncio.CancelledError:
             if not fut.done():
                 fut.set_result(None)
@@ -2405,6 +2471,18 @@ class IterativeResolver:
             fut.set_result(result)
         self._dnskey_inflight.pop(key, None)
         return result
+
+    async def warmup_dnssec_chain(self) -> None:
+        """启动后台预热根区 DNSKEY，降低冷启动首个查询的链构建失败率。
+
+        只预热根区：根 DNSKEY 是整条链的第一级，验证并缓存后，后续 TLD
+        只需查自己的 DS/DNSKEY。预热失败不抛出、不影响服务（下一次查询
+        仍会按重试/负缓存逻辑再试）。
+        """
+        try:
+            await self._get_trusted_dnskey(dns.name.root)
+        except Exception as e:
+            logger.debug("DNSSEC 根区预热失败（不影响服务）: %s", e)
 
     async def _get_trusted_dnskey_uncached(
         self, zone_name: dns.name.Name
@@ -2977,6 +3055,15 @@ class IterativeResolver:
                 if is_del is False:
                     n = n.parent()
                     continue
+                # 即使 n 看起来是委托点，只要父区已被证明未签名，n 一定
+                # 在未签名树下（未签名区不发布 DS/NSEC3）。不能因为
+                # “n 不存在且像委托点”就把 CDN 随机子域整片丢弃。
+                # 实测 v9e169o.edge.mountaintoys.cn：_is_delegation 因
+                # _zone_ns_cache 命中返回 True，父区 mountaintoys.cn 已
+                # insecure，旧代码在这里直接 unknown → 严格模式丢弃；
+                # 父区未签名时 DS NXDOMAIN 是合法的（该名字本就不存在）。
+                if await self._parent_is_insecure(n):
+                    return "insecure"
                 return "unknown"
             # 无 DS：仅当该名字是 zone apex（响应 SOA owner == 查询名）且父区用
             # NSEC/NSEC3 否定记录 + 有效签名证明"该 apex 委托无 DS" 才判 insecure。
@@ -3141,9 +3228,16 @@ class IterativeResolver:
                     # 父区 DNSKEY 取不到（验签后端缺失 / 链查询失败）：
                     # 无法验证否定证明。若父区已证明未签名，则本名字一定
                     # 在未签名树下；否则绝不能升父级把父区 DS 当 secure。
+                    #
+                    # 返回 "error" 而不是 "unknown"：这是**本机取不到父区
+                    # DNSKEY**（链暂时不可用），不是“应答缺少否定证明”。
+                    # 两者必须区分：unknown 会被调用方判为可丢弃，冷启动
+                    # （根/TLD DNSKEY 查询限速/超时）会把合法未签名域名整片
+                    # 丢弃（实测 mountaintoys.cn 的 CDN 子域 60 秒被丢 86 次）；
+                    # error 与 `_iterate_ds_cached` 查询失败同级，按可用性放行。
                     if await self._parent_is_insecure(n):
                         return "insecure"
-                    return "unknown"
+                    return "error"
                 is_del = await self._is_delegation(n)
                 if is_del is False:
                     # n 只是当前区内的普通名：DS 本来就不存在，升到所在区 apex
@@ -3158,6 +3252,7 @@ class IterativeResolver:
                 # NSEC owner 必须等于被查名 target 且类型位图不含 DS
                 # （防重放父区公开有效 NSEC——签名有效但区间不覆盖——伪造 insecure）
                 nsec_valid = False
+                parent_keys = None
                 try:
                     parent_keys = await self._get_trusted_dnskey(n.parent())
                     if parent_keys is not None:
@@ -3185,6 +3280,13 @@ class IterativeResolver:
                     nsec_valid = False
                 if nsec_valid:
                     return "insecure"  # 父区签名证明该委托无 DS → 未签名区
+                if parent_keys is None:
+                    # 父区 DNSKEY 取不到（链暂时不可用）：与上面的 3122 分支
+                    # 同一语义，返回 error 而不是 unknown——否则冷启动时会把
+                    # 合法未签名域名当成“可能被篡改”丢弃。
+                    if await self._parent_is_insecure(n):
+                        return "insecure"
+                    return "error"
                 # NSEC 签名验证失败或语义不符 → 无法证明（剥离/重放风险）
                 return "unknown"
             # 理论上不可达（无证明已在上面处理）；保守返回 unknown，
