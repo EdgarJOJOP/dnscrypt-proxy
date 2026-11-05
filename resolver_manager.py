@@ -20,6 +20,7 @@ import dns.message
 import dns.name
 import dns.rdatatype
 import dns.asyncquery
+import dns.flags
 
 import aiohttp
 
@@ -43,7 +44,8 @@ except ImportError:
     _HAS_OPENSSL4 = False
 
 if _HAS_OPENSSL4:
-    from resolvers.ech_doh import ECHDoHResolver
+    # ECHDoHResolver（resolvers/ech_doh.py）只能走 HTTP/1.1，与「上游 DoH 仅 h3/h2」
+    # 策略冲突，已停用：ECH 的 DoH 上游改由 DoHResolver + Python ssl(ECH) 承担。
     from resolvers.ech_dot import ECHDoTResolver
 
 logger = logging.getLogger("dns-proxy.resolver")
@@ -115,11 +117,18 @@ class UpstreamServer:
         if response_time is not None:
             self._response_times.append(response_time)
 
-    def record_failure(self):
+    def record_failure(self, allow_disable: bool = True):
+        """记一次失败（连续失败 5 次时暂时禁用该上游）
+
+        ``allow_disable=False``：只累计计数、不禁用。用于「唯一上游」场景——
+        纯迭代模式只有 iterative 一个上游，把它禁用会让整机解析直接瘫痪，
+        随后被 _auto_recover 重新启用，形成 禁用↔恢复 的抖动（日志表现为
+        「没有可用的上游服务器，触发自动恢复...」反复出现）。
+        """
         self.consecutive_failures += 1
         self.failures += 1
         # 连续失败 5 次，暂时禁用
-        if self.consecutive_failures >= 5:
+        if allow_disable and self.consecutive_failures >= 5:
             self.enabled = False
             logger.debug("上游 %s 连续失败 %d 次，已暂时禁用", self.name, self.consecutive_failures)
 
@@ -170,6 +179,23 @@ class ResolverManager:
         self._last_silent_probe_time: float = 0.0           # 末次探活时间
         self._silent_probe_interval: float = 60.0           # 探活间隔（秒）
         self._all_failed_silent_rounds: int = getattr(config, 'all_failed_silent_rounds', 5)  # 进入静默的阈值
+        # 单查询总预算（硬上限）：所有前端（DoH/DoT/DoQ/plain）都只是 await
+        # resolve()，它们自己没有解析超时——纯迭代模式下单查询可能跑到
+        # IterativeResolver.total_timeout。前端 6s 已经给客户端回了 504，
+        # 底层 handler 却继续空跑 → 事件循环饱和（所以必须硬取消）。
+        #
+        # 基准取 parallel_timeout×5 = 10s：**故意比前端 forward_timeout(6s) 长**。
+        # 这样「长 CNAME 链、8-10s 才解析完」的域名（如 s1.hdslb.com 这类
+        # bilibili 图床：CNAME 4-6 级 + 无 glue 的 NS 名还要单独迭代）仍能完成
+        # 并写入缓存；浏览器重试/后续访问直接命中缓存，不会每次重跑一遍又失败。
+        #
+        # 注意：这个 10s 只跟 performance.parallel_timeout 有关，**与
+        # iterative.timeout_ms（单跳超时，默认 5000ms）无关**——见
+        # _effective_query_budget()：纯迭代模式下它还要与迭代器自身预算对齐。
+        self._base_query_budget: float = max(
+            3.0,
+            min(15.0, float(getattr(config, "parallel_timeout", 2.0) or 2.0) * 5.0),
+        )
         # 跨层回调：ResolverManager → NetworkMonitor（全部失败时通知）
         self._on_all_upstreams_failed: Optional[callable] = None
         self._ech_fetchers: Dict[str, ECHConfigFetcher] = {}  # hostname -> ECHConfigFetcher
@@ -316,12 +342,15 @@ class ResolverManager:
             logger.debug("无上游域名需要解析（所有主机名已为空）")
             return
 
+        # 固定顺序（set 的迭代顺序在同一对象被修改后会变化，避免
+        # 「协程创建顺序」与「结果配对顺序」不一致导致 IP 串域名）
+        hostnames = sorted(all_hostnames)
         results = await asyncio.gather(
-            *[self._bootstrap_resolve(hostname) for hostname in all_hostnames],
+            *[self._bootstrap_resolve(hostname) for hostname in hostnames],
             return_exceptions=True,
         )
 
-        for hostname, result in zip(all_hostnames, results):
+        for hostname, result in zip(hostnames, results):
             if isinstance(result, list) and result:
                 # 去重并保留顺序
                 seen = set()
@@ -592,6 +621,8 @@ class ResolverManager:
                 ca_path = merged
 
         # DoH
+        # 上游 DoH 协议策略：h3 优先 → h2；HTTP/1.1 永久禁用（upstream.doh_protocols）
+        doh_protocols = self.config.upstream_doh_protocols
         for url in self.config.doh_servers:
             hostname = url.replace("https://", "").split("/")[0].split(":")[0]
             cached_ips = self._bootstrap_cache.get(hostname, [])
@@ -605,23 +636,33 @@ class ResolverManager:
             )
 
             if has_ech:
-                resolver = ECHDoHResolver(
-                    url, timeout=timeout,
-                    ech_fetcher=ech_fetcher,
-                    openssl_wrapper=self._openssl4_wrapper,
-                    ca_path=ca_path,
-                    ciphers=self.config.tls_ciphers,
-                    connect_ips=cached_ips,
-                    concurrency=self.config.connection_pool_size,
-                )
-                if not resolver.available:
-                    resolver = DoHResolver(url, timeout=timeout,
-                                           connection_pool_size=self.config.connection_pool_size,
-                                           connect_ips=cached_ips,
-                                           concurrency=self.config.connection_pool_size,
-                                           ca_path=ca_path or "",
-                                           shared_session=self._shared_doh_session,
-                                           shared_resolver=self._shared_doh_resolver)
+                # 上游 DoH **只允许 h3/h2**（HTTP/1.1 永久禁用）：ECHDoHResolver 是
+                # OpenSSL(ctypes) 手写的 ECH 实现，只能走 HTTP/1.1，与策略冲突，
+                # 因此不再使用。这里改用 DoHResolver：ECH 由 Python ssl 的
+                # ECHClientConfig 承担（h3 因 aioquic 不支持 ECH 自动让位给 h2），
+                # 协议仍严格限制在 h3/h2，不会退回明文 HTTP/1.1。
+                ech_config = b""
+                try:
+                    ech_config = await asyncio.wait_for(
+                        ech_fetcher.get_config(), timeout=2.0
+                    ) or b""
+                except Exception as e:
+                    logger.debug("DoH %s: 获取 ECHConfigList 失败: %s", url, e)
+                if not ech_config:
+                    logger.warning(
+                        "DoH %s: ECH 已启用但拿不到 ECHConfigList，"
+                        "本次按普通 h3/h2 加密上游运行（不做 ECH 封装）", url,
+                    )
+                resolver = DoHResolver(url, timeout=timeout,
+                                       connection_pool_size=self.config.connection_pool_size,
+                                       connect_ips=cached_ips,
+                                       concurrency=self.config.connection_pool_size,
+                                       ca_path=ca_path or "",
+                                       shared_session=self._shared_doh_session,
+                                       shared_resolver=self._shared_doh_resolver,
+                                       protocols=doh_protocols,
+                                       ech_enabled=bool(ech_config),
+                                       ech_config=ech_config)
             else:
                 resolver = DoHResolver(url, timeout=timeout,
                                        connection_pool_size=self.config.connection_pool_size,
@@ -629,7 +670,8 @@ class ResolverManager:
                                        concurrency=self.config.connection_pool_size,
                                        ca_path=ca_path or "",
                                        shared_session=self._shared_doh_session,
-                                       shared_resolver=self._shared_doh_resolver)
+                                       shared_resolver=self._shared_doh_resolver,
+                                       protocols=doh_protocols)
             self._upstream_servers.append(UpstreamServer(resolver, "doh"))
 
         # DoT
@@ -749,6 +791,83 @@ class ResolverManager:
         logger.info("已合并 %d 个本地服务器证书到 CA 信任链", len(extra_certs))
         return tmp_path
 
+    def _effective_query_budget(self) -> float:
+        """当前生效的单查询硬上限（秒）
+
+        三层预算必须自洽，否则会互相打架（实测日志里同时出现 152s/304s 的
+        迭代 total_timeout 与 10.0s 的硬取消）：
+
+          1. ``iterative.timeout_ms`` —— **单跳**（对一台权威的一次查询）超时；
+          2. ``IterativeResolver.total_timeout`` —— 整条迭代链（根→TLD→权威 +
+             CNAME 链 + DNSSEC 链验证）的预算，由 1 与 max_depth 推导，上限 30s；
+          3. 本方法 —— resolver 层硬取消上限。
+
+        纯迭代模式（没有启用的 DoH/DoT/DoQ）下迭代是**唯一**路径，硬上限必须
+        容得下迭代器自己的预算，否则「迭代器还想继续（total_timeout），外层已
+        经砍掉（10s）」——长 CNAME 链（Akamai/CDN 调度域名，实测 10-15s）会
+        被整条取消、连缓存都写不进去，下一次访问又重跑一遍。
+        有加密上游可回退时仍用基准值（10s）：前端 6s 已回 504，留 4s 给缓存写入。
+        """
+        budget = self._base_query_budget
+        try:
+            if self._is_pure_iterative_mode():
+                iter_total = float(
+                    getattr(self._iterative_resolver, "total_timeout", 0.0) or 0.0
+                )
+                if iter_total > 0:
+                    # 20s 上限：够长链（10-15s）跑完并写缓存，又不至于让
+                    # 前端早已放弃的查询在后台空跑太久。
+                    budget = max(budget, min(iter_total, 20.0))
+        except Exception:
+            pass
+        return budget
+
+    async def _resolve_impl_with_budget(self, query_bytes: bytes) -> Optional[bytes]:
+        """带总预算的解析（到点取消，且**不等待取消完成**）
+
+        为什么不用 ``asyncio.wait_for``：wait_for 在超时后会**等待被取消的协程
+        真正结束**，而解析链的 finally 里还要关 socket/收尾，于是 6s 预算实测
+        会拖到 9s、10s 预算拖到 18s（日志里能直接看到）。这里用
+        ``asyncio.wait`` + ``task.cancel()`` 不等待：预算严格生效，
+        被取消的任务在后台自行清理（各处 finally 都限时 0.5s，不会泄漏）。
+        """
+        budget = self._effective_query_budget()
+        task = asyncio.ensure_future(self._resolve_impl(query_bytes))
+        # 任务被取消后可能仍带异常完成（socket 收尾等）：挂一个回调消费掉，
+        # 否则 asyncio 会打 "Future exception was never retrieved" 的 ERROR。
+        def _consume_exc(t):
+            if t.cancelled():
+                return
+            try:
+                t.exception()
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        task.add_done_callback(_consume_exc)
+        try:
+            done, _ = await asyncio.wait({task}, timeout=budget)
+        except asyncio.CancelledError:
+            task.cancel()
+            raise
+        if task in done:
+            try:
+                return task.result()
+            except asyncio.CancelledError:
+                return None
+            except Exception as e:
+                logger.debug("解析任务异常: %s [%s]", e, type(e).__name__)
+                return None
+        task.cancel()
+        self._failure_stats["解析总超时"] = (
+            self._failure_stats.get("解析总超时", 0) + 1
+        )
+        logger.warning(
+            "单次解析超过 %.1fs 总预算，已取消整条解析链"
+            "（前端超时后不再让后台继续空跑）",
+            budget,
+        )
+        return None
+
     async def resolve(self, query_bytes: bytes) -> Optional[bytes]:
         """解析入口：对相同查询做「并发合并」，再交给 _resolve_impl
 
@@ -774,7 +893,7 @@ class ResolverManager:
             key = None
 
         if key is None:
-            return await self._resolve_impl(query_bytes)
+            return await self._resolve_impl_with_budget(query_bytes)
 
         existing = self._inflight_queries.get(key)
         if existing is not None:
@@ -790,7 +909,7 @@ class ResolverManager:
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._inflight_queries[key] = fut
         try:
-            result = await self._resolve_impl(query_bytes)
+            result = await self._resolve_impl_with_budget(query_bytes)
             if not fut.done():
                 fut.set_result(result)
             return result
@@ -821,7 +940,26 @@ class ResolverManager:
             result = await self._parallel_resolve(dnssec_query)
 
         # DNSSEC 验证（在 resolver 层统一执行，所有 server 类型自动受益）
-        if result is not None and self._dnssec is not None and self._dnssec.enabled:
+        #
+        # **迭代上游例外**（2026-10-30）：IterativeResolver 在
+        # `iterative.strict_dnssec=true` 时已经用内置 IANA 根锚做过一遍完整链验证
+        # （根→TLD→父区 DS→DNSKEY→answer RRSIG），verdict 完全决定返回内容：
+        #   secure   → 响应带 RRSIG 且已验签通过（并被标记 AD=1）
+        #   insecure → 合法未签名区，放行
+        #   bogus    → 迭代器内部已丢弃（返回 None，走不到这里）
+        # 此时再跑 resolver 层 `DNSSECValidator(mode=strict)` 是**纯重复劳动**，
+        # 而且它查 DNSKEY 时走 `resolve_dnskey → 迭代上游 → 迭代器内部又验证一次`，
+        # 形成嵌套：冷启动实测单查询 0.13s 被拖到 1.4s 中位、11.5s 峰值
+        # （日志里 ipv4only.arpa 4920ms / app.termly.io 9227ms 即此）。
+        #
+        # 判定只用「纯迭代模式 + 迭代器严格验证已开启」——纯迭代模式下
+        # `_upstream_servers` 里只有 iterative 一个上游，结果必然来自它，不存在
+        # 「被并发查询的其它上游覆盖」的竞态（不能用 `_last_fast_server_obj`：
+        # 那是共享状态，多上游并发时会串味，可能让 DoH 响应误跳过验证）。
+        # 混合模式（iterative + 加密上游）保持原有逐响应验证，宁可慢也不放松。
+        _iter_already_verified = self.iterative_already_verified()
+        if (result is not None and self._dnssec is not None
+                and self._dnssec.enabled and not _iter_already_verified):
             try:
                 dnssec_ok, dnssec_status = await self._dnssec.validate_response(
                     dnssec_query, result
@@ -890,7 +1028,36 @@ class ResolverManager:
                              preferred_count,
                              sum(1 for s in self._upstream_servers if s.enabled))
 
+        # RFC 1035 §4.1.1：作为**递归服务端**统一修正响应 header 位。
+        # 上游可能是权威服务器（迭代：AA=1、RD=0）或 DoH（RA 视上游而定），
+        # 原样透传会出现：
+        #   * RA=0 → 客户端（glibc res_send、部分游戏/浏览器自带解析器）
+        #     据此认为"这台 DNS 不提供递归"，可能弃用/重试到其它服务器；
+        #   * AA=1 → 迭代拿到的是权威应答，透传会让客户端误认为本机是权威；
+        #   * RD=0 → 没有回显查询的 RD 位，属于非法响应形态。
+        # 统一置 RA=1、回显 RD、清 AA（AD/TC/rcode 等保持不变）。
+        if result is not None:
+            result = self._normalize_response_flags(query_bytes, result)
         return result
+
+    @staticmethod
+    def _normalize_response_flags(query_bytes: bytes, resp_bytes: bytes) -> bytes:
+        """把上游响应改写为符合递归服务端语义的 header（RFC 1035 §4.1.1）
+
+        见调用点注释。解析/序列化失败时原样返回，不影响可用性。
+        """
+        try:
+            q = dns.message.from_wire(query_bytes)
+            r = dns.message.from_wire(resp_bytes)
+            if q.flags & dns.flags.RD:
+                r.flags |= dns.flags.RD
+            else:
+                r.flags &= ~dns.flags.RD
+            r.flags |= dns.flags.RA          # 本服务器提供递归
+            r.flags &= ~dns.flags.AA         # 我们不是权威
+            return r.to_wire()
+        except Exception:
+            return resp_bytes
 
     async def _auto_recover(self):
         """
@@ -973,25 +1140,14 @@ class ResolverManager:
         if self._network_down:
             return None
 
-        # === 静默模式探活 ===
-        # 连续多轮全部失败后进入静默模式：每分钟只实际执行一次探活查询
+        # === 静默模式：**只降噪，不拒绝服务** ===
+        # 历史实现：进入静默后 60 秒内直接返回 SERVFAIL（"每分钟仅探活一次"）。
+        # 但「全部上游失败」往往只是**某个域名**超时——纯迭代模式只有一个上游，
+        # 任何一次单域名超时都等于"全部 1 个上游失败"，于是连续几轮后整机解析
+        # 被锁死 60 秒（用户实测：一个域名超时 → 全站打不开）。
+        # 现在静默模式只压制日志与退避重试，查询照常执行；成功即退出静默。
         if self._silent_mode:
-            elapsed_since_last_probe = now - self._last_silent_probe_time
-            if elapsed_since_last_probe < self._silent_probe_interval:
-                # 未到探活时间，静默返回 SERVFAIL，不打印任何日志
-                return None
-            # 到探活时间了：执行一次实际查询，重置探活计时器
             self._last_silent_probe_time = now
-            result = await self._parallel_resolve_once(query_bytes)
-            if result is not None:
-                logger.info("并行查询: 静默探活成功，上游服务器已恢复域名解析")
-                self._last_all_failed_time = 0.0
-                self._consecutive_all_failed_counter = 0
-                self._all_failed_start_time = 0.0
-                self._silent_mode = False
-                return result
-            # 探活仍失败，不打印任何日志，静默返回
-            return None
 
         # === 启动缓冲期 ===
         # 程序刚启动时，上游 DNS 连接尚未建立，给它们 3 秒时间
@@ -1000,7 +1156,11 @@ class ResolverManager:
             result = await self._parallel_resolve_once(query_bytes)
             if result is not None:
                 if self._last_all_failed_time > 0:
-                    logger.info("并行查询: 上游服务器已恢复域名解析")
+                    # 纯迭代模式：上一次只是**某个域名**失败，不是集群故障
+                    if self._is_pure_iterative_mode():
+                        logger.debug("并行查询: 单域名失败后已恢复（纯迭代模式，非集群故障）")
+                    else:
+                        logger.info("并行查询: 上游服务器已恢复域名解析")
                     self._last_all_failed_time = 0.0
                 return result
             # 全部失败：等待到缓冲期结束再试
@@ -1012,14 +1172,23 @@ class ResolverManager:
             result = await self._parallel_resolve_once(query_bytes)
             if result is not None:
                 if self._last_all_failed_time > 0:
-                    logger.info("并行查询: 上游服务器已恢复域名解析 (启动缓冲后)")
+                    if self._is_pure_iterative_mode():
+                        logger.debug("并行查询: 单域名失败后已恢复（纯迭代模式，启动缓冲后）")
+                    else:
+                        logger.info("并行查询: 上游服务器已恢复域名解析 (启动缓冲后)")
                     self._last_all_failed_time = 0.0
                 return result
 
         # === 集群故障冷却 ===
         # 更新时间戳，因为启动缓冲可能已经睡了几秒
+        # 纯迭代模式**跳过冷却**（2026-10-31）：只有一个上游时，「单个域名超时」
+        # 与「集群全部失败」无法区分，若照常冷却，一个慢域名就会让**后续所有
+        # 查询**多等最多 `_all_failed_cooldown`(1s)，浏览器并发时表现为
+        # 「失败 → 等 1 秒 → 成功 → 再失败」的循环（日志里那条
+        # 「上游服务器已恢复域名解析」就是这么刷出来的）。
+        # 多上游集群场景保留冷却（避免重试风暴）。
         now = asyncio.get_event_loop().time()
-        if self._last_all_failed_time > 0:
+        if self._last_all_failed_time > 0 and not self._is_pure_iterative_mode():
             elapsed = now - self._last_all_failed_time
             if elapsed < self._all_failed_cooldown:
                 wait = self._all_failed_cooldown - elapsed
@@ -1029,7 +1198,10 @@ class ResolverManager:
         result = await self._parallel_resolve_once(query_bytes)
         if result is not None:
             if self._last_all_failed_time > 0:
-                logger.info("并行查询: 上游服务器已恢复域名解析")
+                if self._is_pure_iterative_mode():
+                    logger.debug("并行查询: 单域名失败后已恢复（纯迭代模式，非集群故障）")
+                else:
+                    logger.info("并行查询: 上游服务器已恢复域名解析")
                 self._last_all_failed_time = 0.0
             # 恢复成功：重置连续失败计数器、退出静默模式
             if self._consecutive_all_failed_counter > 0 or self._silent_mode:
@@ -1048,11 +1220,28 @@ class ResolverManager:
             self._all_failed_start_time = self._last_all_failed_time
             self._silent_mode = False  # 首次失败时确保退出静默模式
 
-        # 触发跨层回调，通知 NetworkMonitor 进行深度检测
+        # 触发跨层回调，通知 NetworkMonitor 进行深度检测。
+        # 必须在**后台**执行：诊断会跑 ARP/NDP 检查（子进程）+ plain DNS 探活，
+        # 在查询路径上同步 await 会把触发它的客户端查询一起拖住（并发时叠加成
+        # 事件循环卡死）。NetworkMonitor 侧另有「单飞 + 限频」去重。
         if self._on_all_upstreams_failed is not None:
-            elapsed = self._last_all_failed_time - (self._all_failed_start_time if self._all_failed_start_time > 0 else self._last_all_failed_time)
+            elapsed = max(0.0, self._last_all_failed_time - (
+                self._all_failed_start_time if self._all_failed_start_time > 0
+                else self._last_all_failed_time))
             try:
-                await self._on_all_upstreams_failed(self._consecutive_all_failed_counter, elapsed)
+                _task = asyncio.ensure_future(
+                    self._on_all_upstreams_failed(
+                        self._consecutive_all_failed_counter, elapsed
+                    )
+                )
+
+                def _consume_exc(t):
+                    try:
+                        t.exception()
+                    except Exception:
+                        pass
+
+                _task.add_done_callback(_consume_exc)
             except Exception:
                 pass
 
@@ -1063,6 +1252,11 @@ class ResolverManager:
         _failure_start = self._last_all_failed_time
         alive = sum(1 for s in self._upstream_servers if s.enabled)
         _version = self._retry_version
+        # 纯迭代模式（没有 DoH/DoT/DoQ 可回退）：失败往往只是**这一个域名**
+        # 慢（境外权威/冷启动 DNSSEC 链），退避重试 3 次共 1.7-14s 只会把
+        # 客户端拖死，也不会让下一次尝试更容易成功——直接返回，让上层/客户端
+        # 自行重试；同时把日志降为 DEBUG，避免每个域名超时都刷一条 WARNING。
+        pure_iterative = self._is_pure_iterative_mode()
 
         async with self._retry_lock:
             # 检查版本号：如果已在之前的重试中被递增，说明已有其他请求执行过重试
@@ -1070,18 +1264,23 @@ class ResolverManager:
                 return None
 
             # 根据连续失败轮数选择退避延迟
-            if self._consecutive_all_failed_counter >= self._all_failed_silent_rounds:
-                # 连续全部失败达到阈值 → 进入静默模式
+            if (self._consecutive_all_failed_counter >= self._all_failed_silent_rounds
+                    and not pure_iterative):
+                # 连续全部失败达到阈值 → 进入静默模式（仅日志/退避降噪，
+                # 不再拒绝服务；查询仍会照常执行，见 _parallel_resolve 开头）
                 self._silent_mode = True
                 logger.warning("并行查询: 全部 %d 个上游持续失败 %d 轮 (历时 %.0fs)，"
-                               "进入静默模式，每分钟仅探活一次",
+                               "进入静默模式（只压制日志与退避，查询不中断）",
                                alive, self._consecutive_all_failed_counter,
-                               self._last_all_failed_time - self._all_failed_start_time)
+                               max(0.0, self._last_all_failed_time - self._all_failed_start_time))
                 # 重置时间戳以便探活检测使用
                 self._last_silent_probe_time = self._last_all_failed_time
                 self._last_all_failed_time = 0.0
                 self._retry_version += 1
                 return None
+            if pure_iterative:
+                retry_delays = []            # 纯迭代模式不重试，快速失败
+                log_level = "DEBUG"
             elif self._consecutive_all_failed_counter >= 2:
                 retry_delays = [1.0, 3.0, 10.0]  # 升级退避
                 log_level = "DEBUG"  # 降级日志级别
@@ -1111,9 +1310,58 @@ class ResolverManager:
                 self._last_all_failed_time = asyncio.get_event_loop().time()
 
             self._retry_version += 1
-            logger.warning("并行查询: 全部 %d 个上游均失败 (%d 次重试后放弃, 连续%d轮)",
-                           alive, 3, self._consecutive_all_failed_counter)
+            if pure_iterative:
+                logger.debug("并行查询: 迭代解析本次失败（纯迭代模式不重试, 连续%d轮）",
+                             self._consecutive_all_failed_counter)
+            else:
+                logger.warning("并行查询: 全部 %d 个上游均失败 (%d 次重试后放弃, 连续%d轮)",
+                               alive, 3, self._consecutive_all_failed_counter)
             return None
+
+    def _is_pure_iterative_mode(self) -> bool:
+        """当前是否「纯迭代」模式（没有启用的 DoH/DoT/DoQ 加密上游）
+
+        纯迭代模式下只有一个上游，任何**单个域名**超时都表现为「全部 1 个上游
+        失败」。这种失败不指向"上游集群故障"，因此：
+          - 不做退避重试（只会把客户端拖 1.7-14s）；
+          - 不进入静默模式（否则 60s 内整机解析被锁死）；
+          - 日志降为 DEBUG（避免每个域名超时刷一条 WARNING）。
+        """
+        try:
+            return not any(
+                getattr(s, "server_type", "") in ("doh", "dot", "doq")
+                for s in self._upstream_servers
+                if getattr(s, "enabled", True)
+            )
+        except Exception:
+            return False
+
+    def iterative_already_verified(self) -> bool:
+        """本次响应是否已由迭代器内部完成 DNSSEC 验证
+
+        纯迭代模式（没有启用的加密上游）+ 迭代器 strict_dnssec=True 时，
+        `IterativeResolver` 已在**内部**完成严格链验证（bogus 在内部就被丢弃，
+        不会返回到这里）。此时各前端**不应再验一遍**，原因有二：
+
+          1. 重复开销：每域名多若干次 DNSKEY/DS 往返；
+          2. **正确性**：`DNSSECValidator`（wrapper）对负应答（NXDOMAIN /
+             NODATA 的 NSEC/NSEC3 语义）的判定与迭代器不一致——实测同一个
+             `does-not-exist-xyz-123.invalidtld` 的 NXDOMAIN 应答，迭代器判
+             secure，wrapper 却判 `bogus`。叠加 `dnssec.drop_bogus: true` 就会
+             把**合法的 NXDOMAIN 全部变成 SERVFAIL**（不存在的域名一律解析
+             失败）。
+
+        该判定与 `_resolve_impl` 里的 `_iter_already_verified` 完全一致，
+        各 DNS 前端（plain/DoH/DoT/DoQ）直接复用，避免各写一套漂移。
+        """
+        try:
+            return (
+                self._is_pure_iterative_mode()
+                and bool(getattr(self._iterative_resolver, "strict_dnssec", False))
+            )
+        except Exception:
+            return False
+
 
     @staticmethod
     def _get_suffix(hostname: str) -> str:
@@ -1162,17 +1410,27 @@ class ResolverManager:
         """
         按健康评分选择最优的 N 个加密上游（DoH/DoT/DoQ）。
         不包含 plain（普通 DNS 只做 bootstrap 解析）。
+
+        排序键（依次）：
+          1. 未连续失败；
+          2. **已有成功样本**（avg_response_time < 999）——实测可用的上游必须
+             排在"零样本"前面。否则零样本的境外 DoH（配置里靠前）会一直霸占
+             优选名额：冷启动高并发时它们全部超时，而真正可用的境内上游要等到
+             第三波才有机会，最终表现为「全部上游失败 / 大面积 504」；
+          3. 平均延迟越低越前；
+          4. 健康评分。
         """
         encrypted = [
             s for s in self._upstream_servers
             if s.enabled and s.server_type in ("doh", "dot", "doq", "iterative")
         ]
-        # 按健康评分从高到低排序；**连续失败过的排到最后**——否则被墙/超时的
-        # 上游（如境外 DoH）只要配置里靠前就会一直占据首波名额：FIRST_COMPLETED
-        # 虽能先返回快的结果，但首波里混着慢上游会让兜底路径多等一个
-        # parallel_timeout（实测首波含被墙上游时，冷查询会退化到 2s+）。
         encrypted.sort(
-            key=lambda s: (s.consecutive_failures == 0, s.health_score),
+            key=lambda s: (
+                s.consecutive_failures == 0,
+                s.avg_response_time < 999.0,
+                -s.avg_response_time,
+                s.health_score,
+            ),
             reverse=True,
         )
         return encrypted[:count]
@@ -1193,6 +1451,11 @@ class ResolverManager:
             return None
 
         async def query_one(server: UpstreamServer) -> Optional[tuple]:
+            # 纯迭代模式下 iterative 是唯一上游：不能因连续失败禁用它
+            # （禁用 = 整机解析瘫痪，随后 auto_recover 再启用 → 抖动）
+            _allow_disable = not (
+                server.server_type == "iterative" and self._is_pure_iterative_mode()
+            )
             try:
                 result, elapsed = await server.resolver.resolve_with_stats(
                     query_bytes
@@ -1201,7 +1464,7 @@ class ResolverManager:
                     server.record_success(response_time=elapsed)
                     return (result, elapsed, server)
                 if not self._recovery_mode:
-                    server.record_failure()
+                    server.record_failure(allow_disable=_allow_disable)
                     self._failure_stats["返回空"] = self._failure_stats.get("返回空", 0) + 1
                 else:
                     logger.debug("上游 %s 返回空（恢复模式，不计失败）", server.name)
@@ -1210,7 +1473,7 @@ class ResolverManager:
                 return None
             except Exception as e:
                 if not self._recovery_mode:
-                    server.record_failure()
+                    server.record_failure(allow_disable=_allow_disable)
                     logger.warning("上游 %s 查询失败: %s [%s]",
                                    server.name, e, type(e).__name__)
                     err_type = type(e).__name__
@@ -1234,29 +1497,45 @@ class ResolverManager:
         deadline = asyncio.get_event_loop().time() + max(remaining_timeout, _iter_budget)
         successful = []
 
-        while remaining and not successful:
-            now = asyncio.get_event_loop().time()
-            if now >= deadline:
-                break
-            done, remaining = await asyncio.wait(
-                remaining,
-                timeout=deadline - now,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            for task in done:
+        try:
+            while remaining and not successful:
+                now = asyncio.get_event_loop().time()
+                if now >= deadline:
+                    break
+                done, remaining = await asyncio.wait(
+                    remaining,
+                    timeout=deadline - now,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in done:
+                    try:
+                        r = task.result()
+                        if r is not None:
+                            successful.append(r)
+                    except Exception as e:
+                        logger.debug("解析管理器并行查询任务异常: %s", e)
+        finally:
+            # **必须放在 finally**：本函数会被外层「单查询总预算」取消，
+            # 原来把 cancel/await 写在 while 之后，取消时直接跳过清理，
+            # 在飞的 query_one（及其内部迭代协程、UDP socket、DNSSEC 链）
+            # 会继续跑完整条链 → 协程/Task 泄漏（实测 25s 内 coroutine
+            # 2.1万→4.9万、Task 6340→20209，RSS 涨到 2GB）。
+            pending = [t for t in remaining if not t.done()]
+            for task in pending:
+                task.cancel()
+            if pending:
                 try:
-                    r = task.result()
-                    if r is not None:
-                        successful.append(r)
-                except Exception as e:
-                    logger.debug("解析管理器并行查询任务异常: %s", e)
-
-        for task in remaining:
-            task.cancel()
-        # 取消未完成的任务；CancelledError 在 query_one 中被捕获返回 None，
-        # 不会传播到 DoQ 内部。连接清理由各 resolver 的 close/reset 负责。
-        if remaining:
-            await asyncio.gather(*remaining, return_exceptions=True)
+                    # 清理也限时：取消时若子任务还在收尾，wait_for 会等到它们结束，
+                    # 单查询就会从"6s 预算"变成实际 9s+（日志里能看到）。0.5s 足够
+                    # 关 socket/取消 future；超时后 task 已收到 cancel，事件循环会收尾。
+                    await asyncio.wait_for(
+                        asyncio.gather(*pending, return_exceptions=True),
+                        timeout=0.5,
+                    )
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    pass
+                except Exception:
+                    pass
 
         if successful:
             successful.sort(key=lambda x: x[1])
@@ -1279,22 +1558,43 @@ class ResolverManager:
 
         # 首波选择：
         #   iterative.prefer=true（默认）→ 首波直接用根服务器迭代，不依赖第三方 DoH；
-        #     首波预算 max(6s, 2*parallel_timeout)：常规迭代实测 1-5s 能跑完，
-        #     超过则立即转加密上游兜底（避免客户端 2-5s 重传时还在干等）。
         #   iterative.prefer=false → 加密上游首波优先（25-100ms），
         #     iterative 只进备用波作兜底（纯迭代模式下首波即 iterative）。
+        #
+        # 首波**迭代**预算要分两种情况（这里踩过坑）：
+        #   - 有加密上游可回退 → 给短预算（1.8s），超时立刻换 DoH/DoT/DoQ，
+        #     避免客户端干等（实测 bilibili 的 live/upos 域名 3.5s 预算 → 3.6s 才答）；
+        #   - **纯迭代模式**（upstream.enabled=false 或加密上游全空）→ 没有任何
+        #     回退路径，必须给足迭代预算（total_timeout），否则稍慢的境外权威
+        #     会被直接判失败，表现为「全部 1 个上游均失败」、整机解析瘫痪。
         prefer_iterative = bool(
             getattr(self.config, "plain_dns_iterative_prefer", True)
         )
         iterative_servers = [
             s for s in enabled if s.server_type == "iterative"
         ]
+        encrypted_candidates = [
+            s for s in enabled if s.server_type in ("doh", "dot", "doq")
+        ]
         first_budget = timeout
         cap_iterative_budget = False
         if prefer_iterative and iterative_servers:
             first_wave = iterative_servers
-            first_budget = max(6.0, timeout * 2)
-            cap_iterative_budget = True
+            if encrypted_candidates:
+                # 有加密上游兜底 → 迭代只给短预算，超时立即回退
+                first_budget = max(1.8, timeout * 0.9)
+                cap_iterative_budget = True
+            else:
+                # 纯迭代模式：唯一路径，给足预算（IterativeResolver 自己还有
+                # total_timeout 兜底，不会无限等）
+                first_budget = float(getattr(
+                    iterative_servers[0].resolver, "total_timeout", 30.0,
+                ))
+                cap_iterative_budget = False
+                logger.debug(
+                    "纯迭代模式（无加密上游可回退）：首波预算放大到 %.1fs",
+                    first_budget,
+                )
         else:
             wave_candidates = self._select_encrypted_upstreams(count=3)
             first_wave = [
@@ -1304,10 +1604,19 @@ class ResolverManager:
                 first_wave = wave_candidates
 
         if first_wave:
+            if prefer_iterative and iterative_servers:
+                _wave_label = (
+                    # 纯迭代模式（无加密上游可回退）：预算放大的目的是让唯一
+                    # 路径跑完，不是"迭代优先但有 DoH 兜底"——原实现复用
+                    # cap_iterative_budget 判断，日志里会误报"加密上游优先"。
+                    "纯迭代（无回退）" if not encrypted_candidates else "迭代优先"
+                )
+            else:
+                _wave_label = "加密上游优先"
             logger.debug(
                 "首波查询: %d 个上游（%s，预算 %.1fs）",
                 len(first_wave),
-                "迭代优先" if cap_iterative_budget else "加密上游优先",
+                _wave_label,
                 first_budget,
             )
             result = await self._try_upstream_wave(
@@ -1319,16 +1628,49 @@ class ResolverManager:
                 self._last_fast_server_obj = result[2]
                 return result[0]
 
-        # 第二波：剩余加密上游
-        remaining = [
-            s for s in enabled
-            if s not in first_wave
-            and s.server_type in ("doh", "dot", "doq", "iterative")
+        # ---- 第二波：回退到优选加密上游（迭代优先模式下就是"迭代整体失败"的出口）----
+        # 首波是 iterative 时，说明「根 → TLD → 权威」整条链已失败（每跳失败
+        # 过半即放弃 → 迭代整体失败）或超预算：这里回退到**按健康评分排序**的
+        # 优选加密上游（DoH/DoT/DoQ，取 preferred_count 个），不再按配置顺序、
+        # 也不再带 iterative（同一轮里重复死磕同一条迭代链只会继续拖时间）。
+        # 优选波也失败 → 第三波用剩余全部上游做最终兜底（加密优先模式下这一波
+        # 还包含 iterative，与旧行为一致）。每波超时都用完整 parallel_timeout。
+        ordered_encrypted = [
+            s for s in self._select_encrypted_upstreams(count=len(enabled))
+            if s.server_type in ("doh", "dot", "doq") and s not in first_wave
         ]
-        if remaining:
-            logger.debug("备用查询: 尝试剩余 %d 个加密上游", len(remaining))
+        preferred_n = max(
+            3, int(getattr(self.config, "preferred_server_count", 5) or 5)
+        )
+        preferred = ordered_encrypted[:preferred_n]
+        rest = ordered_encrypted[preferred_n:]
+        if not cap_iterative_budget:
+            # 加密上游优先：iterative 作为最后的兜底波（与旧行为一致）。
+            # **纯迭代模式例外**：第一波就是 iterative 且已给足 total_timeout，
+            # 这里再兜一次等于把同一轮迭代（含 bootstrap 兜底）跑两遍，
+            # 实测单查询耗时 3.7s → 7.4s，故跳过。
+            if not self._is_pure_iterative_mode():
+                rest.extend(
+                    s for s in enabled
+                    if s not in first_wave and s.server_type == "iterative"
+                )
+        waves = [
+            (
+                preferred,
+                "迭代整体失败→回退优选加密上游（按健康评分）"
+                if cap_iterative_budget else "加密上游优选",
+            ),
+            (rest, "其余上游最终兜底"),
+        ]
+        for wave_no, (wave_servers, label) in enumerate(waves, start=2):
+            if not wave_servers:
+                continue
+            logger.debug(
+                "备用查询[第%d波]: 尝试 %d 个上游（%s）",
+                wave_no, len(wave_servers), label,
+            )
             result = await self._try_upstream_wave(
-                remaining, query_bytes, timeout * 0.5,
+                wave_servers, query_bytes, timeout,
             )
             if result is not None:
                 self._last_fast_server = result[2].name
@@ -1337,10 +1679,17 @@ class ResolverManager:
 
         if self._failure_stats:
             summary = ", ".join(f"{k}×{v}" for k, v in sorted(self._failure_stats.items()))
-            logger.warning("并行查询: 全部 %d 个上游均失败 — %s", len(enabled), summary)
+            if self._is_pure_iterative_mode():
+                # 纯迭代模式：单域名超时也会表现为「全部 1 个上游失败」，降噪
+                logger.debug("并行查询: 迭代解析失败 — %s", summary)
+            else:
+                logger.warning("并行查询: 全部 %d 个上游均失败 — %s", len(enabled), summary)
             self._failure_stats.clear()
         else:
-            logger.warning("并行查询: 全部 %d 个上游均失败", len(enabled))
+            if self._is_pure_iterative_mode():
+                logger.debug("并行查询: 迭代解析失败（纯迭代模式）")
+            else:
+                logger.warning("并行查询: 全部 %d 个上游均失败", len(enabled))
         return None
 
     async def _background_consistency_check(

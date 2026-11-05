@@ -158,6 +158,10 @@ class AnomalyDetector:
                 偏离判分（例：TTL mean=300、std=0.5 时，8% 的偏离会被
                 z 算成 50σ）。
             ttl_min_ref: 配置 cache.min_ttl（仅用于推导阈值）。
+
+                注意：min_ttl 现在只作为「无 TTL 信息时的兜底下限」，不再参与
+                真实 TTL 的钳制（RFC 2181 §5.1 禁止抬升上游 TTL），因此它只是
+                一个**配置尺度参考值**，不代表实际的缓存寿命下限。
             ttl_default_ref: 配置 cache.default_ttl（仅用于推导阈值）。
         """
         self.enabled = enabled

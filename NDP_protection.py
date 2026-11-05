@@ -36,6 +36,7 @@ import asyncio
 import logging
 import random
 import locale
+import ipaddress
 from typing import Optional, List, Tuple, Dict, Callable, Any
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -45,6 +46,27 @@ from task_pool import TaskLevel, run_blocking
 import socket
 
 logger = logging.getLogger("dns-proxy.ndp")
+
+
+def extract_ipv6_from_line(line: str) -> Optional[str]:
+    """提取文本行里第一个合法 IPv6 字面量（解析 ping 输出用）
+
+    不能用裸字符类 ``[0-9a-fA-F:]+`` 直接 search：英文输出
+    ``Reply from 2001:db8::1: Destination net unreachable`` 里 "Reply" 的
+    ``e`` 属于 ``[0-9a-fA-F]``，会成为第一个匹配（from_ip="e"），于是
+    ``from_ip == 网关地址`` 永远不成立，IPv6 WAN 快速断连检测完全失效。
+    这里改为「候选串 + ipaddress 校验」，候选长度至少 2 且剥掉末尾单冒号。
+    """
+    for m in re.finditer(r'[0-9a-fA-F:]{2,}(?:%\w+)?', line):
+        cand = m.group(0).split('%', 1)[0].rstrip(':')
+        if not cand:
+            continue
+        try:
+            ipaddress.IPv6Address(cand)
+            return cand
+        except ValueError:
+            continue
+    return None
 
 # ======================== scapy 可选引入 ========================
 
@@ -665,18 +687,16 @@ class NDPProtection:
                     else:
                         icmp_code = 0
                     saw_reply = True
-                    # Extract source IP (IPv6)
-                    m = re.search(r'([0-9a-fA-F:]+(?::[0-9a-fA-F:]+)*)', line)
-                    if m:
-                        from_ip = m.group(1)
+                    # Extract source IP (IPv6)：必须走合法字面量校验（见
+                    # extract_ipv6_from_line 的说明），否则英文输出会把
+                    # "Reply" 的 e 当成地址。
+                    from_ip = extract_ipv6_from_line(line) or from_ip
                 elif "Reply from" in line or "来自" in line:
                     saw_reply = True
                     if reachable:
                         icmp_type = 129  # ICMPv6 Echo Reply
                         icmp_code = 0
-                    m = re.search(r'([0-9a-fA-F:]+(?::[0-9a-fA-F:]+)*)', line)
-                    if m:
-                        from_ip = m.group(1)
+                    from_ip = extract_ipv6_from_line(line) or from_ip
 
             return {"reachable": reachable, "icmp_type": icmp_type, "icmp_code": icmp_code,
                     "from_ip": from_ip, "saw_reply": saw_reply}

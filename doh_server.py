@@ -214,15 +214,25 @@ class DoHFrontend:
 
     # ==================== 生命周期 ====================
 
+    def _internal_base_url(self) -> str:
+        """内部站点 base_url
+
+        IPv6 字面量必须加方括号（``http://[::1]:1234``），否则 httpx/URL 解析
+        会把端口误当成地址的一部分。internal_host 现在可由配置指定为 ::1。
+        """
+        host = self.internal_host
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        return f"http://{host}:{self.internal_port}"
+
     async def start(self):
         """启动 TLS 前端（IPv4 必需，IPv6 可选）与 HTTP/3（可选）"""
         ssl_context = self._make_ssl_context()
-
         self._client = httpx.AsyncClient(
-            base_url=f"http://{self.internal_host}:{self.internal_port}",
+            base_url=self._internal_base_url(),
             timeout=httpx.Timeout(self.forward_timeout, connect=5.0),
             limits=httpx.Limits(max_connections=256, max_keepalive_connections=64),
-            # 不读系统代理：内部转发必须直连 127.0.0.1
+            # 不读系统代理：内部转发必须直连回环
             trust_env=False,
             follow_redirects=False,
         )
@@ -231,6 +241,7 @@ class DoHFrontend:
         if self.ipv6_enabled:
             targets.append((self.ipv6_host, self.ipv6_port, "IPv6"))
 
+        listening: List[str] = []
         for host, port, label in targets:
             try:
                 server = await asyncio.start_server(
@@ -248,13 +259,13 @@ class DoHFrontend:
                 logger.warning("DoH 前端 %s 监听失败（跳过）: %s", label, e)
                 continue
             self._servers.append(server)
+            listening.append(f"https://{self._display_host(host, label)}:{port}{self.doh_path}")
+        # 合并成一行（原来每个地址族各打一条，加上 HTTP/3 一次启动要刷 4-5 行）
+        if listening:
             logger.info(
-                "DoH [%s] https://%s:%d%s （ALPN: %s）",
-                label,
-                self._display_host(host, label),
-                port,
-                self.doh_path,
+                "DoH 监听（TLS/ALPN %s）: %s",
                 "/".join(self.protocols.tcp_alpn) or "(无)",
+                " | ".join(listening),
             )
 
         if self.protocols.http3:
@@ -335,6 +346,8 @@ class DoHFrontend:
             logger.warning("HTTP/3 证书加载失败，自动降级到 h2/h1.1: %s", e)
             return
 
+        h3_listening: List[str] = []
+        h3_retry = False
         for host, port, label in targets:
             # 地址验证（Retry）：监听非回环地址时强制开启，阻断伪造源 IP 的
             # UDP 反射放大（未验证地址的客户端只会收到一个 Retry 包，
@@ -358,14 +371,16 @@ class DoHFrontend:
                 logger.warning("DoH HTTP/3 %s 启动异常（跳过）: %s", label, e)
                 continue
             self._quic_servers.append(server)
+            h3_listening.append(
+                f"https://{self._display_host(host, label)}:{port}{self.doh_path}"
+            )
+            h3_retry = h3_retry or need_retry
+        if h3_listening:
+            # 合并成一行（原来每个地址族各打一条）
             logger.info(
-                "DoH [%s] https://%s:%d%s （HTTP/3 / QUIC UDP %d，地址验证=%s）",
-                label,
-                self._display_host(host, label),
-                port,
-                self.doh_path,
-                port,
-                "Retry（已开启）" if need_retry else "无需（回环地址）",
+                "DoH 监听（HTTP/3 / QUIC UDP）: %s（地址验证=%s）",
+                " | ".join(h3_listening),
+                "Retry（已开启）" if h3_retry else "无需（回环地址）",
             )
 
     @staticmethod
@@ -977,6 +992,28 @@ class _H3Protocol(QuicConnectionProtocol if HAS_AIOQUIC else object):
 QTYPE_NAMES = {v: k for k, v in dns.rdatatype.__dict__.items() if isinstance(v, int)}
 
 
+@web.middleware
+async def swallow_client_disconnect(request: web.Request, handler):
+    """吞掉「客户端提前断开」这类传输层异常（**模块级 new-style 中间件**）
+
+    DoH 客户端（浏览器 / 系统解析器）经常在请求体发完前就断开（超时重发、
+    页面切走、QUIC→TCP 回落）。aiohttp 默认会把 ConnectionResetError 冒到
+    error logger，打成一整段 `ERROR [aiohttp.server] ... traceback`。
+
+    必须放在模块级并加 ``@web.middleware``（设置 ``__middleware_version__=1``）：
+    写成实例方法时 aiohttp 会把它当成 **old-style** 中间件，按 ``m(app, handler)``
+    调用，于是 request 位置拿到的是 Application 对象 → 一访问
+    ``request.headers`` 就报 `'Application' object has no attribute 'headers'`。
+    """
+    try:
+        return await handler(request)
+    except (ConnectionResetError, ConnectionAbortedError,
+            BrokenPipeError, ConnectionError) as e:
+        logger.debug("DoH 客户端提前断开（%s %s）: %s",
+                     request.method, request.path, e)
+        return web.Response(status=499)
+
+
 class DoHServer:
     """本地 DNS over HTTPS 服务器（支持 IPv4/IPv6 双栈）"""
 
@@ -1007,7 +1044,10 @@ class DoHServer:
         self.ipv6_host = config.doh_ipv6_host
         self.ipv6_port = config.doh_ipv6_port
 
-        self.app = web.Application(client_max_size=65536)
+        self.app = web.Application(
+            client_max_size=65536,
+            middlewares=[swallow_client_disconnect],
+        )
         self._setup_routes()
         self._runner: Optional[web.AppRunner] = None
         self._sites: List[web.TCPSite] = []
@@ -1020,8 +1060,11 @@ class DoHServer:
 
         # 对外协议前端（TLS ALPN h2/http1.1 + QUIC h3）
         self._frontend: Optional[DoHFrontend] = None
-        # 内部明文 aiohttp 站点：只监听本机，端口由系统分配（0）
-        self.internal_host = "127.0.0.1"
+        # 内部明文 aiohttp 站点：只监听回环，端口由系统分配（0）。
+        # 地址来自 server.doh.internal_host（默认 127.0.0.1，只接受回环地址）；
+        # 早期这里是硬编码 "127.0.0.1"，无法在纯 IPv6 环境（无 IPv4 回环）下
+        # 改用 ::1。
+        self.internal_host = config.doh_internal_host
         self.internal_port = 0
 
         # 并发控制
@@ -1085,7 +1128,10 @@ class DoHServer:
             rcode = msg.rcode()
         except Exception:
             return False
-        if rcode in (dns.rcode.NXDOMAIN, dns.rcode.REFUSED):
+        # RFC 2308 §7：只允许缓存 NXDOMAIN 与 NODATA。REFUSED / SERVFAIL 属于
+        # 错误应答，不是"名字不存在"，不能当负应答（缓存层 cache.set 亦已直接
+        # 拒绝非 NOERROR/NXDOMAIN 的响应，这里同步去掉避免语义混淆）。
+        if rcode == dns.rcode.NXDOMAIN:
             return True
         return rcode == dns.rcode.NOERROR and not msg.answer
 
@@ -1197,7 +1243,14 @@ class DoHServer:
                 )
             return web.Response(status=415, text="需要 Content-Type: application/dns-message")
 
-        wire_data = await request.read()
+        try:
+            wire_data = await request.read()
+        except (ConnectionResetError, ConnectionAbortedError,
+                BrokenPipeError, ConnectionError) as e:
+            # 客户端在请求体发完前断开（浏览器重发/切页）：不是服务端错误，
+            # 由中间件兜底会再收到一次，这里提前收尾避免多余的 ERROR+traceback。
+            logger.debug("DoH POST 请求体读取中断（客户端断开）: %s", e)
+            return web.Response(status=499)
         if not wire_data or len(wire_data) < 12:
             return web.Response(status=400, text="空请求体或无效长度")
         return await self._handle_dns_query(wire_data, request, "wire")
@@ -1303,14 +1356,39 @@ class DoHServer:
             if self.config.filter_enabled and not is_hosts_bypass:
                 blocked, reason = self.filter_engine.check_domain(qname)
                 if blocked:
-                    result["Status"] = 3  # NXDOMAIN
-                    result["Comment"] = f"被过滤规则拦截: {reason}"
-                    # 缓存拦截结果到 DNS 响应缓存，防止上游正向应答重复生效
+                    # 缓存拦截结果到 DNS 响应缓存，防止上游正向应答重复生效。
+                    # blocked=True 打标：规则放宽（删规则/@@ 例外/hosts 白名单）后
+                    # 由 _sweep_cache_after_filter_load 反向清理，避免旧拦截条目
+                    # 把客户端挡到 TTL 到期。
+                    # 缓存键**不含 DO/CD**（拦截响应与 DNSSEC 无关，详见 plain_dns_server 注释）
+                    _block_key = (question.name, question.rdtype, question.rdclass)
                     if self.config.cache_enabled:
-                        response = dns.message.make_response(query)
-                        response.set_rcode(dns.rcode.NXDOMAIN)
-                        await self.cache.set(cache_key, response, True)
-                    return result
+                        # 先查缓存：命中就直接返回（避免每次重新构造/写缓存）
+                        _hit = await self.cache.get(_block_key)
+                        if _hit is not None:
+                            return self._dns_response_to_json(_hit, query)
+                    response = dns.message.make_response(query)
+                    response.set_rcode(dns.rcode.NXDOMAIN)
+                    response.flags |= dns.flags.RA   # RFC 1035：递归服务端
+                    # RFC 2308：补 SOA 让客户端能缓存负应答（详见 plain_dns_server 注释）
+                    try:
+                        _neg_ttl = int(getattr(self.config, "cache_negative_ttl", 60) or 60)
+                        response.authority.append(dns.rrset.from_text(
+                            question.name, _neg_ttl, "IN", "SOA",
+                            "blocked.invalid. hostmaster.blocked.invalid. 1 "
+                            "3600 600 86400 %d" % _neg_ttl,
+                        ))
+                    except Exception:
+                        pass
+                    if self.config.cache_enabled:
+                        await self.cache.set(_block_key, response, True, blocked=True)
+                    # 修复：早期这里 `return result` 返回的是只填了 Status/Comment
+                    # 的内存 dict（Authority 为空），而缓存里存的是带 SOA 的
+                    # response——于是"首次无 SOA、命中后才有 SOA"，既违反
+                    # RFC 2308 的负缓存语义，也和另外三个服务的拦截应答形态
+                    # 不一致。统一走 JSON 序列化，两条路径输出一致。
+                    logger.debug("DoH(JSON) 拦截 %s: %s", qname, reason)
+                    return self._dns_response_to_json(response, query)
 
             # 2. 缓存检查
             if self.config.cache_enabled:
@@ -1328,7 +1406,34 @@ class DoHServer:
 
             response = dns.message.from_wire(result_wire)
 
-            # 4. 缓存
+            # 4. DNSSEC 验证（与 wire 入口 ?dns= **完全共用同一套判定**）
+            #
+            # 修复：早期 JSON 入口（?name=&type=）直接返回上游响应，从不调用
+            # validate_response，于是同一份上游应答走 ?dns= 会判 bogus 而走
+            # ?name= 却放行——bogus 响应可经此入口进入，并写进 source="json"
+            # 的缓存键长期复用（fail-open）。这里按 wire 路径的同一逻辑校验，
+            # 安全默认取最严：drop_bogus 开启时直接回 SERVFAIL。
+            if (self._dnssec_wrapper is not None and self.config.dnssec_enabled
+                    and not self.resolver_manager.iterative_already_verified()):
+                try:
+                    # DNSSECQueryWrapper.validate_response 返回 **(bool, str)** 两元组
+                    # （内部才展开 DNSSECValidator 的 3 元组）；早期这里误按 3 元组
+                    # 解包 → ValueError → 被 except 兜住 → 又踩到未定义的 name，
+                    # 最终整个 JSON 入口回 "内部错误"。
+                    dnssec_ok, dnssec_status = \
+                        await self._dnssec_wrapper.validate_response(wire_data, result_wire)
+                except Exception as e:
+                    # 注意：本方法的局部变量是 qname（不是上层 _handle_request 的
+                    # name）。
+                    logger.debug("JSON 入口 DNSSEC 验证异常 %s: %s", qname, e)
+                    dnssec_ok, dnssec_status = True, "indeterminate"
+                if not dnssec_ok and self.config.dnssec_drop_bogus:
+                    logger.warning("DNSSEC bogus，丢弃 %s 的响应（JSON 入口）", qname)
+                    result["Status"] = 2  # SERVFAIL
+                    result["Comment"] = f"DNSSEC 验证失败: {dnssec_status}"
+                    return result
+
+            # 5. 缓存
             if self.config.cache_enabled:
                 is_negative = self._is_negative_response(response)
                 await self.cache.set(cache_key, response, is_negative)
@@ -1354,6 +1459,11 @@ class DoHServer:
             dns.rcode.NOTIMP: 4,
             dns.rcode.REFUSED: 5,
         }
+        # 注意：query.question[0] 是 RRset（question 段只有 name/type/class，
+        # rdata 为空），而 RRset 的 __bool__ 取决于 rdata 数量 → 空 RRset 为
+        # False。这里必须用 `is not None`，否则 JSON 的 Question 永远为空
+        # （缓存命中/上游返回路径都走本函数，_process_json_query 里直接拼的
+        # Question 会被它覆盖）。
         question = query.question[0] if query.question else None
 
         result = {
@@ -1368,7 +1478,7 @@ class DoHServer:
             "Authority": [],
         }
 
-        if question:
+        if question is not None:
             result["Question"].append({
                 "name": str(question.name).rstrip("."),
                 "type": QTYPE_NAMES.get(question.rdtype, str(question.rdtype)),
@@ -1523,29 +1633,45 @@ class DoHServer:
                 if blocked:
                     block_reason = reason
                     status = "blocked"
-                    # 像 AdGuard 一样重写 IP：A → 0.0.0.0，AAAA → ::，其他类型 → NXDOMAIN
+                    # 缓存键**不含 DO/CD**（拦截响应与 DNSSEC 无关，详见 plain_dns_server 注释）；
+                    # 并**先查缓存**，命中直接返回，避免每次重新构造/写缓存。
+                    _block_key = (question.name, question.rdtype, question.rdclass)
+                    if self.config.cache_enabled:
+                        _hit = await self.cache.get(_block_key)
+                        if _hit is not None:
+                            import copy as _copy
+                            _hit = _copy.copy(_hit)
+                            _hit.id = query.id
+                            elapsed = asyncio.get_event_loop().time() - start_time
+                            await self._log_query(
+                                client_ip, qname,
+                                QTYPE_NAMES.get(question.rdtype, str(question.rdtype)),
+                                elapsed, "cached", upstream, block_reason
+                            )
+                            return self._make_response(
+                                _hit.to_wire(), response_format, query=query)
+                    # 拦截统一返回 NXDOMAIN（2026-10-30，详见 plain_dns_server 注释）：
+                    # block_ip / block_nxdomain 已废弃，不再重写 0.0.0.0 / ::
                     response = dns.message.make_response(query)
-                    rdtype = question.rdtype
-                    if rdtype == dns.rdatatype.A:
-                        response.answer.append(
-                            dns.rrset.RRset(question.name, question.rdclass, dns.rdatatype.A)
-                        )
-                        response.answer[0].add(dns.rdtypes.IN.A.A(dns.rdataclass.IN, dns.rdatatype.A, "0.0.0.0"), ttl=3600)  # nosec B104 - blocked A record, not binding
-                        response.set_rcode(dns.rcode.NOERROR)
-                    elif rdtype == dns.rdatatype.AAAA:
-                        response.answer.append(
-                            dns.rrset.RRset(question.name, question.rdclass, dns.rdatatype.AAAA)
-                        )
-                        response.answer[0].add(dns.rdtypes.IN.AAAA.AAAA(dns.rdataclass.IN, dns.rdatatype.AAAA, "::"), ttl=3600)
-                        response.set_rcode(dns.rcode.NOERROR)
-                    else:
-                        response.set_rcode(dns.rcode.NXDOMAIN)
+                    response.set_rcode(dns.rcode.NXDOMAIN)
+                    response.flags |= dns.flags.RA   # RFC 1035：递归服务端
+                    # RFC 2308：补 SOA 让客户端能缓存负应答（详见 plain_dns_server 注释）
+                    try:
+                        _neg_ttl = int(getattr(self.config, "cache_negative_ttl", 60) or 60)
+                        response.authority.append(dns.rrset.from_text(
+                            question.name, _neg_ttl, "IN", "SOA",
+                            "blocked.invalid. hostmaster.blocked.invalid. 1 "
+                            "3600 600 86400 %d" % _neg_ttl,
+                        ))
+                    except Exception:
+                        pass
                     response_wire = response.to_wire()
-                    # 缓存拦截结果
+                    # 缓存拦截结果（blocked=True 打标，供规则放宽后反向清理）
                     if self.config.cache_enabled:
                         await self.cache.set(
-                            cache_key, response,
+                            _block_key, response,
                             response.rcode() == dns.rcode.NXDOMAIN,
+                            blocked=True,
                         )
                     elapsed = asyncio.get_event_loop().time() - start_time
                     await self._log_query(
@@ -1584,7 +1710,11 @@ class DoHServer:
                 upstream = self.resolver_manager.last_fast_server or ""
                 # 4. DNSSEC 验证（如果启用）
                 dnssec_ok = True
-                if self._dnssec_wrapper is not None and self.config.dnssec_enabled:
+                # 纯迭代 + strict_dnssec 时迭代器内部已严格验证（resolver 层也
+                # 跳过），此处不再重复验证：既省 DNSKEY/DS 往返，也避免 wrapper
+                # 把合法 NXDOMAIN/NSEC 负应答误判 bogus → SERVFAIL。
+                if (self._dnssec_wrapper is not None and self.config.dnssec_enabled
+                        and not self.resolver_manager.iterative_already_verified()):
                     dnssec_ok, dnssec_status = await self._dnssec_wrapper.validate_response(
                         wire_data, result_wire
                     )
@@ -1750,8 +1880,13 @@ class DoHServer:
             internal_port=internal_port,
             protocols=protocols,
             internal_token=self._internal_token,
-            forward_timeout=float(
-                getattr(self.config, "parallel_timeout", 30.0) or 30.0
+            # 前端等待上游解析的**总预算**：必须覆盖「迭代首波（~3.5s）+ 回退
+            # 加密上游（parallel_timeout）」两段。原来直接等于 parallel_timeout
+            # （2s），会把任何需要迭代的冷查询提前截断成 504——这正是"启动后
+            # 完全无法访问网站"的直接原因之一。
+            forward_timeout=max(
+                6.0,
+                float(getattr(self.config, "parallel_timeout", 2.0) or 2.0) * 3.0,
             ),
             # 连接数上限取自 performance.doh_max_connections（默认 200），
             # 与 dot_max_connections / doq_max_connections 同一段配置

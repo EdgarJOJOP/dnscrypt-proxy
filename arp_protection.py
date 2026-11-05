@@ -689,9 +689,16 @@ class ARPProtection:
             reason = f"本地 MAC 冒用攻击！攻击者冒用本机 MAC {sender_mac} 以 {sender_ip} 身份发送 ARP"
 
         # ③ Target = 网关 IP × MAC 不匹配（中间人回复劫持）
-        # 全零 target_mac 特殊处理：某些正常设备会发 target_mac=00:00:00:00:00:00 的 ARP 包
-        # （ARP 探测行为），不是攻击。需要同一 MAC 短时间内多次出现才确认为攻击。
-        elif target_ip == gw_ip and self._baseline_mac and target_mac and self._mac_normalize(target_mac) != self._mac_normalize(self._baseline_mac):
+        # Target = 网关 IP × MAC 不匹配（中间人回复劫持）——**只对 ARP Reply 成立**。
+        #
+        # RFC 826：ARP Request 的 target hardware address 必须填 0（发送方还
+        # 不知道对方 MAC），所以正常设备向网关发请求时 target_mac 恒为
+        # 00:00:00:00:00:00。早期实现把这类请求也计入"可疑次数"，任何设备在
+        # 网关 ARP 表老化后的一轮请求（网关有多个 IP 时一轮就能凑 3-5 个包）
+        # 就会在 10s 内达到阈值 → 被判 MITM → 收到定向伪造 GARP → 该设备
+        # 短暂失联（自伤式误反制）。因此这里要求 opcode == 2 才进入可疑统计。
+        elif (opcode == 2 and target_ip == gw_ip and self._baseline_mac and target_mac
+              and self._mac_normalize(target_mac) != self._mac_normalize(self._baseline_mac)):
             norm_tmac = self._mac_normalize(target_mac)
             norm_smac = self._mac_normalize(sender_mac)
             if norm_smac in self._trusted_sender_macs:
@@ -4150,9 +4157,17 @@ class ARPProtection:
             return False
 
     async def _ping_gateway(self, gw_ip: str) -> bool:
-        """ping 网关（直接使用 ping_interval 转为毫秒，公式 ping_interval×1000 ms）"""
+        """ping 网关（超时 = ping_interval×1000 ms，**不做 TCP 兜底**）
+
+        TCP 兜底对网关探测是有害的：网关与本机在二层同链路，ICMP 超时基本
+        等价于链路/网关异常；而 `_ping_tcp` 会串行尝试 443 与 80、每次最长
+        3 秒，断网期单轮网关采样从 ~0.5s 膨胀到 ~6.5s，滑动窗口（10 个样本）
+        要 65 秒才能填满——这正是"断网后恢复慢/卡死"的成因之一。
+        外网探测路径早已传 use_tcp_fallback=False，这里与之对齐。
+        """
         timeout_ms = max(int(self._ping_interval * 1000), 500)
-        return await ARPProtection._ping_icmp(gw_ip, timeout_ms=timeout_ms)
+        return await ARPProtection._ping_icmp(
+            gw_ip, timeout_ms=timeout_ms, use_tcp_fallback=False)
 
     async def _ping_gateway_fast(self, gw_ip: str) -> bool:
         """ping 网关（快速验证，至少 50ms 超时，用于 GARP 爆发场景后的快速验证，不启用 TCP 兜底）"""
@@ -4243,7 +4258,11 @@ class ARPProtection:
             result["diagnosis"] = "timeout"
             return result
 
-        tcp_ok = await ARPProtection._ping_tcp(ip, timeout_ms=3000)
+        tcp_ok = await ARPProtection._ping_tcp(
+            ip, timeout_ms=max(300, min(int(timeout_ms), 1000)))
+        # TCP 兜底超时由上层的 ICMP 超时推导并封顶 1.0s（原硬编码 3000ms
+        # 让单次兜底最多拖 6 秒：443 与 80 各 3 秒，断网期采样率直接崩塌）。
+        # TCP 兜底只用于区分"ICMP 被防火墙挡但链路其实是通的"，不需要等满。
         if tcp_ok:
             result["reachable"] = True
             result["diagnosis"] = "tcp_ok"

@@ -7,8 +7,10 @@
 """
 
 import asyncio
+import contextvars
 import ipaddress
 import logging
+import os
 import socket
 import struct
 import sys
@@ -16,15 +18,23 @@ import time
 from typing import Optional, Dict, Tuple, Any, List
 
 import dns.message
+import dns.exception
 import dns.query
+import dns.asyncquery
 import dns.flags
 import dns.rcode
+import dns.edns
 import dns.rdatatype
 import dns.rdataclass
 import dns.rdtypes.IN.A
 import dns.rdtypes.IN.AAAA
 import dns.rrset
-from dns_utils import reorder_answer_aaaa_first, sort_dns_response_wire
+from dns_utils import (
+    reorder_answer_aaaa_first,
+    sort_dns_response_wire,
+    has_global_ipv6,
+    probe_ipv6_path,
+)
 
 from config import Config, DEFAULT_ROOT_SERVERS
 from resolver_manager import ResolverManager
@@ -32,13 +42,80 @@ from cache import DNSCache
 from filter_engine import FilterEngine
 from logger import RequestLogger
 from dnssec import DNSSECQueryWrapper, DNSSECValidator
-from task_pool import TaskLevel, run_blocking, get_pressure
 from rate_limiter import get_per_ip_limiter
 
 logger = logging.getLogger("dns-proxy.plain-dns")
 
+
+_V6_DISABLED_CTX: contextvars.ContextVar = contextvars.ContextVar(
+    "iterative_v6_disabled", default=False
+)
+"""本域名本次解析是否已禁用 IPv6（**per-query**，用 ContextVar 隔离）
+
+语义：某一跳的权威服务器里没有可用 IPv6 时，只在**这个域名**的后续跳里
+禁用 IPv6（改用 IPv4），其它域名照常按各自的权威集合跨族交错。
+asyncio 每个 Task 有独立 context，所以不同域名的并发解析互不影响。
+"""
+
+
+def _consume_future_exc(fut: asyncio.Future) -> None:
+    """消费 future 的异常（不取 result，只取 exception 消除告警）
+
+    UDP transport 的 ``connection_lost`` 是异步回调：调用方已经放弃等待后它才给
+    future 设 ``ConnectionError('datagram closed')``，不消费就会触发 asyncio 的
+    ``Future exception was never retrieved`` ERROR 刷屏。
+    """
+    if fut.cancelled():
+        return
+    try:
+        fut.exception()
+    except Exception:
+        pass
+
+
+class _UdpQueryProtocol(asyncio.DatagramProtocol):
+    """单次 DNS UDP 查询的协议：收到首个数据报即完成 future
+
+    配合 ``IterativeResolver._query_one_async`` 使用——原生 asyncio 收发，
+    等待权威应答期间不占工作线程、也不占 CPU（对比 run_in_executor 的
+    「线程被阻塞独占」）。transport 用 remote_addr 连接，来源地址由内核过滤；
+    上层还会校验响应 ID，双保险防串包/伪造。
+    """
+
+    __slots__ = ("future", "transport")
+
+    def __init__(self):
+        self.future: asyncio.Future = asyncio.get_running_loop().create_future()
+        # transport.close() → connection_lost 是**异步回调**，可能在调用方
+        # 已经放弃等待之后才给 future 设异常（ConnectionError('datagram closed')），
+        # 于是 asyncio 打 "Future exception was never retrieved" 的 ERROR 刷屏。
+        # 挂一个消费回调即可根治（正常路径取 result 不受影响）。
+        self.future.add_done_callback(_consume_future_exc)
+        self.transport = None
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def datagram_received(self, data: bytes, addr):
+        if not self.future.done():
+            self.future.set_result(data)
+
+    def error_received(self, exc):
+        # Windows 上 ICMP 端口不可达会以 ConnectionRefusedError 形式到这里
+        if not self.future.done():
+            self.future.set_exception(exc)
+
+    def connection_lost(self, exc):
+        if not self.future.done():
+            self.future.set_exception(exc or ConnectionError("datagram closed"))
+
 # DNS 最大 UDP 数据报大小（DNSSEC 建议 1232，传统 512）
 MAX_UDP_SIZE = 1232
+
+# 无 glue 的 NS 名解析的递归深度上限（远小于 iterative.max_depth）：
+# 权威 NS 名通常 1-2 跳解析出来即可，若跟主链一样允许 16 层，一次 referral
+# 的 26 个 NS 就会逐层展开成指数级协程/Task（实测 4.4 万协程、1.5GB）。
+_NS_RESOLVE_MAX_DEPTH = 3
 
 # Windows WSAIoctl：关闭 UDP socket 的 ICMP「端口不可达」通知
 #   SIO_UDP_CONNRESET = _WSAIOW(IOC_VENDOR, 12) = 0x9800000C
@@ -416,25 +493,71 @@ class PlainDNSServer:
                 if blocked:
                     block_reason = reason
                     status = "blocked"
+                    # **拦截条目的缓存键不含 DO/CD 位**（2026-10-30）：
+                    # 拦截响应固定是 NXDOMAIN + 合成 SOA，与 DNSSEC 需求无关；
+                    # 而浏览器/系统解析器会**交替用 DO=0 / DO=1** 查同一域名。
+                    # 若沿用含 DO 的 `cache_key`，每种组合都要"首次 blocked 一次"
+                    # （实测同一 client_ip 同一 qtype 一秒内出现两条 blocked，
+                    # 看起来像缓存完全没生效）。这里改用 (name, type, class)，
+                    # 让 DO/CD 不同的查询共享同一条拦截缓存。
+                    # 规则放宽后由 _sweep_cache_after_filter_load 按 blocked 标记清理。
+                    _block_key = (question.name, question.rdtype, question.rdclass)
+                    # **先查缓存**（2026-10-30，关键修复）：
+                    # 拦截结果原本会写进缓存，但 `cache.get` 在过滤分支**之后**，
+                    # 被拦域名在这个分支就 return 了 —— 缓存永远读不到。
+                    # 后果：每来一次查询都重新 make_response + cache.set + to_wire
+                    # + 落日志（实测 data.bilibili.com 一次会话被拦 1.8 万次，
+                    # 日志里状态全是 "blocked" 而非 "cached"），这些重复工作在
+                    # 浏览器并发时与纯迭代查询抢事件循环。
+                    # 现在命中缓存的拦截条目直接秒回（与 AdGuard Home 同款行为）。
+                    if self.config.cache_enabled:
+                        _hit = await self.cache.get(_block_key)
+                        if _hit is not None:
+                            import copy as _copy
+                            _hit = _copy.copy(_hit)
+                            reorder_answer_aaaa_first(_hit)
+                            _hit.id = query.id
+                            elapsed = asyncio.get_event_loop().time() - start_time
+                            await self._log_query(
+                                client_ip, qname, qtype_str, elapsed,
+                                "cached", block_reason,
+                            )
+                            return _hit.to_wire()
                     response = dns.message.make_response(query)
-                    if question.rdtype == dns.rdatatype.A:
-                        response.answer.append(
-                            dns.rrset.RRset(question.name, question.rdclass, dns.rdatatype.A)
-                        )
-                        response.answer[0].add(dns.rdtypes.IN.A.A(dns.rdataclass.IN, dns.rdatatype.A, "0.0.0.0"), ttl=3600)  # nosec B104
-                        response.set_rcode(dns.rcode.NOERROR)
-                    elif question.rdtype == dns.rdatatype.AAAA:
-                        response.answer.append(
-                            dns.rrset.RRset(question.name, question.rdclass, dns.rdatatype.AAAA)
-                        )
-                        response.answer[0].add(dns.rdtypes.IN.AAAA.AAAA(dns.rdataclass.IN, dns.rdatatype.AAAA, "::"), ttl=3600)
-                        response.set_rcode(dns.rcode.NOERROR)
-                    else:
-                        response.set_rcode(dns.rcode.NXDOMAIN)
+                    # 拦截统一返回 NXDOMAIN（2026-10-30）：
+                    # 原先 A/AAAA 被重写成 0.0.0.0 / ::（block_ip 机制），客户端会去连
+                    # 这个假地址、连不上就无限重试——实测 data.bilibili.com 一次会话
+                    # 被拦 1.8 万次、单分钟 299 次，重试挤占前端与事件循环，叠加
+                    # 缓存预刷新把纯迭代上游打满（日志出现「迭代解析连续全部失败」），
+                    # 连带其它客户端（游戏/加速器）解析超时。
+                    # NXDOMAIN 让客户端按"域名不存在"处理，不再重连重试。
+                    # block_ip / block_nxdomain 两个配置项随之废弃。
+                    response.set_rcode(dns.rcode.NXDOMAIN)
+                    # RFC 1035 §4.1.1：本机是递归服务端，拦截应答也必须置 RA=1，
+                    # 否则客户端（glibc res_send / 部分游戏解析器）会认为这台
+                    # DNS 不提供递归而弃用。
+                    response.flags |= dns.flags.RA
+                    # **附 SOA 让客户端缓存负应答**（2026-10-30，关键）：
+                    # RFC 2308 §5：NXDOMAIN 的客户端缓存时长由 authority 段
+                    # SOA 的 MINIMUM 字段决定。原来拦截响应只有 rcode、没有 SOA，
+                    # 客户端（浏览器/B 站客户端/系统解析器）无从判断能缓存多久，
+                    # 于是**立刻重试**——实测同一 (client_ip,qtype) 在 3 分钟内被
+                    # 重复拦 264 次。AdGuard Home 拦截时会附带 SOA，所以
+                    # 「拦一次就不再问」。这里补齐，让客户端按 TTL 缓存。
+                    try:
+                        _neg_ttl = int(getattr(self.config, "cache_negative_ttl", 60) or 60)
+                        response.authority.append(dns.rrset.from_text(
+                            question.name, _neg_ttl, "IN", "SOA",
+                            "blocked.invalid. hostmaster.blocked.invalid. 1 "
+                            "3600 600 86400 %d" % _neg_ttl,
+                        ))
+                    except Exception:
+                        pass
                     if self.config.cache_enabled:
                         await self.cache.set(
-                            cache_key, response,
+                            _block_key, response,
                             response.rcode() == dns.rcode.NXDOMAIN,
+                            blocked=True,
                         )
                     reorder_answer_aaaa_first(response)
                     result_wire = response.to_wire()
@@ -475,7 +598,13 @@ class PlainDNSServer:
                 # DNSSEC 验证（仅加密上游路径需要；迭代路径已在上游内部严格验证。
                 # 原 `status != "iterative"` 条件在新架构下恒真——迭代不再由
                 # plain_dns 独立执行，保留为直接执行）
-                if self._dnssec_wrapper is not None and self.config.dnssec_enabled:
+                #
+                # 纯迭代 + strict_dnssec：迭代器内部已完成严格链验证（resolver
+                # 层同样跳过），此处必须一起跳过——否则 wrapper 对 NXDOMAIN/
+                # NSEC 的判定与迭代器不一致，会把合法负应答误判 bogus，在
+                # drop_bogus=true 时变成 SERVFAIL（不存在的域名全部解析失败）。
+                if (self._dnssec_wrapper is not None and self.config.dnssec_enabled
+                        and not self.resolver_manager.iterative_already_verified()):
                     dnssec_ok, _ = await self._dnssec_wrapper.validate_response(
                         data, result_wire
                     )
@@ -568,7 +697,10 @@ class PlainDNSServer:
             rcode = msg.rcode()
         except Exception:
             return False
-        if rcode in (dns.rcode.NXDOMAIN, dns.rcode.REFUSED):
+        # RFC 2308 §7：只允许缓存 NXDOMAIN 与 NODATA。REFUSED / SERVFAIL 属于
+        # 错误应答，不是"名字不存在"，不能当负应答（缓存层 cache.set 亦已直接
+        # 拒绝非 NOERROR/NXDOMAIN 的响应，这里同步去掉避免语义混淆）。
+        if rcode == dns.rcode.NXDOMAIN:
             return True
         return rcode == dns.rcode.NOERROR and not msg.answer
 
@@ -839,6 +971,17 @@ class IterativeResolver:
         self.timeout = float(config.plain_dns_iterative_timeout_ms) / 1000.0
         self.max_depth = int(config.plain_dns_iterative_max_depth)
         self.strict_dnssec = bool(config.plain_dns_iterative_strict_dnssec)
+        # 每跳并行协程数（iterative.hop_parallel，默认 2）：同一跳同时向 2 台
+        # 候选服务器发非递归查询，先回者胜（见 _query_servers）。钳制 1-4。
+        self.hop_parallel = max(
+            1, min(4, int(config.plain_dns_iterative_hop_parallel))
+        )
+        # QNAME 最小化（RFC 9156，iterative.qname_minimization，默认 true）：
+        # 向根/TLD 只发「下一级名字」，完整查询名只发给最终权威。
+        try:
+            self.qname_minimization = bool(config.plain_dns_iterative_qname_minimization)
+        except Exception:
+            self.qname_minimization = True
         if not self.strict_dnssec:
             # security_review MEDIUM：strict_dnssec=False 时迭代响应未做 DNSSEC
             # 严格验证即返回（无第二信任源指纹兜底——cross_verify 已随新架构
@@ -853,20 +996,31 @@ class IterativeResolver:
         # plain_dns_iterative_cross_verify 因此失效），已删除该死代码。
         root = config.plain_dns_iterative_root_servers
         self.root_servers = [str(x) for x in root] if root else list(ROOT_SERVERS)
-        # A3 修复（IPv6 优先）：探测本机 IPv6 公网连通性（UDP connect 公共 IPv6 根，
-        # 仅验证路由可达，不发包），连通时 IPv6 根服务器排前、否则 IPv4 排前——
-        # 满足"main.py 运行的机子有 IPv6 且正常联通公网则优先使用 IPv6"要求
-        self._has_ipv6 = False
-        try:
-            _probe = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
-            try:
-                _probe.settimeout(0.5)
-                _probe.connect(("2001:7fd::1", 53))  # k.root-servers.net IPv6
-                self._has_ipv6 = True
-            finally:
-                _probe.close()
-        except Exception:
-            self._has_ipv6 = False
+        # IPv6 可用性：**地址探测 + 跨族连通性探测**
+        #   1) 网卡上必须存在全局 IPv6 地址（否则直接只用 IPv4）；
+        #   2) 再**同时**向一个 IPv6 根和一个 IPv4 根发真实 DNS 查询：
+        #      v6 根有应答 → IPv6 真的能出网；v4 根有应答作为对照，
+        #      用来区分「IPv6 不通」和「整体断网」（两者日志/处置不同）。
+        # 任一条件不满足 → 本次运行**提前禁用 IPv6**，迭代只用 IPv4。
+        self._has_ipv6 = has_global_ipv6()
+        if self._has_ipv6:
+            _v6_ok, _v4_ok = probe_ipv6_path()
+            self._has_ipv6 = _v6_ok
+            if not _v6_ok:
+                if _v4_ok:
+                    logger.warning(
+                        "IPv6 探测：v6 根无应答、v4 根正常 → 确认 IPv6 不通，"
+                        "本次运行迭代解析只用 IPv4"
+                    )
+                else:
+                    logger.warning(
+                        "IPv6 探测：v6 根与 v4 根均无应答 → 出网异常，"
+                        "本次运行迭代解析只用 IPv4"
+                    )
+        else:
+            logger.info("IPv6 探测：本机无全局 IPv6 地址 → 迭代解析只用 IPv4")
+        # 运行时降级是**按跳/按域名**的（见 `_query_servers` 的 `_hop_v6_fail`）：
+        # 某一跳的 v6 权威不可用只影响该跳，不会全局禁用 v6、也不影响其它域名。
         self.root_servers = sorted(
             self.root_servers,
             key=lambda ip: (0 if ((":" in ip) == self._has_ipv6) else 1, ip),
@@ -881,13 +1035,21 @@ class IterativeResolver:
         # （每台 wait_for(timeout+1.0)≈3s，UDP 超时后还 TCP 重试再 timeout），
         # 正常 3 级查询 + DNSSEC 链验证（DNSKEY/DS 多跳）实际可达 20-40s；
         # 预算改为按「每跳最多尝试 3 台」估算：timeout*max_depth + 3*(timeout+1)*max_depth/2
-        # （折中：默认 2s*8 + 1.5*3s*8 = 52s，成功路径不再被提前截断，
-        #  失败路径仍由 wait_for 兜底避免无限拖垮）
+        #
+        # 上限 30s（2026-10-30）：原公式随 max_depth 线性放大，timeout_ms=5000 +
+        # max_depth=32 时算出 304s，而前端 DoH 6s 就给客户端回了 504、系统 UDP
+        # 客户端更早重试——304s 的"预算"实际等于取消永不生效，与 resolver 层
+        # 硬上限、前端 forward_timeout 三层互相矛盾（日志里 152s/304s 与 10s 并存）。
+        # 收敛到 30s 后：正常查询（0.3-4s）与长 CNAME 链（10-15s）都能完成并写
+        # 缓存，真正卡死的查询也不会无限空跑。
         _per_hop_max = min(3.0, max(1.0, len(self.root_servers) * 0.25))
-        self.total_timeout = max(
-            15.0,
-            self.timeout * self.max_depth
-            + (self.timeout + 1.0) * _per_hop_max * self.max_depth * 0.5,
+        self.total_timeout = min(
+            30.0,
+            max(
+                15.0,
+                self.timeout * self.max_depth
+                + (self.timeout + 1.0) * _per_hop_max * self.max_depth * 0.5,
+            ),
         )
         # 独立 DNSSEC 验证器（内置根信任锚），回调指向迭代解析自身 → 全链自举
         self._dnssec = dnssec_validator or DNSSECValidator(enabled=True, mode="strict")
@@ -904,6 +1066,21 @@ class IterativeResolver:
         self._unknown_warn_last = 0.0
         self._unknown_warn_merged = 0
         self._ns_ip_cache: Dict[str, List[str]] = {}
+        # 权威服务器健康度：ip -> (EWMA 往返耗时秒, 连续失败次数)
+        # 目的：每跳默认只并行 2 台候选，而根/TLD 权威常有 20+ 台、其中部分是
+        # 跨境或异常节点（实测同一跳里的 192.31.80.30 等会反复被选中，每次都
+        # 先把 200-400ms 的 RTT 付出去）。有了这张表，`_query_servers` 的跨族
+        # 交错里会优先排「历史上回得快」的 IP，把「踩到慢权威」的代价从每跳
+        # 一次 RTT 降为偶发。
+        self._server_health: Dict[str, tuple] = {}
+        # DNS Cookie（RFC 7873）：降低 off-path 伪造响应被接受的概率。
+        #   _cookie_secret : 进程级随机 secret（重启即变），用于派生 client cookie
+        #   _server_cookies: ip -> 服务端返回的 server cookie（8-32 字节）
+        #   _cookie_disabled: 明确不支持 COOKIE 的权威 IP（收到 FORMERR/BADVERS 时
+        #                     记入，之后对该 IP 不再发送 COOKIE，避免反复失败）
+        self._cookie_secret: bytes = os.urandom(16)
+        self._server_cookies: Dict[str, bytes] = {}
+        self._cookie_disabled: set = set()
         # 已验证 zone 的 DNSKEY 缓存（避免每域名重复全链迭代流量）
         # 值: (rrset, 失效时间戳)，按缓存条目 TTL 失效，避免 DNSKEY 轮换后旧缓存致 bogus
         self._verified_zone_cache: Dict[str, tuple] = {}
@@ -916,8 +1093,33 @@ class IterativeResolver:
         # `_get_trusted_dnskey` 与 `_zone_signed_status` 会各查一次同一 zone 的 DS；
         # 实测 www.baidu.com 的 DS(baidu.com) 被查了 3 次、每次 200ms+。
         self._ds_cache: Dict[str, tuple] = {}
+        # DNSSEC 链查询的 single-flight 表：zone 名 -> Future
+        # 冷启动高并发时（如浏览器一次打开 30 个站点），每个域名都要验证
+        # 根/TLD 的 DNSKEY 与 DS，若不合并，同一 zone 会被并发查几十次——
+        # 根/TLD 权威会因 RRL 限速而大面积超时（表现为「解析卡 3s+ 后失败」）。
+        self._dnskey_inflight: Dict[str, asyncio.Future] = {}
+        self._ds_inflight: Dict[str, asyncio.Future] = {}
+        # bootstrap 递归兜底的并发闸门（只用于 CDN 调度域名 NODATA 场景）
+        self._bootstrap_sem = asyncio.Semaphore(4)
+        # **迭代 UDP 并发闸门**（2026-10-30）：`_query_one_async` 走原生 asyncio
+        # 数据报端点，**不经过 task_pool 的 PriorityGate**，所以原来没有任何上限。
+        # 浏览器一次开几个标签就能并发几十个域名，每跳又并行 hop_parallel(2) 台
+        # → 200+ 个 UDP 同时在飞；根/TLD 权威有 RRL 限速，于是大面积失败、
+        # 「迭代解析连续全部失败」反复出现，把游戏等其它客户端的解析一起拖垮。
+        # 上限由 `performance.iterative_max_inflight` 控制（默认 128，钳制 16-1024）：
+        # 超出的查询排队等待，宁可慢一点，也不要让上游被打爆后全军覆没。
+        try:
+            _inflight_limit = int(getattr(config, "iterative_max_inflight", 128))
+        except Exception:
+            _inflight_limit = 128
+        _effective_limit = max(16, min(1024, _inflight_limit))
+        self._inflight_sem = asyncio.Semaphore(_effective_limit)
+        logger.info("迭代上游并发闸门: 最多 %d 个单台查询同时在飞"
+                    "（performance.iterative_max_inflight）", _effective_limit)
         # 迭代查询是阻塞 socket 调用，统一交给 task_pool 的共享池 + 优先级闸门
         # （等级 DNS > NDP > ARP），NTP/日志另有专属通道，互不排队。
+        # 注意：`_query_one_async` 已改为原生 asyncio，不占线程池；
+        # 真正约束它并发的是上面的 `_inflight_sem`。
 
     @property
     def stats(self) -> Dict[str, Any]:
@@ -988,103 +1190,415 @@ class IterativeResolver:
         except Exception:
             return None
 
+    def _server_score(self, ip: str) -> float:
+        """权威服务器健康度得分（越小越优先）
+
+        - 未知 IP：给一个中性值 0.20s（既不会把没见过的 IP 排到已测快 IP 前面，
+          也不会让它们永远沉底——首跳仍需覆盖多台权威）；
+        - 已知 IP：EWMA 往返耗时 + 失败惩罚（每连续失败 +0.05s，封顶 0.5s）。
+        """
+        st = self._server_health.get(str(ip))
+        if st is None:
+            return 0.20
+        rtt, fails = st
+        return rtt + 0.05 * min(10, fails)
+
+    def _record_server_health(self, ip: str, rtt: Optional[float]) -> None:
+        """记录一次权威查询结果（rtt=None 表示失败）"""
+        try:
+            key = str(ip)
+            prev_rtt, prev_fails = self._server_health.get(key, (0.20, 0))
+            if rtt is None:
+                # 失败：把该 IP 的估算 RTT 抬高（下次排到后面），失败计数 +1
+                self._server_health[key] = (min(2.0, prev_rtt * 1.5 + 0.05), prev_fails + 1)
+            else:
+                self._server_health[key] = (
+                    0.7 * prev_rtt + 0.3 * max(0.001, float(rtt)),
+                    max(0, prev_fails - 1),
+                )
+            if len(self._server_health) > 4096:
+                # 防无界增长（多 IP/多进程切换场景）：直接清空重学，
+                # 排序只影响「先试哪台」，清空不影响正确性。
+                self._server_health.clear()
+        except Exception:
+            pass
+
     async def _query_servers(self, servers: List[str], qname: str, qtype: int,
                              rdclass: int = 1) -> Optional[dns.message.Message]:
-        """Hedged 查询：先发 1 台，STAGGER 秒内无响应再补发第 2 台
+        """单跳查询：**每跳固定并行 2 个协程**，谁先回用谁（先回者胜）
 
-        为什么不是固定并行 2 台：实测一次 www.baidu.com 解析发出 25 次查询，
-        几乎每条都打了两台（根/TLD/权威各 2 份），流量与线程占用直接翻倍，
-        而延迟没有收益（正常响应 30-250ms，取先回的那台即可）。
+        策略（用户指定）：
+          - 一跳内**同时启动 2 个协程**（同一跳的两个候选服务器 IP），
+            不再"先发 1 台、等 250ms 无响应再补发"；
+          - 任一台成功 → 立即取消另一个，返回先回的那个；
+          - 任一台失败 → 立即补发下一台，把「在飞」数量补回 2；
+          - 候选不足 2 台时按实际数量并行（1 台即单发）；
+          - **失败过半即放弃**：已失败的服务器一旦超过本跳候选总数的一半
+            （failed*2 > total），说明这一跳的权威大面积不可达，再试下去
+            只会让客户端一直等——直接返回 None（上层按 SERVFAIL 处理），
+            让客户端尽快重试，不再死磕剩下的服务器。
 
-        现在的策略：
-          - 先发第 1 台（同地址族优先）；
-          - 250ms 内没响应 → 补发第 2 台（Hedged，RFC 8305 风格）；
-          - 任一台失败 → 立即补发下一台；
-          - 任一台成功 → 取消其余，立即返回。
-        语义仍是「尝试到有响应为止」，只是常态下只发 1 份。
+        为什么固定并行 2 台：同一跳的多个根/权威 IP 里常有一台跨境 RTT 很高
+        或已下线，先回者胜把「踩到坏服务器」的代价从一整个超时（1.5-2s）压到
+        另一台的正常 RTT（30-250ms）；代价是首包查询量翻倍（DNS 查询仅几十
+        字节，可接受）。并行度由 iterative.hop_parallel 配置（默认 2，钳制
+        1-4）；每个协程是纯 asyncio 收发，不占 task_pool 线程。
         """
         if not servers:
             return None
-        # 地址族优先：本机 IPv6 可用时，先用同族的其它地址；同族耗尽才换另一族。
-        # （避免 referral/glue 的原始顺序导致 IPv6 可用时先打 IPv4 根或权威）
-        _prefer_v6 = bool(getattr(self, "_has_ipv6", False))
-        servers = sorted(
-            servers,
-            key=lambda ip: 0 if ((":" in str(ip)) == _prefer_v6) else 1,
-        )
-        # 共享池压力大时不再 hedge（只串行逐台），少占线程
-        stagger = 0.25 if get_pressure() < 0.5 else 3600.0
-        max_parallel = 2
+        # 地址族排序：**跨族交错**（优先族第 1 台、另一族第 1 台、优先族第 2 台…）
+        # 而不是"优先族全部排前面"。原因：每跳默认只并行 2 台，若这 2 台都是
+        # IPv6 而该权威的 v6 路径不通/丢包，就要等满一次超时才补发，长 CNAME 链
+        # （s1.hdslb.com 之类）很容易因此整条超时；交错后同一批里必有一台 v4，
+        # v6 不通时 v4 仍能在本跳内返回。
+        # 地址族策略（**按域名 + 按跳**判定）：
+        #   - 本机没有可用 IPv6（无全局地址或连通性探测失败）→ 只用 IPv4；
+        #   - 本域名本次解析已被判定「权威没有可用 IPv6」（`_V6_DISABLED_CTX`）
+        #     → 该域名后续跳都用 IPv4，**其它域名不受影响**；
+        #   - 本跳候选里没有 v6 地址 → 本跳只用 IPv4；
+        #   - 否则跨族交错（v6 第 1 台 + v4 第 1 台 …）。
+        _v6_off_here = bool(_V6_DISABLED_CTX.get())
+        _prefer_v6 = bool(getattr(self, "_has_ipv6", False)) and not _v6_off_here
+        # 每个地址族内部按健康度排序（快的在前），再跨族交错——既保留
+        # 「同批必有一台 v4」的抗 v6 不通能力，又避免每跳先踩到慢权威。
+        _v6 = sorted((ip for ip in servers if ":" in str(ip)), key=self._server_score)
+        _v4 = sorted((ip for ip in servers if ":" not in str(ip)), key=self._server_score)
+        if not _prefer_v6:
+            servers = _v4 or servers
+        elif not _v6:
+            # 本跳权威服务器**没有 IPv6 地址** → 本域名后续跳也禁用 IPv6
+            # （per-domain：其它域名仍按各自权威集合跨族交错）
+            _V6_DISABLED_CTX.set(True)
+            logger.debug(
+                "迭代查询: %s 本跳权威无 IPv6 地址 → 本域名后续只用 IPv4",
+                _safe_qname(qname),
+            )
+        else:
+            _ordered: List[str] = []
+            for _i in range(max(len(_v6), len(_v4))):
+                if _i < len(_v6):
+                    _ordered.append(_v6[_i])
+                if _i < len(_v4):
+                    _ordered.append(_v4[_i])
+            servers = _ordered
+        total = len(servers)
+        # 每跳并行协程数（默认 2：两路竞速、先回者胜）
+        max_parallel = max(1, min(4, int(getattr(self, "hop_parallel", 2) or 2)))
+        # 本跳总预算：候选多/权威全灭时，最多花「2 倍单跳超时」就放弃本跳，
+        # 避免单跳把整个迭代预算（以及上层波次预算）吃掉。
+        hop_deadline = time.monotonic() + max(1.0, min(4.0, self.timeout * 2))
         tasks: Dict[asyncio.Task, str] = {}
+        started: Dict[asyncio.Task, float] = {}
         idx = 0
-        try:
-            if idx < len(servers):
-                task = asyncio.ensure_future(
-                    self._query_one_async(servers[idx], qname, qtype, rdclass)
-                )
-                tasks[task] = servers[idx]
-                idx += 1
+        failed = 0
+        # 本跳 v6 失败计数：达到阈值后只在本跳跳过剩余 v6 候选
+        # （按跳/按域名降级，不影响其它域名）
+        _hop_v6_fail = 0
 
+        def _launch() -> None:
+            """把「在飞」协程补满 max_parallel（首次即同时发出 2 个）"""
+            nonlocal idx
+            while len(tasks) < max_parallel and idx < total:
+                ip = servers[idx]
+                idx += 1
+                if _hop_v6_fail >= 2 and ":" in str(ip):
+                    logger.debug(
+                        "迭代查询: %s 本跳 IPv6 已判定不可用，跳过 %s",
+                        _safe_qname(qname), ip,
+                    )
+                    continue
+                task = asyncio.ensure_future(
+                    self._query_one_async(ip, qname, qtype, rdclass)
+                )
+                tasks[task] = ip
+                started[task] = time.monotonic()
+                logger.debug("迭代查询: %s 并发发出 %s（在飞 %d/%d）",
+                             _safe_qname(qname), ip, len(tasks), max_parallel)
+
+        try:
+            _launch()
             while tasks:
+                remaining = hop_deadline - time.monotonic()
+                if remaining <= 0.01:
+                    logger.debug("迭代查询: %s 本跳预算耗尽，放弃本跳", _safe_qname(qname))
+                    return None
                 done, _ = await asyncio.wait(
-                    tasks.keys(), timeout=stagger,
+                    tasks.keys(), timeout=remaining,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
+                if not done:
+                    logger.debug("迭代查询: %s 本跳超时（%.1fs 预算用尽），放弃本跳",
+                                 _safe_qname(qname),
+                                 max(1.0, min(4.0, self.timeout * 2)))
+                    return None
                 for task in done:
                     ip = tasks.pop(task)
+                    _elapsed = time.monotonic() - started.pop(task, time.monotonic())
                     try:
                         resp = task.result()
                     except Exception:
                         resp = None
                     if resp is not None:
+                        self._record_server_health(ip, _elapsed)
                         logger.debug(
                             "迭代查询: %s 响应 %s (rcode=%s, answer=%d, authority=%d)",
                             ip, _safe_qname(qname), dns.rcode.to_text(resp.rcode()),
                             len(resp.answer), len(resp.authority),
                         )
                         return resp
+                    self._record_server_health(ip, None)
                     logger.debug("迭代查询: %s 查询 %s 超时/失败，补发下一台",
                                  ip, _safe_qname(qname))
-                    # 失败：立即补发下一台
-                    if idx < len(servers) and len(tasks) < max_parallel:
-                        nxt = asyncio.ensure_future(
-                            self._query_one_async(servers[idx], qname, qtype, rdclass)
+                    # 本域名禁用 IPv6：同一跳里 2 台 v6 权威都失败 →
+                    # 该域名后续所有跳都改用 IPv4（ContextVar 隔离，
+                    # 其它域名照常跨族交错）
+                    if ":" in str(ip):
+                        _hop_v6_fail += 1
+                        if _hop_v6_fail == 2:
+                            _V6_DISABLED_CTX.set(True)
+                            logger.debug(
+                                "迭代查询: %s 本跳 v6 权威连续失败 → "
+                                "本域名后续只用 IPv4",
+                                _safe_qname(qname),
+                            )
+                    failed += 1
+                    # 失败过半（>50% 的候选权威都不可用）→ 放弃本跳，
+                    # 让上层尽快返回 SERVFAIL，而不是把全部服务器都试一遍
+                    if failed * 2 > total:
+                        logger.debug(
+                            "迭代查询: %s 已有 %d/%d 台服务器失败（超过半数），放弃本跳",
+                            _safe_qname(qname), failed, total,
                         )
-                        tasks[nxt] = servers[idx]
-                        idx += 1
-                # STAGGER 超时且无完成：hedge 补发一台
-                if not done and idx < len(servers) and len(tasks) < max_parallel:
-                    logger.debug("迭代查询: %s 无响应 %.0fms，hedge 补发 %s",
-                                 _safe_qname(qname), stagger * 1000, servers[idx])
-                    nxt = asyncio.ensure_future(
-                        self._query_one_async(servers[idx], qname, qtype, rdclass)
-                    )
-                    tasks[nxt] = servers[idx]
-                    idx += 1
+                        return None
+                # 有协程结束（成功已返回/失败已计数）→ 立即补满并行槽位
+                _launch()
             return None
         finally:
             for task in tasks:
                 task.cancel()
             if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+                # 清理限时：取消时若子查询还在收尾，无限等会把本跳拖长
+                #（单查询预算被拉长到 9s+ 的原因之一）。0.5s 足够关 socket。
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*tasks, return_exceptions=True),
+                        timeout=0.5,
+                    )
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    pass
+
+    @staticmethod
+    def _response_matches_query(resp, q) -> bool:
+        """响应的 question 段是否与查询一致（RFC 5452 §9.1 纵深防御）
+
+        - 查询或响应缺少 question 时不因此拒绝（少数权威/精简实现会省略
+          question 段，一律拒绝会造成解析失败）；
+        - 名字比较大小写不敏感（RFC 4343）。
+        """
+        try:
+            if not getattr(q, "question", None):
+                return True
+            if not getattr(resp, "question", None):
+                return True
+            qq = q.question[0]
+            rq = resp.question[0]
+            return (str(qq.name).lower() == str(rq.name).lower()
+                    and qq.rdtype == rq.rdtype
+                    and qq.rdclass == rq.rdclass)
+        except Exception:
+            return True
+
+    # ---------- DNS Cookie（RFC 7873） ----------
+
+    def _client_cookie(self, ip: str) -> bytes:
+        """8 字节 client cookie（RFC 7873 §5.1：本地 secret 与服务端 IP 派生）"""
+        import hashlib
+        return hashlib.sha256(self._cookie_secret + str(ip).encode()).digest()[:8]
+
+    def _apply_cookie(self, q, ip: str) -> bool:
+        """给查询加 COOKIE EDNS option（RFC 7873）。返回是否真的加上了。"""
+        key = str(ip)
+        if key in self._cookie_disabled:
+            return False
+        try:
+            opt = dns.edns.CookieOption(
+                self._client_cookie(key), self._server_cookies.get(key, b""))
+            q.use_edns(0, q.ednsflags, payload=1232, options=[opt])
+            return True
+        except Exception:
+            return False
+
+    def _learn_cookie(self, ip: str, resp) -> None:
+        """从响应里学习 server cookie（8-32 字节）"""
+        try:
+            for opt in (getattr(resp, "options", None) or []):
+                if getattr(opt, "otype", None) == dns.edns.COOKIE:
+                    srv = bytes(getattr(opt, "server", b"") or b"")
+                    if len(srv) >= 8:
+                        self._server_cookies[str(ip)] = srv[:32]
+                    return
+        except Exception:
+            pass
+
+    def _cookie_unsupported(self, ip: str, rcode: int) -> None:
+        """权威不支持 COOKIE（FORMERR/BADVERS/NOTIMP）：禁用该 IP 的 cookie"""
+        key = str(ip)
+        if key not in self._cookie_disabled:
+            logger.debug("权威 %s 不支持 DNS COOKIE（%s），已禁用该 IP 的 cookie",
+                         key, dns.rcode.to_text(rcode))
+        self._cookie_disabled.add(key)
+        self._server_cookies.pop(key, None)
 
     async def _query_one_async(self, ip: str, qname: str, qtype: int, rdclass: int):
-        """单台查询（带超时），供 _query_servers 并行调用
+        """单台查询入口：先过并发闸门，再走原生 asyncio 收发
 
-        走 task_pool 的**共享池 + 优先级闸门**（等级 DNS，高于 NDP/ARP）：
-        迭代查询是阻塞 socket 调用，必须借线程执行；用优先级而不是默认
-        executor，避免缓存预刷新等大批并发把 NTP/日志等任务挤到队尾。
+        `_inflight_sem` 限制「同时在飞的单台查询」数量：超出部分排队等待，
+        避免浏览器/预刷新把上游并发推到几百、触发权威 RRL 限速后整体失败。
         """
-        return await asyncio.wait_for(
-            run_blocking(TaskLevel.DNS, self._query_one, ip, qname, qtype, rdclass),
-            timeout=self.timeout + 1.0,
-        )
+        async with self._inflight_sem:
+            return await self._query_one_async_inner(ip, qname, qtype, rdclass)
+
+    async def _query_one_async_inner(self, ip: str, qname: str, qtype: int, rdclass: int):
+        """单台查询：**原生 asyncio**（纯协程，不再借线程）
+
+        旧实现把 dns.query.udp（同步阻塞 API）丢进 run_in_executor：
+        等待权威应答期间协程确实能让出 CPU 去调度其它域名的查询，
+        但**那个工作线程被独占**直到应答/超时，所以并发域名数实际被
+        「共享池线程数 = cpu_core_limit×2」卡住（实测 30 个域名瞬时并发时
+        排队把 p95 拖到 6 秒）。
+
+        现在用 asyncio 数据报端点直接收发：等待时既不占线程也不占 CPU，
+        迭代并发只受 max_concurrent / 句柄数约束；取消任务时会真正关闭
+        socket（不再出现"取消后线程还在阻塞 1.5 秒"）。
+        """
+        q = dns.message.make_query(qname, qtype, rdclass=rdclass, want_dnssec=True)
+        q.flags &= ~dns.flags.RD
+        # DNS Cookie（RFC 7873）：首次带 client cookie，权威回 server cookie 后
+        # 后续查询带完整 cookie，降低 off-path 伪造响应被接受的概率。
+        _cookie_used = self._apply_cookie(q, ip)
+        resp = await self._udp_exchange(ip, q)
+        # 权威不支持 COOKIE → FORMERR/BADVERS/NOTIMP：禁用该 IP 的 cookie，
+        # 并**在同一次查询内无 cookie 重发一次**（不把兼容性问题变成解析失败）。
+        if (resp is not None and _cookie_used
+                and resp.rcode() in (dns.rcode.FORMERR, dns.rcode.BADVERS,
+                                     dns.rcode.NOTIMP)):
+            self._cookie_unsupported(ip, resp.rcode())
+            q = dns.message.make_query(qname, qtype, rdclass=rdclass,
+                                       want_dnssec=True)
+            q.flags &= ~dns.flags.RD
+            resp = await self._udp_exchange(ip, q)
+        if resp is None:
+            return None
+        if resp.flags & dns.flags.TC:
+            # 截断 → TCP 重查（RFC 1035 §4.2.2）；q 仍带 cookie（TCP 同样支持）
+            return await self._query_one_tcp(ip, q)
+        return resp
+
+    async def _udp_exchange(self, ip: str, q):
+        """发一次 UDP 查询并校验响应（ID + 问题段），顺手学习 server cookie
+
+        失败/不匹配返回 None。socket 生命周期严格限定在本函数内——取消/异常
+        路径都不会留下未关闭的 transport。
+        """
+        wire = q.to_wire()
+        loop = asyncio.get_running_loop()
+        transport = None
+        protocol = None
+        try:
+            # remote_addr 已由内核过滤来源地址；后面仍校验 ID 与问题段
+            transport, protocol = await loop.create_datagram_endpoint(
+                _UdpQueryProtocol,
+                remote_addr=(str(ip), 53),
+            )
+            transport.sendto(wire)
+            data = await asyncio.wait_for(protocol.future, timeout=self.timeout)
+            resp = dns.message.from_wire(data)
+            if resp.id != q.id:
+                logger.debug("迭代查询: %s 响应 ID 不匹配，丢弃", ip)
+                return None
+            # 纵深防御（RFC 5452 §9.1）：问题段必须与查询一致。内核已按
+            # remote_addr 过滤来源 IP/端口，但仍要防"问题段不同的响应"被
+            # 当成答案（例如把 A 的应答套用到 AAAA 查询上）。
+            if not self._response_matches_query(resp, q):
+                logger.debug("迭代查询: %s 响应问题段不匹配，丢弃", ip)
+                return None
+            self._learn_cookie(ip, resp)
+            return resp
+        except (asyncio.TimeoutError, OSError, dns.exception.DNSException):
+            return None
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return None
+        finally:
+            if protocol is not None:
+                fut = protocol.future
+                if not fut.done():
+                    # 取消/异常路径：避免 "Future exception was never retrieved"
+                    fut.cancel()
+                elif not fut.cancelled():
+                    # 已完成但仍带异常（如 transport 关闭时的 ConnectionError）：
+                    # 必须消费掉，否则 asyncio 会打 "Future exception was never
+                    # retrieved" 的 ERROR 刷屏。
+                    try:
+                        fut.exception()
+                    except Exception:
+                        pass
+            if transport is not None:
+                try:
+                    transport.close()
+                except Exception:
+                    pass
+
+    async def _query_one_tcp(self, ip: str, q: "dns.message.Message"):
+        """TCP 重查（纯协程，2 字节长度前缀）——用于 UDP 截断（TC=1）的场景"""
+        wire = q.to_wire()
+        writer = None
+        try:
+            reader, writer = await asyncio.open_connection(str(ip), 53)
+            writer.write(struct.pack("!H", len(wire)) + wire)
+            await writer.drain()
+            length = struct.unpack(
+                "!H", await asyncio.wait_for(reader.readexactly(2), timeout=self.timeout)
+            )[0]
+            data = await asyncio.wait_for(
+                reader.readexactly(length), timeout=self.timeout
+            )
+            resp = dns.message.from_wire(data)
+            if resp.id != q.id or not self._response_matches_query(resp, q):
+                return None
+            # 必须显式返回：本函数原先在这里直接落到 finally 之后，函数末尾
+            # 没有 return，于是 **TCP 成功读到的响应也被当成失败返回 None**，
+            # 导致所有 UDP 截断（TC=1）的查询全部失败——典型受害者是
+            # DNSKEY（.org 的响应 1319 字节 > EDNS 1232）→ DNSSEC 信任链
+            # 在 TLD 层断裂 → 签名域名全部 bogus。finally 仍会关闭连接。
+            return resp
+        except (asyncio.TimeoutError, OSError, dns.exception.DNSException):
+            return None
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return None
+        finally:
+            if writer is not None:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
 
     # ---------- 下一跳服务器提取 ----------
 
-    async def _extract_next_servers(self, response) -> List[str]:
+    async def _extract_next_servers(self, response, depth: int = 0) -> List[str]:
         """从 authority NS + additional glue 提取下一级服务器 IP。
-        无 glue 的 NS 名称在 _resolve_ns_ip 中迭代解析。"""
+
+        无 glue 的 NS 名称交给 `_resolve_ns_ip` 迭代解析。
+
+        **必须传入当前迭代深度**：早期版本在这里调用 ``_resolve_ns_ip(ns_name)``
+        用默认 depth=0，于是"每一层 referral 的无 glue NS"都能重新递归满 16 层；
+        一次 referral 常带 26 个 NS，逐层展开就是指数级协程/Task 爆炸
+        （实测协程 4.4 万、RSS 1.5GB，来源 Top 全是 _lookup）。
+        """
         ns_names = []
         for rrset in response.authority:
             if rrset.rdtype == dns.rdatatype.NS:
@@ -1122,7 +1636,10 @@ class IterativeResolver:
             async def _lookup(ns_name: str) -> tuple:
                 async with _sem:
                     try:
-                        return ns_name, await self._resolve_ns_ip(ns_name)
+                        # 关键：带上当前深度（否则每层都能重新递归满 max_depth）
+                        return ns_name, await self._resolve_ns_ip(ns_name, depth + 1)
+                    except asyncio.CancelledError:
+                        raise
                     except Exception:
                         return ns_name, []
 
@@ -1142,8 +1659,13 @@ class IterativeResolver:
         return uniq
 
     async def _resolve_ns_ip(self, ns_name: str, depth: int = 0) -> List[str]:
-        """对无 glue 的 NS 名称迭代解析其 A/AAAA（子问题，从根开始）。"""
-        if depth >= self.max_depth:
+        """对无 glue 的 NS 名称迭代解析其 A/AAAA（子问题，从根开始）。
+
+        递归上限比 max_depth 小得多（`_NS_RESOLVE_MAX_DEPTH`）：解析"权威的
+        NS 名"通常 1-2 跳就够，没必要跟着主链跑满 16 层——否则一次 referral
+        的 26 个 NS 会逐层展开成指数级协程。
+        """
+        if depth >= min(self.max_depth, _NS_RESOLVE_MAX_DEPTH):
             return []
         # M3 修复：NS IP 缓存带 TTL（默认 300s），避免 NS 换 IP（CDN/云权威常见）
         # 后长期使用旧地址——与 _verified_zone_cache 按 TTL 失效的设计对齐
@@ -1201,6 +1723,42 @@ class IterativeResolver:
 
     # ---------- 主迭代循环 ----------
 
+    @staticmethod
+    def _next_closer_name(qname: dns.name.Name, zone: dns.name.Name) -> dns.name.Name:
+        """qname 相对 zone 的「下一级名字」（RFC 9156 §2.1 next closer name）
+
+        例：qname=www.example.com.
+              zone=.             → com.
+              zone=com.          → example.com.
+              zone=example.com.  → www.example.com.（= qname，说明已到最终名）
+        """
+        try:
+            q_labels = qname.labels            # 末尾是 b'' 空标签
+            z_labels = zone.labels
+            n_zone = max(0, len(z_labels) - 1)  # 根的名字标签数为 0
+            n_q = max(0, len(q_labels) - 1)
+            if n_q <= n_zone:
+                return qname
+            # 取 qname 末尾 (n_zone + 1) 个有效标签 + 末尾空标签 = 共 n_zone+2 个
+            # （zone 为空根时取 com.；zone=com. 时取 example.com.）
+            return dns.name.Name(q_labels[-(n_zone + 2):])
+        except Exception:
+            return qname
+
+    @staticmethod
+    def _referral_zone(response) -> Optional[dns.name.Name]:
+        """referral 的区名（authority 段里最长的 NS owner）"""
+        best: Optional[dns.name.Name] = None
+        try:
+            for rrset in response.authority:
+                if rrset.rdtype != dns.rdatatype.NS:
+                    continue
+                if best is None or len(rrset.name.labels) > len(best.labels):
+                    best = rrset.name
+        except Exception:
+            return None
+        return best
+
     async def _iterate(self, qname: str, qtype: int, depth: int = 0,
                        rdclass: int = 1) -> Optional[dns.message.Message]:
         """迭代解析主循环：根→TLD→权威，返回最终响应。"""
@@ -1218,13 +1776,31 @@ class IterativeResolver:
             servers, started_from_cache = _cached_start
         cname_targets: List[str] = []
         cname_chain: List[bytes] = []  # 中间跳 CNAME 响应 wire（供上层验签，防 target 篡改）
+        # QNAME 最小化（RFC 9156）：向当前区只问「下一级名字」，中间级用 NS 查询，
+        # 到最终名才用原 qtype——根/TLD 看不到完整查询名（隐私），也少发无用查询。
+        # 缓存起跳时当前区未知，跳过最小化；一旦发现区名没推进，也自动回退全名，
+        # 避免把"实现不规范的权威"变成解析失败。
+        _minimize = bool(getattr(self, "qname_minimization", True)) and not started_from_cache
+        current_zone = dns.name.root
         for _hop in range(self.max_depth - depth):
             # A2（已降级 debug）：每跳过程日志——需查看时设 DEBUG 级
             logger.debug("迭代解析 [跳%d/%d]: %s %s 候选服务器 %d 台%s",
                          _hop + 1, self.max_depth, _safe_qname(qname),
                          dns.rdatatype.to_text(qtype), len(servers),
                          "（缓存区权威）" if started_from_cache else "")
-            response = await self._query_servers(servers, qname, qtype, rdclass)
+            # 本跳实际查询的名字/类型：最小化时向当前区只问「下一级名字」，
+            # 且中间级用 NS 查询（到最终名才用原 qtype）。
+            _q_name, _q_type = qname, qtype
+            if _minimize:
+                try:
+                    _nc = self._next_closer_name(dns.name.from_text(qname), current_zone)
+                    if str(_nc).rstrip(".").lower() != qname.rstrip(".").lower():
+                        _q_name = str(_nc).rstrip(".")
+                        _q_type = dns.rdatatype.NS
+                except Exception:
+                    _minimize = False
+                    _q_name, _q_type = qname, qtype
+            response = await self._query_servers(servers, _q_name, _q_type, rdclass)
             if response is None and started_from_cache:
                 # 缓存里的权威已失效/换 IP：回退到根重新走完整链路，功能不降级
                 logger.debug("缓存区权威不可达，回退根服务器重试: %s", _safe_qname(qname))
@@ -1250,14 +1826,32 @@ class IterativeResolver:
                     pass
                 return response
             # 2. NXDOMAIN → 返回（负应答）
+            has_soa = any(rrset.rdtype == dns.rdatatype.SOA for rrset in response.authority)
+            has_ns_ref = any(rrset.rdtype == dns.rdatatype.NS for rrset in response.authority)
+            # 最小化的**中间级**（_q_name != qname，用 NS 查询）：
+            #   有 referral → 继续下钻（第 4 步）；
+            #   负应答（NXDOMAIN / NODATA）→ 该中间级不存在 → 直接作为最终答案
+            #   返回（RFC 8020 剪枝：连该 TLD/区都不存在，更深的名字必然不存在）。
+            #   question 改回原始名，客户端看到的仍是它问的名字。
+            if _minimize and _q_type == dns.rdatatype.NS and _q_name != qname:
+                if response.rcode() == dns.rcode.NXDOMAIN or (has_soa and not has_ns_ref):
+                    try:
+                        if response.question:
+                            response.question = [dns.rrset.RRset(
+                                dns.name.from_text(original_qname),
+                                response.question[0].rdclass,
+                                response.question[0].rdtype)]
+                        response._cname_targets = list(cname_targets)
+                        response._cname_chain = list(cname_chain)
+                    except Exception:
+                        pass
+                    return response
             if response.rcode() == dns.rcode.NXDOMAIN:
                 return response
             # 2b. 权威负应答（NODATA）：authority 段有 SOA（zone 权威的否定应答），
             #     无 NS referral → 直接返回，避免 _extract_next_servers 死循环
             #     注意：answer 可能含 CNAME + authority NSEC（RFC 4035 §5.2 同响应
             #     CNAME→NODATA）——早退前需填充 _cname_targets 供上层验证
-            has_soa = any(rrset.rdtype == dns.rdatatype.SOA for rrset in response.authority)
-            has_ns_ref = any(rrset.rdtype == dns.rdatatype.NS for rrset in response.authority)
             if has_soa and not has_ns_ref:
                 # 若 answer 含 CNAME（目标类型缺失的 NODATA），记录 target
                 cname_local = self._extract_cname(response, expected_owner=qname)
@@ -1286,16 +1880,34 @@ class IterativeResolver:
                 qname = str(cname)
                 # CNAME 目标可能在别的 TLD：重新按目标名挑最近的已知区（可能没有）
                 started_from_cache = False
+                # 目标名是"新查询"：当前区回到根；若命中缓存起跳则关闭最小化
+                current_zone = dns.name.root
                 _cached = self._closest_zone_servers(qname, qtype)
                 if _cached is not None:
                     servers, started_from_cache = _cached
+                    _minimize = False
                 else:
                     servers = list(self.root_servers)
+                    _minimize = bool(getattr(self, "qname_minimization", True))
                 continue
             # 4. referral：authority NS → 下一级
-            next_servers = await self._extract_next_servers(response)
+            next_servers = await self._extract_next_servers(response, depth + _hop)
             if not next_servers:
                 return None
+            # 最小化：记录本跳 referral 的区名，下一跳按「下一级名字」继续下钻。
+            # 若区名没有推进（权威实现不规范，仍返回同一级的 referral），
+            # 立即回退全名查询，避免在同一条链上死循环。
+            _zone = self._referral_zone(response)
+            if _zone is not None:
+                try:
+                    if _minimize and len(_zone.labels) <= len(current_zone.labels):
+                        logger.debug("QNAME 最小化: 区名未推进（%s），回退全名查询",
+                                     _safe_qname(str(_zone)))
+                        _minimize = False
+                    else:
+                        current_zone = _zone
+                except Exception:
+                    _minimize = False
             # 缓存「子区 → 权威 IP」：同 TLD 的后续查询 / DS 查询可少走 1-2 跳。
             # 只缓存「从根起跳」链路上的 referral——缓存起跳之后的更深 referral
             # 未经完整链路，可信度更低，不写缓存。
@@ -1398,7 +2010,29 @@ class IterativeResolver:
             if time.time() < expire_at:
                 return resp
             self._ds_cache.pop(key, None)
-        resp = await self._iterate(str(zone_name), dns.rdatatype.DS, 0)
+        # single-flight：同一 zone 的并发 DS 查询合并成一次
+        inflight = self._ds_inflight.get(key)
+        if inflight is not None:
+            try:
+                return await asyncio.shield(inflight)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return None
+        fut = asyncio.get_running_loop().create_future()
+        self._ds_inflight[key] = fut
+        try:
+            resp = await self._iterate(str(zone_name), dns.rdatatype.DS, 0)
+        except asyncio.CancelledError:
+            if not fut.done():
+                fut.set_result(None)
+            self._ds_inflight.pop(key, None)
+            raise
+        except Exception:
+            if not fut.done():
+                fut.set_result(None)
+            self._ds_inflight.pop(key, None)
+            return None
         ttl = 300.0
         if resp is None:
             ttl = 60.0
@@ -1414,6 +2048,9 @@ class IterativeResolver:
         if len(self._ds_cache) > 512:
             self._ds_cache.clear()
         self._ds_cache[key] = (resp, time.time() + ttl)
+        if not fut.done():
+            fut.set_result(resp)
+        self._ds_inflight.pop(key, None)
         return resp
 
     def _invalidate_zone_cache(self, qname: str):
@@ -1478,6 +2115,46 @@ class IterativeResolver:
         return None
 
     async def _get_trusted_dnskey(self, zone_name: dns.name.Name) -> Optional[dns.rrset.RRset]:
+        """DNSSEC 链验证入口（带缓存 + single-flight）
+
+        冷启动并发时（浏览器一次打开几十个站点），每个域名都要验证根/TLD 的
+        DNSKEY；若各查一遍，同一 zone 会被并发查几十次，根/TLD 权威因 RRL
+        限速而大面积超时。这里把同一 zone 的并发请求合并成一次，其余等待结果。
+        """
+        key = str(zone_name).lower()
+        cached = self._verified_zone_cache.get(key)
+        if cached is not None and time.time() < cached[1]:
+            return cached[0]
+        inflight = self._dnskey_inflight.get(key)
+        if inflight is not None:
+            try:
+                return await asyncio.shield(inflight)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return None
+        fut = asyncio.get_running_loop().create_future()
+        self._dnskey_inflight[key] = fut
+        try:
+            result = await self._get_trusted_dnskey_uncached(zone_name)
+        except asyncio.CancelledError:
+            if not fut.done():
+                fut.set_result(None)
+            self._dnskey_inflight.pop(key, None)
+            raise
+        except Exception:
+            if not fut.done():
+                fut.set_result(None)
+            self._dnskey_inflight.pop(key, None)
+            return None
+        if not fut.done():
+            fut.set_result(result)
+        self._dnskey_inflight.pop(key, None)
+        return result
+
+    async def _get_trusted_dnskey_uncached(
+        self, zone_name: dns.name.Name
+    ) -> Optional[dns.rrset.RRset]:
         """从内置 IANA 根信任锚出发，沿 DS→DNSKEY 链逐级数学验证，
         返回 zone 的已信任 DNSKEY RRset；任一级验证失败返回 None。
 
@@ -1688,14 +2365,31 @@ class IterativeResolver:
             return False
         return False
 
+    # NSEC3 迭代次数上限（RFC 9276 §3：建议 0；BIND 等实现的硬上限是 150）。
+    # 超过此值直接视为"无法验证"（返回 b"" → 上层按 bogus 拒绝，fail-closed）。
+    # 原因：iterations 完全由**响应**里的 NSEC3 rdata 决定，恶意/被劫持的权威
+    # 可以返回 iterations=65535，使每次 hash 变成 65536 次 SHA-1；而一个负应答
+    # 里会多次调用本函数（closest-encloser、wildcard、DS 存在性…），且这些调用
+    # 跑在**事件循环线程**里（同步），足以把整个 DNS 服务卡死（CPU 放大 DoS）。
+    _NSEC3_MAX_ITERATIONS = 150
+
     @staticmethod
     def _nsec3_hash(name: dns.name.Name, salt: bytes, iterations: int,
                     algorithm: int) -> bytes:
         """RFC 5155 §5 NSEC3 hash 计算：SHA-1 迭代（algorithm=1）。
         owner name 用 canonical wire（RFC 4034 §6.2 小写形式）——
-        大小写混合 qname 的 hash 才能与权威一致。"""
+        大小写混合 qname 的 hash 才能与权威一致。
+
+        iterations 超过 `_NSEC3_MAX_ITERATIONS` 时返回 b""（=无法验证），
+        防止响应驱动的 CPU 放大攻击（见常量注释）。
+        """
         import hashlib
         if algorithm != 1:
+            return b""
+        try:
+            if iterations < 0 or iterations > IterativeResolver._NSEC3_MAX_ITERATIONS:
+                return b""
+        except Exception:
             return b""
         h = name.to_wire(canonicalize=True)
         try:
@@ -1866,7 +2560,11 @@ class IterativeResolver:
             visited.add(n)
             ds_resp = await self._iterate_ds_cached(n)
             if ds_resp is None:
-                return "unknown"
+                # 查询失败 ≠ 无法证明：DS 查询超时/失败时不能据此判定
+                # 「无法确认应答未被篡改」，否则冷启动（DNSSEC 链缓存尚未建立）
+                # 会把本可解析的域名整片丢弃（纯迭代模式没有加密上游兜底，
+                # 表现为「部分站点完全打不开」）。交由上层按 insecure 放行并记日志。
+                return "error"
             # DS 存在 → 签名委托
             if any(rrset.rdtype == dns.rdatatype.DS for rrset in ds_resp.answer):
                 return "secure"
@@ -2122,21 +2820,131 @@ class IterativeResolver:
             insecure（父区 NSEC 签名证明无 DS）→ 放行
             unknown（无法证明）→ 保守丢弃（上层回退加密上游）
         整个流程（迭代 + 链验证）受 total_timeout 总预算约束。
+
+        bogus 重试（2026-10-30）：严格模式在**冷启动/高并发**下会误判——实测
+        one.one.one.one 首次必被当作"签名区无 RRSIG"丢弃、www.ripe.net 的 Akamai
+        CNAME 中间跳被判"剥离攻击"（真实日志中的 c0.pki.goog 同理），第二次即
+        正常。纯迭代模式没有加密上游可回退，这类一次性误判会直接变成客户端
+        SERVFAIL。处理：判定为 bogus 时**清掉该链区域/DS 缓存，在剩余预算内
+        重跑一次**；判定标准完全不变（第二次仍 bogus 就丢弃），因此攻击者
+        无法借重试绕过验签，只多付一次查询成本。
         """
         self._stats["queries"] += 1
+        deadline = time.monotonic() + self.total_timeout
+        for attempt in range(2):
+            _bogus_before = self._stats["bogus"]
+            try:
+                resp = await asyncio.wait_for(
+                    self._resolve_verified(qname, qtype, rdclass),
+                    timeout=max(0.5, deadline - time.monotonic()),
+                )
+            except asyncio.TimeoutError:
+                logger.debug("迭代解析总超时: %s", _safe_qname(qname))
+                self._stats["fail"] += 1
+                return None
+            except Exception as e:
+                logger.debug("迭代解析异常: %s", e)
+                self._stats["fail"] += 1
+                return None
+            if resp is not None:
+                return resp
+            if attempt == 0 and self._stats["bogus"] > _bogus_before:
+                self._invalidate_zone_cache(qname)
+                logger.debug(
+                    "DNSSEC 严格模式丢弃 %s（可能为冷启动链缓存未就绪），"
+                    "清缓存后用剩余 %.1fs 重试一次",
+                    _safe_qname(qname), max(0.0, deadline - time.monotonic()),
+                )
+                continue
+            return None
+        return None
+
+    @staticmethod
+    def _needs_bootstrap_fallback(resp, qtype: int) -> bool:
+        """是否需要走 bootstrap 递归兜底
+
+        只在「迭代没拿到最终答案」时兜底：
+          - resp is None（迭代整体失败）；
+          - rcode=NOERROR 但 answer 里没有 qtype 记录（NODATA，CDN 调度域名常见）。
+        NXDOMAIN / SERVFAIL 是明确语义，**不**兜底（避免把"域名不存在"变成"能解析"）。
+        """
+        if resp is None:
+            return True
         try:
-            return await asyncio.wait_for(
-                self._resolve_verified(qname, qtype, rdclass),
-                timeout=self.total_timeout,
-            )
-        except asyncio.TimeoutError:
-            logger.debug("迭代解析总超时: %s", _safe_qname(qname))
-            self._stats["fail"] += 1
+            if resp.rcode() != dns.rcode.NOERROR:
+                return False
+            return not any(rrset.rdtype == qtype for rrset in resp.answer)
+        except Exception:
+            return False
+
+    async def _bootstrap_recursive(
+        self, qname: str, qtype: int, rdclass: int = 1
+    ) -> Optional[dns.message.Message]:
+        """用配置里的 bootstrap DNS 做一次**递归**查询（RD=1）作为可用性兜底
+
+        只在 `_needs_bootstrap_fallback` 为真时调用（CDN 调度域名 NODATA /
+        迭代整体失败），其余查询仍完全走本地迭代。限并发 4，避免 NODATA
+        风暴时把 bootstrap DNS 打爆。
+        """
+        servers = [str(s) for s in (self.config.bootstrap_resolvers or [])]
+        if not servers:
             return None
-        except Exception as e:
-            logger.debug("迭代解析异常: %s", e)
-            self._stats["fail"] += 1
-            return None
+        q = dns.message.make_query(qname, qtype, rdclass=rdclass, want_dnssec=True)
+        # RD=1：make_query 默认带 RD，这里显式确保
+        try:
+            q.flags |= dns.flags.RD
+        except Exception:
+            pass
+        # 兜底是"可用性"性质的，给 0.5-1s 即可：给太多会把预算吃满，
+        # 让本来只是缺少最终答案的查询变成整体超时。
+        timeout = min(1.0, max(0.5, self.timeout))
+        async with self._bootstrap_sem:
+            # **并行**问前 3 台：串行试 4 台最坏要 4×2s=8s，会把整个查询预算
+            # （10s）吃光，让本来能成功的查询变成超时。
+            targets = servers[:3]
+            tasks: Dict[asyncio.Future, str] = {}
+            for _s in targets:
+                try:
+                    tasks[asyncio.ensure_future(
+                        dns.asyncquery.udp(
+                            q, _s, timeout=timeout, ignore_unexpected=True,
+                        )
+                    )] = _s
+                except Exception:
+                    continue
+            if not tasks:
+                return None
+            try:
+                pending = set(tasks)
+                deadline = asyncio.get_running_loop().time() + timeout + 0.5
+                while pending:
+                    left = deadline - asyncio.get_running_loop().time()
+                    if left <= 0:
+                        break
+                    done, pending = await asyncio.wait(
+                        pending, timeout=left,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for t in done:
+                        try:
+                            r = t.result()
+                        except Exception:
+                            continue
+                        if r is not None and r.answer:
+                            logger.debug(
+                                "迭代兜底：%s %s 经 bootstrap %s 递归取到 %d 条答案",
+                                _safe_qname(qname),
+                                dns.rdatatype.to_text(qtype),
+                                tasks.get(t, "?"), len(r.answer),
+                            )
+                            return r
+                return None
+            finally:
+                # 取消未完成的任务并消费其异常（避免 "Future exception was never retrieved"）
+                for t in tasks:
+                    if not t.done():
+                        t.cancel()
+                    t.add_done_callback(_consume_future_exc)
 
     async def _resolve_verified(self, qname: str, qtype: int, rdclass: int) -> Optional[dns.message.Message]:
         """resolve 的内部实现：迭代 + DNSSEC 严格验证（受外层 total_timeout 约束）。
@@ -2148,7 +2956,26 @@ class IterativeResolver:
         DS/DNSKEY 并行 + DS 缓存 + 启动 warmup 已足够）。
         """
         try:
+            # 每个域名解析入口重置"本次解析禁用 IPv6"标记（per-query 语义）
+            _V6_DISABLED_CTX.set(False)
             resp = await self._iterate(qname, qtype, 0, rdclass)
+            # CDN 调度域名兜底：迭代拿不到最终答案时，用 bootstrap DNS 递归一次。
+            # 典型场景：bilibili 的 i1/s2/s3/static.hdslb.com → CNAME 到腾讯
+            # 调度域名（*.tdnsv5.com），其权威对迭代查询直接返回 NODATA
+            # （实测 1.12.0.17 等：NOERROR/answer=0），只有递归服务器能拿到 A。
+            # 纯迭代模式下这类域名必然解析失败（图床/静态资源全挂），
+            # 因此仅在「没有 qtype 记录且非 NXDOMAIN」时兜底一次。
+            if self._needs_bootstrap_fallback(resp, qtype):
+                fb = await self._bootstrap_recursive(qname, qtype, rdclass)
+                if fb is not None and fb.answer:
+                    fb._bootstrap_fallback = True
+                    # 兜底响应**不再直接返回**：与迭代响应走同一套 DNSSEC 校验。
+                    # 兜底用的是明文 bootstrap DNS（UDP，无加密、无认证），若原样
+                    # 放行，攻击者只需污染 bootstrap 应答即可向签名区注入伪造记录、
+                    # 绕过整条 strict_dnssec 信任链（真实的降级攻击面）。
+                    # 因此：带 RRSIG → 正常链验签；无 RRSIG → 按区域 DNSSEC 状态
+                    # 判定（签名区拒绝，未签名/无法证明时按可用性兜底放行）。
+                    resp = fb
             if resp is None:
                 self._stats["fail"] += 1
                 return None
@@ -2192,33 +3019,70 @@ class IterativeResolver:
                     self._stats["insecure"] += 1
                     self._stats["success"] += 1
                     return resp
-                # unknown：既没有签名、也没有"该域名本就未签名"的证明 → 严格模式下丢弃
+                if zone_status == "error":
+                    # DNSSEC 状态**查询失败**（DS/链查询超时、权威不可达）≠ 无法证明。
+                    # 严格模式如果据此丢弃，冷启动（链缓存未建立）或纯迭代模式下
+                    # 会把大量本可解析的域名整片打成 SERVFAIL——可用性优先，放行
+                    # 并留下 debug 线索（与上游不返回 DNSSEC 记录时的处理一致）。
+                    self._stats["insecure"] += 1
+                    self._stats["success"] += 1
+                    logger.debug(
+                        "DNSSEC 状态查询失败（DS 链超时/权威不可达）: %s，按 insecure 放行",
+                        _safe_qname(qname),
+                    )
+                    return resp
+                # unknown：既没有签名、也没有"该域名本就未签名"的证明 → 严格模式下丢弃。
+                # 例外：bootstrap 递归兜底响应。兜底本身是可用性措施（迭代对某些
+                # CDN 调度域名只回 NODATA），若把它一并丢弃，这类域名在纯迭代模式
+                # 下就永远 SERVFAIL；而能走到这里说明区域状态**无法证明**（secure
+                # 已在上面拒绝），因此放行并留 debug 线索，不静默。
+                if getattr(resp, "_bootstrap_fallback", False):
+                    self._stats["insecure"] += 1
+                    self._stats["success"] += 1
+                    logger.debug(
+                        "DNSSEC: bootstrap 兜底响应无签名、区域状态无法证明(%s): %s，"
+                        "按可用性放行（未经验签）",
+                        zone_status, _safe_qname(qname),
+                    )
+                    return resp
                 self._stats["bogus"] += 1
                 self._report_unsigned_unknown(qname)
                 self._invalidate_zone_cache(qname)
                 return None
 
             # 对每个 signer 做链验证，收集可信 keys（{signer: DNSKEY RRset}）
+            #
+            # **并行**（2026-10-30）：CNAME 链常跨 2-3 个签名区（例：
+            # rockstargames.com → edgekey.net → akamaiedge.net，或
+            # bilibili → bilivideo），原实现挨个 await，每级 DNSKEY/DS 各一次
+            # 迭代（30-300ms），串行累加就是主要的冷解析延迟。
+            # `_get_trusted_dnskey` 自带缓存 + single-flight，并发调用安全：
+            # 同一 zone 的多个 signer 只会真的查一次。
             trusted_keys: Dict = {}
-            for signer in signers:
+            _signer_list = list(signers)
+            _keys_results = await asyncio.gather(
+                *[self._get_trusted_dnskey(s) for s in _signer_list],
+                return_exceptions=True,
+            )
+            for signer, _rrset in zip(_signer_list, _keys_results):
+                if isinstance(_rrset, BaseException):
+                    _rrset = None
                 if signer == dns.name.root:
                     # 根区密钥来自内置信任锚（RFC 4033 §6）：用根锚验证根 DNSKEY 后
                     # 才能验签 root 签名的 RRset。之前直接 continue 会让 trusted_keys
                     # 缺 root → 验签 KeyError → 合法响应被误判 bogus（可用性缺陷）。
-                    root_rrset = await self._get_trusted_dnskey(dns.name.root)
-                    if root_rrset is None:
+                    if _rrset is None:
                         self._stats["bogus"] += 1
                         logger.warning("DNSSEC 根区 DNSKEY 验证失败，拒绝签名响应")
                         return None
-                    trusted_keys[signer] = root_rrset
+                    trusted_keys[signer] = _rrset
                     continue
-                dnskey_rrset = await self._get_trusted_dnskey(signer)
-                if dnskey_rrset is None:
+                if _rrset is None:
                     self._stats["bogus"] += 1
                     logger.warning("DNSSEC 链验证失败，拒绝 %s 的签名响应", _safe_qname(signer))
                     self._invalidate_zone_cache(qname)
                     return None
-                trusted_keys[signer] = dnskey_rrset
+                trusted_keys[signer] = _rrset
 
             # 关键安全约束 0：CNAME 链中间跳的 CNAME RRset 必须签名有效（若所在
             # zone 是签名区）。中间跳响应在 _iterate 中被丢弃，MITM 可篡改 CNAME
@@ -2399,14 +3263,54 @@ class IterativeResolver:
                     return None
 
             if answer_unsigned:
-                # answer 段存在任一无签名 RRset → 拒绝（部分剥离攻击：
-                # 攻击者保留 CNAME 等任一合法签名、剥离并篡改其余 RRset）
-                self._stats["bogus"] += 1
-                logger.warning(
-                    "DNSSEC answer 段存在无签名 RRset（剥离攻击）: %s %s",
-                    _safe_qname(qname), [str(r.name) for r in answer_unsigned][:3],
+                # answer 段某个 RRset 无 RRSIG：**不能一律判剥离攻击**——
+                # CNAME 链常跨到未签名区（实测 www.ripe.net →
+                # e337066.dscb.akamaiedge.net、c0.pki.goog →
+                # www3.l.google.com：akamaiedge.net / l.google.com 本身无 DS =
+                # insecure，无签名完全合法）。原实现把所有这类应答判成
+                # "部分剥离攻击"直接丢弃，纯迭代模式无加密上游可回退 → 这些
+                # 域名必 SERVFAIL（真实日志里的 c0.pki.goog 即此）。
+                # 改为逐个按 owner 所在 zone 的 DS 状态判定（与"整个响应无
+                # RRSIG"分支同一套判据，安全性不降级）：
+                #   insecure → 合法未签名，放行该 RRset
+                #   error    → DS 链查询失败（冷启动/权威不可达），按可用性放行
+                #   secure   → 签名区被剥离 RRSIG，真实的降级攻击 → 拒绝
+                #   unknown  → 无法证明，保守拒绝
+                _stripped = []
+                for rr in answer_unsigned:
+                    try:
+                        zs = await self._zone_signed_status(rr.name)
+                    except Exception:
+                        zs = "unknown"
+                    if zs in ("insecure", "error"):
+                        logger.debug(
+                            "DNSSEC: %s 无 RRSIG，但所在区域判定为 %s → 按未签名放行",
+                            _safe_qname(str(rr.name)), zs,
+                        )
+                        continue
+                    _stripped.append(rr)
+                if _stripped:
+                    self._stats["bogus"] += 1
+                    logger.warning(
+                        "DNSSEC answer 段存在无签名 RRset（剥离攻击）: %s %s",
+                        _safe_qname(qname), [str(r.name) for r in _stripped][:3],
+                    )
+                    return None
+
+            if answer_unsigned and not answer_validated:
+                # answer 段有数据但**全部**未签名，且上面已逐个确认它们所在区域
+                # 是 insecure（或 DS 链查询失败按可用性放行）→ 这是「未签名区的
+                # 正应答」，合法。典型：www.ripe.net → e337066.dscb.akamaiedge.net
+                # （签名区 CNAME 到未签名 Akamai 区）、c0.pki.goog →
+                # www3.l.google.com。**不能**再按负应答要求 SOA/NSEC 否定证明——
+                # 正应答本来就没有，原逻辑会把它当"伪造负应答"丢弃。
+                self._stats["insecure"] += 1
+                self._stats["success"] += 1
+                logger.debug(
+                    "DNSSEC: %s 的正应答全部落在未签名区（%d 个 RRset），按 insecure 放行",
+                    _safe_qname(qname), len(answer_unsigned),
                 )
-                return None
+                return resp
 
             if answer_validated:
                 # answer 段全部签名验证通过 → secure
@@ -2706,12 +3610,34 @@ class IterativeResolver:
             # qname——防止攻击者重放任意区的有效签名 NSEC 伪造 NXDOMAIN/NODATA。
             auth_unsigned: List[dns.rrset.RRset] = []
             nsec_semantic_ok = False
+            # 是否有**任一** NSEC/NSEC3 的区间覆盖了被查名（根区例外判定用）
+            nsec_covers_any = False
             has_nsec = False
             # SOA owner 必须是 qname 的权威 zone（qname 或祖先 apex）——
             # 防重放任意签名区真实 SOA+RRSIG 伪造任意域名 NODATA 空应答
             soa_owner_valid = False
             soa_owner_zone: Optional[dns.name.Name] = None
             qn = dns.name.from_text(qname)
+            # **最终查询名**（2026-10-31）：负应答的 authority 段由**最后一级权威**
+            # 产生。CNAME 跨区时（例：www.foo.com → edge.cdn.net，cdn.net 返回
+            # NXDOMAIN），SOA owner 是 cdn.net，而 `qn` 仍是原始 www.foo.com——
+            # 用 `qn` 找祖先会得到 None，于是后面所有 NSEC 都被判
+            # 「NSEC signer 非 (无SOA) 权威 zone（跨区重放）」而整条拒绝
+            # （实测同一秒刷 14 条 WARNING，对应某个跨区域名的 A/AAAA 反复重试）。
+            # 这里改用 CNAME 链终点做祖先判定；**无 CNAME 时 qn_final == qn，
+            # 与原有行为完全一致**，"重放任意区 SOA" 的防护仍然成立
+            # （SOA owner 必须是 qn_final 的祖先）。
+            qn_final = qn
+            try:
+                _targets = getattr(resp, "_cname_targets", None) or []
+                if _targets:
+                    qn_final = dns.name.from_text(str(_targets[-1]))
+            except Exception:
+                qn_final = qn
+            # 后续所有 NSEC/NSEC3 否定证明与 closest-encloser 计算都针对
+            # **最终查询名**（CNAME 链终点）——权威证明的是"终点不存在"，
+            # 而不是原始查询名。无 CNAME 时两者相同，行为不变。
+            qn = qn_final
             # RFC 6604 CNAME+NXDOMAIN：负应答 answer 段可能含 CNAME（指向不存在
             # 目标的链）——与正应答对称：answer 段 CNAME 有签名必验、无签名按
             # zone 状态拒绝（防攻击者在签名区负应答注入未签名 CNAME）。
@@ -2744,14 +3670,20 @@ class IterativeResolver:
                 if rrset.rdtype == dns.rdatatype.RRSIG:
                     continue
                 if rrset.rdtype == dns.rdatatype.SOA:
-                    # qname 或祖先 == SOA owner
-                    anc = qn
-                    while anc is not None and anc != dns.name.root:
-                        if anc == rrset.name:
+                    # SOA owner 必须是 qn_final（CNAME 链终点）的祖先**或等于**它。
+                    # 用 is_subdomain 而不是手写 parent() 循环：**必须包含根区**——
+                    # 根区负应答（不存在的 TLD，例如 Firefox 的
+                    # smartblock.firefox.etp / .local / .invalid）的 SOA owner 就是
+                    # 根 "."，原来 `while anc != dns.name.root` 把 root 排除在外，
+                    # 导致 soa_owner_zone 恒为 None → 后面所有 NSEC 都被判
+                    # 「NSEC signer 非 (无SOA) 权威 zone（跨区重放）」整条拒绝
+                    # （实测同一秒刷 14 条 WARNING，对应 .etp 的 A/AAAA/HTTPS 反复重试）。
+                    try:
+                        if qn_final == rrset.name or qn_final.is_subdomain(rrset.name):
                             soa_owner_valid = True
                             soa_owner_zone = rrset.name
-                            break
-                        anc = anc.parent()
+                    except Exception:
+                        pass
                 rrsig_set = self._find_rrsig_for(resp, rrset)
                 if rrsig_set is None:
                     auth_unsigned.append(rrset)
@@ -2785,8 +3717,11 @@ class IterativeResolver:
                     if not nsec_zone_ok:
                         self._stats["bogus"] += 1
                         logger.warning(
-                            "DNSSEC 负应答 NSEC signer 非 %s 权威 zone（跨区重放）— 拒绝",
+                            "DNSSEC 负应答 NSEC signer 非 %s 权威 zone（跨区重放）— 拒绝: %s"
+                            "（CNAME 终点 %s）",
                             soa_owner_zone if soa_owner_zone is not None else "(无SOA)",
+                            _safe_qname(qname),
+                            _safe_qname(str(qn_final)),
                         )
                         return None
                     for rdata in rrset:
@@ -2801,6 +3736,7 @@ class IterativeResolver:
                                 # 若 example.com.ua 是真实委托，foo 属其子区，
                                 # 此 NSEC 不能证明 foo 不存在。
                                 if self._nsec_covers(rdata, rrset.name, qn):
+                                    nsec_covers_any = True
                                     # RFC 8020 语义：owner 与被查名同 zone（且非
                                     # 委托点，见下）即可——真实权威的 next-closer
                                     # NSEC owner 常为同 zone 前驱兄弟名（如
@@ -2819,6 +3755,22 @@ class IterativeResolver:
                                         and not self._nsec_has_type(
                                             rdata, dns.rdatatype.SOA)
                                     ) or self._nsec_has_type(rdata, dns.rdatatype.DS)
+                                    # **qname 不在该委托点之下时，「委托」标记不适用**
+                                    #（2026-10-31）：NSEC(owner=et., next=eu.) 覆盖
+                                    # smartblock.firefox.etp，证明的是"etp. 这个 TLD
+                                    # 不存在"——etp 与 et **同级**，不是 et 的子区。
+                                    # 原实现只要 owner 含 DS/NS 就保守拒绝，导致所有
+                                    # 不存在的 TLD（.etp / .local / .invalid）都被判
+                                    # 「NSEC/NSEC3 区间不覆盖（重放攻击）」整条拒绝
+                                    # （实测 Firefox 的 smartblock.firefox.etp 每秒
+                                    # 刷十几条 WARNING）。仅当被查名**落在委托之下**
+                                    # （可能属于更深 zone）时才需要更深层的证明。
+                                    if owner_is_delegation:
+                                        try:
+                                            if not qn.is_subdomain(rrset.name):
+                                                owner_is_delegation = False
+                                        except Exception:
+                                            pass
                                     if not owner_is_delegation:
                                         # wildcard 否定检查（RFC 7129 §5.3.3）：
                                         # 需证明 *.CE（CE=覆盖 NSEC owner）也不存在。
@@ -3154,12 +4106,23 @@ class IterativeResolver:
                 return None
 
             if has_nsec and not nsec_semantic_ok:
-                # 有 NSEC/NSEC3 但区间语义不覆盖本次 qname → 重放攻击 → 拒绝
-                self._stats["bogus"] += 1
-                logger.warning(
-                    "DNSSEC 负应答 NSEC/NSEC3 区间不覆盖 %s（重放攻击）— 拒绝", _safe_qname(qname),
-                )
-                return None
+                # **根区负应答例外**（2026-10-31）：根区的 NSEC 链完整、
+                # **没有任何通配符记录**，也不存在"更深委托区可能掩盖 qname"
+                # 的问题（TLD 的存否由根区唯一决定）。RFC 4035 §5.4 要求补
+                # wildcard 否定证明是为了防"区内通配符合成应答"，对根区不适用。
+                # 因此「NSEC 已验签（上面的循环）+ 区间覆盖被查名」即为完整证明。
+                # 否则所有**不存在的 TLD**（.etp / .local / .invalid …）都会被判
+                # 「区间不覆盖」整条拒绝（实测 Firefox 的
+                # smartblock.firefox.etp 每秒刷十几条 WARNING）。
+                if soa_owner_zone == dns.name.root and nsec_covers_any:
+                    nsec_semantic_ok = True
+                else:
+                    # 有 NSEC/NSEC3 但区间语义不覆盖本次 qname → 重放攻击 → 拒绝
+                    self._stats["bogus"] += 1
+                    logger.warning(
+                        "DNSSEC 负应答 NSEC/NSEC3 区间不覆盖 %s（重放攻击）— 拒绝", _safe_qname(qname),
+                    )
+                    return None
 
             # SOA owner 校验：负应答（NODATA/NXDOMAIN）authority 含 SOA 时，
             # SOA owner 必须属于 qname 的权威 zone——防重放任意签名区 SOA。

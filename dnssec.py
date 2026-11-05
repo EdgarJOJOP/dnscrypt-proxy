@@ -568,8 +568,20 @@ class DNSSECValidator:
 
         # 2. 逐级 DS 验证取回可信 DNSKEY
         indeterminate = False
+        root_name = dns.name.from_text(".")
+        # 根区密钥是否已从「信任锚（KSK）」升级为完整 DNSKEY RRset（含 ZSK）。
+        # 只有 True 时 keys[.] 才能用来验证根区日常记录。
+        root_dnskey_ok = False
         for signer in signers:
-            if signer in keys:
+            # 根签名者必须单独处理：keys[root] 初始只是**信任锚**（通常只有 KSK），
+            # 而根区的 SOA / NSEC / DNSKEY 等日常记录由 **ZSK** 签名。早期实现
+            # 用 `if signer in keys: continue` 把根跳过了，于是拿信任锚去验 ZSK
+            # 签名必然 ValidationFailure → 返回 False → 判 bogus。
+            # 后果：**所有以根区为 signer 的应答**（典型是 NXDOMAIN/NODATA 的
+            # NSEC 否定证明，如不存在的 TLD）在 strict 模式 + drop_bogus 下
+            # 全部被丢弃成 SERVFAIL。
+            # 这里先用信任锚验出根 DNSKEY RRset（含 ZSK），拿到完整密钥集再验签。
+            if signer in keys and signer != root_name:
                 continue
             status, zkeys = await self._get_verified_zone_keys(signer)
             if status == "bogus":
@@ -577,6 +589,10 @@ class DNSSECValidator:
                 return False
             if status == "secure":
                 keys.update(zkeys)
+                # 根区密钥已从「信任锚」升级为完整 DNSKEY RRset（含 ZSK），
+                # 此时才能用它验证根区日常记录。
+                if signer == root_name:
+                    root_dnskey_ok = True
             else:
                 # insecure / indeterminate：该 signer 无可用可信 key
                 indeterminate = True
@@ -591,6 +607,13 @@ class DNSSECValidator:
                 if rrsig_set is None:
                     continue
                 signer = rrsig_set[0].signer
+                if signer == root_name and not root_dnskey_ok:
+                    # 根 DNSKEY 没能取到（无查询回调 / 查询失败）：此时 keys[.] 还
+                    # 只是**信任锚（KSK）**，而根区记录由 ZSK 签名——拿它验必然
+                    # ValidationFailure。这属于"无法判定"，绝不能据此判 bogus
+                    # （否则所有根区签名的负应答都会被丢弃）。
+                    indeterminate = True
+                    continue
                 if signer not in keys:
                     indeterminate = True
                     continue

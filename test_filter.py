@@ -232,9 +232,12 @@ def test_parser_in_engine():
     engine = FilterEngine()
 
     # 模拟规则文本
+    # 注意：$third-party / HTML 过滤（##）在 DNS 层无法评估，按 AdGuard DNS
+    # 文档整条忽略——因此这里用无修饰符的 ||doubleclick.net^ 做主拦截用例。
     text = """! Title: Test Filter
 ! 规则测试
 # comment
+||doubleclick.net^
 ||doubleclick.net^$third-party
 ||google-analytics.com/analytics.js
 @@||example.com^
@@ -245,6 +248,10 @@ shandian.biz##.ad-banner
     engine.load_rules_from_text(text, source="test")
     assert engine.stats["total_rules"] >= 4, f"规则不足: {engine.stats['total_rules']}"  # nosec B101
     print(f"  OK 从文本加载: {engine.stats['total_rules']} 条规则")
+    assert engine.stats["skipped_html_rules"] >= 1, engine.stats  # nosec B101
+    assert engine.stats["skipped_modifier_rules"] >= 1, engine.stats  # nosec B101
+    print(f"  OK 非 DNS 规则未加载: HTML {engine.stats['skipped_html_rules']} 条 / "
+          f"非 DNS 修饰符 {engine.stats['skipped_modifier_rules']} 条")
 
     # 测试拦截
     blocked, reason = engine.check_domain("doubleclick.net")
@@ -392,54 +399,59 @@ def test_badfilter():
 
 # ===== Test 7: $dnsrewrite =====
 def test_dnsrewrite():
-    """测试 $dnsrewrite 修饰符"""
+    """测试 $dnsrewrite 修饰符 —— 当前策略是**整条跳过**
+
+    解析器能识别 dnsrewrite 的语法，但四个 DNS 前端（plain/DoH/DoT/DoQ）都
+    没有消费 get_last_dnsrewrite()，规则生效时只会退化成"整域 NXDOMAIN"，
+    把本应返回 1.2.3.4 / REFUSED / 空应答的域名直接拦死（误拦截）。
+    因此在真正实现响应重写之前，带该修饰符的规则一律整条跳过。
+    """
     print()
     print("=" * 60)
-    print("7. 测试 $dnsrewrite 修饰符")
+    print("7. 测试 $dnsrewrite 修饰符（整条跳过策略）")
     print("=" * 60)
     from filter_engine import FilterRule, FilterEngine
 
     ok = total = 0
 
-    # 7.1 解析格式
+    # 7.1 所有 dnsrewrite 形式都必须被跳过（不能生效、也不能被当成普通域名规则）
     cases = [
-        ("||t.com^$dnsrewrite", "noerror", None),
-        ("||t.com^$dnsrewrite=1.2.3.4", "dnsrewrite", "A:1.2.3.4"),
-        ("||t.com^$dnsrewrite=::1", "dnsrewrite", "AAAA:::1"),
-        ("||t.com^$dnsrewrite=host:my.d", "dnsrewrite", "CNAME:my.d"),
-        ("||t.com^$dnsrewrite=REFUSED", "dnsrewrite", "rc:REFUSED"),
-        ("||t.com^$dnsrewrite=NOERROR;A;5.6.7.8", "dnsrewrite", "A:5.6.7.8"),
+        "||t.com^$dnsrewrite",
+        "||t.com^$dnsrewrite=1.2.3.4",
+        "||t.com^$dnsrewrite=::1",
+        "||t.com^$dnsrewrite=host:my.d",
+        "||t.com^$dnsrewrite=REFUSED",
+        "||t.com^$dnsrewrite=NOERROR;A;5.6.7.8",
     ]
-    for rule_text, exp_action, exp_detail in cases:
+    for rule_text in cases:
         rule = FilterRule(rule_text)
         total += 1
-        if rule._skip or rule.dnsrewrite is None:
-            print(f"  xx [7.1] 解析失败: {rule_text[:40]}")
-        elif rule.dnsrewrite.get('action') == exp_action:
+        if rule._skip and rule.dnsrewrite is None:
             ok += 1
         else:
-            print(f"  xx [7.1] {rule_text[:40]}: action={rule.dnsrewrite.get('action')}, 期望={exp_action}")
+            print(f"  xx [7.1] 未被跳过: {rule_text[:48]} "
+                  f"(skip={rule._skip}, dnsrewrite={rule.dnsrewrite})")
 
-    # 7.2 集成: check_domain + get_last_dnsrewrite
+    # 7.2 集成：带 dnsrewrite 的域名**不应被拦截**（否则就是整域 NXDOMAIN 误拦截）
     e1 = FilterEngine()
     e1.load_rules_from_text("||rewrite.com^$dnsrewrite=10.0.0.1", source="dr1")
     total += 1
     blocked, reason = e1.check_domain("rewrite.com")
-    d = e1.get_last_dnsrewrite()
-    if blocked and reason == "dnsrewrite" and d and d.get('value') == '10.0.0.1':
-        ok += 1; print("  OK [7.2] dnsrewrite 集成: blocked + reason + data 正确")
+    if not blocked:
+        ok += 1; print("  OK [7.2] 带 dnsrewrite 的域名未被拦截（不误拦）")
     else:
-        print(f"  xx [7.2] 集成错误: blocked={blocked}, reason={reason}, data={d}")
+        print(f"  xx [7.2] 误拦截: blocked={blocked}, reason={reason}")
 
-    # 7.3 白名单可覆盖 dnsrewrite
+    # 7.3 同一域名还有普通拦截规则时，普通规则仍然生效
     e2 = FilterEngine()
-    e2.load_rules_from_text("||r.com^$dnsrewrite=10.0.0.1\n@@||r.com^", source="dr2")
+    e2.load_rules_from_text(
+        "||r.com^$dnsrewrite=10.0.0.1\n||r.com^", source="dr2")
     total += 1
     blocked, _ = e2.check_domain("r.com")
-    if not blocked:
-        ok += 1; print("  OK [7.3] 白名单覆盖 dnsrewrite")
+    if blocked:
+        ok += 1; print("  OK [7.3] dnsrewrite 跳过不影响同一域名的普通拦截规则")
     else:
-        print("  xx [7.3] 白名单应覆盖 dnsrewrite")
+        print("  xx [7.3] 普通拦截规则应生效")
 
     print(f"  => dnsrewrite 测试: {ok}/{total} 通过")
 
@@ -558,6 +570,144 @@ def test_boundary():
     print(f"  => 边界条件测试: {ok}/{total} 通过")
 
 
+# ===== Test 10: 只加载 DNS 域名规则 =====
+def test_dns_only_loading():
+    """按 AdGuard DNS 过滤语法：只加载域名拦截/放行规则。
+
+    HTML 过滤（元素隐藏 / 扩展 CSS / CSS 注入 / scriptlet / HTML 过滤）与
+    带文档未列出修饰符的规则（$third-party / $script / $redirect / $cookie …）
+    必须在解析入口丢弃——不建对象、不入索引、不参与匹配。
+    """
+    print()
+    print("=" * 60)
+    print("10. 测试只加载 DNS 域名规则（HTML 过滤 / 非 DNS 修饰符不加载）")
+    print("=" * 60)
+    from filter_engine import FilterEngine, is_html_filter_rule, has_non_dns_modifier
+
+    ok = total = 0
+
+    # 10.1 HTML 过滤标记全覆盖
+    html_rules = [
+        "example.com##.ad-banner",
+        "example.com#@#.ad-banner",
+        "example.com#?#div:-abp-has(.ad)",
+        "example.com#@?#div:-abp-has(.ad)",
+        "example.com#$#body{background:none}",
+        "example.com#@$#body{background:none}",
+        "example.com#%#window.alert(1)",
+        "example.com#@%#window.alert(1)",
+        "##.ad-banner",
+        "example.com$$script[tag-content=\"ads\"]",
+        "example.com$@$script[tag-content=\"ads\"]",
+    ]
+    total += len(html_rules)
+    for r in html_rules:
+        if is_html_filter_rule(r):
+            ok += 1
+        else:
+            print(f"  xx [10.1] 未识别为 HTML 过滤规则: {r}")
+    # 普通域名规则不能被误判
+    for r in ("||example.com^", "@@||example.com^", "example.com",
+              "0.0.0.0 tracker.example", "||ads.com^$important",
+              "||ads.com^$dnsrewrite=NOERROR;A;1.2.3.4"):
+        total += 1
+        if not is_html_filter_rule(r):
+            ok += 1
+        else:
+            print(f"  xx [10.1] DNS 规则被误判为 HTML 过滤: {r}")
+    print(f"  => HTML 过滤判定: {ok}/{total}")
+
+    # 10.2 非 DNS 修饰符判定
+    non_dns = [
+        "||ads.com^$third-party", "||ads.com^$3p", "||ads.com^$script",
+        "||ads.com^$image,third-party", "||ads.com^$redirect=noopjs",
+        "||ads.com^$removeparam=p", "||ads.com^$cookie=x",
+        "||ads.com^$csp=frame-src 'none'", "||ads.com^$app=com.x",
+        "||ads.com^$domain=example.com", "||ads.com^$network",
+        "||ads.com^$unknownmod",
+        # dnsrewrite 已改为「整条跳过」（无前端消费，生效会退化成整域 NXDOMAIN）
+        "||ads.com^$dnsrewrite=NOERROR;A;1.2.3.4", "||ads.com^$dnsrewrite",
+    ]
+    dns_mods = [
+        "||ads.com^$important", "||ads.com^$badfilter",
+        "||ads.com^$dnstype=A", "||ads.com^$denyallow=sub.ads.com",
+        "||ads.com^$client=127.0.0.1", "||ads.com^$respgeo=US",
+        "||ads.com^$_", "example.com",
+    ]
+    ok2 = t2 = 0
+    for r in non_dns:
+        t2 += 1
+        if has_non_dns_modifier(r):
+            ok2 += 1
+        else:
+            print(f"  xx [10.2] 未识别为非 DNS 修饰符: {r}")
+    for r in dns_mods:
+        t2 += 1
+        if not has_non_dns_modifier(r):
+            ok2 += 1
+        else:
+            print(f"  xx [10.2] DNS 修饰符被误判: {r}")
+    ok += ok2; total += t2
+    print(f"  => 修饰符判定: {ok2}/{t2}")
+
+    # 10.3 引擎加载：非 DNS 规则不占索引、不拦截
+    e = FilterEngine()
+    e.load_rules_from_text(
+        "||dns-block.com^\n"
+        "@@||dns-allow.com^\n"
+        "0.0.0.0 hosts-block.com\n"
+        "||dns-important.com^$important\n"
+        "||browser-only.com^$third-party\n"
+        "||script-only.com^$script\n"
+        "||redirect-only.com^$redirect=noopjs\n"
+        "||cookie-only.com^$cookie=x\n"
+        "html-only.com##.ad\n"
+        "css-only.com#?#div:-abp-has(.ad)\n"
+        "js-only.com#%#window.x=1\n"
+        "filters-only.com$$script[tag-content=\"x\"]\n",
+        source="dnsonly",
+    )
+    st = e.stats
+    checks = [
+        ("dns-block.com", True),
+        ("dns-allow.com", False),
+        ("hosts-block.com", True),
+        ("dns-important.com", True),
+        ("browser-only.com", False),
+        ("script-only.com", False),
+        ("redirect-only.com", False),
+        ("cookie-only.com", False),
+        ("html-only.com", False),
+        ("css-only.com", False),
+        ("js-only.com", False),
+        ("filters-only.com", False),
+    ]
+    ok3 = t3 = 0
+    for domain, expect in checks:
+        t3 += 1
+        got = e.check_domain(domain)[0]
+        if got == expect:
+            ok3 += 1
+        else:
+            print(f"  xx [10.3] {domain}: 期望{'拦截' if expect else '放行'}，实际{'拦截' if got else '放行'}")
+    ok += ok3; total += t3
+    print(f"  => 引擎加载/匹配: {ok3}/{t3}  总规则={st['total_rules']} "
+          f"跳过HTML={st['skipped_html_rules']} 跳过非DNS修饰符={st['skipped_modifier_rules']}")
+
+    # 10.4 跳过统计必须真实反映（4 条 HTML + 4 条非 DNS 修饰符）
+    total += 2
+    if st["skipped_html_rules"] == 4:
+        ok += 1
+    else:
+        print(f"  xx [10.4] skipped_html_rules={st['skipped_html_rules']} 期望 4")
+    if st["skipped_modifier_rules"] == 4:
+        ok += 1
+    else:
+        print(f"  xx [10.4] skipped_modifier_rules={st['skipped_modifier_rules']} 期望 4")
+
+    print(f"  => 只加载 DNS 域名规则: {ok}/{total} 通过")
+
+
 # ===== 更新 main 入口 =====
 
 if __name__ == "__main__":
@@ -577,3 +727,4 @@ if __name__ == "__main__":
     test_dnsrewrite()
     test_atomic_reload()
     test_boundary()
+    test_dns_only_loading()

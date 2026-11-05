@@ -18,10 +18,12 @@ import os
 import re
 import time
 import zlib
+import codecs
 import threading
 import asyncio
 import logging
-from typing import List, Tuple, Optional, Set, Callable, BinaryIO, TextIO
+from typing import List, Tuple, Optional, Set, Callable, BinaryIO, TextIO, Dict
+from bisect import bisect_left
 from io import BytesIO, StringIO
 from pathlib import Path
 from urllib.parse import urlparse
@@ -35,6 +37,7 @@ import dns.rdatatype
 import dns.rdataclass
 import dns.name
 import dns.flags
+import dns.rcode
 
 logger = logging.getLogger("dns-proxy.filter")
 
@@ -74,17 +77,154 @@ def _is_redos_prone(regex_text: str) -> bool:
 DEFAULT_RULE_BUF_SIZE = 65536
 
 
-class ParseResult:
-    """规则解析结果，类似 Go 的 ParseResult"""
+# ============================================================
+# DNS 规则判定（解析入口零分配预过滤）
+# ------------------------------------------------------------
+# DNS 过滤只能看到「域名 + 查询类型」，看不到页面 DOM/CSS/脚本，因此
+# AdGuard 的 HTML 过滤规则（元素隐藏、扩展 CSS、CSS 注入、scriptlet、
+# HTML 过滤）在 DNS 层完全没有意义：它们既不可能命中，又会为每条规则
+# 构造 FilterRule 对象、编译正则、占用内存。规则列表动辄 50 万行，
+# 必须在**建对象之前**按字符串丢掉。
+# ============================================================
 
-    __slots__ = ("title", "rules_count", "checksum", "bytes_written")
+# 以 # 开头的 HTML 过滤标记（元素隐藏 / 扩展 CSS / CSS 注入 / scriptlet）
+_HTML_FILTER_HASH_MARKERS = (
+    "##", "#@#",      # 元素隐藏 / 例外
+    "#?#", "#@?#",    # 扩展 CSS / 例外
+    "#$#", "#@$#",    # CSS 注入 / 例外
+    "#%#", "#@%#",    # scriptlet / 例外
+)
+# 以 $ 开头的 HTML 过滤标记（HTML 过滤 / 例外）
+_HTML_FILTER_DOLLAR_MARKERS = ("$$", "$@$")
+
+
+def is_html_filter_rule(line: str) -> bool:
+    """该行是否为 AdGuard 的 HTML 过滤规则（元素隐藏 / scriptlet / HTML 过滤）。
+
+    纯字符串判定、不分配对象（调用方每行都要检查，列表可到 50 万行）。
+    以 `#` / `$` 做粗筛：域名规则几乎不含这两个字符，绝大多数行只做 1-2 次
+    `in` 判断就返回 False。
+    """
+    if "#" in line:
+        for marker in _HTML_FILTER_HASH_MARKERS:
+            if marker in line:
+                return True
+    if "$" in line:
+        for marker in _HTML_FILTER_DOLLAR_MARKERS:
+            if marker in line:
+                return True
+    return False
+
+
+# AdGuard DNS 过滤规则文档列出的、可能出现在 DNS 规则上的修饰符。
+# 文档明确要求：**规则包含未列出的修饰符时，必须忽略整条规则**（避免把
+# 面向浏览器/HTTP 的过滤列表套用到 DNS 层产生误报）。因此 third-party /
+# script / image / redirect / removeparam / cookie / csp / replace 等
+# 浏览器级修饰符不再放行——带这些修饰符的规则整条丢弃，既不匹配也不占内存。
+#
+# 本程序对其中各修饰符的实际处理：
+#   important   —— 支持（优先级高于普通规则/普通例外）
+#   badfilter   —— 支持（禁用同 pattern 的其它规则）
+#   dnsrewrite  —— **整条跳过**（2026-10-31）：解析器能识别它，但四个 DNS 前端
+#                  都没有消费 get_last_dnsrewrite()——带该修饰符的规则只会退化成
+#                  "整域 NXDOMAIN"，即把本应返回 1.2.3.4 / REFUSED / 空应答的域名
+#                  直接拦死（误拦截）。在真正实现响应重写之前，宁可少拦不误拦。
+#   client      —— AdGuard Home/DNS 专用；本程序无客户端身份，无法评估 → 整条跳过
+#   ctag        —— 同上（客户端标签）→ 整条跳过
+#   respgeo     —— AdGuard DNS 专用（按响应 IP 国家/ASN）→ 无法评估 → 整条跳过
+#   denyallow   —— DNS 可评估，但本程序尚未实现 → 整条跳过（宁可少拦，不误拦）
+#   dnstype     —— 同上（按查询类型）→ 整条跳过
+_DNS_DOC_MODIFIERS = frozenset({
+    "important", "badfilter",
+    "client", "ctag", "respgeo",
+    "denyallow", "dnstype",
+})
+
+
+def _free_regex_parts(line: str):
+    """把 `/regex/` 或 `/regex/$modifiers` 拆成 (正则部分, 修饰符部分)
+
+    不是自由正则规则时返回 None。
+
+    必须**在** `$` 修饰符切分之前识别：自由正则里的 `$` 是行尾锚点，
+    早期实现直接 `rsplit("$", 1)`，会把 `/^ads\\.example\\.com$/` 切成
+    正则 `/^ads\\.example\\.com` + 修饰符 `/`，然后因为 `/` 不是合法修饰符
+    而把整条规则丢弃——所有带行尾锚点的正则规则全部静默失效（漏拦截）。
+    """
+    text = line.strip()
+    if len(text) < 3 or not text.startswith("/"):
+        return None
+    last = text.rfind("/")
+    if last <= 0:
+        return None
+    regex_part = text[:last + 1]
+    rest = text[last + 1:]
+    if not rest:
+        return regex_part, None
+    if rest.startswith("$"):
+        return regex_part, rest[1:]
+    return None
+
+
+def has_non_dns_modifier(line: str) -> bool:
+    """规则是否带有 AdGuard DNS 文档未列出的修饰符（非 DNS 规则）。
+
+    不含 `$` → False（纯域名规则）。修饰符解析规则与 FilterRule._parse 一致：
+    取最后一个 `$` 之后的部分、按逗号分隔、`name=value` 只取 name、`~` 前缀
+    去掉；纯下划线（noop）按规范忽略。自由正则 `/regex/` 先整体识别，
+    其中的 `$` 属于正则语法而非修饰符。
+    """
+    parts = _free_regex_parts(line)
+    if parts is not None:
+        line = parts[0]
+        if parts[1] is None:
+            return False
+        # 只校验正则之后的修饰符部分
+        line = "$" + parts[1]
+    if "$" not in line:
+        return False
+    modifiers = line.rsplit("$", 1)[1]
+    for mod in modifiers.split(","):
+        mod = mod.strip()
+        if not mod:
+            continue
+        name = mod.split("=", 1)[0].strip() if "=" in mod else mod
+        if name.startswith("~"):
+            name = name[1:]
+        if not name:
+            continue
+        # noop 修饰符：纯下划线序列（任意长度），规范定义为"什么也不做"
+        if not name.strip("_"):
+            continue
+        if name not in _DNS_DOC_MODIFIERS:
+            return True
+    return False
+
+
+class ParseResult:
+    """规则解析结果，类似 Go 的 ParseResult
+
+    skipped_html / skipped_non_dns：解析阶段按 DNS 语法丢弃的规则数
+    （HTML 过滤 / 带非 DNS 修饰符）。这些规则不会进入任何索引，用于日志与
+    stats 观测"到底省掉了多少条"。
+    """
+
+    __slots__ = ("title", "rules_count", "checksum", "bytes_written",
+                 "skipped_html", "skipped_non_dns", "text")
 
     def __init__(self, title: str = "", rules_count: int = 0,
-                 checksum: int = 0, bytes_written: int = 0):
+                 checksum: int = 0, bytes_written: int = 0,
+                 skipped_html: int = 0, skipped_non_dns: int = 0,
+                 text: str = ""):
         self.title = title
         self.rules_count = rules_count
         self.checksum = checksum
         self.bytes_written = bytes_written
+        self.skipped_html = skipped_html
+        self.skipped_non_dns = skipped_non_dns
+        # 清理后的规则文本（只含 DNS 规则）：parse_to_text 直接复用，
+        # 避免为 50 万行列表再全量扫描一遍（纯 CPU 浪费）。
+        self.text = text
 
 
 class AdGuardRuleParser:
@@ -98,7 +238,12 @@ class AdGuardRuleParser:
     @staticmethod
     def _looks_like_html(text: str) -> bool:
         """检测内容是否为 HTML（检查前 100 行）"""
-        lines = text.splitlines()[:100]
+        # **只切前 100 行**（2026-10-30）：原实现 `text.splitlines()[:100]` 会先对
+        # 整个文件做一次 splitlines——hagezi tif 有 185 万行/37MB，这一刀就是
+        # 约 7.8s 的纯 C 操作，持 GIL 不释放，事件循环线程被饿死，
+        # 加载期间进程内的 DNS 服务一个查询都处理不了。
+        # `str.split(sep, maxsplit)` 有切分数上限，代价只与切出的行数相关。
+        lines = text.split("\n", 100)[:100]
         for line in lines:
             stripped = line.strip()
             if not stripped:
@@ -116,22 +261,34 @@ class AdGuardRuleParser:
                 break
         return False
 
-    @staticmethod
-    def _has_binary_chars(text: str) -> Tuple[bool, int, str]:
+    # 二进制控制字符（与旧实现的判定范围严格一致）：
+    #   0x00-0x08、0x0E-0x1B、0x1F、0x7F。
+    # 不含 0x0B/0x0C/0x1C-0x1E —— 它们是 `str.splitlines()` 的行分隔符，
+    # 旧实现逐行遍历时**永远看不到**这些字符，这里保持一致，避免把
+    # 含分页符的合法规则文件误判成二进制。
+    _BINARY_CTRL_RE = re.compile(r"[\x00-\x08\x0e-\x1b\x1f\x7f]")
+
+    @classmethod
+    def _has_binary_chars(cls, text: str) -> Tuple[bool, int, str]:
         """
         检测二进制字符（仅检测真正的控制字符，不误伤中文等 Unicode）
         返回: (是否检测到, 行号, 描述)
+
+        **改用 C 层正则**（2026-10-30）：原实现是 `for line in text.splitlines():
+        for ch in line:` 的双层 Python 循环——37MB/185 万行要 7.4s，且 splitlines
+        本身再来一次全量切分。正则一次扫描是毫秒级，语义完全相同（都返回
+        第一个控制字符所在的行号/列号）。
         """
-        for i, line in enumerate(text.splitlines(), 1):
-            for j, ch in enumerate(line):
-                code = ord(ch)
-                # 只检测真正的控制字节：0x00-0x08, 0x0B-0x0C, 0x0E-0x1F, 0x7F
-                # 不检测 > 0x7E（中文、日文等 Unicode 字符不是二进制垃圾）
-                if (0x00 <= code <= 0x08) or (0x0B <= code <= 0x0C) or \
-                   (0x0E <= code <= 0x1F) or code == 0x7F:
-                    char_desc = f"'\\x{code:02x}'"
-                    return True, i, f"line {i}: character {j}: likely binary character {char_desc}"
-        return False, 0, ""
+        m = cls._BINARY_CTRL_RE.search(text)
+        if m is None:
+            return False, 0, ""
+        pos = m.start()
+        line_no = text.count("\n", 0, pos) + 1
+        col = pos - (text.rfind("\n", 0, pos) + 1)
+        code = ord(m.group())
+        return True, line_no, (
+            f"line {line_no}: character {col}: likely binary character '\\x{code:02x}'"
+        )
 
     @staticmethod
     def _extract_title(text: str) -> str:
@@ -157,7 +314,8 @@ class AdGuardRuleParser:
         返回清理后的规则行，或 None 表示跳过
         - 去除首尾空白
         - 跳过空行和注释
-        - 跳过 cosmetic 规则
+        - 跳过所有 HTML 过滤规则（元素隐藏 / 扩展 CSS / CSS 注入 / scriptlet /
+          HTML 过滤）——DNS 层不可见、无意义，见 is_html_filter_rule
         """
         line = line.strip()
         if not line:
@@ -165,8 +323,8 @@ class AdGuardRuleParser:
         # 注释: ! 或 #
         if line.startswith("!") or line.startswith("#"):
             return None
-        # cosmetic 规则: ## #@# $$ 以及 scriptlet 规则 #%#
-        if "##" in line or "#@#" in line or "$$" in line or "#%#" in line:
+        # HTML 过滤规则：与 DNS 过滤无关，直接丢弃（不建对象、不入索引）
+        if is_html_filter_rule(line):
             return None
 
         # etc/hosts 格式: 0.0.0.0 domain.com 或 127.0.0.1 domain.com
@@ -180,6 +338,12 @@ class AdGuardRuleParser:
             # 跳过带路径的 hosts 条目
             if "/" not in domain:
                 return domain  # 裸域名 → FilterRule 会做精确匹配
+
+        # 带 AdGuard DNS 文档未列出的修饰符（$third-party / $script /
+        # $redirect / $cookie …）→ 整条丢弃：DNS 层无法评估，加载只会误拦。
+        # 文档要求：未列出的修饰符必须忽略整条规则。
+        if has_non_dns_modifier(line):
+            return None
 
         return line
 
@@ -210,8 +374,27 @@ class AdGuardRuleParser:
         # 4. 解析并写入输出
         output = StringIO()
         rules_count = 0
+        skipped_html = 0
+        skipped_non_dns = 0
 
         for raw_line in text.splitlines():
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+            # HTML 过滤规则（元素隐藏 / 扩展 CSS / CSS 注入 / scriptlet /
+            # HTML 过滤）：DNS 层无意义 → 丢弃并计数（不写进 cleaned_text，
+            # 后续 _compile_rules 连见都见不到）
+            if is_html_filter_rule(stripped):
+                skipped_html += 1
+                continue
+            # 注释: ! 或 #
+            if stripped.startswith("!") or stripped.startswith("#"):
+                continue
+            # 带 AdGuard DNS 文档未列出的修饰符（$third-party / $script /
+            # $redirect / $cookie …）→ 整条丢弃（文档要求：未列出即忽略整条）
+            if has_non_dns_modifier(stripped):
+                skipped_non_dns += 1
+                continue
             cleaned = self._clean_rule_line(raw_line)
             if cleaned is None:
                 continue
@@ -229,22 +412,21 @@ class AdGuardRuleParser:
             rules_count=rules_count,
             checksum=checksum,
             bytes_written=len(output_str),
+            skipped_html=skipped_html,
+            skipped_non_dns=skipped_non_dns,
+            text=output_str,
         )
 
     def parse_to_text(self, text: str) -> Tuple[str, ParseResult]:
         """
         解析并返回清理后的规则文本
         返回: (cleaned_text, parse_result)
+
+        直接复用 parse() 已经拼好的输出（只含 DNS 规则），不再对原始文本做
+        第二遍全量扫描——50 万行列表的二次扫描是纯 CPU 浪费。
         """
         result = self.parse(text)
-        # 重新生成清理后的文本
-        lines = []
-        for raw_line in text.splitlines():
-            cleaned = self._clean_rule_line(raw_line)
-            if cleaned is not None:
-                lines.append(cleaned)
-        cleaned_text = "\n".join(lines)
-        return cleaned_text, result
+        return result.text, result
 
 
 # =============================================================================
@@ -252,7 +434,7 @@ class AdGuardRuleParser:
 # ★ 对简单域名规则（||domain^、裸域名、hosts格式）使用字符串匹配而非正则
 # =============================================================================
 
-# 紧凑规则类型常量（DomainTrie 用）
+# 规则类型常量（DomainTrie 用，1 字节存进 bytearray）
 _RT_NONE = 0
 _RT_BLOCK_EXACT = 1       # 精确域名拦截
 _RT_BLOCK_SUBDOMAIN = 2   # ||domain^ 子域名拦截
@@ -261,115 +443,267 @@ _RT_ALLOW_SUBDOMAIN = 4   # @@||domain^ 子域名白名单
 _RT_IMPORTANT_EXACT = 5   # 重要规则精确
 _RT_IMPORTANT_SUBDOMAIN = 6  # 重要规则子域名
 
+# 只有这三种类型在「非完整域名」层级也算命中（与旧 trie 的语义一致）
+_SUBDOMAIN_TYPES = frozenset({
+    _RT_BLOCK_SUBDOMAIN, _RT_ALLOW_SUBDOMAIN, _RT_IMPORTANT_SUBDOMAIN,
+})
 
-class _DomainTrieNode:
-    """域名 Trie 节点 — 紧凑存储，无正则编译"""
-    __slots__ = ('children', 'rule_type', 'dnsrewrite', 'raw_short')
+# 普通规则不保存原文，日志里用这些可读占位
+_RT_RAW_TEXT = {
+    _RT_BLOCK_EXACT: "compact:block",
+    _RT_BLOCK_SUBDOMAIN: "compact:block+sub",
+    _RT_ALLOW_EXACT: "compact:allow",
+    _RT_ALLOW_SUBDOMAIN: "compact:allow+sub",
+    _RT_IMPORTANT_EXACT: "compact:important",
+    _RT_IMPORTANT_SUBDOMAIN: "compact:important+sub",
+}
 
-    def __init__(self):
-        # ★ 惰性初始化：不预先分配空 dict，叶子节点永远不需要 children
-        self.children = None  # type: Optional[Dict[str, '_DomainTrieNode']]
-        self.rule_type: int = _RT_NONE
-        self.dnsrewrite: Optional[dict] = None
-        self.raw_short: str = ""
+
+def _merge_rule_type(cur: int, new: int) -> int:
+    """合并同一域名的多条规则（逐字复现旧 trie 的 add 优先级）：
+
+    - important 覆盖一切；
+    - block 覆盖非 important 的规则（同域名的旧 block 也被后来者替换，
+      因此 EXACT/SUB 的粒度以最后一条 block 规则为准）；
+    - allow 只在当前没有规则时生效。
+    """
+    if new in (_RT_IMPORTANT_EXACT, _RT_IMPORTANT_SUBDOMAIN):
+        return new
+    if new in (_RT_BLOCK_EXACT, _RT_BLOCK_SUBDOMAIN):
+        if cur in (_RT_IMPORTANT_EXACT, _RT_IMPORTANT_SUBDOMAIN):
+            return cur
+        return new
+    if new in (_RT_ALLOW_EXACT, _RT_ALLOW_SUBDOMAIN):
+        if cur == _RT_NONE:
+            return new
+        return cur
+    return cur
 
 
 class _DomainTrie:
-    """
-    域名 Trie 索引 — 反向标签索引。
-    
-    为 95% 以上的简单域名规则提供紧凑存储和快速匹配，
-    避免创建 FilterRule 对象和编译正则表达式。
+    """域名索引 —— 反转标签排序的扁平表（真正的紧凑存储）。
+
+    旧实现（每个标签一个 `_DomainTrieNode` + 每层一个 dict）在 32.9 万条
+    真实规则下实测：「紧凑」名不副实 ——
+
+        462,375 个节点对象  28.2MB
+        139,840 个 dict      32.3MB
+        462,374 个标签字符串 22.0MB
+        合计                 82.5MB（每域名 263B，是域名文本本身的 10 倍以上）
+
+    这里把同一棵树压成三组平行结构：
+
+      _keys    list[bytes]  反转标签后的域名键（mediav.com → b"com.mediav"），
+                            按字节序排序；父域在排序中恰是子域的前缀
+      _types   bytearray    与 _keys 对齐的规则类型（_RT_*，1 字节/条）
+      _rewrites/_raws       dict，稀疏旁路：仅 $dnsrewrite 与 important 规则的原文
+
+    内存：每域名 ≈ 一个 bytes（33+len）+ 8B 列表槽 + 1B 类型 ≈ 60B；
+    32.9 万条实测 18.9MB（**旧实现的 23%**）。
+
+    匹配：对「本域 + 各级父域」（反转后即前缀）各做一次 bisect——C 实现的
+    二分，实测 3.2µs/次（旧 trie 2.3µs/次；QPS 1000 时 <0.1% CPU）。
+
+    增量写入：加载期间先写 `_pending` dict（同域名按优先级合并），加载结束
+    （或增量达到 `_FINALIZE_THRESHOLD`）再一次性归并进排序表，避免每条规则
+    都重排整个数组。match/has_domain 会同时查 pending 与表，保持旧 trie 的
+    「加载中已可见」语义。
     """
 
-    __slots__ = ('_root', '_count', '_domain_count')
+    __slots__ = ('_keys', '_types', '_rewrites', '_raws',
+                 '_pending', '_pending_rewrites', '_pending_raws',
+                 '_count', '_domain_count')
+
+    # 增量区达到该条数时自动归并：限制加载峰值内存，同时避免频繁 O(N) 归并
+    _FINALIZE_THRESHOLD = 50000
 
     def __init__(self):
-        self._root = _DomainTrieNode()
+        self._keys: List[bytes] = []
+        self._types = bytearray()
+        # 稀疏旁路（绝大多数规则既没有 dnsrewrite，也没有保留原文）
+        self._rewrites: Dict[bytes, dict] = {}
+        self._raws: Dict[bytes, str] = {}
+        # 增量区（尚未归并进 _keys/_types）
+        self._pending: Dict[bytes, int] = {}
+        self._pending_rewrites: Dict[bytes, dict] = {}
+        self._pending_raws: Dict[bytes, str] = {}
         self._count = 0
         self._domain_count = 0
 
+    # ---- 键变换 ----
+
+    @staticmethod
+    def _reverse_key(domain: str) -> bytes:
+        """域名 → 反转标签键（小写）。父域反转后是子域反转键的前缀。"""
+        return ".".join(reversed(domain.lower().rstrip('.').split('.'))).encode()
+
+    def _lookup(self, key: bytes) -> int:
+        """在「增量区 + 排序表」里查规则类型，未命中返回 _RT_NONE。"""
+        pending = self._pending
+        if pending:
+            rt = pending.get(key, _RT_NONE)
+            if rt != _RT_NONE:
+                return rt
+        keys = self._keys
+        idx = bisect_left(keys, key)
+        if idx < len(keys) and keys[idx] == key:
+            return self._types[idx]
+        return _RT_NONE
+
+    # ---- 写入 ----
+
     def add(self, domain: str, rule_type: int, dnsrewrite: Optional[dict] = None,
             raw_short: str = "") -> bool:
-        """添加域名规则到 Trie"""
-        labels = domain.lower().rstrip('.').split('.')[::-1]
-        node = self._root
-        for label in labels:
-            if node.children is None:
-                node.children = {}
-            if label not in node.children:
-                node.children[label] = _DomainTrieNode()
-            node = node.children[label]
-
-        is_new_domain = (node.rule_type == _RT_NONE)
-
-        # 合并规则类型：同一域名可能有多条规则，保留最高优先级
-        if rule_type in (_RT_IMPORTANT_EXACT, _RT_IMPORTANT_SUBDOMAIN):
-            node.rule_type = rule_type
-        elif rule_type in (_RT_BLOCK_EXACT, _RT_BLOCK_SUBDOMAIN):
-            if node.rule_type not in (_RT_IMPORTANT_EXACT, _RT_IMPORTANT_SUBDOMAIN):
-                node.rule_type = rule_type
-        elif rule_type in (_RT_ALLOW_EXACT, _RT_ALLOW_SUBDOMAIN):
-            if node.rule_type == _RT_NONE:
-                node.rule_type = rule_type
-
+        """添加域名规则（返回该域名是否首次出现）。"""
+        key = self._reverse_key(domain)
+        pending = self._pending
+        cur = pending.get(key)
+        is_new = False
+        if cur is None:
+            keys = self._keys
+            idx = bisect_left(keys, key)
+            if idx < len(keys) and keys[idx] == key:
+                cur = self._types[idx]
+            else:
+                cur = _RT_NONE
+                is_new = True
+        pending[key] = _merge_rule_type(cur, rule_type)
         if dnsrewrite:
-            node.dnsrewrite = dnsrewrite
-        if raw_short and not node.raw_short:
-            node.raw_short = raw_short
-
+            self._pending_rewrites[key] = dnsrewrite
+        if raw_short and key not in self._raws and key not in self._pending_raws:
+            self._pending_raws[key] = raw_short
         self._count += 1
-        if is_new_domain:
+        if is_new:
             self._domain_count += 1
-        return is_new_domain
+        if len(pending) >= self._FINALIZE_THRESHOLD:
+            self.finalize()
+        return is_new
+
+    def finalize(self):
+        """把增量区归并进已排序的扁平表，并释放临时 dict。
+
+        表为空时直接排序建表；表非空时归并两个有序序列（O(N)；同键以增量区
+        为准——增量区里的类型已经是「表值 + 新规则」合并后的结果）。
+        """
+        pending = self._pending
+        if not pending:
+            return
+        pk = sorted(pending)
+        keys = self._keys
+        if not keys:
+            self._keys = pk
+            self._types = bytearray(pending[k] for k in pk)
+        else:
+            types = self._types
+            out_keys: List[bytes] = []
+            out_types = bytearray()
+            i = j = 0
+            npk = len(pk)
+            nk = len(keys)
+            while i < npk and j < nk:
+                a = pk[i]
+                b = keys[j]
+                if a < b:
+                    out_keys.append(a)
+                    out_types.append(pending[a])
+                    i += 1
+                elif a > b:
+                    out_keys.append(b)
+                    out_types.append(types[j])
+                    j += 1
+                else:
+                    out_keys.append(a)
+                    out_types.append(pending[a])
+                    i += 1
+                    j += 1
+            if i < npk:
+                out_keys.extend(pk[i:])
+                out_types.extend(pending[k] for k in pk[i:])
+            if j < nk:
+                out_keys.extend(keys[j:])
+                out_types.extend(types[j:])
+            self._keys = out_keys
+            self._types = out_types
+        if self._pending_rewrites:
+            self._rewrites.update(self._pending_rewrites)
+            self._pending_rewrites = {}
+        if self._pending_raws:
+            self._raws.update(self._pending_raws)
+            self._pending_raws = {}
+        self._pending = {}
+
+    # ---- 查询 ----
 
     def match(self, domain: str) -> Optional[Tuple[Optional['_MatchInfo'], str]]:
+        """匹配域名，返回 (_MatchInfo, 匹配方式)。
+
+        语义与旧 trie 完全一致：
+          - 完整域名层级：任意规则类型都算命中；
+          - 中间层级（父域）：只有子域类型（block+sub / allow+sub /
+            important+sub）才算命中；
+          - 命中取**最深**（最具体）的那一级。
         """
-        匹配域名，返回 (_MatchInfo, 匹配方式)。
-        按精确域名 → 父域名链匹配。
-        """
-        labels = domain.lower().rstrip('.').split('.')[::-1]
+        d = domain.lower().rstrip('.')
+        if not d:
+            return None
+        labels = d.split('.')
         if not labels or not labels[0]:
             return None
-
-        node = self._root
-        matched = None
-
-        for i, label in enumerate(labels):
-            if node.children is not None and label in node.children:
-                node = node.children[label]
-                if node.rule_type != _RT_NONE:
-                    if i == len(labels) - 1:
-                        # 精确到完整域名
-                        matched = (node, i + 1)
-                    elif node.rule_type in (_RT_BLOCK_SUBDOMAIN, _RT_ALLOW_SUBDOMAIN,
-                                            _RT_IMPORTANT_SUBDOMAIN):
-                        matched = (node, i + 1)
-            else:
-                break
-
-        if matched is not None:
-            matched_node, depth = matched
-            matched_domain = '.'.join(labels[:depth][::-1])
-            return (_MatchInfo(matched_node), f"域名匹配 ({matched_domain})")
-
-        return None
+        n = len(labels)
+        last = n - 1
+        hit_key = b""
+        hit_text = ""
+        hit_type = _RT_NONE
+        # 同时维护两种累积：
+        #   key_acc  —— 反转标签键（com → com.ads），用于查表
+        #   text_acc —— 原域名文本（com → ads.com），用于日志/命中域名
+        key_acc = labels[-1]
+        text_acc = labels[-1]
+        for i in range(n):
+            if i:
+                key_acc = key_acc + '.' + labels[n - i - 1]
+                text_acc = labels[n - i - 1] + '.' + text_acc
+            key = key_acc.encode()
+            rt = self._lookup(key)
+            if rt != _RT_NONE and (i == last or rt in _SUBDOMAIN_TYPES):
+                hit_key = key
+                hit_text = text_acc
+                hit_type = rt
+        if hit_type == _RT_NONE:
+            return None
+        raw = self._raws.get(hit_key)
+        if not raw:
+            raw = self._pending_raws.get(hit_key)
+        rewrite = self._rewrites.get(hit_key)
+        if rewrite is None:
+            rewrite = self._pending_rewrites.get(hit_key)
+        return (_MatchInfo(hit_type, raw, rewrite), f"域名匹配 ({hit_text})")
 
     def has_domain(self, domain: str) -> bool:
-        """域名是否在索引中（快速检查）"""
-        labels = domain.lower().rstrip('.').split('.')[::-1]
-        node = self._root
-        for label in labels:
-            if node.children is not None and label in node.children:
-                node = node.children[label]
-                if node.rule_type != _RT_NONE:
-                    return True
-            else:
-                return False
-        return node.rule_type != _RT_NONE
+        """域名（或任一父域）是否有规则（诊断用，宽松判定，与旧实现一致）。"""
+        d = domain.lower().rstrip('.')
+        if not d:
+            return False
+        labels = d.split('.')
+        if not labels or not labels[0]:
+            return False
+        n = len(labels)
+        key_acc = labels[-1]
+        for i in range(n):
+            if i:
+                key_acc = key_acc + '.' + labels[n - i - 1]
+            if self._lookup(key_acc.encode()) != _RT_NONE:
+                return True
+        return False
 
     def clear(self):
-        self._root = _DomainTrieNode()
+        self._keys = []
+        self._types = bytearray()
+        self._rewrites = {}
+        self._raws = {}
+        self._pending = {}
+        self._pending_rewrites = {}
+        self._pending_raws = {}
         self._count = 0
         self._domain_count = 0
 
@@ -383,45 +717,27 @@ class _DomainTrie:
 
 
 class _MatchInfo:
-    """
-    匹配结果信息 — 轻量替代 FilterRule。
-    由 DomainTrie.match() 返回，兼容 FilterRule 的接口子集。
-    """
-    __slots__ = ('_node',)
+    """匹配结果 — 轻量替代 FilterRule（只保留 check_domain 需要的字段）。
 
-    def __init__(self, node: _DomainTrieNode):
-        self._node = node
+    与旧实现不同：不再持有 trie 节点（节点已不存在），直接存规则类型、
+    原文（仅 important 规则保留）/ dnsrewrite（仅 $dnsrewrite 规则）。
+    """
+
+    __slots__ = ('rule_type', 'raw', 'dnsrewrite')
+
+    def __init__(self, rule_type: int, raw: str = "",
+                 dnsrewrite: Optional[dict] = None):
+        self.rule_type = rule_type
+        self.raw = raw or _RT_RAW_TEXT.get(rule_type, "compact:unknown")
+        self.dnsrewrite = dnsrewrite
 
     @property
     def is_important(self) -> bool:
-        return self._node.rule_type in (_RT_IMPORTANT_EXACT, _RT_IMPORTANT_SUBDOMAIN)
+        return self.rule_type in (_RT_IMPORTANT_EXACT, _RT_IMPORTANT_SUBDOMAIN)
 
     @property
     def is_exception(self) -> bool:
-        return self._node.rule_type in (_RT_ALLOW_EXACT, _RT_ALLOW_SUBDOMAIN)
-
-    @property
-    def dnsrewrite(self) -> Optional[dict]:
-        return self._node.dnsrewrite
-
-    @property
-    def raw(self) -> str:
-        if self._node.raw_short:
-            return self._node.raw_short
-        rt = self._node.rule_type
-        if rt == _RT_BLOCK_EXACT:
-            return "compact:block"
-        elif rt == _RT_BLOCK_SUBDOMAIN:
-            return "compact:block+sub"
-        elif rt == _RT_ALLOW_EXACT:
-            return "compact:allow"
-        elif rt == _RT_ALLOW_SUBDOMAIN:
-            return "compact:allow+sub"
-        elif rt == _RT_IMPORTANT_EXACT:
-            return "compact:important"
-        elif rt == _RT_IMPORTANT_SUBDOMAIN:
-            return "compact:important+sub"
-        return "compact:unknown"
+        return self.rule_type in (_RT_ALLOW_EXACT, _RT_ALLOW_SUBDOMAIN)
 
 
 class FilterRule:
@@ -431,7 +747,10 @@ class FilterRule:
                  "raw", "_skip",
                  "is_badfilter", "dnsrewrite",
                  # ★ Phase 1: 紧凑匹配字段
-                 "_simple_match", "_simple_domain", "_match_subdomains")
+                 "_simple_match", "_simple_domain", "_match_subdomains",
+                 # 通配符/正则规则的「匹配必要条件」锚点（供 DomainIndex 分组索引）
+                 "_anchor_suffix", "_anchor_sld", "_anchor_prefix",
+                 "_anchor_contains", "_order")
 
     def __init__(self, rule_text: str):
         self.raw = rule_text
@@ -448,116 +767,50 @@ class FilterRule:
         self._simple_match = False
         self._simple_domain = ""
         self._match_subdomains = False
+        # 锚点（只有 pattern 规则会用到；simple 规则留空）
+        self._anchor_suffix = ""
+        self._anchor_sld = ""
+        self._anchor_prefix = ""
+        self._anchor_contains = ""
+        self._order = 0
 
         self._parse()
 
-    # AdGuard 官方已知的全部 modifier 集合
-    # 参见: https://adguard.com/kb/general/ad-filtering/create-own-filters/
-    # 不在列表中的 modifier → 整条规则跳过（官方规范）
-    _KNOWN_MODIFIERS = {
-        # DNS-specific（完全支持）
-        'important', 'badfilter', 'client', 'denyallow', 'dnstype',
-        'dnsrewrite', 'ctag',
-        # Content-type（浏览器级别，DNS 列表中常见，安全忽略）
-        'third-party', 'strict-third-party', 'strict-first-party',
-        'script', 'image', 'stylesheet', 'object',
-        'xmlhttprequest', 'subdocument', 'font', 'media', 'popup',
-        'document', 'websocket', 'other', 'all',
-        'ping', 'webrtc', 'popup', 'frame', 'xhr',
-        'inline-font', 'inline-script',
-        # 修饰符别名（AdGuard 规范定义）
-        'css',           # $stylesheet 的别名
-        'doc',           # $document 的别名
-        'ehide',         # $elemhide 的别名
-        'ghide',         # $generichide 的别名
-        'shide',         # $specifichide 的别名
-        '3p',            # $third-party 的别名
-        'strict3p',      # $strict-third-party 的别名
-        'strict1p',      # $strict-first-party 的别名
-        # 条件修饰符（需要请求上下文，DNS 无法评估）
-        'domain', 'match-case', 'method', 'to', 'header', 'app',
-        # URL/内容修改
-        'redirect', 'redirect-rule', 'replace', 'removeparam',
-        'queryprune', 'removeheader', 'csp', 'permissions',
-        'referrerpolicy', 'urltransform', 'xmlprune', 'empty',
-        # 例外相关
-        'elemhide', 'generichide', 'specifichide', 'jsinject',
-        'urlblock', 'content', 'extension', 'genericblock',
-        # 杂项
-        'popunder', 'network', 'hls', 'jsonprune', 'cookie',
-        # 其他
-        'noop', 'reason', 'stealth', 'mp4',
-    }
+        # 只有通配符/正则规则（非 simple_match）才需要锚点：simple 规则走 trie，
+        # 锚点只用于把 pattern 规则分组，避免未命中时线性跑全部正则。
+        if not self._skip and not self._simple_match:
+            self._set_anchor()
 
-    # 例外规则上 DNS 级别无法评估/不需要的修饰符集合
-    # 这些修饰符限制了例外规则的适用范围（如仅限特定页面/请求类型），
-    # 但 DNS 代理无法区分请求来源和类型，所以带这些修饰符的例外规则应跳过。
-    # 注意：$document 不在其中 —— 它在例外规则上的含义是"完全禁用该域名的所有过滤"，
-    # 等价于 DNS 级别的白名单，应被接受为普通例外规则处理。
+    # AdGuard **DNS** 过滤规则文档列出的修饰符集合。
+    # 参见: https://adguard-dns.io/kb/general/dns-filtering-syntax/
+    # 文档明确要求：不在列表中的 modifier → 整条规则忽略（官方规范），
+    # 以免把浏览器/HTTP 级过滤列表套用到 DNS 层产生误报。
+    #
+    # 旧实现把 third-party / script / image / redirect / cookie 等浏览器级
+    # 修饰符也放进"已知"集合，导致这些规则的域名被无条件加载进 trie、参与
+    # 拦截匹配（DNS 层根本无法评估它们）。现在统一改为：只认下面 8 个 DNS
+    # 修饰符，其余整条丢弃（在解析入口 has_non_dns_modifier 就已跳过，
+    # 连 FilterRule 对象都不会创建）。
+    _KNOWN_MODIFIERS = _DNS_DOC_MODIFIERS
+
+    # 例外规则上无法评估/会改变语义的 DNS 修饰符集合。
+    # 带这些修饰符的例外规则不能当作"无条件放行"，否则会放行过多域名。
+    #   client / ctag / respgeo —— 本程序没有客户端身份 / 响应地理信息
+    #   denyallow / dnstype     —— DNS 可评估但本程序尚未实现
     _EXCEPTION_RESTRICTIVE_MODIFIERS = frozenset({
-        # 条件修饰符（需要页面域名/请求来源上下文）
-        'domain', 'third-party', 'strict-third-party', 'strict-first-party',
-        'denyallow', 'app', 'method', 'to', 'header', 'client', 'ctag', 'dnstype',
-        # Content-type（需要请求类型信息）
-        'script', 'image', 'stylesheet', 'object', 'xmlhttprequest',
-        'subdocument', 'font', 'media', 'popup',
-        'websocket', 'other', 'all', 'ping', 'webrtc', 'popup',
-        'frame', 'xhr', 'inline-font', 'inline-script',
-        # match-case（DNS 大小写不敏感）
-        'match-case',
-        # URL/内容修改（DNS 级别无法修改请求/响应）
-        'redirect', 'redirect-rule', 'replace', 'removeparam',
-        'queryprune', 'removeheader', 'csp', 'permissions',
-        'referrerpolicy', 'urltransform', 'xmlprune', 'empty',
-        # 伪装/例外相关（DNS 级别无意义）
-        'elemhide', 'generichide', 'specifichide', 'jsinject',
-        'urlblock', 'content', 'extension', 'genericblock',
-        # 杂项限制修饰符
-        'popunder', 'network', 'hls', 'jsonprune', 'cookie', 'stealth',
+        'client', 'ctag', 'respgeo',
+        'denyallow', 'dnstype',
     })
 
-    # 拦截规则上 DNS 级别无法评估的范围限制修饰符集合
-    # 这些修饰符将拦截规则的适用范围限制在特定页面/应用/请求上下文中，
-    # 如 $domain=xxx（仅特定页面）、$app=xxx（仅特定应用）。
-    # DNS 代理无法评估这些条件，若不跳过会导致全局拦截 → 误拦合法域名。
-    # 注意：content-type 修饰符（$script、$image 等）不在其中——
-    # 对广告域名进行全类型拦截是可接受的。
-    #
-    # 此外还包括 HTTP 级别操作修饰符（如 $cookie、$redirect 等），
-    # 这些修饰符表示规则的意图是修改 HTTP 请求/响应，而非 DNS 拦截。
-    # DNS 代理无法执行这些操作（如修改 Cookie、重定向到本地资源），
-    # 若在 DNS 级别应用会导致整个域名被误拦截。
+    # 拦截规则上无法评估（或会改变语义）的 DNS 修饰符集合。
+    # 带这些修饰符的拦截规则若当作"全域拦截"会误拦合法域名，因此整条跳过。
+    # （$important / $dnsrewrite / $badfilter 不在此列：它们与域名拦截正交。）
     _BLOCK_RESTRICTIVE_MODIFIERS = frozenset({
-        # 范围限制修饰符（需要请求上下文，DNS 无法评估）
-        'domain',    # 限制到特定来源页面
-        'app',       # 限制到特定应用
-        'method',    # 限制到特定 HTTP 方法
-        'to',        # 限制到特定请求目标
-        'header',    # 限制到特定 HTTP 头
-        'client',    # 限制到特定 DHCP 客户端
-        'ctag',      # 限制到特定客户端标签
-        'dnstype',   # 限制到特定 DNS 记录类型（DNS 无法评估）
-        'denyallow', # 限制到特定排除域名（DNS 无法评估排除逻辑）
-        # ========== HTTP 级别操作修饰符 ==========
-        # 以下修饰符表示规则意图是修改 HTTP 请求/响应而非 DNS 拦截。
-        # DNS 代理无法执行这些操作，跳过以避免误拦截整个域名。
-        'cookie',          # 修改/移除 Cookie（HTTP 响应头/请求头）
-        'removeparam',     # 移除 URL 查询参数（HTTP 请求）
-        'queryprune',      # $removeparam 的别名
-        'removeheader',    # 移除 HTTP 请求/响应头
-        'redirect',        # 重定向到本地资源（HTTP 响应）
-        'redirect-rule',   # 条件重定向（HTTP 响应）
-        'replace',         # 替换响应内容（HTTP 响应）
-        'csp',             # 修改 Content-Security-Policy（HTTP 响应头）
-        'permissions',     # 修改 Permissions-Policy（HTTP 响应头）
-        'referrerpolicy',  # 修改 Referrer-Policy（HTTP 响应头）
-        'urltransform',    # 修改请求 URL（HTTP 请求）
-        'xmlprune',        # 修剪 XML 响应内容（HTTP 响应）
-        'empty',           # 返回空响应（HTTP 响应，已弃用）
-        'hls',             # 修改 HLS 流（HTTP 响应）
-        'jsonprune',       # 修剪 JSON 响应内容（HTTP 响应）
-        'network',         # 防火墙规则（IP/端口级别，非 DNS）
-        'mp4',             # 替换为视频占位符（HTTP 响应，已弃用）
+        'client',     # 仅对特定客户端拦截 → 无法评估
+        'ctag',       # 仅对特定客户端标签拦截 → 无法评估
+        'respgeo',    # 仅按响应 IP 国家/ASN 拦截 → 无法评估
+        'dnstype',    # 仅对特定 DNS 记录类型拦截 → 未实现
+        'denyallow',  # 排除指定域名的拦截 → 未实现
     })
 
     @staticmethod
@@ -661,14 +914,24 @@ class FilterRule:
             self.is_exception = True
             text = text[2:]
 
-        # 2. 跳过 cosmetic 规则（## #@# $$）和 scriptlet 规则（#%#）
-        if "##" in text or "#@#" in text or "$$" in text or "#%#" in text:
+        # 2. 跳过所有 HTML 过滤规则（元素隐藏 / 扩展 CSS / CSS 注入 /
+        #    scriptlet / HTML 过滤）。DNS 层看不到 DOM/CSS/脚本，这类规则
+        #    永远不可能命中；正常入口（load_rules_from_*）已在解析前用
+        #    is_html_filter_rule 预过滤，这里作为直接构造 FilterRule 时的纵深防御。
+        if is_html_filter_rule(text):
             self._skip = True
             return
 
         # 3. 分离 $modifiers 并验证
+        #
+        # 自由正则 /regex/ 必须先整体识别：正则里的 `$` 是行尾锚点，不是修饰符。
+        # 早期实现无条件 rsplit("$", 1)，导致 `/^ads\.example\.com$/` 被切成
+        # 正则 `/^ads\.example\.com` + 修饰符 `/` → 判为未知修饰符 → 整条丢弃。
         modifiers_str = None
-        if "$" in text:
+        _regex_parts = _free_regex_parts(text)
+        if _regex_parts is not None:
+            text, modifiers_str = _regex_parts
+        elif "$" in text:
             parts = text.rsplit("$", 1)
             text = parts[0]
             modifiers_str = parts[1]
@@ -690,11 +953,14 @@ class FilterRule:
                     self.is_badfilter = True
                     break
 
-            # 检测 dnsrewrite 修饰符
+            # dnsrewrite：**当前整条跳过**（不再解析）
+            # 解析出来的 rewrite 值没有任何 DNS 前端消费，实际行为会退化成
+            # "整域 NXDOMAIN"——把本该返回 1.2.3.4 / REFUSED / 空应答的域名
+            # 直接拦死。整条跳过前，先把它记成跳过原因便于排障。
             for mod in modifiers_str.split(','):
                 if mod.strip().startswith('dnsrewrite'):
-                    self._parse_dnsrewrite(mod.strip())
-                    break
+                    self._skip = True
+                    return
 
             # 例外规则带有限制性修饰符（如 $domain=xxx、$third-party、$script 等）
             # 则跳过该规则。DNS 代理无法评估这些修饰符的条件，
@@ -988,6 +1254,92 @@ class FilterRule:
         logger.debug("无法识别的 $dnsrewrite 值: %s (规则: %s)", value, self.raw[:80])
         self.dnsrewrite = {'action': 'noerror'}
 
+    def _set_anchor(self):
+        """提取该通配符/正则规则的「匹配必要条件」锚点。
+
+        旧实现里 pattern 规则只能在 `DomainIndex.match` 中线性跑正则：hululu
+        的 550 条让每次**未命中**多花约 213µs。这里从规则文本提取保守的必要
+        条件，交给 DomainIndex 分组索引 + 预筛，使被排除的规则根本不进正则
+        引擎。
+
+        提取原则：只提取「匹配的必要条件」——宁可漏提取（退回线性），也不能
+        错提（错提会让本该命中的规则漏掉）：
+          suffix   —— 匹配的域名必须以它结尾（`||…tail^`、`tail|`）
+          sld      —— `||x.*`：域名倒数第二段必须是 x
+          prefix   —— `|head`：匹配的域名必须以它开头
+          contains —— 通配符两侧剩余的字面量必须作为子串出现在域名里
+        """
+        raw = self.raw.strip()
+        while raw.startswith("@@"):
+            raw = raw[2:]
+        raw = raw.strip()
+        if not raw:
+            return
+        # 自由正则 /regex/：无法安全提取字面锚点 → 保持线性
+        if raw.startswith("/") and raw.endswith("/"):
+            return
+
+        body = raw
+        double_bar = body.startswith("||")         # 域名边界锚定（可匹配子域）
+        anchored_start = body.startswith("|")      # | 或 ||
+        end_anchored = body.endswith("|")          # 结尾锚定
+        if anchored_start:
+            body = body[2:] if double_bar else body[1:]
+        if end_anchored:
+            body = body[:-1]
+        body = body.rstrip("^").strip()
+        if not body:
+            return
+
+        if "*" not in body:
+            # 无通配：||domain（域名边界 + 子域）、|prefix（字符串开头）、
+            # suffix|（域名结尾）
+            if double_bar:
+                # ||domain 匹配 domain 及其子域 → 域名必然以 domain 结尾
+                self._anchor_suffix = body.lstrip(".")
+            elif end_anchored:
+                self._anchor_suffix = body.lstrip(".")
+            elif anchored_start:
+                self._anchor_prefix = body
+            elif "." in body:
+                # 理论上不进 pattern（简单域名规则应走 trie），兜底用 contains
+                self._anchor_contains = body
+            return
+
+        # ||x.* —— SLD 通配（唯一 * 在末尾、x 不含点）
+        if body.endswith(".*") and body.count("*") == 1:
+            sld = body[:-2]
+            if sld and "." not in sld and "*" not in sld:
+                self._anchor_sld = sld
+                return
+
+        first = body.find("*")
+        last = body.rfind("*")
+        head = body[:first]        # 第一个 * 之前的字面量
+        tail = body[last + 1:]     # 最后一个 * 之后的字面量
+
+        if tail and "*" not in tail and "/" not in tail:
+            if tail.startswith("."):
+                # `*` 与尾部之间是标签边界（如 ad-*.aliyuncs.com）→ tail 是
+                # 合法的「标签边界后缀」，可以作为分组 key
+                self._anchor_suffix = tail.lstrip(".")
+            elif "." in tail:
+                # `*` 直接连着尾部字面量（如 tongji.*kuwo.cn 的 "kuwo.cn"）：
+                # 域名以它结尾，但它可能落在某个标签中间（akuwo.cn），
+                # 不能当分组 key，只能当 contains 预筛
+                self._anchor_contains = tail
+        if head and "*" not in head and "/" not in head:
+            if "." in head:
+                # 含点的字面头部必须作为子串出现在域名里
+                self._anchor_contains = self._anchor_contains or head
+            elif not double_bar and anchored_start and not self._anchor_suffix:
+                # 只有单竖线 |head*（字符串开头锚定）才能用前缀锚点
+                self._anchor_prefix = head
+            else:
+                # ||head*（域名边界语义）不要求域名以 head 开头（可匹配
+                # sub.head…），但 head 必然作为子串出现
+                self._anchor_contains = self._anchor_contains or head
+
     def matches(self, domain: str) -> bool:
         """检查域名是否匹配此规则"""
         # ★ Phase 1: 紧凑匹配路径（无需正则）
@@ -1016,7 +1368,8 @@ class DomainIndex:
     ★ Phase 2: 单规则域名直接用对象而非 List 包装。
     """
 
-    __slots__ = ('_trie', '_pattern_rules', '_count', '_free_regex_count')
+    __slots__ = ('_trie', '_pattern_rules', '_count', '_free_regex_count',
+                 '_pat_suffix', '_pat_sld', '_pat_prefix', '_pat_other')
 
     # 自由正则规则数达到上限时的告警只提示一次（类级共享）
     _warned_free_regex_full = False
@@ -1024,11 +1377,20 @@ class DomainIndex:
     def __init__(self):
         # ★ Phase 1: 紧凑 Trie 替代 _by_domain Dict
         self._trie = _DomainTrie()
-        # 复杂正则/通配规则（无法用紧凑匹配的）
+        # 全部通配符/正则规则（保持加载顺序；has_domain/domain_count 仍用它）
         self._pattern_rules: List[FilterRule] = []
         self._count = 0
         # /regex/ 自由正则规则计数（用于上限控制，防线性遍历放大）
         self._free_regex_count = 0
+        # ★ pattern 规则分组索引：用「匹配必要条件」把线性遍历拆成 O(1) 分组
+        #   _pat_suffix: 后缀锚点（域名后缀 → 规则），如 ||a*.b.com^ → "b.com"
+        #   _pat_sld   : SLD 锚点（倒数第二段 → 规则），如 ||x.* → "x"
+        #   _pat_prefix: 前缀锚点（|head 开头）
+        #   _pat_other : 无法锚定（自由正则等），仍线性但数量少
+        self._pat_suffix: Dict[str, List[FilterRule]] = {}
+        self._pat_sld: Dict[str, List[FilterRule]] = {}
+        self._pat_prefix: List[FilterRule] = []
+        self._pat_other: List[FilterRule] = []
 
     def add_rule(self, rule: FilterRule, index_domain: Optional[str]):
         """
@@ -1057,19 +1419,34 @@ class DomainIndex:
                 rt = _RT_IMPORTANT_SUBDOMAIN if rule._match_subdomains else _RT_IMPORTANT_EXACT
             else:
                 rt = _RT_BLOCK_SUBDOMAIN if rule._match_subdomains else _RT_BLOCK_EXACT
-            self._trie.add(index_domain, rt, rule.dnsrewrite, rule.raw)
-        elif index_domain:
-            # 有域名但不能紧凑匹配（如含通配符）→ 需保留 FilterRule
-            self._pattern_rules.append(rule)
+            # raw 只给「重要规则」保留（数量少、排查时有用）。普通规则不存原文：
+            # 54 万条规则每条多存 40 字符原文 ≈ 40MB，而匹配完全不需要它
+            # （_MatchInfo.raw 已有 compact:block 这类可读兜底）。
+            self._trie.add(
+                index_domain, rt, rule.dnsrewrite,
+                rule.raw if rule.is_important else "",
+            )
         else:
+            # 通配符 / 正则 / 前缀 / 后缀规则：保留 FilterRule，并按「匹配必要
+            # 条件」挂到分组索引（后缀 / SLD / 前缀 / 其它），避免未命中时线性
+            # 跑全部正则。
+            rule._order = self._count
             self._pattern_rules.append(rule)
+            if rule._anchor_suffix:
+                self._pat_suffix.setdefault(rule._anchor_suffix, []).append(rule)
+            elif rule._anchor_sld:
+                self._pat_sld.setdefault(rule._anchor_sld, []).append(rule)
+            elif rule._anchor_prefix:
+                self._pat_prefix.append(rule)
+            else:
+                self._pat_other.append(rule)
         self._count += 1
 
     def match(self, domain: str) -> Optional[Tuple[object, str]]:
         """
         匹配域名，返回 (匹配对象, 匹配方式)。
-        
-        ★ Phase 1: 先查 Trie（紧凑匹配），再查 _pattern_rules（正则）
+
+        ★ Phase 1: 先查 Trie（紧凑匹配），未命中再查 pattern 规则（分组索引）
         """
         domain_lower = domain.lower().rstrip('.')
 
@@ -1078,15 +1455,100 @@ class DomainIndex:
         if trie_result is not None:
             return trie_result
 
-        # 2. _pattern_rules 正则匹配（复杂规则）
-        for rule in self._pattern_rules:
+        # 2. pattern 规则：按「匹配必要条件」分组定位，避免线性跑全部正则
+        if not self._pattern_rules:
+            return None
+        rule = self._match_patterns(domain_lower)
+        if rule is None:
+            return None
+        return rule, "模式匹配"
+
+    def _match_patterns(self, domain: str) -> Optional[FilterRule]:
+        """在 pattern 规则里找**序号最小**的命中项（等价于旧实现的列表顺序优先）。
+
+        分组后每组内部仍按加载顺序排列，所以组内第一个命中就是该组最优；
+        跨组再比较 `_order` 取最小，保证与「线性遍历 + 第一个命中即返回」
+        完全等价。组内先用 contains/prefix 锚点做 C 级预筛，只有可能命中的
+        规则才进正则引擎。
+        """
+        best: Optional[FilterRule] = None
+        best_order = -1
+        labels = domain.split('.')
+        n = len(labels)
+
+        # 1. 后缀锚点组：候选后缀（本域 + 各级父域，反转后即前缀）
+        pat_suffix = self._pat_suffix
+        if pat_suffix and n:
+            acc = labels[-1]
+            for i in range(n):
+                if i:
+                    acc = labels[n - i - 1] + '.' + acc
+                rules = pat_suffix.get(acc)
+                if not rules:
+                    continue
+                for r in rules:
+                    if best is not None and r._order > best_order:
+                        break
+                    ac = r._anchor_contains
+                    if ac and ac not in domain:
+                        continue
+                    try:
+                        if r.matches(domain):
+                            best = r
+                            best_order = r._order
+                            break
+                    except Exception:
+                        continue
+
+        # 2. SLD 锚点组（||x.*）：域名倒数第二段
+        pat_sld = self._pat_sld
+        if pat_sld and n >= 2:
+            rules = pat_sld.get(labels[-2])
+            if rules:
+                for r in rules:
+                    if best is not None and r._order > best_order:
+                        break
+                    ac = r._anchor_contains
+                    if ac and ac not in domain:
+                        continue
+                    try:
+                        if r.matches(domain):
+                            best = r
+                            best_order = r._order
+                            break
+                    except Exception:
+                        continue
+
+        # 3. 前缀锚点组（|head）
+        for r in self._pat_prefix:
+            if best is not None and r._order > best_order:
+                break
+            if not domain.startswith(r._anchor_prefix):
+                continue
             try:
-                if rule.matches(domain_lower):
-                    return rule, "模式匹配"
+                if r.matches(domain):
+                    best = r
+                    best_order = r._order
+                    break
             except Exception:
                 continue
 
-        return None
+        # 4. 其余（无法锚定：自由正则 / 无点通配等），线性 + contains 预筛
+        for r in self._pat_other:
+            if best is not None and r._order > best_order:
+                break
+            ac = r._anchor_contains
+            if ac and ac not in domain:
+                continue
+            try:
+                if r.matches(domain):
+                    best = r
+                    best_order = r._order
+                    break
+            except Exception:
+                continue
+
+        return best
 
     def has_domain(self, domain: str) -> bool:
         """域名是否在索引中（快速检查）"""
@@ -1104,8 +1566,21 @@ class DomainIndex:
     def clear(self):
         self._trie.clear()
         self._pattern_rules.clear()
+        self._pat_suffix.clear()
+        self._pat_sld.clear()
+        self._pat_prefix.clear()
+        self._pat_other.clear()
         self._count = 0
         self._free_regex_count = 0
+
+    def finalize(self):
+        """把域名索引的增量区归并进排序扁平表（加载结束后调用）。
+
+        `_DomainTrie` 采用「增量 dict + 排序扁平表」两段式存储：add 只写
+        dict（同域名按优先级合并），finalize 一次性归并并释放临时 dict。
+        增量超过阈值时 trie 也会自动归并，所以即使漏调也不会无限涨内存。
+        """
+        self._trie.finalize()
 
     @property
     def count(self) -> int:
@@ -1121,6 +1596,14 @@ class _EncryptedDNSResolver:
     """
     aiohttp 自定义 DNS 解析器 — 使用程序中的加密上游（DoH/DoT/DoQ）解析域名。
     实现 aiohttp 的 resolver 接口，用于过滤规则下载时的安全域名解析。
+
+    解析路径**跟随当前上游配置**（不额外走 bootstrap 明文）：
+      * `iterative.enabled=true` 且没有加密上游（纯迭代模式，`upstream.enabled=false`）
+        → 走迭代解析（根→TLD→权威），与用户查询同一条链路；
+      * `upstream.enabled=true` → 走 `resolver_manager` 的上游调度
+        （优选加密 DoH/DoT/DoQ，迭代按 `iterative.prefer` 参与首波/兜底）。
+    规则下载只需要拿到 CDN 的 A/AAAA（响应内容另过 HTML/二进制校验），
+    这里不做额外的隐私降级或旁路。
     """
 
     def __init__(self, resolver_manager):
@@ -1283,6 +1766,14 @@ class FilterEngine:
         # $dnsrewrite 匹配结果缓存
         self._badfilter_lock: threading.Lock = threading.Lock()
         self._last_dnsrewrite: Optional[dict] = None
+        # ===== 解析入口预过滤统计（不进内存的规则）=====
+        # DNS 层只加载「域名拦截 / 放行」规则；HTML 过滤规则（元素隐藏 /
+        # 扩展 CSS / CSS 注入 / scriptlet / HTML 过滤）与带 AdGuard DNS 文档
+        # 未列出修饰符的规则（$third-party / $script / $redirect / $cookie …）
+        # 在解析入口就丢弃，连 FilterRule 对象都不创建。
+        # 这两个计数供日志与 /stats 观测"到底有多少规则被省掉了"。
+        self._skipped_html_rules = 0
+        self._skipped_modifier_rules = 0
         # ========== Atomic reload: pending state ==========
         # Rule reload writes new rules to pending indices while active indices
         # continue answering DNS queries. Atomically swap on success.
@@ -1321,7 +1812,8 @@ class FilterEngine:
             return None
         if line.startswith("!") or line.startswith("#"):
             return None
-        if "##" in line or "#@#" in line or "$$" in line:
+        # HTML 过滤规则（元素隐藏 / scriptlet / HTML 过滤）不是域名规则
+        if is_html_filter_rule(line):
             return None
 
         while line.startswith("@@"):
@@ -1432,20 +1924,10 @@ class FilterEngine:
             if len(rule.raw) > 40:
                 rule.raw = rule.raw[:40] + "…"
 
-        # 为纯域名拦截规则（无通配符/正则）添加快速 set-lookup
-        # 例外规则不加入 _plain_domains：该检查在白名单之后执行，
-        # 已由 allowlist 放行的域名不会再被这里拦截；
-        # _plain_domains 仅作为拦截快速路径，白名单不需要在此记录。
-        if not rule.is_exception and not rule.is_regex and not rule._skip:
-            domain = rule_text.strip().lower().rstrip('^')
-            # 去除 || 和 *. 前缀，提取实际域名用于快速查找
-            if domain.startswith('||'):
-                domain = domain[2:]
-            if domain.startswith('*.'):
-                domain = domain[2:]
-            # 仅当规则是普通域名（不含 * ? 等特殊字符）
-            if domain and '.' in domain and '*' not in domain and '/' not in domain:
-                plain_domains.add(domain)
+        # 说明：早期版本会把"纯域名拦截规则"再存一份到 _plain_domains（Set[str]）
+        # 作为 check_domain 的快速路径。实测 54 万条规则时这第二份副本约 38MB，
+        # 而 `_DomainTrie` 本身已能精确匹配（且 check_domain 里 trie 结果同样在
+        # 白名单之后才生效），因此不再重复存储——过滤语义不变。
 
     @staticmethod
     def _extract_badfilter_target(rule_text: str) -> Optional[str]:
@@ -1460,14 +1942,48 @@ class FilterEngine:
         pattern = rule_text.split('$')[0] if '$' in rule_text else rule_text
         return pattern in self._badfilter_patterns
 
+    def _finalize_indexes(self):
+        """把域名索引的增量区归并进排序扁平表（释放加载期临时内存）。
+
+        `_DomainTrie` 加载时先写增量 dict（同域名按优先级合并），加载结束再
+        一次性归并成「反转键排序表」。因此每条加载路径结束时都要调用一次；
+        原子重载的 pending 索引同样处理。
+        """
+        for index in (self._block_index, self._allow_index,
+                      self._pending_block_index, self._pending_allow_index):
+            if index is None:
+                continue
+            try:
+                index.finalize()
+            except Exception as e:
+                logger.debug("域名索引 finalize 异常: %s", e)
+
     def _compile_rules(self, cleaned_text: str, source: str = "memory"):
         """
         编译清理后的规则文本为 FilterRule 对象并建立索引
 
         两阶段加载：先收集 $badfilter 目标，再索引剩余规则。
+
+        ★ 解析入口预过滤（两阶段都生效）：HTML 过滤规则（元素隐藏 / 扩展 CSS /
+        CSS 注入 / scriptlet / HTML 过滤）与带 AdGuard DNS 文档未列出修饰符的
+        规则（$third-party / $script / $image / $redirect / $cookie / $csp …）
+        在这里直接丢弃——**不构造 FilterRule 对象、不进 trie/pattern 索引、
+        不参与匹配、不占内存**。DNS 层只能看到域名与查询类型，这些规则既不可
+        评估也没有意义（浏览器/HTTP 级过滤）。文档要求：含未列出修饰符的规则
+        必须忽略整条，以免把浏览器过滤列表套到 DNS 层产生误报。
         """
         count = 0
         skip_count = 0
+        skipped_html = 0
+        skipped_modifier = 0
+
+        def _prefilter(line: str) -> int:
+            """0 = 可能是 DNS 规则；1 = HTML 过滤规则；2 = 带非 DNS 修饰符"""
+            if is_html_filter_rule(line):
+                return 1
+            if has_non_dns_modifier(line):
+                return 2
+            return 0
 
         # 第一阶段：收集 $badfilter 目标 pattern
         for line in cleaned_text.splitlines():
@@ -1475,6 +1991,8 @@ class FilterEngine:
             if not line:
                 continue
             if '$' not in line:
+                continue
+            if _prefilter(line):
                 continue
             rule = FilterRule(line)
             if rule.is_badfilter:
@@ -1486,6 +2004,14 @@ class FilterEngine:
         for line in cleaned_text.splitlines():
             line = line.strip()
             if not line:
+                continue
+
+            kind = _prefilter(line)
+            if kind == 1:
+                skipped_html += 1
+                continue
+            if kind == 2:
+                skipped_modifier += 1
                 continue
 
             rule = FilterRule(line)
@@ -1502,6 +2028,9 @@ class FilterEngine:
 
             self._index_rule(rule, line)
             count += 1
+
+        self._skipped_html_rules += skipped_html
+        self._skipped_modifier_rules += skipped_modifier
 
         # 原子重载期间使用 pending 计数
         if self._pending_block_index is not None:
@@ -1528,17 +2057,40 @@ class FilterEngine:
                 source, count,
                 total, block_domains, allow_domains,
             )
+        if skipped_html or skipped_modifier:
+            logger.info(
+                "  %s: 跳过 %d 条非 DNS 规则（HTML 过滤 %d 条 / 非 DNS 修饰符 %d 条）"
+                "——未建对象、未入索引",
+                source, skipped_html + skipped_modifier, skipped_html, skipped_modifier,
+            )
 
     def load_rules_from_text(self, text: str, source: str = "memory"):
         """
         从文本加载规则（完整流程：解析 → 编译）
+
+        解析阶段（AdGuardRuleParser.parse）与编译阶段（_compile_rules）都会
+        按 DNS 语法预过滤：HTML 过滤规则、带非 DNS 修饰符的规则一律丢弃，
+        既不构造 FilterRule 也不进任何索引。这里把解析阶段的丢弃数并入统计，
+        使 `stats["skipped_html_rules"] / ["skipped_modifier_rules"]` 反映
+        **本地文件 + 内存文本**的完整口径。
         """
         try:
             cleaned_text, parse_res = self._parser.parse_to_text(text)
+            self._skipped_html_rules += parse_res.skipped_html
+            self._skipped_modifier_rules += parse_res.skipped_non_dns
             if parse_res.rules_count > 0:
                 self._compile_rules(cleaned_text, source=source)
             if parse_res.title and not self._title:
                 self._title = parse_res.title
+            self._finalize_indexes()
+            if parse_res.skipped_html or parse_res.skipped_non_dns:
+                logger.info(
+                    "  %s: 解析阶段跳过 %d 条非 DNS 规则（HTML 过滤 %d 条 / "
+                    "非 DNS 修饰符 %d 条）——未建对象、未入索引",
+                    source,
+                    parse_res.skipped_html + parse_res.skipped_non_dns,
+                    parse_res.skipped_html, parse_res.skipped_non_dns,
+                )
             return parse_res
         except ValueError as e:
             logger.error("解析 %s 失败: %s", source, e)
@@ -1613,31 +2165,87 @@ class FilterEngine:
             logger.error("从 URL %s 加载规则失败: %s", url, e)
             return None
 
+    async def _decode_utf8_incremental(self, data: bytes, step: int = 2_000_000) -> str:
+        """把大块 bytes 增量解码成 str，并按块让出事件循环
+
+        为什么不用 `data.decode("utf-8", errors="replace")` 一次到位：
+        规则文件 20-40MB，一次性解码是数秒级的纯 C 操作，持 GIL 不释放，
+        事件循环线程被完全饿死 —— 加载期间进程内的 DNS 服务一个查询都处理不了
+        （实测下载完成瞬间有 7.5s 停顿）。
+        增量解码器（codecs.IncrementalDecoder）能正确处理跨块的多字节字符，
+        每块之间 await sleep(0) 让事件循环处理在飞的 DNS 查询/上游响应。
+        """
+        dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        total = len(data)
+        parts: List[str] = []
+        pos = 0
+        while pos < total:
+            end = min(pos + step, total)
+            parts.append(dec.decode(data[pos:end]))
+            pos = end
+            await asyncio.sleep(0)
+        parts.append(dec.decode(b"", True))
+        return "".join(parts)
+
     async def _process_rules_from_text(self, text: str, url: str) -> bool:
         """
         两遍解析全文规则并索引（使用 ThreadPoolExecutor 多线程并行）。
         第 1 遍：收集 $badfilter 目标（确保顺序无关）
         第 2 遍：索引规则，跳过被 badfilter 禁用的
         调用方须确保 text 已通过 HTML/二进制检测。
+
+        ★ 与 `_compile_rules` 一致：HTML 过滤规则与带非 DNS 修饰符的规则在
+        两遍扫描的入口就被丢弃（不构造 FilterRule、不入索引、不参与匹配）。
+        远程列表（EasyList 之类）里这类规则占比可能很高，提前丢弃既省内存
+        也省掉每行的正则编译成本。
         """
-        lines = text.splitlines()
-        if not lines:
+        loop = asyncio.get_running_loop()
+        # **分块取行**（2026-10-30）：一次性 `text.splitlines()` 对 100-200 万行
+        # 是 7-8s 的纯 C 操作（实测 hagezi tif 185 万行 = 7.81s），而 CPython 的
+        # C 字符串操作在释放 GIL 前不可中断——即使丢进线程池，事件循环线程也会
+        # 被饿死 7.8s，进程内的 DNS 服务一个查询都处理不了（用户看到的
+        # 「开了 filter 后游戏加载不出/网络问题」正是这类停顿）。
+        # 这里按 ~2MB 文本切块（对齐到换行边界），每块单独 splitlines：
+        # 单次占用 GIL 约 0.4s，块与块之间 await sleep(0) 让事件循环处理在飞的
+        # DNS 查询。总加载时间略增，但服务不再出现秒级「黑洞」。
+        _text = text
+        _text_len = len(_text)
+        _CHUNK_CHARS = 2_000_000
+
+        def _take_chunk(pos: int):
+            """切出下一块文本并 splitlines，返回 (lines, next_pos)
+
+            边界处理：优先在块内**最后一个换行符**处切开，保证不把一行规则
+            劈成两半。若块内没有换行（某条规则长度超过 _CHUNK_CHARS，理论上
+            可能出现在畸形/被拼接的列表里），则**向后找该行的换行符**而不是
+            硬切——硬切会让这一行变成两条无效规则（解析失败、规则丢失）。
+            """
+            end = min(pos + _CHUNK_CHARS, _text_len)
+            if end < _text_len:
+                nl = _text.rfind("\n", pos, end)
+                if nl > pos:
+                    end = nl + 1
+                else:
+                    # 块内无换行：扩大到下一个换行（找不到就取到文本末尾）
+                    nxt = _text.find("\n", end)
+                    end = (_text_len if nxt < 0 else nxt + 1)
+            return _text[pos:end].splitlines(), end
+
+        if _text_len == 0:
             return False
 
-        NUM_WORKERS = 4
-        chunk_size = (len(lines) + NUM_WORKERS - 1) // NUM_WORKERS
-        loop = asyncio.get_running_loop()
-
         # ===== 第 1 遍：收集 $badfilter 目标（确保顺序无关）=====
-        def collect_badfilters(start: int, end: int):
+        def collect_badfilters(chunk_lines):
             """扫描一个分块，收集 $badfilter 目标 pattern"""
-            for i in range(start, end):
-                raw_line = lines[i]
+            for raw_line in chunk_lines:
                 # 快速跳过：不含 $ 的行不可能有 badfilter
                 if "$" not in raw_line:
                     continue
                 stripped = raw_line.rstrip("\r").strip()
                 if not stripped:
+                    continue
+                # 非 DNS 规则不可能贡献 badfilter（HTML 过滤 / 浏览器级修饰符）
+                if is_html_filter_rule(stripped) or has_non_dns_modifier(stripped):
                     continue
                 cleaned = AdGuardRuleParser._clean_rule_line(stripped)
                 if cleaned is None:
@@ -1648,42 +2256,78 @@ class FilterEngine:
                     if target:
                         with self._badfilter_lock: self._badfilter_patterns.add(target)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=NUM_WORKERS) as pool:
-            tasks = []
-            for i in range(0, len(lines), chunk_size):
-                end = min(i + chunk_size, len(lines))
-                tasks.append(
-                    loop.run_in_executor(pool, collect_badfilters, i, end)
-                )
-            try:
-                await asyncio.gather(*tasks)
-            except (StopIteration, RuntimeError) as e:
-                # PEP 479：worker/协程内逸出的 StopIteration 会被 asyncio 转成
-                # RuntimeError("coroutine raised StopIteration")。baifilter 收集失败
-                # 只影响 $badfilter 生效范围，不应让整次规则加载失败。
-                logger.warning("规则解析阶段异常（已忽略该遍）: %r", e)
+        # 单 worker 串行：$badfilter 收集与索引都必须保持"按文件顺序"，且
+        # `_index_rule` 写 `_pending_*` 索引，串行写入与原实现语义完全一致。
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            _pos = 0
+            while _pos < _text_len:
+                try:
+                    _chunk_lines, _pos = await loop.run_in_executor(
+                        pool, _take_chunk, _pos
+                    )
+                    await loop.run_in_executor(pool, collect_badfilters, _chunk_lines)
+                except (StopIteration, RuntimeError) as e:
+                    # PEP 479：worker 内逸出的 StopIteration 会被 asyncio 转成
+                    # RuntimeError("coroutine raised StopIteration")。$badfilter
+                    # 收集失败只影响 badfilter 生效范围，不应让整次加载失败。
+                    logger.warning("规则解析阶段异常（已忽略该块）: %r", e)
+                await asyncio.sleep(0)
 
         # ===== 第 2 遍：索引规则（_index_rule 自动处理 pending/active）=====
         _index_rule = self._index_rule
         _is_rule_badfiltered = self._is_rule_badfiltered
         FilterRule_ = FilterRule
+
+        def _index_chunk(chunk_lines):
+            """索引一个分块，返回 (规则数, 跳过HTML, 跳过修饰符)"""
+            _total = 0
+            _html = 0
+            _mod = 0
+            for raw_line in chunk_lines:
+                stripped = raw_line.strip()
+                if not stripped or stripped.startswith("!") or stripped.startswith("#"):
+                    continue
+                # 解析入口预过滤：HTML 过滤规则 / 带非 DNS 修饰符的规则 → 直接丢弃
+                if is_html_filter_rule(stripped):
+                    _html += 1
+                    continue
+                if has_non_dns_modifier(stripped):
+                    _mod += 1
+                    continue
+                rule = FilterRule_(stripped)
+                if rule._skip or rule.is_badfilter:
+                    continue
+                # ★ BUGFIX: 使用 cleaned 行检查 badfilter（与第 1 阶段格式一致）
+                cleaned = AdGuardRuleParser._clean_rule_line(stripped)
+                if cleaned is not None and _is_rule_badfiltered(cleaned):
+                    continue
+                _index_rule(rule, stripped)
+                _total += 1
+            return _total, _html, _mod
+
         total_rules = 0
-        for raw_line in lines:
-            stripped = raw_line.strip()
-            if not stripped or stripped.startswith("!") or stripped.startswith("#"):
-                continue
-            # 快速跳过 cosmetic 规则（避免 FilterRule._parse 无谓开销）
-            if "##" in stripped or "#@#" in stripped or "$$" in stripped or "#%#" in stripped:
-                continue
-            rule = FilterRule_(stripped)
-            if rule._skip or rule.is_badfilter:
-                continue
-            # ★ BUGFIX: 使用 cleaned 行检查 badfilter（与第 1 阶段格式一致）
-            cleaned = AdGuardRuleParser._clean_rule_line(stripped)
-            if cleaned is not None and _is_rule_badfiltered(cleaned):
-                continue
-            _index_rule(rule, stripped)
-            total_rules += 1
+        skipped_html = 0
+        skipped_modifier = 0
+        # 单 worker：`_index_rule` 会写 `_pending_*` 索引，串行执行保持与
+        # 原实现完全相同的写入顺序与语义（不引入并发写入的竞态）。
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ipool:
+            _pos = 0
+            while _pos < _text_len:
+                _chunk_lines, _pos = await loop.run_in_executor(
+                    ipool, _take_chunk, _pos
+                )
+                if _chunk_lines:
+                    _n, _h, _m = await loop.run_in_executor(
+                        ipool, _index_chunk, _chunk_lines
+                    )
+                    total_rules += _n
+                    skipped_html += _h
+                    skipped_modifier += _m
+                # 让出事件循环：处理此刻在飞的 DNS 查询/上游响应
+                await asyncio.sleep(0)
+
+        self._skipped_html_rules += skipped_html
+        self._skipped_modifier_rules += skipped_modifier
 
         # 跟踪 URL（与流式路径一致）
         if self._pending_block_index is not None:
@@ -1696,6 +2340,13 @@ class FilterEngine:
             total = self._rule_count
 
         logger.info("从 %s 加载了 %d 条规则 (总: %d)", url, total_rules, total)
+        if skipped_html or skipped_modifier:
+            logger.info(
+                "  %s: 跳过 %d 条非 DNS 规则（HTML 过滤 %d 条 / 非 DNS 修饰符 %d 条）"
+                "——未建对象、未入索引",
+                url, skipped_html + skipped_modifier, skipped_html, skipped_modifier,
+            )
+        self._finalize_indexes()
         return total_rules > 0
 
     async def _download_url_parallel(self, url: str, num_chunks: int = 8,
@@ -1832,7 +2483,7 @@ class FilterEngine:
             parallel_data = await self._download_url_parallel(url)
             if parallel_data is not None:
                 # 并行下载成功 → 全量文本解析
-                text = parallel_data.decode("utf-8", errors="replace")
+                text = await self._decode_utf8_incremental(parallel_data)
                 # HTML 检测
                 if self._parser._looks_like_html(text):
                     logger.error("URL %s 内容包含 HTML，跳过", url)
@@ -1876,7 +2527,7 @@ class FilterEngine:
                                      url, len(raw), DEFAULT_MAX_SIZE)
                         return False
 
-                    text = raw.decode("utf-8", errors="replace")
+                    text = await self._decode_utf8_incremental(raw)
 
                     # HTML 检测
                     if self._parser._looks_like_html(text):
@@ -1928,7 +2579,7 @@ class FilterEngine:
                         logger.error("URL %s 实际大小 %d 超过限制 %d",
                                      url, len(raw), DEFAULT_MAX_SIZE)
                         return False
-                    text = raw.decode("utf-8", errors="replace")
+                    text = await self._decode_utf8_incremental(raw)
                     if self._parser._looks_like_html(text):
                         logger.error("URL %s 内容包含 HTML，跳过", url)
                         return False
@@ -1964,12 +2615,22 @@ class FilterEngine:
 
         # 2. 创建 pending 状态（不触碰活跃索引）
         gc.collect(generation=2)
+        # 重载会**重建**整份索引：此时 checksum 命中跳过解析＝把该文件的规则
+        # 直接丢掉（pending 里只剩远程 URL 的规则），因此重载路径必须清空
+        # checksum 缓存强制重解析；badfilter 集合同理，否则旧列表的
+        # $badfilter 会永久压制新列表里的同名规则。
+        self._file_checksums.clear()
+        with self._badfilter_lock:
+            self._badfilter_patterns.clear()
         self._pending_block_index = DomainIndex()
         self._pending_allow_index = DomainIndex()
         self._pending_plain_domains = set()
         self._pending_rule_count = 0
         self._pending_loaded_files = []
         self._pending_loaded_urls = []
+        # 预过滤统计按「本次加载」重新累计（旧值随旧规则集一起作废）
+        self._skipped_html_rules = 0
+        self._skipped_modifier_rules = 0
         self._loading = True
 
         # 3. 加载到 pending 状态
@@ -1982,6 +2643,9 @@ class FilterEngine:
                     *[self.load_rules_from_url_async(url) for url in urls],
                     return_exceptions=True,
                 )
+
+            # 域名索引：把增量区归并进排序扁平表（释放临时 dict）
+            self._finalize_indexes()
 
             # 4. 原子交换或恢复
             if self._pending_rule_count == 0 and saved_state['rule_count'] > 0:
@@ -2041,12 +2705,20 @@ class FilterEngine:
 
         # 2. 创建 pending 状态（不触碰活跃索引）
         gc.collect(generation=2)
+        # 与 async_reload 一致：重载重建索引，checksum 缓存必须失效强制重解析，
+        # 否则本地规则在重载后整体消失；badfilter 集合也随旧规则集作废。
+        self._file_checksums.clear()
+        with self._badfilter_lock:
+            self._badfilter_patterns.clear()
         self._pending_block_index = DomainIndex()
         self._pending_allow_index = DomainIndex()
         self._pending_plain_domains = set()
         self._pending_rule_count = 0
         self._pending_loaded_files = []
         self._pending_loaded_urls = []
+        # 预过滤统计按「本次加载」重新累计（旧值随旧规则集一起作废）
+        self._skipped_html_rules = 0
+        self._skipped_modifier_rules = 0
         self._loading = True
 
         # 3. 加载到 pending 状态
@@ -2072,6 +2744,9 @@ class FilterEngine:
                         self._pending_loaded_urls.append(url)
                     except Exception as e:
                         logger.error("从 %s 加载规则失败: %s", url, e)
+
+            # 域名索引：把增量区归并进排序扁平表（释放临时 dict）
+            self._finalize_indexes()
 
             # 4. 原子交换或恢复
             if self._pending_rule_count == 0 and saved_state['rule_count'] > 0:
@@ -2190,13 +2865,10 @@ class FilterEngine:
             logger.debug("放行(白名单): %s | %s: %s", domain, method, rule.raw[:60])
             return False, ""
 
-        # 3b. 快速纯域名 set 查找（在白名单之后，防止绕过白名单）
-        if domain in self._plain_domains:
-            reason = "plain_domain_block"
-            if not self._cache_suspended:
-                self._filter_cache[domain] = (True, reason, now, False)
-            self._defer_trim()
-            return True, reason
+        # 3b.（已移除）早期在这里用 _plain_domains 做"纯域名快速 set 查找"。
+        # 该集合是 trie 的第二份域名副本（54 万条 ≈38MB），而步骤 2 的
+        # `_block_index.match()` 已通过紧凑 trie 得到同样的结果，且同样在
+        # 白名单之后生效（步骤 4），故删除以省内存。过滤语义不变。
 
         # 4. 使用步骤 2 保存的 block 匹配结果（如有）
         if block_rule_result is not None:
@@ -2470,6 +3142,9 @@ class FilterEngine:
             "important_rules": 0,  # 不再单独追踪，包含在 block_rules 中
             "block_index_domains": self._block_index.domain_count,
             "allow_index_domains": self._allow_index.domain_count,
+            # 解析入口按 DNS 语法预过滤掉的规则（未建对象、未入索引、不占内存）
+            "skipped_html_rules": self._skipped_html_rules,
+            "skipped_modifier_rules": self._skipped_modifier_rules,
             "filter_cache_size": len(self._filter_cache),
             "loaded_files": self._loaded_files,
             "loaded_urls": self._loaded_urls,

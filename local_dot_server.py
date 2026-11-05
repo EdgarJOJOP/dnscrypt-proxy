@@ -115,7 +115,10 @@ class LocalDoTServer:
             rcode = msg.rcode()
         except Exception:
             return False
-        if rcode in (dns.rcode.NXDOMAIN, dns.rcode.REFUSED):
+        # RFC 2308 §7：只允许缓存 NXDOMAIN 与 NODATA。REFUSED / SERVFAIL 属于
+        # 错误应答，不是"名字不存在"，不能当负应答（缓存层 cache.set 亦已直接
+        # 拒绝非 NOERROR/NXDOMAIN 的响应，这里同步去掉避免语义混淆）。
+        if rcode == dns.rcode.NXDOMAIN:
             return True
         return rcode == dns.rcode.NOERROR and not msg.answer
 
@@ -390,27 +393,41 @@ class LocalDoTServer:
                 if blocked:
                     block_reason = reason
                     status = "blocked"
+                    # 缓存键**不含 DO/CD**（拦截响应与 DNSSEC 无关，详见 plain_dns_server 注释）；
+                    # 并**先查缓存**，命中直接返回。
+                    _block_key = (question.name, question.rdtype, question.rdclass)
+                    if self.config.cache_enabled:
+                        _hit = await self.cache.get(_block_key)
+                        if _hit is not None:
+                            import copy as _copy
+                            _hit = _copy.copy(_hit)
+                            _hit.id = query.id
+                            await self._log_query(
+                                client_ip, qname, qtype_name, "cached", block_reason)
+                            return _hit.to_wire()
+                    # 拦截统一返回 NXDOMAIN（2026-10-30，详见 plain_dns_server 注释）
                     response = dns.message.make_response(query)
-                    rdtype = question.rdtype
-                    if rdtype == dns.rdatatype.A:
-                        response.answer.append(
-                            dns.rrset.RRset(question.name, question.rdclass, dns.rdatatype.A)
-                        )
-                        response.answer[0].add(dns.rdtypes.IN.A.A(dns.rdataclass.IN, dns.rdatatype.A, "0.0.0.0"), ttl=3600)  # nosec B104 - blocked A record, not binding
-                        response.set_rcode(dns.rcode.NOERROR)
-                    elif rdtype == dns.rdatatype.AAAA:
-                        response.answer.append(
-                            dns.rrset.RRset(question.name, question.rdclass, dns.rdatatype.AAAA)
-                        )
-                        response.answer[0].add(dns.rdtypes.IN.AAAA.AAAA(dns.rdataclass.IN, dns.rdatatype.AAAA, "::"), ttl=3600)
-                        response.set_rcode(dns.rcode.NOERROR)
-                    else:
-                        response.set_rcode(dns.rcode.NXDOMAIN)
+                    response.set_rcode(dns.rcode.NXDOMAIN)
+                    response.flags |= dns.flags.RA   # RFC 1035：递归服务端
+                    # RFC 2308：补 SOA 让客户端能缓存负应答（详见 plain_dns_server 注释）
+                    try:
+                        _neg_ttl = int(getattr(self.config, "cache_negative_ttl", 60) or 60)
+                        response.authority.append(dns.rrset.from_text(
+                            question.name, _neg_ttl, "IN", "SOA",
+                            "blocked.invalid. hostmaster.blocked.invalid. 1 "
+                            "3600 600 86400 %d" % _neg_ttl,
+                        ))
+                    except Exception:
+                        pass
                     response_wire = response.to_wire()
+                    # 拦截占位打标（blocked=True）：规则放宽后由
+                    # _sweep_cache_after_filter_load 反向清理，避免旧拦截缓存
+                    # 把客户端挡到 TTL 到期
                     if self.config.cache_enabled:
                         await self.cache.set(
-                            cache_key, response,
+                            _block_key, response,
                             response.rcode() == dns.rcode.NXDOMAIN,
+                            blocked=True,
                         )
                     await self._log_query(client_ip, qname, qtype_name, status, block_reason)
                     return response_wire
@@ -439,7 +456,11 @@ class LocalDoTServer:
             else:
                 # DNSSEC 验证
                 dnssec_ok = True
-                if self._dnssec_wrapper is not None and self.config.dnssec_enabled:
+                # 纯迭代 + strict_dnssec 时迭代器内部已严格验证（resolver 层也
+                # 跳过），此处不再重复验证：既省 DNSKEY/DS 往返，也避免 wrapper
+                # 把合法 NXDOMAIN/NSEC 负应答误判 bogus → SERVFAIL。
+                if (self._dnssec_wrapper is not None and self.config.dnssec_enabled
+                        and not self.resolver_manager.iterative_already_verified()):
                     dnssec_ok, _ = await self._dnssec_wrapper.validate_response(wire_data, result_wire)
                     if not dnssec_ok and self.config.dnssec_drop_bogus:
                         response = dns.message.make_response(query)

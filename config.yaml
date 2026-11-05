@@ -13,6 +13,13 @@ server:
     cert_path: certs/localhost.crt
     key_path: certs/localhost.key
     # ------------------------------------------------------------
+    # 内部明文站点地址（h3 / TLS 前端把请求转发进来的地方，仅本机使用）
+    #   只接受回环地址：127.0.0.1 / ::1 / localhost
+    #   该站点是**明文 HTTP**，仅靠一个进程内随机 token 保护，绑到非回环
+    #   会把"内部"通道暴露到局域网；填了非回环值会被忽略并回退 127.0.0.1。
+    #   选 ::1 时内部站点走 IPv6（前端会自动补方括号拼 URL）。
+    internal_host: "127.0.0.1"
+    # ------------------------------------------------------------
     # 协议开关（降级链 h3 → h2 → h1.1；三者全关时回落 HTTP/1.1）
     #   http1_1: HTTP/1.1 over TLS（ALPN=http/1.1）
     #   http2  : HTTP/2 over TLS（ALPN=h2）
@@ -50,14 +57,14 @@ server:
   doq:
     enabled: false               # 默认关闭，设为 true 开启
     host: 127.0.0.1             # IPv4 监听地址
-    port: 784                   # 标准 DoQ 端口
+    port: 853                   # 标准 DoQ 端口
     domain: ''                  # 服务器域名（SNI），留空则使用证书 CN
     cert_path: certs/localhost.crt
     key_path: certs/localhost.key
     ipv6:
       enabled: false
       host: ::1
-      port: 784
+      port: 853
 
   # 本地纯 DNS 服务器（UDP 53，不加密，默认关闭）
   plain_dns:
@@ -87,7 +94,7 @@ upstream:
   #   注意：本段下的 dnssec: 配置不受此开关影响，始终完整生效——
   #         它就是 resolver 层统一验证链的配置，iterative 的响应同样经过它
   #         （迭代器内部另有 strict_dnssec 全链自举验证）。
-  enabled: true
+  enabled: false
   # bootstrap DNS：仅用于解析 DoH/DoT/DoQ 服务器的 IP 地址
   # 包含 IPv4 + IPv6 双栈 DNS 服务器
   # （upstream.enabled=false 时不会发起任何 bootstrap 查询）
@@ -122,6 +129,18 @@ upstream:
   # ============================================================
   preferred_count: 5          # 一致性验证后台对照的优选上游数量（consistency 关闭时不生效）
   suffix_dedup: true          # 上述优选是否避免同后缀域名（consistency 关闭时不生效）
+
+  # ============================================================
+  # 上游 DoH 协议策略（HTTP/1.1 永久禁用，不可配置开启）
+  #   http3: true = 首选 HTTP/3（QUIC，aioquic）——服务器不支持时自动降级 http2
+  #   http2: true = 其次 HTTP/2（ALPN=h2）
+  # ALPN 未协商到 h2/h3 的上游（只支持 HTTP/1.1）按**失败**处理，
+  # 绝不静默降级到明文 HTTP/1.1。两项都关时强制 http2=true。
+  # 注意：只约束上游；本地 DoH 前端对外协议仍由 server.doh.protocols 决定。
+  # ============================================================
+  doh_protocols:
+    http3: true
+    http2: true
 
   doh:
     - https://dns.alidns.com/dns-query
@@ -193,10 +212,26 @@ iterative:
   # 根服务器列表（留空或省略则使用内置 IANA 根列表）
   root_servers: ["2001:7fd::1","2001:500:2f::f","2001:503:c27::2:30","193.0.14.129","192.5.5.241","192.58.128.30"]
   # 单跳查询超时（毫秒）
-  timeout_ms: 1500
+  timeout_ms: 5000
+  # 每跳并行协程数：同一跳**同时**向 2 台候选服务器发非递归查询，哪个先回用
+  #   哪个（先回者胜）；任一台失败立即补发下一台。已失败的服务器超过本跳候选
+  #   总数的一半时**放弃本跳**（不再死磕剩下的服务器），迭代整体失败后回退到
+  #   按健康评分排序的优选加密上游（DoH/DoT/DoQ）。范围 1-preferred_count，默认 2。
+  hop_parallel: 2
+  # QNAME 最小化（RFC 9156）：向根/TLD 只发送「下一级名字」——
+  #   根只看到 com.、com. 只看到 example.com.，完整查询名只发给最终权威。
+  #   作用：减少隐私泄露（根/TLD 看不到完整域名）与根区负载。
+  #   对实现不规范的权威会自动回退全名查询（不会因此解析失败）。
+  #   排障时可临时设为 false 做对照（缓存起跳的查询本来就会跳过最小化）。
+  qname_minimization: true
   # 迭代最大深度（根→TLD→权威的跳数上限）
-  max_depth: 8
+  # 注意：**每跟一次 CNAME 也算一跳**，而 bilibili 这类站点的 CNAME 链常有 4-6 级
+  #（s1.hdslb.com → bstatic.hdslb.com → s1.hdslb.com.a.bdydns.com → opencdncloud*.jomodns.com），
+  # 再加上无 glue 的 NS 名还要单独迭代一遍；8 跳会在边界上频繁失败，因此放大到 16。
+  max_depth: 32
   # 严格 DNSSEC：签名链验证失败（bogus）时丢弃响应返回 SERVFAIL
+  # false = 跳过多余的 DNSKEY/DS 链验证（实测同一批域名快 2-3 倍）；
+  # 未签名/无法证明的响应直接放行（安全性与"上游不返回 DNSSEC 记录"时一致）。
   strict_dnssec: true
   # 全局确认：迭代结果与加密上游结果做一致性交叉验证（已废弃，仅保留兼容）
   cross_verify: false
@@ -204,13 +239,26 @@ iterative:
 cache:
   enabled: true
   max_size: 10000           # 最大缓存条目数，超限 LRU 淘汰
-  default_ttl: 1500          # 默认缓存时间（秒）
-  min_ttl: 600               # 最小缓存时间（秒）
-  max_ttl: 3600            # 最大缓存时间（秒）
-  negative_ttl: 60          # 负面应答缓存时间（秒）
+  default_ttl: 1500         # 无 TTL 信息时的缺省基线（秒），不是上限
+  min_ttl: 600              # 缓存 TTL 下限（秒），但**豁免极短 TTL**：
+                            #   ① 完全没有 TTL 信息时 → 作为兜底下限
+                            #   ② 上游 TTL > ttl_floor_threshold → 不足 min_ttl 的抬到 min_ttl
+                            #   ③ 上游 TTL <= ttl_floor_threshold → 完全按权威原值（不抬升）
+  max_ttl: 3600             # 缓存 TTL 上限（秒）：权威 TTL 超过它时向下截断
+  # ---- 非标准扩展：min_ttl 下限（**明确违反 RFC 2181 §5.1**）----
+  # 语义：**只有上游 TTL > 本阈值**的记录，才把不足 min_ttl 的缓存寿命抬到
+  #       min_ttl；TTL <= 本阈值的极短记录完全尊重权威原值。
+  # 为什么豁免极短 TTL：1-5 秒通常是 DDNS / 健康检查 / 动态调度，变化极快，
+  #       强行原地缓存会让客户端拿到过期数据（比"多回源几次"更糟）。
+  # 合规性：RFC 2181 §5.1 规定 TTL 不得增加；BIND 的 min-cache-ttl 同样被官方
+  #       标注为非标准扩展。追求严格合规时把本项设为 0（关闭全部抬升）。
+  # 副作用：抬升后缓存寿命变长，命中时返回给客户端的 TTL（= 缓存剩余寿命）
+  #       也随之变大，客户端会被动延长缓存。
+  ttl_floor_threshold: 5    # 秒；0 = 关闭（纯 RFC 行为：一律 min(上游TTL, max_ttl)）
+  negative_ttl: 60          # 负应答缓存**上限**（秒）：实际取 min(SOA.TTL, SOA.MINIMUM)
   cleanup_interval: 60      # 过期清理间隔（秒）
   # ---- 主动预刷新（正应答条目在过期前自动重新解析）----
-  # 开启后：后台用最小堆按「每条目最终 TTL（经 min_ttl/max_ttl 钳制）」动态调度，
+  # 开启后：后台用最小堆按「每条目最终 TTL（权威 TTL 经 max_ttl 向下钳制）」动态调度，
   #         没有固定扫描周期——条目剩余 TTL 降到 advance_ratio 比例时提前重查上游，
   #         使客户端访问始终命中未过期条目（避免"访问时才发现过期→本次请求等上游"）。
   #         队列无长度上限、可随时插入；每批处理 batch_size 条，上一批执行完再执行下一批。
@@ -265,17 +313,17 @@ filter:
     # 注释掉的全网收集的adguard拦截规则总和，容易误拦截
     # 说明：以 # 开头的行就是 YAML 注释，程序不会下载/加载它；
     #       日志里的「远程:N」只统计下面未注释的条目数量。
-    - https://gh-proxy.com/https://github.com/hululu1068/AdGuard-Rule/blob/main/rule/domain.txt
+    - https://cdn.jsdelivr.net/gh/hululu1068/AdGuard-Rule@main/rule/domain.txt
     #- https://cdn.jsdelivr.net/gh/hululu1068/AdGuard-Rule@main/rule/domain.txt
-    # 这个最全但是玩某些游戏时容易卡界面所以注释掉
+    - https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/tif.txt
     #- https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/pro.txt
-    # 这个很有用防止黑客攻击的，但是拦截规则很大
-    #- https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/tif.txt
   update_interval: 24
-  # 是否拦截后返回 NXDOMAIN
-  block_nxdomain: true
-  # 自定义拦截页面 IP（NXDOMAIN 模式下无效）
-  block_ip: 0.0.0.0
+  # 拦截统一返回 NXDOMAIN（2026-10-30）：
+  # 原 block_nxdomain / block_ip 两个配置项已废弃并删除。
+  # 原因：A/AAAA 被重写成 0.0.0.0/:: 会让客户端「连不上」并无限重试
+  # （实测 data.bilibili.com 一次会话被拦 1.8 万次），重试风暴叠加缓存预刷新
+  # 会把纯迭代上游打满，连带其它客户端解析超时。NXDOMAIN 让客户端按
+  # 「域名不存在」处理，直接停止重连。
 
 # ============================================================
 # 请求日志（异步缓冲写入）
@@ -331,9 +379,20 @@ tls:
 # ============================================================
 network_monitor:
   enabled: true
-  ping_interval: 0.05       # 网关检测间隔（秒，0.01 = 10ms）
+  # 网关检测间隔（秒）。原 0.05s（20 次/秒）过于激进：Windows 上一次
+  # ping 子进程的启动+回包本身就常超过 50ms，相邻两次探测互相排队，
+  # 丢包率被算虚（实测 v4gw=8/10 下一轮直接 0/10），于是误判
+  # 「网关丢包 100% / 外网不可达」→ set_network_down(True) → 所有 DNS
+  # 查询 1-6ms 返回 SERVFAIL（游戏/浏览器同时卡死）。
+  # 0.5s 仍能秒级发现真断网，又不会自己制造丢包。
+  ping_interval: 0.5
   external_interval: 15     # 外网 ping/DNS 探测间隔（秒）
-  ping_timeout: 0.085       # ping 超时（秒，与 ping_interval 一致）
+  # ping_timeout 同时用于：① ICMP 探活（ping 子进程超时）② plain DNS 探活
+  # （深度诊断时向 bootstrap DNS 发真实查询的超时）。原来 0.085s 是照
+  # ping_interval 取的，但明文 DNS 查询 85ms 内答不出来很正常，会被误判成
+  # 「plain DNS 也失败 → 网络中断」并 set_network_down 暂停全部解析。
+  # 调到 0.5s：ICMP 与明文 DNS 探活都够用，且不会明显拖慢监控循环。
+  ping_timeout: 0.5
   # ICMP ping 检测目标（IPv4 + IPv6 双栈）
   ping_targets_v4:
     - 223.5.5.5
@@ -455,12 +514,20 @@ performance:
   parallel_timeout: 2.0     # 并行查询超时（秒）
   max_concurrent: 1000      # 最大并发查询数（受 Windows 句柄数限制，需注册表调整 HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\Ancillary Function Driver for Winsock\Parameters\MaxUserPort，默认 16384，建议 ≥30000）
   max_concurrent_per_ip: 50 # 单 IP 最大并发查询数（127.0.0.1 和 ::1 除外）
+  # 迭代上游「同时在飞的单台 UDP 查询」上限（16-1024，默认 128）。
+  # 迭代查询走原生 asyncio 数据报端点，不经过 task_pool 的优先级闸门，
+  # 并发完全由这个值约束：超出的查询排队等待。
+  #   * 调小（如 32-64）：上游压力最小，但浏览器并发多时排队变长；
+  #   * 调大（如 256-512）：单次解析更快，但根/TLD 权威有 RRL 限速，
+  #     并发过高会出现「迭代解析连续全部失败」并波及其它客户端。
+  # 实测纯迭代 + 浏览器并发场景 128 是较稳的折中。
+  iterative_max_inflight: 128
   connection_pool_size: 1000 # 连接池大小（同时打开的上游连接数，每个 TCP 连接消耗 2-3 个句柄）
-  memory_limit_mb: 768      # 内存软限制（MB）
+  memory_limit_mb: 640      # 内存软限制（MB）；比 768 略低，让 optimizer 更早介入峰值
   cpu_core_limit: 2         # CPU 核心限制（0=自动=总核心数-1；手动设置如 4 表示最多用 4 核）
   # 说明：上面这行也决定「阻塞任务共享池」的线程数 = 核数 × 2
   #   （DNS 迭代查询 / NDP / ARP 的阻塞调用共用）。想更省资源就把它调小。
-  monitor_interval: 30      # 资源监控间隔（秒）
+  monitor_interval: 10      # 资源监控间隔（秒）；10s 才能及时抓住启动后/清缓存时的内存峰值
   aggressive_gc: true       # 低负载时主动 GC
   gc_interval: 60           # GC 触发间隔（秒）
   # ============================================================

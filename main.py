@@ -102,6 +102,36 @@ class _SanitizeLogFilter(logging.Filter):
 _SANITIZE_LOG_FILTER = _SanitizeLogFilter()
 
 
+class _QuietThirdPartyFilter(logging.Filter):
+    """第三方协议栈日志降噪（handler 级双保险）。
+
+    `setup_logging` 已把 hpack/h2/h11/quic/aioquic 这些 logger 的级别提到
+    WARNING，但第三方库可能在运行期把自己或子 logger 的级别重置为 DEBUG
+    （实测 proxy.log 出现过 ``DEBUG [hpack.hpack] Encoding 8 with 6 bits`` /
+    ``Decoded 7, consumed 1 bytes`` 这类逐字节 HPACK 日志）。一旦被重置，
+    这些日志会经 root handler 直接写进 proxy.log，把文件刷满且毫无排障价值。
+
+    这里在 handler 层再拦一道：只丢弃这些第三方 logger 的 DEBUG/INFO，
+    WARNING 及以上照常记录（真正的告警仍然可见）。
+    """
+
+    # 需要静默的第三方 logger 前缀（含其子 logger，如 hpack.hpack / h2.events）
+    _PREFIXES = ("hpack", "h2", "h11", "hyperframe", "quic", "aioquic",
+                 "httpcore", "httpx")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno >= logging.WARNING:
+            return True
+        name = record.name or ""
+        for prefix in self._PREFIXES:
+            if name == prefix or name.startswith(prefix + "."):
+                return False
+        return True
+
+
+_QUIET_THIRD_PARTY_FILTER = _QuietThirdPartyFilter()
+
+
 def setup_logging(log_dir: str = "logs", max_log_size_mb: int = 100):
     """配置日志系统（所有文件日志均带自动裁剪功能）"""
     log_path = Path(PROJECT_ROOT) / log_dir
@@ -115,12 +145,14 @@ def setup_logging(log_dir: str = "logs", max_log_size_mb: int = 100):
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(logging.Formatter(LOG_FORMAT, DATE_FORMAT))
     file_handler.addFilter(_SANITIZE_LOG_FILTER)
+    file_handler.addFilter(_QUIET_THIRD_PARTY_FILTER)
 
     # 控制台日志
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(logging.Formatter(LOG_FORMAT, DATE_FORMAT))
     console_handler.addFilter(_SANITIZE_LOG_FILTER)
+    console_handler.addFilter(_QUIET_THIRD_PARTY_FILTER)
 
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.DEBUG)
@@ -140,6 +172,16 @@ def setup_logging(log_dir: str = "logs", max_log_size_mb: int = 100):
     logging.getLogger("quic").setLevel(logging.ERROR)
     logging.getLogger("aioquic").setLevel(logging.ERROR)
     logging.getLogger("scapy").setLevel(logging.ERROR)  # yi zhi scapy L2 socket guan bi jing gao
+    # hpack / h2 / h11：HTTP/2 头部压缩与协议栈。hpack 在 DEBUG 下会逐字节
+    # 打印 "Decoded 7, consumed 1 bytes"、"Decoded (b':scheme', b'https')"、
+    # "Encoding 8 with 6 bits" 之类的 HPACK 编解码细节——本地 DoH 前端和
+    # httpx 上游都用 HTTP/2，这类日志对排障没有价值，只会把 proxy.log 刷满。
+    # 父 logger 与已知子 logger 都显式设置：只设父级时，若子 logger 曾被
+    # 显式 setLevel(DEBUG) 就会绕过父级（子 logger 的 level 优先）。
+    for _name in ("hpack", "hpack.hpack", "hpack.table",
+                  "h2", "h2.connection", "h2.events",
+                  "h11", "hyperframe"):
+        logging.getLogger(_name).setLevel(logging.WARNING)
 
     return root_logger
 
@@ -231,6 +273,9 @@ class DNSProxyApp:
             cleanup_interval=self.config.cache_cleanup_interval,
             prefetch_enabled=self.config.cache_prefetch_enabled,
             prefetch_advance_ratio=self.config.cache_prefetch_advance_ratio,
+            # 非标准扩展（违反 RFC 2181 §5.1）：只对极短 TTL 抬升到 min_ttl，
+            # 0 = 关闭并回到纯 RFC 行为。详见 DNSCache._calculate_ttl。
+            ttl_floor_threshold=self.config.cache_ttl_floor_threshold,
         )
 
         # 2. DNSSEC 验证器
@@ -501,9 +546,7 @@ class DNSProxyApp:
         logger.info("  内存优化: gc.freeze() 已执行, 当前内存 %.0f MB",
                      self._get_memory_mb())
 
-        logger.info("=" * 60)
-        logger.info("初始化完成！")
-        logger.info("=" * 60)
+        logger.debug("初始化阶段完成，开始启动本地服务...")
 
         # 迭代解析预热（后台任务，不阻塞启动）：预取根 DNSKEY 与常用 TLD 的
         # DS/DNSKEY。首次解析任何域名都要现查这几项，其中 TLD 权威多在境外
@@ -559,8 +602,16 @@ class DNSProxyApp:
 
     async def _sweep_cache_after_filter_load(self):
         """
-        过滤规则加载完毕后，并行扫描 DNS 缓存中的域名。
-        如果有域名匹配新的拦截规则，将其 IP 覆写为 0.0.0.0（A记录）或 ::（AAAA记录）。
+        过滤规则加载完毕后，**双向**对账 DNS 缓存。
+
+        1. 正向（规则收紧）：缓存里是真实应答、但当前规则已拦截 →
+           覆写为拦截占位（A→0.0.0.0 / AAAA→:: / 其它类型→NXDOMAIN）。
+        2. 反向（规则放宽）：缓存里仍是拦截占位、但当前规则已放行
+           （删除规则 / 新增 @@ 例外 / hosts 白名单）→ 删除该条目，
+           让下一次查询重新走上游。旧实现只做正向覆写，规则一放宽，
+           客户端会被旧拦截缓存挡到 TTL 到期（最长 max_ttl，默认 3600s），
+           表现为"规则已经删了/加白名单了，域名还是 0.0.0.0"。
+
         使用 asyncio.gather + Semaphore 并行处理，避免阻塞事件循环。
         """
         if not self.cache or not self.config.cache_enabled or not self.config.filter_enabled:
@@ -575,50 +626,58 @@ class DNSProxyApp:
 
         sem = asyncio.Semaphore(200)  # 最多 200 个并发任务
 
-        async def _sweep_one(cache_key) -> bool:
-            """处理单条缓存条目，返回 True=已覆写"""
+        async def _sweep_one(cache_key) -> int:
+            """处理单条缓存条目：0=未动，1=覆写为拦截，2=清理旧拦截条目"""
             async with sem:
                 # 缓存键为 (name, rdtype, rdclass, DO, CD)[, source]，取前 3 项
                 qname, qtype, qclass = cache_key[:3]
                 domain = str(qname).rstrip(".")
                 blocked, _ = self.filter_engine.check_domain(domain)
-                if not blocked:
-                    return False
                 cached_response = await self.cache.peek(cache_key)
                 if cached_response is None:
-                    return False
-                # 跳过已是 0.0.0.0 / :: 的条目
-                for rrset in cached_response.answer:
-                    for rd in rrset:
-                        if rd.rdtype == dns.rdatatype.A and str(rd.address) == "0.0.0.0":
-                            return False
-                        if rd.rdtype == dns.rdatatype.AAAA and str(rd.address) == "::":
-                            return False
-                # 构造拦截响应
+                    return 0
+                if not blocked:
+                    # 反向对账：当前已放行，但缓存仍是拦截占位 → 删掉重查。
+                    # 判定用写入时的 blocked 标记（拦截统一返回 NXDOMAIN 后，
+                    # 应答里不再有 0.0.0.0/:: 占位可识别；cache 无磁盘持久化，
+                    # 重启即空，不存在"升级前旧条目"需要兜底）。
+                    is_placeholder = await self.cache.is_blocked_entry(cache_key)
+                    if not is_placeholder:
+                        return 0
+                    removed = await self.cache.discard(cache_key)
+                    return 2 if removed else 0
+                # 命中拦截规则：缓存里若是规则更新前的**正向应答**，必须立即
+                # 覆写成拦截应答，否则客户端会继续拿到真实 IP 直到 TTL 到期
+                #（最长 max_ttl=3600 秒；min_ttl 只兜底无 TTL 的场景，不再抬升）。
+                # 覆写目标键与前端拦截分支一致：(name, type, class)（不含 DO/CD），
+                # 同时删掉旧的含 DO 条目，避免两套键并存。
+                already_blocked = await self.cache.is_blocked_entry(cache_key)
+                if already_blocked:
+                    return 0
                 q_msg = dns.message.make_query(qname, qtype, qclass)
                 new_resp = dns.message.make_response(q_msg)
-                new_resp.answer.clear()
-                if qtype == dns.rdatatype.A:
-                    new_resp.answer.append(dns.rrset.RRset(qname, qclass, dns.rdatatype.A))
-                    new_resp.answer[0].add(
-                        dns.rdtypes.IN.A.A(dns.rdataclass.IN, dns.rdatatype.A, "0.0.0.0"), ttl=3600
-                    )
-                    new_resp.set_rcode(dns.rcode.NOERROR)
-                elif qtype == dns.rdatatype.AAAA:
-                    new_resp.answer.append(dns.rrset.RRset(qname, qclass, dns.rdatatype.AAAA))
-                    new_resp.answer[0].add(
-                        dns.rdtypes.IN.AAAA.AAAA(dns.rdataclass.IN, dns.rdatatype.AAAA, "::"), ttl=3600
-                    )
-                    new_resp.set_rcode(dns.rcode.NOERROR)
-                else:
-                    new_resp.set_rcode(dns.rcode.NXDOMAIN)
-                is_neg = new_resp.rcode() == dns.rcode.NXDOMAIN
-                await self.cache.set(cache_key, new_resp, is_negative=is_neg)
-                return True
+                new_resp.set_rcode(dns.rcode.NXDOMAIN)
+                new_resp.flags |= dns.flags.RA          # RFC 1035：递归服务端
+                try:
+                    _neg_ttl = int(self.config.cache_negative_ttl or 60)
+                    new_resp.authority.append(dns.rrset.from_text(
+                        qname, _neg_ttl, "IN", "SOA",
+                        "blocked.invalid. hostmaster.blocked.invalid. 1 "
+                        "3600 600 86400 %d" % _neg_ttl,
+                    ))
+                except Exception:
+                    pass
+                await self.cache.discard(cache_key)
+                await self.cache.set(
+                    (qname, qtype, qclass), new_resp,
+                    is_negative=True, blocked=True,
+                )
+                return 1
 
         results = await asyncio.gather(*[_sweep_one(k) for k in cache_keys])
-        changed = sum(1 for r in results if r)
-        logger.info("缓存并行扫描完成: %d 条, 覆写 %d 条", len(cache_keys), changed)
+        purged = sum(1 for r in results if r == 2)
+        logger.info("缓存并行扫描完成: %d 条, 清理旧拦截 %d 条",
+                    len(cache_keys), purged)
 
     @staticmethod
     def _get_memory_mb() -> float:
@@ -742,11 +801,11 @@ class DNSProxyApp:
         """后台主动预刷新即将过期的正应答缓存条目。
 
         调度由缓存内部的最小堆驱动（见 DNSCache._schedule_prefetch）：
-        每条正应答条目按「最终 TTL（经 min_ttl/max_ttl 钳制）推导出的
-        刷新时刻」入堆；本循环每次休眠到堆顶时刻（而非固定周期），到点后
-        成批取走已到期条目执行——上一批执行完再取下一批（批间串行），
-        批内按 cache_prefetch_concurrency 限流并发。堆空时以
-        cache_cleanup_interval 作兜底休眠（避免空转）。
+        每条正应答条目按「最终 TTL（权威 TTL 经 max_ttl 向下钳制；min_ttl
+        只在无 TTL 信息时兜底）推导出的刷新时刻」入堆；本循环每次休眠到堆顶
+        时刻（而非固定周期），到点后成批取走已到期条目执行——上一批执行完再
+        取下一批（批间串行），批内按 cache_prefetch_concurrency 限流并发。
+        堆空时以 cache_cleanup_interval 作兜底休眠（避免空转）。
         """
         log = logging.getLogger("dns-proxy.app")
         while self._running:
@@ -925,13 +984,14 @@ class DNSProxyApp:
         # 启动后再次 GC
         gc.collect()
         logger.info("  - 启动后内存: %.0f MB", self._get_memory_mb())
-        logger.info("  - DoH 服务器: https://%s:%s%s (IPv4)",
-                    self.config.doh_host if self.config.doh_host != "0.0.0.0" else "127.0.0.1",  # nosec B104 - display formatting
-                    self.config.doh_port,
-                    self.config.doh_path)
+        # 监听地址按协议族合并成一行，避免 IPv4/IPv6 各打一条（日志更紧凑）
+        _doh_host = self.config.doh_host if self.config.doh_host != "0.0.0.0" else "127.0.0.1"  # nosec B104
+        _doh_urls = [f"https://{_doh_host}:{self.config.doh_port}{self.config.doh_path}"]
         if self.config.doh_ipv6_enabled:
-            logger.info("  - DoH 服务器: https://[%s]:%d%s (IPv6)",
-                        self.config.doh_ipv6_host, self.config.doh_ipv6_port, self.config.doh_path)
+            _doh_urls.append(
+                f"https://[{self.config.doh_ipv6_host}]:{self.config.doh_ipv6_port}{self.config.doh_path}"
+            )
+        logger.info("  - DoH 服务器: %s", " | ".join(_doh_urls))
         if self.config.local_dot_enabled:
             logger.info("  - DoT 服务器: tls://%s:%d (域名=%s)",
                         self.config.local_dot_host if self.config.local_dot_host != "0.0.0.0" else "127.0.0.1",  # nosec B104 - display formatting
@@ -944,12 +1004,29 @@ class DNSProxyApp:
                         self.config.local_doq_domain or "未设置")
         _iter_state = ("启用（%d 台根）" % len(self.config.plain_dns_iterative_root_servers)
                        if self.config.plain_dns_iterative_enabled else "禁用")
-        logger.info("  - 上游服务器: DoH x%d + DoT x%d + DoQ x%d (upstream.enabled=%s) | 迭代解析上游: %s",
-                    len(self.config.doh_servers),
-                    len(self.config.dot_servers),
-                    len(self.config.doq_servers),
-                    self.config.upstream_enabled,
-                    _iter_state)
+        _n_encrypted = (len(self.config.doh_servers) + len(self.config.dot_servers)
+                        + len(self.config.doq_servers))
+        if _n_encrypted == 0:
+            logger.info("  - 上游服务器: 纯迭代模式（无 DoH/DoT/DoQ，upstream.enabled=%s）| 迭代解析: %s",
+                        self.config.upstream_enabled, _iter_state)
+        else:
+            logger.info("  - 上游服务器: DoH x%d + DoT x%d + DoQ x%d | 迭代解析: %s",
+                        len(self.config.doh_servers),
+                        len(self.config.dot_servers),
+                        len(self.config.doq_servers),
+                        _iter_state)
+            _doh_proto = self.config.upstream_doh_protocols
+            _proto_state = " → ".join(
+                name for name, on in (
+                    ("HTTP/3", _doh_proto.get("http3")),
+                    ("HTTP/2", _doh_proto.get("http2")),
+                ) if on
+            ) or "HTTP/2"
+            logger.info("  - 上游 DoH 协议: %s（HTTP/1.1 已禁用，ALPN 未协商到 h2/h3 即按失败处理）",
+                        _proto_state)
+        if self.config.plain_dns_iterative_enabled:
+            logger.info("  - 迭代每跳并行: %d 个协程（同一跳两路竞速、先回者胜；失败过半放弃本跳）",
+                        self.config.plain_dns_iterative_hop_parallel)
         logger.info("  - DNSSEC:     %s (mode=%s)",
                      "启用" if self.config.dnssec_enabled else "禁用",
                      self.config.dnssec_mode)

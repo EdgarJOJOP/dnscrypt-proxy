@@ -49,6 +49,7 @@ try:
         StreamDataReceived,
         HandshakeCompleted,
         ConnectionTerminated,
+        ConnectionIdIssued,
     )
     HAS_AIOQUIC = True
 except ImportError:
@@ -68,10 +69,17 @@ class _DoQConnection:
         transport: asyncio.DatagramTransport,
         addr: tuple,
         original_destination_connection_id: Optional[bytes] = None,
+        on_new_cid=None,
     ):
         self._server = server
         self._transport = transport
         self._addr = addr
+        # 服务器在握手中会分配新的 connection id（ConnectionIdIssued），
+        # 客户端之后的数据报**用服务器分配的 CID 作为 destination CID**。
+        # 不走这个回调注册，_connections 里就只有客户端的原始 DCID，
+        # 后续包查表必然未命中（见 datagram_received 的说明）。
+        self._on_new_cid = on_new_cid
+        self.terminated = False
         # aioquic 1.x：服务端连接必须携带客户端选定的原始 DCID，否则构造即断言失败
         try:
             self._quic = QuicConnection(
@@ -105,8 +113,17 @@ class _DoQConnection:
             while event is not None:
                 if isinstance(event, StreamDataReceived):
                     self._handle_stream_data(event)
+                elif isinstance(event, ConnectionIdIssued):
+                    # 服务器分配的 CID → 注册到连接的 CID 表，后续数据报才能
+                    # 按 destination CID 找回这个连接（QUIC 握手的标准流程）。
+                    if self._on_new_cid is not None:
+                        try:
+                            self._on_new_cid(event.connection_id, self)
+                        except Exception:
+                            pass
                 elif isinstance(event, ConnectionTerminated):
                     logger.debug("DoQ 客户端 %s 断开连接", self._addr[0])
+                    self.terminated = True
                 event = self._quic.next_event()
         except Exception as e:
             logger.debug("DoQ 事件处理异常: %s", e)
@@ -246,9 +263,13 @@ class _DoQUdpProtocol(asyncio.DatagramProtocol):
         dcid = header.destination_cid
         conn = self._connections.get(dcid)
         if conn is None:
-            # QUIC 连接迁移：源端口变化时按对端地址（host）回退查找
+            # 连接迁移/重连：只有**完整对端地址**（IP + 端口）都相同才回退。
+            # 早期实现只比 IP，于是同一主机上的第二个 DoQ 客户端（新端口、
+            # 新 DCID）会被喂进旧连接，新连接永远建不起来——浏览器 + 系统
+            # 解析器同时用 DoQ 时必然有一个不可用。
             for c in list(self._connections.values()):
-                if getattr(c, "_addr", None) and c._addr[0] == addr[0]:
+                c_addr = getattr(c, "_addr", None)
+                if c_addr and c_addr[0] == addr[0] and c_addr[1] == addr[1]:
                     conn = c
                     break
         if conn is None:
@@ -259,6 +280,8 @@ class _DoQUdpProtocol(asyncio.DatagramProtocol):
             conn = _DoQConnection(
                 self._server, self._quic_config, self.transport, addr,
                 original_destination_connection_id=dcid,
+                # 服务器分配的 CID 也要能查回本连接（ConnectionIdIssued 事件）
+                on_new_cid=lambda cid, c: self._connections.setdefault(cid, c),
             )
             self._connections[dcid] = conn
         conn.receive_datagram(data)
@@ -396,7 +419,10 @@ class LocalDoQServer:
             rcode = msg.rcode()
         except Exception:
             return False
-        if rcode in (dns.rcode.NXDOMAIN, dns.rcode.REFUSED):
+        # RFC 2308 §7：只允许缓存 NXDOMAIN 与 NODATA。REFUSED / SERVFAIL 属于
+        # 错误应答，不是"名字不存在"，不能当负应答（缓存层 cache.set 亦已直接
+        # 拒绝非 NOERROR/NXDOMAIN 的响应，这里同步去掉避免语义混淆）。
+        if rcode == dns.rcode.NXDOMAIN:
             return True
         return rcode == dns.rcode.NOERROR and not msg.answer
 
@@ -588,27 +614,41 @@ class LocalDoQServer:
                 if blocked:
                     block_reason = reason
                     status = "blocked"
+                    # 缓存键**不含 DO/CD**（拦截响应与 DNSSEC 无关，详见 plain_dns_server 注释）；
+                    # 并**先查缓存**，命中直接返回。
+                    _block_key = (question.name, question.rdtype, question.rdclass)
+                    if self.config.cache_enabled:
+                        _hit = await self.cache.get(_block_key)
+                        if _hit is not None:
+                            import copy as _copy
+                            _hit = _copy.copy(_hit)
+                            _hit.id = query.id
+                            await self._log_query(
+                                client_ip, qname, qtype_name, "cached", block_reason)
+                            return _hit.to_wire()
+                    # 拦截统一返回 NXDOMAIN（2026-10-30，详见 plain_dns_server 注释）
                     response = dns.message.make_response(query)
-                    rdtype = question.rdtype
-                    if rdtype == dns.rdatatype.A:
-                        response.answer.append(
-                            dns.rrset.RRset(question.name, question.rdclass, dns.rdatatype.A)
-                        )
-                        response.answer[0].add(dns.rdtypes.IN.A.A(dns.rdataclass.IN, dns.rdatatype.A, "0.0.0.0"), ttl=3600)  # nosec B104 - blocked A record, not binding
-                        response.set_rcode(dns.rcode.NOERROR)
-                    elif rdtype == dns.rdatatype.AAAA:
-                        response.answer.append(
-                            dns.rrset.RRset(question.name, question.rdclass, dns.rdatatype.AAAA)
-                        )
-                        response.answer[0].add(dns.rdtypes.IN.AAAA.AAAA(dns.rdataclass.IN, dns.rdatatype.AAAA, "::"), ttl=3600)
-                        response.set_rcode(dns.rcode.NOERROR)
-                    else:
-                        response.set_rcode(dns.rcode.NXDOMAIN)
+                    response.set_rcode(dns.rcode.NXDOMAIN)
+                    response.flags |= dns.flags.RA   # RFC 1035：递归服务端
+                    # RFC 2308：补 SOA 让客户端能缓存负应答（详见 plain_dns_server 注释）
+                    try:
+                        _neg_ttl = int(getattr(self.config, "cache_negative_ttl", 60) or 60)
+                        response.authority.append(dns.rrset.from_text(
+                            question.name, _neg_ttl, "IN", "SOA",
+                            "blocked.invalid. hostmaster.blocked.invalid. 1 "
+                            "3600 600 86400 %d" % _neg_ttl,
+                        ))
+                    except Exception:
+                        pass
                     response_wire = response.to_wire()
+                    # 拦截占位打标（blocked=True）：规则放宽后由
+                    # _sweep_cache_after_filter_load 反向清理，避免旧拦截缓存
+                    # 把客户端挡到 TTL 到期
                     if self.config.cache_enabled:
                         await self.cache.set(
-                            cache_key, response,
+                            _block_key, response,
                             response.rcode() == dns.rcode.NXDOMAIN,
+                            blocked=True,
                         )
                     await self._log_query(client_ip, qname, qtype_name, status, block_reason)
                     return response_wire
@@ -636,7 +676,11 @@ class LocalDoQServer:
                 status = "error"
             else:
                 dnssec_ok = True
-                if self._dnssec_wrapper is not None and self.config.dnssec_enabled:
+                # 纯迭代 + strict_dnssec 时迭代器内部已严格验证（resolver 层也
+                # 跳过），此处不再重复验证：既省 DNSKEY/DS 往返，也避免 wrapper
+                # 把合法 NXDOMAIN/NSEC 负应答误判 bogus → SERVFAIL。
+                if (self._dnssec_wrapper is not None and self.config.dnssec_enabled
+                        and not self.resolver_manager.iterative_already_verified()):
                     dnssec_ok, _ = await self._dnssec_wrapper.validate_response(wire_data, result_wire)
                     if not dnssec_ok and self.config.dnssec_drop_bogus:
                         response = dns.message.make_response(query)

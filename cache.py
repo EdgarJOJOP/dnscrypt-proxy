@@ -20,6 +20,7 @@ from functools import lru_cache
 
 import dns.message
 import dns.name
+import dns.rcode
 import dns.rdatatype
 import dns.rrset
 
@@ -94,19 +95,43 @@ def evict_cold_query_templates():
     logger.debug("查询模板缓存已全量清空 (lru_cache maxsize=512)")
 
 
-def _has_block_placeholder(msg: "dns.message.Message") -> bool:
-    """应答是否含过滤拦截占位地址（A=0.0.0.0 / AAAA=::）。
+def _is_zero_answer(response: dns.message.Message) -> bool:
+    """应答是否为「零地址映射」（A=0.0.0.0 / AAAA=::）
 
-    这类条目是过滤引擎写入的拦截结果，不应被上游真实 IP 覆写，
-    预刷新时须跳过（改由规则重载时的 _sweep_cache_after_filter_load 处理）。
+    这类条目来自 **hosts 自定义 IP 映射**（用户故意指向 0.0.0.0 屏蔽某个
+    域名）。它们**不能进预刷新堆**：预刷新会重新走上游解析该域名、拿到真实
+    IP 后覆写缓存，用户的自定义映射就悄悄失效了。
+    （拦截应答统一是 NXDOMAIN、answer 为空，本来就不会入堆。）
     """
-    for rrset in msg.answer:
-        for rd in rrset:
-            if rd.rdtype == dns.rdatatype.A and str(rd.address) == "0.0.0.0":
-                return True
-            if rd.rdtype == dns.rdatatype.AAAA and str(rd.address) == "::":
-                return True
+    try:
+        for rrset in response.answer:
+            for rd in rrset:
+                if rd.rdtype == dns.rdatatype.A and str(rd.address) == "0.0.0.0":
+                    return True
+                if rd.rdtype == dns.rdatatype.AAAA and str(rd.address) == "::":
+                    return True
+    except Exception:
+        pass
     return False
+
+
+def _clamp_response_ttl(response: dns.message.Message, cap: int) -> None:
+    """把响应各段 RRset 的 TTL 截断到不高于 ``cap``（就地修改）
+
+    目的：让**返回给客户端的 TTL** 与本地缓存寿命一致。上游常给 86400 这类
+    长 TTL，若原样透传给客户端，客户端会缓存一整天，而本地缓存只保留
+    ``max_ttl``（默认 3600 秒）——上游更换 IP 后客户端仍用旧记录，表现为
+    「首次访问 TTL 特大、刷新后才正常、个别站点打不开」。
+    """
+    if cap is None or cap <= 0:
+        return
+    for section in (response.answer, response.authority, response.additional):
+        for rrset in section:
+            try:
+                if rrset.ttl > cap:
+                    rrset.ttl = cap
+            except Exception:
+                continue
 
 
 class CacheEntry:
@@ -118,9 +143,10 @@ class CacheEntry:
     """
 
     __slots__ = ("_wire", "_response_msg", "ttl", "created_at", "epoch",
-                 "_hit_count", "_seq")
+                 "_hit_count", "_seq", "blocked")
 
-    def __init__(self, response: dns.message.Message, ttl: int, epoch: int = 0):
+    def __init__(self, response: dns.message.Message, ttl: int, epoch: int = 0,
+                 blocked: bool = False):
         # 主存储：序列化为紧凑的 wire bytes
         self._wire: bytes = response.to_wire()
         # 加速缓存：保留反序列化后的 Message 对象（可被 drop）
@@ -130,6 +156,11 @@ class CacheEntry:
         self.epoch: int = epoch  # 分配世代（用于 arena 生命周期追踪）
         self._hit_count: int = 0  # 命中次数（用于智能 Message 丢弃）
         self._seq: int = 0        # 预刷新调度序号（0 = 未调度）
+        # 是否为过滤引擎写入的**拦截占位应答**（A=0.0.0.0 / AAAA=:: / NXDOMAIN）。
+        # 规则放宽（删规则 / 加 @@ 例外 / hosts 白名单）后，规则重载的 sweep
+        # 依据该标记精确删除旧拦截条目，而不是靠猜应答内容（真实 NXDOMAIN、
+        # 以及用户自定义 hosts 映射到 0.0.0.0 的条目长得完全一样）。
+        self.blocked: bool = bool(blocked)
 
     @property
     def response_msg(self) -> dns.message.Message:
@@ -174,9 +205,18 @@ class CacheEntry:
         # 通过 property 获取 Message（惰性水合），然后浅拷贝
         msg = self.response_msg
 
+        # ⚠ dnspython 的 Message 把四个 section 存在 `msg.sections` 里，
+        # answer / authority / additional 都是映射到 sections 的 property；
+        # copy.copy() 只做浅拷贝 → sections 与外层列表都和源对象共享。
+        # 一旦下面写 `response.answer = ...` / `response.authority = []`，
+        # 改动会**穿透到缓存条目本身**（实测：条目 authority 在第一次 get
+        # 之后永久变空，多协程并发 get 还会互相踩 TTL/顺序）。
+        # 这里必须把 sections 复制成独立列表。
+        response = copy.copy(msg)
+        response.sections = [list(section) for section in msg.sections]
+
         # ★ P3: 剩余 TTL >= 95% 时走轻量路径（仍修改所有 answer，仅跳过 authority/additional 深拷贝）
         if remaining >= self.ttl * 0.95:
-            response = copy.copy(msg)
             response.answer = list(msg.answer)
             # 修改所有 answer 的 TTL（不依赖 rrset 顺序）
             new_answer = []
@@ -204,7 +244,7 @@ class CacheEntry:
             return response
 
         # ===== 完整深拷贝路径（TTL 偏差 > 5%） =====
-        response = copy.copy(msg)
+        # response 已在函数开头复制（含独立的 sections），这里直接复用
         response.answer = list(msg.answer)
         # 为每个 RRset 创建新实例以安全修改 TTL
         new_answer = []
@@ -262,6 +302,7 @@ class DNSCache:
         cleanup_interval: int = 60,
         prefetch_enabled: bool = True,
         prefetch_advance_ratio: float = 0.5,
+        ttl_floor_threshold: int = 5,
     ):
         self.max_size = max_size
         self.default_ttl = default_ttl
@@ -269,10 +310,21 @@ class DNSCache:
         self.max_ttl = max_ttl
         self.negative_ttl = negative_ttl
         self.cleanup_interval = cleanup_interval
+        # 「min_ttl 下限豁免」阈值（秒，0 = 关闭整个抬升）。
+        # 语义：**只有上游 TTL > 该阈值**的记录才把不足 min_ttl 的寿命抬到
+        #   min_ttl；TTL <= 阈值（默认 5 秒）的极短记录完全尊重权威原值
+        #   （这类记录通常是 DDNS/健康检查/动态调度，变化极快）。
+        # ⚠ 抬升本身是非标准扩展，违反 RFC 2181 §5.1（"TTL 不得增加"）。
+        #   设 0 即恢复纯 RFC 行为。见 _calculate_ttl 的完整说明。
+        try:
+            self._ttl_floor_threshold = max(0, min(60, int(ttl_floor_threshold)))
+        except (TypeError, ValueError):
+            self._ttl_floor_threshold = 5
         # ===== 主动预刷新（最小堆动态调度）=====
-        # 开启后：正应答条目在 set() 时按「最终 TTL（经 min_ttl/max_ttl 钳制）
-        # 推导出的刷新时刻」入堆；后台循环休眠到堆顶时刻再成批刷新——
-        # 因此不存在固定扫描周期，刷新节奏由 TTL 参数与 advance_ratio 共同决定。
+        # 开启后：正应答条目在 set() 时按「最终 TTL（权威 TTL 经 max_ttl 向下
+        # 钳制，必要时按 min_ttl 抬升）推导出的刷新时刻」入堆；
+        # 后台循环休眠到堆顶时刻再成批刷新——因此不存在固定扫描周期，
+        # 刷新节奏由 TTL 参数与 advance_ratio 共同决定。
         self.prefetch_enabled = bool(prefetch_enabled)
         self._prefetch_ratio = max(0.0, min(1.0, float(prefetch_advance_ratio)))
 
@@ -329,17 +381,56 @@ class DNSCache:
             return entry.get_adjusted_response()
 
     async def set(
-        self, key: Tuple, response: dns.message.Message, is_negative: bool = False
+        self, key: Tuple, response: dns.message.Message, is_negative: bool = False,
+        blocked: bool = False,
     ):
         """
         设置缓存条目
         key: (qname, qtype, qclass)
         超过 MAX_CACHED_WIRE_SIZE 的响应不被缓存，避免单个大条目撑破内存
+
+        blocked: 该条目是**过滤引擎生成的拦截占位应答**（A=0.0.0.0 /
+        AAAA=:: / 其它类型的 NXDOMAIN）。标记随条目保存，规则重载的
+        `_sweep_cache_after_filter_load` 据此在规则放宽后精确删除旧拦截
+        条目（见 is_blocked_entry / discard），否则客户端会一直被旧缓存
+        挡到 TTL 到期（最长 max_ttl）。
         """
         async with self._lock:
+            # RFC 2308 §7：只有 NOERROR（含 NODATA）与 NXDOMAIN 可以缓存。
+            # REFUSED / SERVFAIL / FORMERR / NOTIMP 等**错误应答不入缓存**：
+            # 早期实现把 REFUSED 当负应答缓存 negative_ttl 秒，于是单台上游的
+            # 一次临时 REFUSED 就能让该域名在本机整个 TTL 内持续失败（服务
+            # 降级，且客户端拿到的是"权威拒绝"这种误导性结论）。
+            try:
+                if response.rcode() not in (dns.rcode.NOERROR, dns.rcode.NXDOMAIN):
+                    return
+            except Exception:
+                pass
+
             # 如果已存在，先删除
             if key in self._cache:
                 del self._cache[key]
+
+            # 计算 TTL（正应答基于上游原始 TTL；负应答按 RFC 2308 §5 取
+            # min(SOA.TTL, SOA.MINIMUM)，拿不到 SOA 才退回配置的 negative_ttl）
+            if is_negative:
+                ttl = self._negative_ttl_from_soa(response)
+            else:
+                ttl = self._calculate_ttl(response)
+
+            # RFC 2181 §5.1：TTL=0 的记录只能用于当前事务，不得缓存。
+            # 早期实现会照常插入并**先淘汰一条健康条目**，结果是每次 get 都 miss
+            # 却反复挤掉有效缓存，与 _calculate_ttl 里"TTL<=0 视为不可缓存"的
+            # 注释正好相反。
+            if ttl <= 0:
+                return
+
+            # 把响应各段 RRset 的 TTL 截断到不高于缓存 TTL，再返回给客户端。
+            # 否则首次应答会携带上游原始 TTL（常见 86400），客户端（浏览器/系统
+            # 解析器）会把这条记录缓存一整天，而本地缓存只保留 max_ttl（默认
+            # 3600 秒）——上游换 IP 后客户端仍用旧记录，表现为「首次访问 TTL
+            # 特别大、刷新后才正常、某些站点打不开」。
+            _clamp_response_ttl(response, ttl)
 
             # 一次性序列化 wire，避免重复 to_wire() 调用
             wire = response.to_wire()
@@ -349,9 +440,6 @@ class DNSCache:
                 self._stats["misses"] += 1
                 return
 
-            # 计算 TTL
-            ttl = self._calculate_ttl(response) if not is_negative else self.negative_ttl
-
             # 创建缓存条目（传入预序列化的 wire）
             entry = CacheEntry.__new__(CacheEntry)
             entry._wire = wire
@@ -360,6 +448,11 @@ class DNSCache:
             entry.created_at = time.time()
             entry.epoch = self._current_epoch
             entry._hit_count = 0
+            # 必须显式初始化调度序号：__slots__ 已声明 _seq，未赋值时任何读取
+            # （pop_due_prefetch / 调试 / 未来的清理逻辑）都会抛 AttributeError。
+            # 与 rebuild()/defrag() 保持一致（0 = 未调度）。
+            entry._seq = 0
+            entry.blocked = bool(blocked)
 
             # LRU 淘汰
             while len(self._cache) >= self.max_size:
@@ -370,21 +463,96 @@ class DNSCache:
             self._stats["size"] = len(self._cache)
             # ★ P1: 记录一次插入（用于 defrag 触发计数）
             self._insert_count += 1
-            # 主动预刷新：仅正应答（有 answer 且非过滤拦截占位）入堆
+            # 主动预刷新：仅正应答入堆。拦截应答是 NXDOMAIN（answer 为空），
+            # 天然不入堆；hosts 的零地址映射（0.0.0.0 / ::）**必须显式排除**，
+            # 否则预刷新会重新走上游、把用户的映射覆盖成真实 IP。
             if (self.prefetch_enabled and ttl > 0 and response.answer
-                    and not _has_block_placeholder(response)):
+                    and not _is_zero_answer(response)):
                 self._schedule_prefetch(key, entry)
 
-    def _calculate_ttl(self, response: dns.message.Message) -> int:
-        """从 DNS 响应中计算合适 TTL
+    async def discard(self, key: Tuple) -> bool:
+        """按缓存键删除单条条目，返回是否真的删除了条目。
 
-        语义（修复）：
-          - 取响应 answer 段中最小的有效 TTL 作为基线；
-          - 响应无有效 TTL 时才用 default_ttl 兜底：default_ttl 是「缺省基线」，
-            不再充当上限（旧实现从 default_ttl 起步只向下调，
-            导致 max_ttl 永远不会生效）；
-          - 最后统一 clamp 到 [min_ttl, max_ttl]，使 max_ttl 真正封顶；
+        用途：过滤规则**放宽**（删除规则 / 新增 ``@@`` 例外 / hosts 白名单）后，
+        把缓存里仍是拦截占位的旧条目删掉，让下一次查询重新走上游。
+
+        预刷新堆无需同步清理：堆元素带 seq，`pop_due_prefetch` 会按
+        「条目仍存在 + seq 一致」惰性校验，条目被删除后这些元素（幽灵元素）
+        自然被跳过。
+        """
+        async with self._lock:
+            entry = self._cache.pop(key, None)
+            if entry is None:
+                return False
+            self._stats["size"] = len(self._cache)
+            return True
+
+    async def is_blocked_entry(self, key: Tuple) -> bool:
+        """该缓存条目是否为过滤引擎写入的拦截占位。
+
+        标记由拦截分支 `set(..., blocked=True)` 写入；历史条目（升级前写入、
+        没有标记）返回 False，调用方可用应答内容（0.0.0.0 / :: / NXDOMAIN）
+        做兜底判断。
+        """
+        async with self._lock:
+            entry = self._cache.get(key)
+            return bool(entry is not None and getattr(entry, "blocked", False))
+
+    def _negative_ttl_from_soa(self, response: dns.message.Message) -> int:
+        """负应答缓存时长（RFC 2308 §5：min(SOA.TTL, SOA.MINIMUM)）
+
+        `negative_ttl` 作为**上限**（用户希望负应答不要缓存太久）：
+          - SOA 允许 900s、negative_ttl=60 → 60（尊重配置上限）
+          - SOA 只允许 5s、negative_ttl=60  → 5（不得超过权威授权时长）
+        拿不到 authority SOA（本地生成的拦截 NXDOMAIN、上游未回 SOA）时
+        退回 negative_ttl。
+        """
+        try:
+            cap = max(1, int(self.negative_ttl))
+            max_ttl = max(1, int(self.max_ttl))
+            for rrset in response.authority:
+                if rrset.rdtype != dns.rdatatype.SOA:
+                    continue
+                for rdata in rrset:
+                    minimum = int(getattr(rdata, "minimum", 0) or 0)
+                    soa_ttl = int(getattr(rrset, "ttl", 0) or 0)
+                    if minimum > 0 and soa_ttl > 0:
+                        allowed = min(soa_ttl, minimum)
+                    elif minimum > 0:
+                        allowed = minimum
+                    elif soa_ttl > 0:
+                        allowed = soa_ttl
+                    else:
+                        break
+                    return max(1, min(allowed, cap, max_ttl))
+                break
+        except Exception:
+            pass
+        return max(1, min(int(self.negative_ttl), int(self.max_ttl)))
+
+    def _calculate_ttl(self, response: dns.message.Message) -> int:
+        """从 DNS 响应中计算缓存 TTL（RFC 2181 §5.1 + 一处显式标注的非标准扩展）
+
+        语义：
+          - 取响应 answer 段中最小的有效 TTL 作为基线（权威授权时长）；
+          - `max_ttl` 是向下的上限钳制（保护本机内存与"最长缓存"意图）；
+          - `min_ttl` 是**缓存 TTL 下限**，但**豁免极短 TTL**：
+              * 上游 TTL > ttl_floor_threshold（默认 5s）→ 不足 min_ttl 的抬到
+                min_ttl（常规 min-cache-ttl 下限保护）；
+              * 上游 TTL <= ttl_floor_threshold → **完全尊重权威原值**，不抬升。
+                这类 1-5 秒的记录通常是 DDNS / 健康检查 / 动态调度，变化极快，
+                强行缓存在原地会让客户端拿到过期数据；
+              * 完全没有 TTL 信息 → 用 max(default_ttl, min_ttl) 兜底；
+          - ⚠ "TTL > 阈值时抬到 min_ttl"这一步是**非标准扩展**，违反 RFC 2181
+            §5.1（"TTL 不得增加"；BIND 的 min-cache-ttl 同样被官方标注为非标准）。
+            把 `cache.ttl_floor_threshold` 设为 0 即完全关闭，回到纯 RFC 行为：
+            此时一律 `min(上游 TTL, max_ttl)`；
           - TTL <= 0 视为不可缓存（返回 0）。
+
+        该函数同时服务**加密上游（DoH/DoT/DoQ）与纯迭代**两条路径：四个前端
+        （plain/DoH/DoT/DoQ）与 resolver_manager 都经由 `cache.set()` 落盘，
+        因此 upstream: enabled 时走的是同一套规则（含同一处抬升豁免逻辑），
+        不会因为"上游是加密的"而不同。
         """
         resp_ttl: Optional[int] = None
         for rrset in response.answer:
@@ -394,12 +562,30 @@ class DNSCache:
             if resp_ttl is None or t < resp_ttl:
                 resp_ttl = t
         if resp_ttl is None:
-            # 无 answer 或无有效 TTL → 用 default_ttl 作为缺省基线
-            resp_ttl = self.default_ttl
+            # 完全没有 TTL 信息来源（空 answer / 无 rrset）→ 兜底基线。
+            # min_ttl 的**唯一**作用点：保证这类条目至少缓存 min_ttl 秒。
+            resp_ttl = max(self.default_ttl, self.min_ttl)
         if resp_ttl <= 0:
             return 0
-        # 真正 clamp 到配置区间：上游 TTL 大于 max_ttl 时被截断（max_ttl 生效）
-        return max(self.min_ttl, min(resp_ttl, self.max_ttl))
+        # RFC 2181 §5.1：只允许向下钳制（max_ttl 封顶），绝不向上抬升。
+        capped = min(resp_ttl, self.max_ttl)
+        # ---- 非标准扩展：min_ttl 下限（豁免极短 TTL）----
+        # 规则：**只有上游 TTL > ttl_floor_threshold（默认 5s）的记录**才把不足
+        #       min_ttl 的缓存寿命抬到 min_ttl；TTL <= 阈值的极短记录**完全尊重
+        #       权威原值**（1-5 秒通常是 DDNS / 健康检查 / 动态调度，变化极快，
+        #       强行原地缓存会让客户端拿到过期数据）。
+        # ⚠ 抬升这一步明确违反 RFC 2181 §5.1（"TTL 不得增加"；BIND 的
+        #   min-cache-ttl 同样被官方标注为非标准扩展）。设
+        #   cache.ttl_floor_threshold: 0 → 关闭，回到纯 RFC 行为（一律只向下钳制）。
+        #   副作用：抬升后缓存寿命变长，get_adjusted_response() 返回给客户端的
+        #   TTL（= 缓存剩余寿命）也随之变大，客户端会被动延长缓存——这正是
+        #   "常规下限保护"想要的效果，但它同时也是同一处 RFC 偏离。
+        threshold = getattr(self, "_ttl_floor_threshold", 0)
+        if (threshold > 0
+                and resp_ttl > threshold
+                and self.min_ttl > capped):
+            capped = min(self.min_ttl, self.max_ttl)
+        return max(1, capped)
 
     async def evict_largest(self, ratio: float = 0.2) -> int:
         """按估算字节大小淘汰最大的 N% 条目（跳过已过期条目）。
@@ -459,9 +645,10 @@ class DNSCache:
         就到期而空转。若上式右侧为负（TTL 极小、advance_ratio 很大时），
         提前量取 0（即不提前，等条目自然到期），不会出现负提前量。
 
-        注意：min_ttl 是「缓存 TTL 下限」，不是「提前量下限」。旧实现用
+        注意：min_ttl 是「无 TTL 信息时的兜底下限」，**不是**「缓存 TTL 下限」，
+        也不参与真实 TTL 的钳制（RFC 2181 §5.1 禁止抬升上游 TTL）。旧实现用
         max(min_ttl, TTL*advance_ratio) 作为提前量，会让所有最终 TTL <= min_ttl
-        的条目（_calculate_ttl 会把上游 TTL < min_ttl 的响应钳到 min_ttl）
+        的条目（旧 _calculate_ttl 会把上游 TTL < min_ttl 的响应钳到 min_ttl）
         提前量被夹到 TTL-1 → 刷新时刻 = 插入后 1 秒，形成「每秒重新查询
         上游一次」的死循环（实测稳态每秒上百次上游查询）。
         """
@@ -597,7 +784,11 @@ class DNSCache:
                 return 0
             now = time.time()
             # 收集（跳过过期），使用 list() 快照避免迭代时修改
-            items = [(key, entry._wire, entry.ttl, entry.created_at)
+            # blocked 标记必须随条目一起迁移：否则 rebuild 之后拦截占位会
+            # 退化成"按 0.0.0.0/:: 识别"，NXDOMAIN 类型的拦截占位就再也
+            # 无法被规则放宽时的反向清理识别。
+            items = [(key, entry._wire, entry.ttl, entry.created_at,
+                      getattr(entry, "blocked", False))
                      for key, entry in list(self._cache.items())
                      if not entry.is_expired(now)]
             old_count = len(self._cache)
@@ -622,7 +813,7 @@ class DNSCache:
             survived = 0
             # 按 wire 大小升序回填：同大小 wire 连续分配，减少堆碎片
             items.sort(key=lambda x: len(x[1]))
-            for key, wire, ttl, created_at in items:
+            for key, wire, ttl, created_at, blocked in items:
                 # ★ 修复 P0: 不覆盖锁外 GC 期间其他协程写入的新数据
                 if key in self._cache:
                     continue
@@ -635,6 +826,7 @@ class DNSCache:
                 entry.epoch = new_epoch       # 标记新世代
                 entry._hit_count = 0          # 重置命中计数
                 entry._seq = 0                # 调度序号由 _schedule_prefetch 重分配
+                entry.blocked = blocked       # 保留拦截占位标记
                 self._cache[key] = entry
                 # 保留原预刷新调度（刷新时刻基于 created_at，不受 rebuild 影响）
                 if key in old_scheduled and ttl > 0:
@@ -661,14 +853,15 @@ class DNSCache:
             if not self._cache:
                 return 0
             now = time.time()
-            items = [(key, entry._wire, entry.ttl, entry.created_at, entry._hit_count)
+            items = [(key, entry._wire, entry.ttl, entry.created_at, entry._hit_count,
+                      getattr(entry, "blocked", False))
                      for key, entry in self._cache.items()
                      if not entry.is_expired(now)]
             old_scheduled = {k for _, _, k in self._prefetch_heap}
             self._prefetch_heap = []
             self._cache.clear()
             items.sort(key=lambda x: len(x[1]))
-            for key, wire, ttl, created_at, hit_count in items:
+            for key, wire, ttl, created_at, hit_count, blocked in items:
                 entry = CacheEntry.__new__(CacheEntry)
                 entry._wire = wire
                 entry._response_msg = None
@@ -677,6 +870,7 @@ class DNSCache:
                 entry.epoch = self._current_epoch
                 entry._hit_count = hit_count
                 entry._seq = 0
+                entry.blocked = blocked   # 保留拦截占位标记
                 self._cache[key] = entry
                 if key in old_scheduled and ttl > 0:
                     self._schedule_prefetch(key, entry)

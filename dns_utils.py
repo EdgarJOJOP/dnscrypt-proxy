@@ -2,10 +2,112 @@
 DNS 响应工具函数
 - AAAA (IPv6) 优先于 A (IPv4) 排序
 - 安全实现：只交换连续 A/AAAA 段内的顺序，不移动 CNAME/SOA/NS 等非地址记录
+- 本机 IPv6 可用性探测（决定上游/权威是否优先用 IPv6）
 """
+
+import ipaddress
+import socket
+from typing import Optional
 
 import dns.message
 import dns.rdatatype
+
+# 本机是否存在全局 IPv6 地址（进程内缓存；网络变化后可 reset_ipv6_probe()）
+_HAS_GLOBAL_IPV6: Optional[bool] = None
+
+
+def has_global_ipv6() -> bool:
+    """本机是否存在**全局** IPv6 地址（能出公网），结果进程内缓存
+
+    为什么不用 UDP connect 探测路由：Windows 上「有 IPv6 默认路由但实际不通」
+    （运营商未下发前缀 / 防火墙丢弃 v6）非常常见，UDP connect 不会失败，
+    于是「IPv6 优先」会退化成「每次先白等一个超时」。这里直接检查接口地址：
+    只有存在全局单播地址（非回环 / 非链路本地 / 非 ULA / 非文档地址）才认为
+    可用 IPv6；否则调用方应只用 IPv4。
+    """
+    global _HAS_GLOBAL_IPV6
+    if _HAS_GLOBAL_IPV6 is not None:
+        return _HAS_GLOBAL_IPV6
+    ok = False
+    try:
+        try:
+            import psutil
+            ifaces = psutil.net_if_addrs()
+        except Exception:
+            ifaces = {}
+        for _name, addrs in ifaces.items():
+            for addr in addrs:
+                if addr.family != socket.AF_INET6 or not addr.address:
+                    continue
+                raw = str(addr.address).split("%", 1)[0]
+                try:
+                    ip = ipaddress.ip_address(raw)
+                except ValueError:
+                    continue
+                if ip.is_global:
+                    ok = True
+                    break
+            if ok:
+                break
+    except Exception:
+        ok = False
+    _HAS_GLOBAL_IPV6 = ok
+    return ok
+
+
+def reset_ipv6_probe() -> None:
+    """网络变化（网卡启停 / VPN 切换 / 重新拨号）后重新探测 IPv6 可用性"""
+    global _HAS_GLOBAL_IPV6
+    _HAS_GLOBAL_IPV6 = None
+
+
+# 连通性探测目标：**跨族并发**——同时问一个 IPv6 根和一个 IPv4 根。
+# v4 根在这里不是"兜底"，而是对照：用来区分「IPv6 不通」与「整体断网」。
+_PROBE_V6_TARGET = "2001:7fd::1"     # k.root-servers.net (IPv6)
+_PROBE_V4_TARGET = "192.5.5.241"     # f.root-servers.net (IPv4)
+
+
+def probe_ipv6_path(timeout: float = 0.8) -> tuple:
+    """跨族并发探测：同时向一个 IPv6 根和一个 IPv4 根发真实 DNS 查询
+
+    返回 ``(v6_ok, v4_ok)``：
+      - ``v6_ok``：IPv6 根有应答 → IPv6 真的能出网，可以用"IPv6 优先"；
+      - ``v4_ok``：IPv4 根有应答 → 网络本身正常，仅作为对照。
+
+    为什么要 v4 对照：只看 v6 超时无法区分「IPv6 不通」和「整台机器断网」，
+    两者应给出不同的日志与处置（前者降级为纯 IPv4 继续服务，后者说明网络异常）。
+    两台并发发出，总耗时最多 ``timeout`` 秒，只在启动/重探时调用一次。
+    """
+    import concurrent.futures as _futures
+
+    import dns.message
+    import dns.query
+    import dns.rdatatype
+
+    try:
+        q = dns.message.make_query(".", dns.rdatatype.NS)
+    except Exception:
+        return (False, False)
+
+    def _one(server: str) -> bool:
+        try:
+            r = dns.query.udp(q, server, timeout=timeout, ignore_unexpected=True)
+            return r is not None and len(r.answer) > 0
+        except Exception:
+            return False
+
+    try:
+        with _futures.ThreadPoolExecutor(max_workers=2) as pool:
+            f_v6 = pool.submit(_one, _PROBE_V6_TARGET)
+            f_v4 = pool.submit(_one, _PROBE_V4_TARGET)
+            return (bool(f_v6.result()), bool(f_v4.result()))
+    except Exception:
+        return (False, False)
+
+
+def ipv6_dns_reachable(timeout: float = 0.8) -> bool:
+    """IPv6 是否真的能出网（等价于 ``probe_ipv6_path()[0]``）"""
+    return probe_ipv6_path(timeout)[0]
 
 
 def reorder_answer_aaaa_first(msg):
@@ -44,23 +146,28 @@ def reorder_answer_aaaa_first(msg):
     if not has_aaaa or not has_a:
         return
 
-    # 范围内 AAAA 在前，A 在后
-    aaaa_in_range = [
-        rrset for rrset in msg.answer[first_aa:last_aa + 1]
-        if rrset.rdtype == dns.rdatatype.AAAA
-    ]
-    a_in_range = [
-        rrset for rrset in msg.answer[first_aa:last_aa + 1]
-        if rrset.rdtype == dns.rdatatype.A
-    ]
+    # 范围内按类型分组重建（见下方 reordered）；这里只判断"两者都有"才值得重排
 
-    # 构建新 answer：范围外的保持原位，范围内 AAAA 在前
+    # 构建新 answer：范围外的保持原位，范围内**只把 AAAA 块整体前移**，
+    # 其余 RRset（A、RRSIG、HTTPS…）保持原相对顺序。
+    #
+    # 修复：早期版本用 `aaaa_in_range + a_in_range` 重建区间，只保留 A/AAAA，
+    # 区间内的其它 RRset 会被**直接丢弃**。带 DO=1 的应答形如
+    # [A, RRSIG(A), AAAA, RRSIG(AAAA)]，重排后变成 [AAAA, A]——两个 RRSIG
+    # 都被静默剥离，下游（浏览器安全 DNS / 其它校验器）验签必然失败。
+    range_items = list(msg.answer[first_aa:last_aa + 1])
+    reordered = [rrset for rrset in range_items
+                 if rrset.rdtype == dns.rdatatype.AAAA]
+    reordered += [rrset for rrset in range_items
+                  if rrset.rdtype != dns.rdatatype.AAAA]
     new_answer = (
         list(msg.answer[:first_aa])
-        + aaaa_in_range
-        + a_in_range
+        + reordered
         + list(msg.answer[last_aa + 1:])
     )
+    # 防御：RRset 数量必须不变，否则说明重排逻辑漏项 → 放弃重排
+    if len(new_answer) != len(msg.answer):
+        return
 
     if msg.answer != new_answer:
         msg.answer.clear()
