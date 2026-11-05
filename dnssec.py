@@ -353,12 +353,161 @@ class DNSSECValidator:
             self._zone_ds_cache.clear()
         return result
 
-    async def _zone_has_ds_uncached(self, qname: dns.name.Name) -> Optional[bool]:
-        """逐级向上查询父区 DS（无缓存路径）"""
+    # ---- NSEC/NSEC3 否定证明（仅用于「DS NODATA 是否成立」的判定） ----
+
+    @staticmethod
+    def _nsec_has_type(nsec_rdata, rdtype: int) -> bool:
+        """检查 NSEC/NSEC3 rdata 的类型位图是否包含指定类型
+
+        NSEC（RFC 4034 §4.1.2）：windows 是 (window, bitmap) 的可迭代；
+        NSEC3（RFC 5155 §3.2）：windows 布局不同，改用 to_text 解析类型列表。
+        与 `plain_dns_server.IterativeResolver._nsec_has_type` 完全一致，
+        避免两个模块对同一份数据给出不同结论。
+        """
         try:
-            name = qname.parent()
+            from dns.rdtypes.ANY.NSEC3 import NSEC3 as NSEC3Cls
+            if isinstance(nsec_rdata, NSEC3Cls):
+                parts = nsec_rdata.to_text().split()
+                parsed_any = False
+                for p in parts[5:]:
+                    try:
+                        parsed_any = True
+                        if dns.rdatatype.from_text(p) == rdtype:
+                            return True
+                    except Exception:
+                        continue
+                if parsed_any:
+                    return False
+                # NSEC3 最小记录（RFC 5155 §3.2.1）：隐含 NS + RRSIG + NSEC3
+                return rdtype in (dns.rdatatype.NS, dns.rdatatype.RRSIG,
+                                  dns.rdatatype.NSEC3)
+            for window, bitmap in nsec_rdata.windows:
+                if rdtype // 256 == window:
+                    byte = rdtype % 256 // 8
+                    bit = 0x80 >> (rdtype % 8)
+                    return bool(bitmap[byte] & bit) if byte < len(bitmap) else False
         except Exception:
-            return None
+            return False
+        return False
+
+    @staticmethod
+    def _nsec3_hash(name: dns.name.Name, salt: bytes, iterations: int,
+                    algorithm: int) -> bytes:
+        """RFC 5155 §5：NSEC3 hash（SHA-1 迭代，algorithm=1）
+
+        iterations 上限 150（RFC 9276 §3 建议值），防响应驱动的 CPU 放大攻击；
+        超限返回 b""（=无法验证），调用方按"无证明"处理。
+        """
+        import hashlib
+        if algorithm != 1:
+            return b""
+        try:
+            if iterations < 0 or iterations > 150:
+                return b""
+        except Exception:
+            return b""
+        try:
+            h = name.to_wire(canonicalize=True)
+            for _ in range(iterations + 1):
+                h = hashlib.sha1(h + salt).digest()
+            return h
+        except Exception:
+            return b""
+
+    @staticmethod
+    def _nsec3_owner_hash(owner: dns.name.Name) -> bytes:
+        """NSEC3 owner 名的 hash bytes（base32hex，RFC 4648 §7）"""
+        import base64
+        try:
+            label = str(owner).split(".")[0].upper()
+            table = str.maketrans("0123456789ABCDEFGHIJKLMNOPQRSTUV",
+                                  "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567")
+            b32 = label.translate(table)
+            pad = "=" * ((8 - len(b32) % 8) % 8)
+            return base64.b32decode(b32 + pad)
+        except Exception:
+            return b""
+
+    @staticmethod
+    def _hash_in_interval(target: bytes, owner: bytes, nxt: bytes) -> bool:
+        """NSEC3 hash 是否落在 (owner, next) 区间（含回绕，RFC 5155 §8.4）
+
+        target == owner（该名字本身存在）或 target == next（下一条记录存在）
+        都不算"覆盖"，否则会把真实存在的签名委托误判为不存在。
+        """
+        if not target or not owner or not nxt:
+            return False
+        if target == owner or target == nxt:
+            return False
+        if owner < nxt:
+            return owner < target < nxt
+        return target > owner or target < nxt
+
+    @staticmethod
+    def _nsec3_optout(rdata) -> bool:
+        """NSEC3 flags 的 Opt-Out 位（RFC 5155 §3.1.2.1）"""
+        try:
+            return bool(int(getattr(rdata, "flags", 0)) & 0x01)
+        except Exception:
+            return False
+
+    def _ds_nodata_proves_insecure(self, resp, name: dns.name.Name) -> bool:
+        """DS 查询的 NODATA 响应是否**数学上**证明 name 没有 DS
+
+        RFC 4035 §5.2 要求：只有拿到父区签名的否定证明，才能把该名字判为
+        insecure 委托。旧实现只看"响应里有没有 NSEC/NSEC3 记录"就认定未签名，
+        任意 NSEC 响应都能把签名区降级。
+
+        认可三种证明（与 `plain_dns_server._zone_signed_status` 语义一致）：
+          1. NSEC owner == name 且位图**含 NS 但不含 DS**（未签名委托点）
+          2. NSEC3 hash(name) == owner hash 且位图含 NS 不含 DS（未签名委托点）
+          3. NSEC3 opt-out 区间覆盖 name + 位图含 NS（RFC 5155 §8.6：
+             区间内可能存在被省略的未签名委托）
+
+        ★ "含 NS"这个条件不能省：普通记录（如 www.ietf.org 在签名区 ietf.org
+          内）也有 NSEC3 且位图不含 DS，但它不是委托点，DS NODATA 不能据此
+          推断"所在区未签名"（实测漏掉该条件会把签名区里的普通名字判成
+          未签名，进而让 include_rrsig 严格模式放行被剥离签名的应答）。
+        """
+        rd_DS = dns.rdatatype.DS
+        rd_NS = dns.rdatatype.NS
+        for rrset in list(resp.answer) + list(resp.authority):
+            if rrset.rdtype == dns.rdatatype.NSEC:
+                if rrset.name != name:
+                    continue
+                for rd in rrset:
+                    if (self._nsec_has_type(rd, rd_NS)
+                            and not self._nsec_has_type(rd, rd_DS)):
+                        return True
+            elif rrset.rdtype == dns.rdatatype.NSEC3:
+                owner_hash = self._nsec3_owner_hash(rrset.name)
+                if not owner_hash:
+                    continue
+                for rd in rrset:
+                    th = self._nsec3_hash(name, rd.salt, rd.iterations, rd.algorithm)
+                    if not th:
+                        continue
+                    if (owner_hash == th
+                            and self._nsec_has_type(rd, rd_NS)
+                            and not self._nsec_has_type(rd, rd_DS)):
+                        return True
+                    if (self._hash_in_interval(th, owner_hash, rd.next)
+                            and self._nsec3_optout(rd)
+                            and self._nsec_has_type(rd, rd_NS)):
+                        return True
+        return False
+
+    async def _zone_has_ds_uncached(self, qname: dns.name.Name) -> Optional[bool]:
+        """逐级向上查询 DS，判断该名字所在区是否应为签名区
+
+        ★ 必须从 **qname 自身** 起跳：qname 自己就可能是一个 zone apex
+          （DS 由父区持有）。旧实现从 `qname.parent()` 起跳，会直接看到父区
+          （如 com.）有 DS 就判"应有签名"——实测 `google.com`（未签名）因此
+          被判 True，开启 `require_rrsig` 后合法应答会被当成"签名被剥离"丢弃。
+        ★ 无 DS 时必须验证否定证明的语义（见 `_ds_nodata_proves_insecure`），
+          不能只看"响应里有没有 NSEC/NSEC3"。无证明时升父级继续找委托点。
+        """
+        name = qname
         for _ in range(8):
             if name == dns.name.root:
                 return False
@@ -375,11 +524,7 @@ class DNSSECValidator:
                 return None
             if any(rr.rdtype == dns.rdatatype.DS for rr in resp.answer):
                 return True
-            # 无 DS：只有拿到 NSEC/NSEC3 否定证明才能确认"该区未签名"
-            if any(
-                rr.rdtype in (dns.rdatatype.NSEC, dns.rdatatype.NSEC3)
-                for rr in (list(resp.answer) + list(resp.authority))
-            ):
+            if self._ds_nodata_proves_insecure(resp, name):
                 return False
             name = name.parent()
         return None
@@ -416,23 +561,27 @@ class DNSSECValidator:
         except Exception:
             return None
 
-    async def _query_rrset(self, zone: dns.name.Name, rdtype: int):
-        """查询 zone 的指定 RR 类型，返回 (rrset, rrsig_set)；任一缺失返回 (None, None)"""
+    async def _query_rrset_ex(self, zone: dns.name.Name, rdtype: int):
+        """查询 zone 的 RR 类型，返回 (rrset, rrsig_set, full_response)
+
+        比 `_query_rrset` 多返回完整报文：判定「DS NODATA 是否成立」必须看
+        否定证明（NSEC/NSEC3），只有 rrset 是不够的。
+        """
         if self._dns_query_callback is None:
-            return None, None
+            return None, None, None
         try:
             from cache import get_query_wire
 
             query_bytes = get_query_wire(str(zone), rdtype, want_dnssec=True)
             if query_bytes is None:
-                return None, None
+                return None, None, None
             response_bytes = await self._dns_query_callback(query_bytes)
             if response_bytes is None:
-                return None, None
+                return None, None, None
             resp = dns.message.from_wire(response_bytes)
         except Exception as e:
             logger.debug("查询 %s %s 失败: %s", zone, dns.rdatatype.to_text(rdtype), e)
-            return None, None
+            return None, None, None
 
         target = None
         for rrset in resp.answer:
@@ -440,8 +589,13 @@ class DNSSECValidator:
                 target = rrset
                 break
         if target is None:
-            return None, None
-        return target, self._find_rrsig_for(resp, resp.answer, target)
+            return None, None, resp
+        return target, self._find_rrsig_for(resp, resp.answer, target), resp
+
+    async def _query_rrset(self, zone: dns.name.Name, rdtype: int):
+        """查询 zone 的指定 RR 类型，返回 (rrset, rrsig_set)；任一缺失返回 (None, None)"""
+        rrset, sigs, _resp = await self._query_rrset_ex(zone, rdtype)
+        return rrset, sigs
 
     @staticmethod
     def _ds_matches_dnskey(ds_rdata, zone_name: dns.name.Name, dnskey_rdata) -> bool:
@@ -503,9 +657,17 @@ class DNSSECValidator:
             return parent_status, {}
 
         # 父区 DS：查询不到 DS 记录 = insecure 委托（RFC 4035 §5.2 的合法情形）
-        ds_rrset, ds_sigs = await self._query_rrset(zone, dns.rdatatype.DS)
+        #
+        # ★ 但"查不到 DS"不等于"没有 DS"：中间人可以让 DS 查询返回 NODATA，
+        #   把签名区降级成 insecure（DNSSEC 降级攻击）。RFC 4035 §5.2 要求
+        #   必须拿到父区**签名过的否定证明**（NSEC/NSEC3）才能判 insecure；
+        #   拿不到证明就只能判 indeterminate（不放行也不判伪造）。
+        ds_rrset, ds_sigs, ds_resp = await self._query_rrset_ex(
+            zone, dns.rdatatype.DS)
         if ds_rrset is None:
-            return "insecure", {}
+            if ds_resp is not None and self._ds_nodata_proves_insecure(ds_resp, zone):
+                return "insecure", {}
+            return "indeterminate", {}
         if ds_sigs is None:
             return "indeterminate", {}
         try:
@@ -519,19 +681,23 @@ class DNSSECValidator:
         if dnskey_rrset is None or sigs is None:
             return "indeterminate", {}
 
-        # DS digest 匹配出父区授权的 KSK，再用它验证 DNSKEY 集合的自签
-        auth_ksk = None
-        for ds in ds_rrset:
-            for key in dnskey_rrset:
+        # DS digest 匹配出父区授权的 key —— **收集全部**匹配项，再用它们验证
+        # DNSKEY 集合的自签。KSK 轮换窗口内父区会同时发布新旧两条 DS，而自签
+        # RRSIG 只由其中一把签发；且权威返回的 DS 顺序不固定（同一 zone 两次
+        # 查询可能顺序相反）。只取"第一把匹配的 key"会误判 bogus
+        # （实测 sc.：DS={2539,35612}，RRSIG(DNSKEY) 由 35612 签）。
+        # 安全性不变：能进入 trusted 的 key 必须匹配**已验签**的 DS。
+        auth_keys = []
+        for key in dnskey_rrset:
+            for ds in ds_rrset:
                 if self._ds_matches_dnskey(ds, zone, key):
-                    auth_ksk = key
+                    auth_keys.append(key)
                     break
-            if auth_ksk is not None:
-                break
-        if auth_ksk is None:
+        if not auth_keys:
             return "bogus", {}
         ksk_rrset = dns.rrset.RRset(zone, dns.rdataclass.IN, dns.rdatatype.DNSKEY)
-        ksk_rrset.add(auth_ksk)
+        for key in auth_keys:
+            ksk_rrset.add(key)
         try:
             dns.dnssec.validate(dnskey_rrset, sigs, {zone: ksk_rrset})
         except dns.dnssec.ValidationFailure:
