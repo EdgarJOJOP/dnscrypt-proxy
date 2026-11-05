@@ -125,45 +125,17 @@ def is_html_filter_rule(line: str) -> bool:
 # 本程序对其中各修饰符的实际处理：
 #   important   —— 支持（优先级高于普通规则/普通例外）
 #   badfilter   —— 支持（禁用同 pattern 的其它规则）
-#   dnsrewrite  —— **整条跳过**（2026-10-31）：解析器能识别它，但四个 DNS 前端
-#                  都没有消费 get_last_dnsrewrite()——带该修饰符的规则只会退化成
-#                  "整域 NXDOMAIN"，即把本应返回 1.2.3.4 / REFUSED / 空应答的域名
-#                  直接拦死（误拦截）。在真正实现响应重写之前，宁可少拦不误拦。
+#   dnsrewrite  —— 支持（响应重写，见 FilterRule._parse_dnsrewrite）
 #   client      —— AdGuard Home/DNS 专用；本程序无客户端身份，无法评估 → 整条跳过
 #   ctag        —— 同上（客户端标签）→ 整条跳过
 #   respgeo     —— AdGuard DNS 专用（按响应 IP 国家/ASN）→ 无法评估 → 整条跳过
 #   denyallow   —— DNS 可评估，但本程序尚未实现 → 整条跳过（宁可少拦，不误拦）
 #   dnstype     —— 同上（按查询类型）→ 整条跳过
 _DNS_DOC_MODIFIERS = frozenset({
-    "important", "badfilter",
+    "important", "badfilter", "dnsrewrite",
     "client", "ctag", "respgeo",
     "denyallow", "dnstype",
 })
-
-
-def _free_regex_parts(line: str):
-    """把 `/regex/` 或 `/regex/$modifiers` 拆成 (正则部分, 修饰符部分)
-
-    不是自由正则规则时返回 None。
-
-    必须**在** `$` 修饰符切分之前识别：自由正则里的 `$` 是行尾锚点，
-    早期实现直接 `rsplit("$", 1)`，会把 `/^ads\\.example\\.com$/` 切成
-    正则 `/^ads\\.example\\.com` + 修饰符 `/`，然后因为 `/` 不是合法修饰符
-    而把整条规则丢弃——所有带行尾锚点的正则规则全部静默失效（漏拦截）。
-    """
-    text = line.strip()
-    if len(text) < 3 or not text.startswith("/"):
-        return None
-    last = text.rfind("/")
-    if last <= 0:
-        return None
-    regex_part = text[:last + 1]
-    rest = text[last + 1:]
-    if not rest:
-        return regex_part, None
-    if rest.startswith("$"):
-        return regex_part, rest[1:]
-    return None
 
 
 def has_non_dns_modifier(line: str) -> bool:
@@ -171,16 +143,8 @@ def has_non_dns_modifier(line: str) -> bool:
 
     不含 `$` → False（纯域名规则）。修饰符解析规则与 FilterRule._parse 一致：
     取最后一个 `$` 之后的部分、按逗号分隔、`name=value` 只取 name、`~` 前缀
-    去掉；纯下划线（noop）按规范忽略。自由正则 `/regex/` 先整体识别，
-    其中的 `$` 属于正则语法而非修饰符。
+    去掉；纯下划线（noop）按规范忽略。
     """
-    parts = _free_regex_parts(line)
-    if parts is not None:
-        line = parts[0]
-        if parts[1] is None:
-            return False
-        # 只校验正则之后的修饰符部分
-        line = "$" + parts[1]
     if "$" not in line:
         return False
     modifiers = line.rsplit("$", 1)[1]
@@ -923,15 +887,8 @@ class FilterRule:
             return
 
         # 3. 分离 $modifiers 并验证
-        #
-        # 自由正则 /regex/ 必须先整体识别：正则里的 `$` 是行尾锚点，不是修饰符。
-        # 早期实现无条件 rsplit("$", 1)，导致 `/^ads\.example\.com$/` 被切成
-        # 正则 `/^ads\.example\.com` + 修饰符 `/` → 判为未知修饰符 → 整条丢弃。
         modifiers_str = None
-        _regex_parts = _free_regex_parts(text)
-        if _regex_parts is not None:
-            text, modifiers_str = _regex_parts
-        elif "$" in text:
+        if "$" in text:
             parts = text.rsplit("$", 1)
             text = parts[0]
             modifiers_str = parts[1]
@@ -953,14 +910,11 @@ class FilterRule:
                     self.is_badfilter = True
                     break
 
-            # dnsrewrite：**当前整条跳过**（不再解析）
-            # 解析出来的 rewrite 值没有任何 DNS 前端消费，实际行为会退化成
-            # "整域 NXDOMAIN"——把本该返回 1.2.3.4 / REFUSED / 空应答的域名
-            # 直接拦死。整条跳过前，先把它记成跳过原因便于排障。
+            # 检测 dnsrewrite 修饰符
             for mod in modifiers_str.split(','):
                 if mod.strip().startswith('dnsrewrite'):
-                    self._skip = True
-                    return
+                    self._parse_dnsrewrite(mod.strip())
+                    break
 
             # 例外规则带有限制性修饰符（如 $domain=xxx、$third-party、$script 等）
             # 则跳过该规则。DNS 代理无法评估这些修饰符的条件，
@@ -2615,13 +2569,6 @@ class FilterEngine:
 
         # 2. 创建 pending 状态（不触碰活跃索引）
         gc.collect(generation=2)
-        # 重载会**重建**整份索引：此时 checksum 命中跳过解析＝把该文件的规则
-        # 直接丢掉（pending 里只剩远程 URL 的规则），因此重载路径必须清空
-        # checksum 缓存强制重解析；badfilter 集合同理，否则旧列表的
-        # $badfilter 会永久压制新列表里的同名规则。
-        self._file_checksums.clear()
-        with self._badfilter_lock:
-            self._badfilter_patterns.clear()
         self._pending_block_index = DomainIndex()
         self._pending_allow_index = DomainIndex()
         self._pending_plain_domains = set()
@@ -2705,11 +2652,6 @@ class FilterEngine:
 
         # 2. 创建 pending 状态（不触碰活跃索引）
         gc.collect(generation=2)
-        # 与 async_reload 一致：重载重建索引，checksum 缓存必须失效强制重解析，
-        # 否则本地规则在重载后整体消失；badfilter 集合也随旧规则集作废。
-        self._file_checksums.clear()
-        with self._badfilter_lock:
-            self._badfilter_patterns.clear()
         self._pending_block_index = DomainIndex()
         self._pending_allow_index = DomainIndex()
         self._pending_plain_domains = set()

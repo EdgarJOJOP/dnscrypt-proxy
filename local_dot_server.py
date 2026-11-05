@@ -115,10 +115,7 @@ class LocalDoTServer:
             rcode = msg.rcode()
         except Exception:
             return False
-        # RFC 2308 §7：只允许缓存 NXDOMAIN 与 NODATA。REFUSED / SERVFAIL 属于
-        # 错误应答，不是"名字不存在"，不能当负应答（缓存层 cache.set 亦已直接
-        # 拒绝非 NOERROR/NXDOMAIN 的响应，这里同步去掉避免语义混淆）。
-        if rcode == dns.rcode.NXDOMAIN:
+        if rcode in (dns.rcode.NXDOMAIN, dns.rcode.REFUSED):
             return True
         return rcode == dns.rcode.NOERROR and not msg.answer
 
@@ -456,11 +453,7 @@ class LocalDoTServer:
             else:
                 # DNSSEC 验证
                 dnssec_ok = True
-                # 纯迭代 + strict_dnssec 时迭代器内部已严格验证（resolver 层也
-                # 跳过），此处不再重复验证：既省 DNSKEY/DS 往返，也避免 wrapper
-                # 把合法 NXDOMAIN/NSEC 负应答误判 bogus → SERVFAIL。
-                if (self._dnssec_wrapper is not None and self.config.dnssec_enabled
-                        and not self.resolver_manager.iterative_already_verified()):
+                if self._dnssec_wrapper is not None and self.config.dnssec_enabled:
                     dnssec_ok, _ = await self._dnssec_wrapper.validate_response(wire_data, result_wire)
                     if not dnssec_ok and self.config.dnssec_drop_bogus:
                         response = dns.message.make_response(query)

@@ -214,25 +214,15 @@ class DoHFrontend:
 
     # ==================== 生命周期 ====================
 
-    def _internal_base_url(self) -> str:
-        """内部站点 base_url
-
-        IPv6 字面量必须加方括号（``http://[::1]:1234``），否则 httpx/URL 解析
-        会把端口误当成地址的一部分。internal_host 现在可由配置指定为 ::1。
-        """
-        host = self.internal_host
-        if ":" in host and not host.startswith("["):
-            host = f"[{host}]"
-        return f"http://{host}:{self.internal_port}"
-
     async def start(self):
         """启动 TLS 前端（IPv4 必需，IPv6 可选）与 HTTP/3（可选）"""
         ssl_context = self._make_ssl_context()
+
         self._client = httpx.AsyncClient(
-            base_url=self._internal_base_url(),
+            base_url=f"http://{self.internal_host}:{self.internal_port}",
             timeout=httpx.Timeout(self.forward_timeout, connect=5.0),
             limits=httpx.Limits(max_connections=256, max_keepalive_connections=64),
-            # 不读系统代理：内部转发必须直连回环
+            # 不读系统代理：内部转发必须直连 127.0.0.1
             trust_env=False,
             follow_redirects=False,
         )
@@ -1060,11 +1050,8 @@ class DoHServer:
 
         # 对外协议前端（TLS ALPN h2/http1.1 + QUIC h3）
         self._frontend: Optional[DoHFrontend] = None
-        # 内部明文 aiohttp 站点：只监听回环，端口由系统分配（0）。
-        # 地址来自 server.doh.internal_host（默认 127.0.0.1，只接受回环地址）；
-        # 早期这里是硬编码 "127.0.0.1"，无法在纯 IPv6 环境（无 IPv4 回环）下
-        # 改用 ::1。
-        self.internal_host = config.doh_internal_host
+        # 内部明文 aiohttp 站点：只监听本机，端口由系统分配（0）
+        self.internal_host = "127.0.0.1"
         self.internal_port = 0
 
         # 并发控制
@@ -1128,10 +1115,7 @@ class DoHServer:
             rcode = msg.rcode()
         except Exception:
             return False
-        # RFC 2308 §7：只允许缓存 NXDOMAIN 与 NODATA。REFUSED / SERVFAIL 属于
-        # 错误应答，不是"名字不存在"，不能当负应答（缓存层 cache.set 亦已直接
-        # 拒绝非 NOERROR/NXDOMAIN 的响应，这里同步去掉避免语义混淆）。
-        if rcode == dns.rcode.NXDOMAIN:
+        if rcode in (dns.rcode.NXDOMAIN, dns.rcode.REFUSED):
             return True
         return rcode == dns.rcode.NOERROR and not msg.answer
 
@@ -1356,6 +1340,8 @@ class DoHServer:
             if self.config.filter_enabled and not is_hosts_bypass:
                 blocked, reason = self.filter_engine.check_domain(qname)
                 if blocked:
+                    result["Status"] = 3  # NXDOMAIN
+                    result["Comment"] = f"被过滤规则拦截: {reason}"
                     # 缓存拦截结果到 DNS 响应缓存，防止上游正向应答重复生效。
                     # blocked=True 打标：规则放宽（删规则/@@ 例外/hosts 白名单）后
                     # 由 _sweep_cache_after_filter_load 反向清理，避免旧拦截条目
@@ -1367,28 +1353,21 @@ class DoHServer:
                         _hit = await self.cache.get(_block_key)
                         if _hit is not None:
                             return self._dns_response_to_json(_hit, query)
-                    response = dns.message.make_response(query)
-                    response.set_rcode(dns.rcode.NXDOMAIN)
-                    response.flags |= dns.flags.RA   # RFC 1035：递归服务端
-                    # RFC 2308：补 SOA 让客户端能缓存负应答（详见 plain_dns_server 注释）
-                    try:
-                        _neg_ttl = int(getattr(self.config, "cache_negative_ttl", 60) or 60)
-                        response.authority.append(dns.rrset.from_text(
-                            question.name, _neg_ttl, "IN", "SOA",
-                            "blocked.invalid. hostmaster.blocked.invalid. 1 "
-                            "3600 600 86400 %d" % _neg_ttl,
-                        ))
-                    except Exception:
-                        pass
-                    if self.config.cache_enabled:
+                        response = dns.message.make_response(query)
+                        response.set_rcode(dns.rcode.NXDOMAIN)
+                        response.flags |= dns.flags.RA   # RFC 1035：递归服务端
+                        # RFC 2308：补 SOA 让客户端能缓存负应答（详见 plain_dns_server 注释）
+                        try:
+                            _neg_ttl = int(getattr(self.config, "cache_negative_ttl", 60) or 60)
+                            response.authority.append(dns.rrset.from_text(
+                                question.name, _neg_ttl, "IN", "SOA",
+                                "blocked.invalid. hostmaster.blocked.invalid. 1 "
+                                "3600 600 86400 %d" % _neg_ttl,
+                            ))
+                        except Exception:
+                            pass
                         await self.cache.set(_block_key, response, True, blocked=True)
-                    # 修复：早期这里 `return result` 返回的是只填了 Status/Comment
-                    # 的内存 dict（Authority 为空），而缓存里存的是带 SOA 的
-                    # response——于是"首次无 SOA、命中后才有 SOA"，既违反
-                    # RFC 2308 的负缓存语义，也和另外三个服务的拦截应答形态
-                    # 不一致。统一走 JSON 序列化，两条路径输出一致。
-                    logger.debug("DoH(JSON) 拦截 %s: %s", qname, reason)
-                    return self._dns_response_to_json(response, query)
+                    return result
 
             # 2. 缓存检查
             if self.config.cache_enabled:
@@ -1406,34 +1385,7 @@ class DoHServer:
 
             response = dns.message.from_wire(result_wire)
 
-            # 4. DNSSEC 验证（与 wire 入口 ?dns= **完全共用同一套判定**）
-            #
-            # 修复：早期 JSON 入口（?name=&type=）直接返回上游响应，从不调用
-            # validate_response，于是同一份上游应答走 ?dns= 会判 bogus 而走
-            # ?name= 却放行——bogus 响应可经此入口进入，并写进 source="json"
-            # 的缓存键长期复用（fail-open）。这里按 wire 路径的同一逻辑校验，
-            # 安全默认取最严：drop_bogus 开启时直接回 SERVFAIL。
-            if (self._dnssec_wrapper is not None and self.config.dnssec_enabled
-                    and not self.resolver_manager.iterative_already_verified()):
-                try:
-                    # DNSSECQueryWrapper.validate_response 返回 **(bool, str)** 两元组
-                    # （内部才展开 DNSSECValidator 的 3 元组）；早期这里误按 3 元组
-                    # 解包 → ValueError → 被 except 兜住 → 又踩到未定义的 name，
-                    # 最终整个 JSON 入口回 "内部错误"。
-                    dnssec_ok, dnssec_status = \
-                        await self._dnssec_wrapper.validate_response(wire_data, result_wire)
-                except Exception as e:
-                    # 注意：本方法的局部变量是 qname（不是上层 _handle_request 的
-                    # name）。
-                    logger.debug("JSON 入口 DNSSEC 验证异常 %s: %s", qname, e)
-                    dnssec_ok, dnssec_status = True, "indeterminate"
-                if not dnssec_ok and self.config.dnssec_drop_bogus:
-                    logger.warning("DNSSEC bogus，丢弃 %s 的响应（JSON 入口）", qname)
-                    result["Status"] = 2  # SERVFAIL
-                    result["Comment"] = f"DNSSEC 验证失败: {dnssec_status}"
-                    return result
-
-            # 5. 缓存
+            # 4. 缓存
             if self.config.cache_enabled:
                 is_negative = self._is_negative_response(response)
                 await self.cache.set(cache_key, response, is_negative)
@@ -1710,11 +1662,7 @@ class DoHServer:
                 upstream = self.resolver_manager.last_fast_server or ""
                 # 4. DNSSEC 验证（如果启用）
                 dnssec_ok = True
-                # 纯迭代 + strict_dnssec 时迭代器内部已严格验证（resolver 层也
-                # 跳过），此处不再重复验证：既省 DNSKEY/DS 往返，也避免 wrapper
-                # 把合法 NXDOMAIN/NSEC 负应答误判 bogus → SERVFAIL。
-                if (self._dnssec_wrapper is not None and self.config.dnssec_enabled
-                        and not self.resolver_manager.iterative_already_verified()):
+                if self._dnssec_wrapper is not None and self.config.dnssec_enabled:
                     dnssec_ok, dnssec_status = await self._dnssec_wrapper.validate_response(
                         wire_data, result_wire
                     )

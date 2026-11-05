@@ -957,7 +957,10 @@ class ResolverManager:
         # 「被并发查询的其它上游覆盖」的竞态（不能用 `_last_fast_server_obj`：
         # 那是共享状态，多上游并发时会串味，可能让 DoH 响应误跳过验证）。
         # 混合模式（iterative + 加密上游）保持原有逐响应验证，宁可慢也不放松。
-        _iter_already_verified = self.iterative_already_verified()
+        _iter_already_verified = (
+            self._is_pure_iterative_mode()
+            and bool(getattr(self._iterative_resolver, "strict_dnssec", False))
+        )
         if (result is not None and self._dnssec is not None
                 and self._dnssec.enabled and not _iter_already_verified):
             try:
@@ -1335,33 +1338,6 @@ class ResolverManager:
             )
         except Exception:
             return False
-
-    def iterative_already_verified(self) -> bool:
-        """本次响应是否已由迭代器内部完成 DNSSEC 验证
-
-        纯迭代模式（没有启用的加密上游）+ 迭代器 strict_dnssec=True 时，
-        `IterativeResolver` 已在**内部**完成严格链验证（bogus 在内部就被丢弃，
-        不会返回到这里）。此时各前端**不应再验一遍**，原因有二：
-
-          1. 重复开销：每域名多若干次 DNSKEY/DS 往返；
-          2. **正确性**：`DNSSECValidator`（wrapper）对负应答（NXDOMAIN /
-             NODATA 的 NSEC/NSEC3 语义）的判定与迭代器不一致——实测同一个
-             `does-not-exist-xyz-123.invalidtld` 的 NXDOMAIN 应答，迭代器判
-             secure，wrapper 却判 `bogus`。叠加 `dnssec.drop_bogus: true` 就会
-             把**合法的 NXDOMAIN 全部变成 SERVFAIL**（不存在的域名一律解析
-             失败）。
-
-        该判定与 `_resolve_impl` 里的 `_iter_already_verified` 完全一致，
-        各 DNS 前端（plain/DoH/DoT/DoQ）直接复用，避免各写一套漂移。
-        """
-        try:
-            return (
-                self._is_pure_iterative_mode()
-                and bool(getattr(self._iterative_resolver, "strict_dnssec", False))
-            )
-        except Exception:
-            return False
-
 
     @staticmethod
     def _get_suffix(hostname: str) -> str:

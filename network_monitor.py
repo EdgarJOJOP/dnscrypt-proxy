@@ -93,6 +93,17 @@ class NetworkMonitor:
         # DNS 探测复用解析器缓存（避免每次探测创建新 UDP 套接字）
         self._dns_probe_resolvers: Dict[str, "PlainDNSResolver"] = {}
 
+        # ========== 「全上游失败」深度诊断的单飞 + 限频 ==========
+        # 并发查询会同时把"全部失败"报上来；而每次诊断都要跑 ARP/NDP 检查
+        # （可能起子进程）+ plain DNS 探活（多地串行，最长数秒）。若不去重，
+        # 30 个并发查询全失败 = 30 份诊断同时跑 → 事件循环被淹没、内存暴涨
+        # （实测 30s 内 +436MB、页面全部超时）。
+        self._diagnose_in_progress = False
+        self._last_diagnose_at = 0.0
+        # 纯迭代模式只有 1 个上游，任何单域名超时都会报"全部失败"，
+        # 诊断间隔放得更长（30s）；多上游模式 10s。
+        self._diagnose_min_interval = 30.0
+
         # ARP 防护
         self._arp_protection = ARPProtection(config.arp_protection_config,
                                               ping_interval=self._interval,
@@ -495,10 +506,21 @@ class NetworkMonitor:
                     elif self._arp_protection.enabled \
                             and not self._arp_protection.is_manual:
                         v6_has_ext = len(self._ext_results_v6) > 0 and sum(self._ext_results_v6) > 0
-                        if len(self._gw_results) >= 5 and not v6_has_ext:
-                            self.resolver_manager.set_network_down(True)
-                        elif not v6_has_ext:
-                            logger.debug("ARP v4 gw window small (%d), skip DNS pause", len(self._gw_results))
+                        # **不再因「部分丢包」切断 DNS**（2026-10-30）：
+                        # arp_issue = 网关/外网仍有部分探测成功，链路是通的。
+                        # 原实现在 len(_gw_results) >= 5 且无 v6 外网结果时直接
+                        # set_network_down(True)，而 _network_down 会让
+                        # ResolverManager._parallel_resolve 立即返回 None ——
+                        # 所有客户端查询变成 1-6ms 的 SERVFAIL（实测
+                        # connect.ol.epicgames.com 在 23:00:44 连续几十条 error，
+                        # 全部 1-6ms），游戏/浏览器一起卡死。
+                        # 部分丢包只启动 ARP 修复；断网确认交给
+                        # 「连续 2 轮 network_down」与「网关+外网全不通」两条路径。
+                        if not v6_has_ext:
+                            logger.debug(
+                                "ARP v4 gw window (%d), 仅启动 ARP 修复（不切断 DNS）",
+                                len(self._gw_results),
+                            )
                         else:
                             logger.debug("ARP v6 ext ok, skip DNS pause")
                         if not self._arp_task or self._arp_task.done():
@@ -1306,20 +1328,73 @@ class NetworkMonitor:
 
     # ======================== Resolver 全部失败回调 ========================
 
-    async def on_all_upstreams_failed(self, consecutive_count: int, elapsed_seconds: float):
-        """
-        ResolverManager 回调：所有上游 DNS 服务器连续全部失败时调用。
-        执行深度检测尝试定位问题根源。
+    def _is_pure_iterative_mode(self) -> bool:
+        """当前是否「纯迭代」模式（没有任何 DoH/DoT/DoQ 加密上游）
 
-        Args:
-            consecutive_count: 连续全部失败的轮数
-            elapsed_seconds: 从首次全部失败到现在的持续时间
+        纯迭代模式（config: upstream.enabled=false）下，迭代解析失败**不是**
+        「加密 DNS 被拦截 / 加密上游集体故障」，启动预热未完成时阶段性失败也
+        属正常——诊断与告警必须按实际模式走，否则会误报并连带触发 ARP/NDP 反制。
+        """
+        try:
+            rm = self.resolver_manager
+            if rm is None:
+                return False
+            servers = getattr(rm, "_upstream_servers", None) or []
+            return not any(
+                getattr(s, "server_type", "") in ("doh", "dot", "doq")
+                for s in servers
+            )
+        except Exception:
+            return False
+
+    async def on_all_upstreams_failed(self, consecutive_count: int, elapsed_seconds: float):
+        """ResolverManager 回调：所有上游连续全部失败时触发深度诊断
+
+        **单飞 + 限频（关键修复）**：并发查询会同时把"全部失败"报上来，而一次
+        诊断要跑 ARP/NDP 检查（可能起子进程）+ plain DNS 探活（最长数秒）。若每次
+        失败都同步跑一遍，30 并发 × 数秒 = 事件循环被淹没、内存暴涨（实测 30s 内
+        +436MB、页面全部超时）。这里保证同一时刻只有一份诊断在跑，且两次诊断至少
+        间隔 _diagnose_min_interval（纯迭代 30s / 多上游 10s）。
         """
         if not self._running:
             return
+        self._diagnose_min_interval = 30.0 if self._is_pure_iterative_mode() else 10.0
+        now = asyncio.get_event_loop().time()
+        if self._diagnose_in_progress:
+            logger.debug("深度诊断进行中，跳过本次触发（第%d轮）", consecutive_count)
+            return
+        if now - self._last_diagnose_at < self._diagnose_min_interval:
+            return
+        self._diagnose_in_progress = True
+        self._last_diagnose_at = now
+        try:
+            await self._run_deep_diagnose(consecutive_count, elapsed_seconds)
+        except Exception as e:
+            logger.debug("深度诊断异常: %s", e)
+        finally:
+            self._diagnose_in_progress = False
+
+    async def _run_deep_diagnose(self, consecutive_count: int, elapsed_seconds: float):
+        """真正的深度诊断（ARP/NDP 检查 + plain DNS 探活 + 决策）
+
+        只由 on_all_upstreams_failed 在「单飞 + 限频」通过后调用。
+        """
+        pure_iterative = self._is_pure_iterative_mode()
 
         # 日志：持续全部失败，但 NetworkMonitor 尚未判定断网
-        if consecutive_count == 1:
+        if pure_iterative:
+            # 纯迭代模式没有加密上游可回退：启动预热未完成、根/TLD 权威慢、
+            # 迭代查询被限速都会造成阶段性失败。常规轮次降为 DEBUG，避免与
+            # ARP/NDP 反制联动刷屏（每轮触发一次反制会扰动网络）。
+            if consecutive_count in (3, 10, 30, 60):
+                logger.warning(
+                    "纯迭代模式：迭代解析连续 %d 轮全部失败（无加密上游可回退；"
+                    "常见于启动预热未完成 / 根或 TLD 权威响应慢 / 迭代被限速）",
+                    consecutive_count)
+            else:
+                logger.debug("纯迭代模式：迭代解析连续全部失败（第%d轮, %.0fs）",
+                             consecutive_count, elapsed_seconds)
+        elif consecutive_count == 1:
             logger.warning("DNS 上游全部失败 (第1轮) — 但网络连通性检测正常，"
                            "启动深度诊断: ARP/NDP 检查 + plain DNS 探活")
         elif consecutive_count <= 3:
@@ -1330,11 +1405,13 @@ class NetworkMonitor:
             logger.debug("DNS 上游持续全部失败 (第%d轮, %.0fs) — "
                          "深度诊断持续中", consecutive_count, elapsed_seconds)
 
-        # 执行深度诊断
-        try:
-            await self._force_arp_ndp_check(consecutive_count)
-        except Exception as e:
-            logger.debug("深度诊断 ARP/NDP 检查异常: %s", e)
+        # ARP/NDP 深度检查与反制：纯迭代模式下迭代变慢/失败并不指向 ARP 投毒，
+        # 只在连续多轮失败时才做，避免每次慢查询都触发一轮反制。
+        if (not pure_iterative) or consecutive_count >= 5:
+            try:
+                await self._force_arp_ndp_check(consecutive_count)
+            except Exception as e:
+                logger.debug("深度诊断 ARP/NDP 检查异常: %s", e)
 
         try:
             plain_dns_ok = await self._probe_plain_dns_canary()
@@ -1344,17 +1421,28 @@ class NetworkMonitor:
 
         # 根据诊断结果决策
         if plain_dns_ok:
-            if consecutive_count <= 3:
+            if pure_iterative:
+                if consecutive_count in (3, 10, 30):
+                    logger.warning(
+                        "⚠️ 深度诊断: plain DNS 探活成功，但迭代解析上游暂时失败 — "
+                        "当前是纯迭代模式（没有 DoH/DoT/DoQ 可回退），"
+                        "通常是冷启动 DNSSEC 链未预热完成或根/TLD 权威响应慢，"
+                        "一般 1-3 秒内自行恢复；若长期不恢复可把 upstream.enabled 设为 true")
+            elif consecutive_count <= 3:
                 logger.warning("⚠️ 深度诊断: plain DNS 探活成功，但加密 DNS (DoH/DoT/DoQ) 全部失败 — "
                                "可能原因: ① 光猫/路由器对加密 DNS 端口限速或劫持  "
                                "② ISP 临时阻断非标准 DNS 流量  "
                                "③ 上游 DNS 服务器集体故障")
         else:
-            if consecutive_count >= 3:
+            # 判定"网络中断"的门槛：纯迭代模式没有加密上游可交叉验证，plain 探活
+            # 失败也可能只是探活目标（bootstrap 明文 DNS）临时不可用，因此要求更
+            # 多轮连续失败才抑制解析（避免 21:44:17 那种一两次探活失败就 set_network_down）。
+            required_rounds = 5 if pure_iterative else 3
+            if consecutive_count >= required_rounds:
                 # plain DNS 也失败，且已持续多轮 → 确认为网络中断
                 if not self._arp_network_down and not self._ndp_network_down:
-                    logger.warning("⚠️ 深度诊断: plain DNS 探活也失败 — "
-                                   "确认网络中断，自动抑制 DNS 查询")
+                    logger.warning("⚠️ 深度诊断: plain DNS 探活也失败（连续 %d 轮）— "
+                                   "确认网络中断，自动抑制 DNS 查询", consecutive_count)
                     # 修复：不再清空滑动窗口填 False（原清空导致恢复需 15s×10 轮才翻转，
                     # 期间 network_down 拦截所有 DNS 查询；protect_window 已防瞬时误恢复）
                     self._wan_dead_confirmed_at = asyncio.get_event_loop().time()
@@ -1478,39 +1566,42 @@ class NetworkMonitor:
             probe_domains = ["www.baidu.com", "www.qq.com"]
 
         from resolvers.plain import PlainDNSResolver
+        import dns.message
+        import dns.rdatatype
 
-        for domain in probe_domains:
-            if not self._is_valid_domain(domain):
-                continue
-            for addr in bootstrap_addrs:
-                try:
-                    import dns.message
-                    import dns.rdatatype
-                    q = dns.message.make_query(domain, dns.rdatatype.A)
-                    qbytes = q.to_wire()
+        async def probe_one(domain: str, addr: str) -> bool:
+            try:
+                q = dns.message.make_query(domain, dns.rdatatype.A)
+                qbytes = q.to_wire()
+                family = "v6" if ":" in addr else "v4"
+                resolver = self._dns_probe_resolvers.get(addr)
+                if resolver is None:
+                    resolver = PlainDNSResolver(addr, timeout=self._ping_timeout)
+                    self._dns_probe_resolvers[addr] = resolver
+                result = await asyncio.wait_for(
+                    resolver.resolve(qbytes, prefer_family=family),
+                    timeout=self._ping_timeout,
+                )
+                if result is not None:
+                    logger.debug("深度诊断 plain DNS 探活: %s → %s ✅", addr, domain)
+                    return True
+            except asyncio.TimeoutError:
+                pass
+            except Exception as e:
+                logger.debug("深度诊断 plain DNS 探活异常 (%s): %s", addr, e)
+            return False
 
-                    is_ipv6 = ":" in addr
-                    family = "v6" if is_ipv6 else "v4"
-
-                    # 复用或创建解析器
-                    resolver = self._dns_probe_resolvers.get(addr)
-                    if resolver is None:
-                        resolver = PlainDNSResolver(
-                            addr, timeout=self._ping_timeout,
-                        )
-                        self._dns_probe_resolvers[addr] = resolver
-
-                    result = await asyncio.wait_for(
-                        resolver.resolve(qbytes, prefer_family=family),
-                        timeout=self._ping_timeout,
-                    )
-                    if result is not None:
-                        logger.debug("深度诊断 plain DNS 探活: %s → %s ✅", addr, domain)
-                        return True
-                except asyncio.TimeoutError:
-                    continue
-                except Exception as e:
-                    logger.debug("深度诊断 plain DNS 探活异常 (%s): %s", addr, e)
-                    continue
+        # 并发探测：原来「域名 × bootstrap 地址」双层串行，最多 12 次 × ping_timeout，
+        # 单次诊断能把事件循环拖住数秒。并发后总耗时 ≈ 单次超时（≈0.5s）。
+        tasks = [
+            probe_one(domain, addr)
+            for domain in probe_domains if self._is_valid_domain(domain)
+            for addr in bootstrap_addrs
+        ]
+        if not tasks:
+            return False
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        if any(r is True for r in results):
+            return True
         logger.debug("深度诊断 plain DNS 探活: 全部失败 ❌")
         return False
