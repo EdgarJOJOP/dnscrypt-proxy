@@ -13,6 +13,13 @@ server:
     cert_path: certs/localhost.crt
     key_path: certs/localhost.key
     # ------------------------------------------------------------
+    # 内部明文站点地址（h3 / TLS 前端把请求转发进来的地方，仅本机使用）
+    #   只接受回环地址：127.0.0.1 / ::1 / localhost
+    #   该站点是**明文 HTTP**，仅靠一个进程内随机 token 保护，绑到非回环
+    #   会把"内部"通道暴露到局域网；填了非回环值会被忽略并回退 127.0.0.1。
+    #   选 ::1 时内部站点走 IPv6（前端会自动补方括号拼 URL）。
+    internal_host: "127.0.0.1"
+    # ------------------------------------------------------------
     # 协议开关（降级链 h3 → h2 → h1.1；三者全关时回落 HTTP/1.1）
     #   http1_1: HTTP/1.1 over TLS（ALPN=http/1.1）
     #   http2  : HTTP/2 over TLS（ALPN=h2）
@@ -50,14 +57,14 @@ server:
   doq:
     enabled: false               # 默认关闭，设为 true 开启
     host: 127.0.0.1             # IPv4 监听地址
-    port: 784                   # 标准 DoQ 端口
+    port: 853                   # 标准 DoQ 端口
     domain: ''                  # 服务器域名（SNI），留空则使用证书 CN
     cert_path: certs/localhost.crt
     key_path: certs/localhost.key
     ipv6:
       enabled: false
       host: ::1
-      port: 784
+      port: 853
 
   # 本地纯 DNS 服务器（UDP 53，不加密，默认关闭）
   plain_dns:
@@ -211,6 +218,12 @@ iterative:
   #   总数的一半时**放弃本跳**（不再死磕剩下的服务器），迭代整体失败后回退到
   #   按健康评分排序的优选加密上游（DoH/DoT/DoQ）。范围 1-preferred_count，默认 2。
   hop_parallel: 2
+  # QNAME 最小化（RFC 9156）：向根/TLD 只发送「下一级名字」——
+  #   根只看到 com.、com. 只看到 example.com.，完整查询名只发给最终权威。
+  #   作用：减少隐私泄露（根/TLD 看不到完整域名）与根区负载。
+  #   对实现不规范的权威会自动回退全名查询（不会因此解析失败）。
+  #   排障时可临时设为 false 做对照（缓存起跳的查询本来就会跳过最小化）。
+  qname_minimization: true
   # 迭代最大深度（根→TLD→权威的跳数上限）
   # 注意：**每跟一次 CNAME 也算一跳**，而 bilibili 这类站点的 CNAME 链常有 4-6 级
   #（s1.hdslb.com → bstatic.hdslb.com → s1.hdslb.com.a.bdydns.com → opencdncloud*.jomodns.com），
@@ -226,13 +239,26 @@ iterative:
 cache:
   enabled: true
   max_size: 10000           # 最大缓存条目数，超限 LRU 淘汰
-  default_ttl: 1500          # 默认缓存时间（秒）
-  min_ttl: 600               # 最小缓存时间（秒）
-  max_ttl: 3600            # 最大缓存时间（秒）
-  negative_ttl: 60          # 负面应答缓存时间（秒）
+  default_ttl: 1500         # 无 TTL 信息时的缺省基线（秒），不是上限
+  min_ttl: 600              # 缓存 TTL 下限（秒），但**豁免极短 TTL**：
+                            #   ① 完全没有 TTL 信息时 → 作为兜底下限
+                            #   ② 上游 TTL > ttl_floor_threshold → 不足 min_ttl 的抬到 min_ttl
+                            #   ③ 上游 TTL <= ttl_floor_threshold → 完全按权威原值（不抬升）
+  max_ttl: 3600             # 缓存 TTL 上限（秒）：权威 TTL 超过它时向下截断
+  # ---- 非标准扩展：min_ttl 下限（**明确违反 RFC 2181 §5.1**）----
+  # 语义：**只有上游 TTL > 本阈值**的记录，才把不足 min_ttl 的缓存寿命抬到
+  #       min_ttl；TTL <= 本阈值的极短记录完全尊重权威原值。
+  # 为什么豁免极短 TTL：1-5 秒通常是 DDNS / 健康检查 / 动态调度，变化极快，
+  #       强行原地缓存会让客户端拿到过期数据（比"多回源几次"更糟）。
+  # 合规性：RFC 2181 §5.1 规定 TTL 不得增加；BIND 的 min-cache-ttl 同样被官方
+  #       标注为非标准扩展。追求严格合规时把本项设为 0（关闭全部抬升）。
+  # 副作用：抬升后缓存寿命变长，命中时返回给客户端的 TTL（= 缓存剩余寿命）
+  #       也随之变大，客户端会被动延长缓存。
+  ttl_floor_threshold: 5    # 秒；0 = 关闭（纯 RFC 行为：一律 min(上游TTL, max_ttl)）
+  negative_ttl: 60          # 负应答缓存**上限**（秒）：实际取 min(SOA.TTL, SOA.MINIMUM)
   cleanup_interval: 60      # 过期清理间隔（秒）
   # ---- 主动预刷新（正应答条目在过期前自动重新解析）----
-  # 开启后：后台用最小堆按「每条目最终 TTL（经 min_ttl/max_ttl 钳制）」动态调度，
+  # 开启后：后台用最小堆按「每条目最终 TTL（权威 TTL 经 max_ttl 向下钳制）」动态调度，
   #         没有固定扫描周期——条目剩余 TTL 降到 advance_ratio 比例时提前重查上游，
   #         使客户端访问始终命中未过期条目（避免"访问时才发现过期→本次请求等上游"）。
   #         队列无长度上限、可随时插入；每批处理 batch_size 条，上一批执行完再执行下一批。

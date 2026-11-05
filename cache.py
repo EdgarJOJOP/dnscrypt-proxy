@@ -20,6 +20,7 @@ from functools import lru_cache
 
 import dns.message
 import dns.name
+import dns.rcode
 import dns.rdatatype
 import dns.rrset
 
@@ -301,6 +302,7 @@ class DNSCache:
         cleanup_interval: int = 60,
         prefetch_enabled: bool = True,
         prefetch_advance_ratio: float = 0.5,
+        ttl_floor_threshold: int = 5,
     ):
         self.max_size = max_size
         self.default_ttl = default_ttl
@@ -308,10 +310,21 @@ class DNSCache:
         self.max_ttl = max_ttl
         self.negative_ttl = negative_ttl
         self.cleanup_interval = cleanup_interval
+        # 「min_ttl 下限豁免」阈值（秒，0 = 关闭整个抬升）。
+        # 语义：**只有上游 TTL > 该阈值**的记录才把不足 min_ttl 的寿命抬到
+        #   min_ttl；TTL <= 阈值（默认 5 秒）的极短记录完全尊重权威原值
+        #   （这类记录通常是 DDNS/健康检查/动态调度，变化极快）。
+        # ⚠ 抬升本身是非标准扩展，违反 RFC 2181 §5.1（"TTL 不得增加"）。
+        #   设 0 即恢复纯 RFC 行为。见 _calculate_ttl 的完整说明。
+        try:
+            self._ttl_floor_threshold = max(0, min(60, int(ttl_floor_threshold)))
+        except (TypeError, ValueError):
+            self._ttl_floor_threshold = 5
         # ===== 主动预刷新（最小堆动态调度）=====
-        # 开启后：正应答条目在 set() 时按「最终 TTL（经 min_ttl/max_ttl 钳制）
-        # 推导出的刷新时刻」入堆；后台循环休眠到堆顶时刻再成批刷新——
-        # 因此不存在固定扫描周期，刷新节奏由 TTL 参数与 advance_ratio 共同决定。
+        # 开启后：正应答条目在 set() 时按「最终 TTL（权威 TTL 经 max_ttl 向下
+        # 钳制，必要时按 min_ttl 抬升）推导出的刷新时刻」入堆；
+        # 后台循环休眠到堆顶时刻再成批刷新——因此不存在固定扫描周期，
+        # 刷新节奏由 TTL 参数与 advance_ratio 共同决定。
         self.prefetch_enabled = bool(prefetch_enabled)
         self._prefetch_ratio = max(0.0, min(1.0, float(prefetch_advance_ratio)))
 
@@ -383,12 +396,34 @@ class DNSCache:
         挡到 TTL 到期（最长 max_ttl）。
         """
         async with self._lock:
+            # RFC 2308 §7：只有 NOERROR（含 NODATA）与 NXDOMAIN 可以缓存。
+            # REFUSED / SERVFAIL / FORMERR / NOTIMP 等**错误应答不入缓存**：
+            # 早期实现把 REFUSED 当负应答缓存 negative_ttl 秒，于是单台上游的
+            # 一次临时 REFUSED 就能让该域名在本机整个 TTL 内持续失败（服务
+            # 降级，且客户端拿到的是"权威拒绝"这种误导性结论）。
+            try:
+                if response.rcode() not in (dns.rcode.NOERROR, dns.rcode.NXDOMAIN):
+                    return
+            except Exception:
+                pass
+
             # 如果已存在，先删除
             if key in self._cache:
                 del self._cache[key]
 
-            # 计算 TTL（基于上游原始 TTL）
-            ttl = self._calculate_ttl(response) if not is_negative else self.negative_ttl
+            # 计算 TTL（正应答基于上游原始 TTL；负应答按 RFC 2308 §5 取
+            # min(SOA.TTL, SOA.MINIMUM)，拿不到 SOA 才退回配置的 negative_ttl）
+            if is_negative:
+                ttl = self._negative_ttl_from_soa(response)
+            else:
+                ttl = self._calculate_ttl(response)
+
+            # RFC 2181 §5.1：TTL=0 的记录只能用于当前事务，不得缓存。
+            # 早期实现会照常插入并**先淘汰一条健康条目**，结果是每次 get 都 miss
+            # 却反复挤掉有效缓存，与 _calculate_ttl 里"TTL<=0 视为不可缓存"的
+            # 注释正好相反。
+            if ttl <= 0:
+                return
 
             # 把响应各段 RRset 的 TTL 截断到不高于缓存 TTL，再返回给客户端。
             # 否则首次应答会携带上游原始 TTL（常见 86400），客户端（浏览器/系统
@@ -413,6 +448,10 @@ class DNSCache:
             entry.created_at = time.time()
             entry.epoch = self._current_epoch
             entry._hit_count = 0
+            # 必须显式初始化调度序号：__slots__ 已声明 _seq，未赋值时任何读取
+            # （pop_due_prefetch / 调试 / 未来的清理逻辑）都会抛 AttributeError。
+            # 与 rebuild()/defrag() 保持一致（0 = 未调度）。
+            entry._seq = 0
             entry.blocked = bool(blocked)
 
             # LRU 淘汰
@@ -459,16 +498,61 @@ class DNSCache:
             entry = self._cache.get(key)
             return bool(entry is not None and getattr(entry, "blocked", False))
 
-    def _calculate_ttl(self, response: dns.message.Message) -> int:
-        """从 DNS 响应中计算合适 TTL
+    def _negative_ttl_from_soa(self, response: dns.message.Message) -> int:
+        """负应答缓存时长（RFC 2308 §5：min(SOA.TTL, SOA.MINIMUM)）
 
-        语义（修复）：
-          - 取响应 answer 段中最小的有效 TTL 作为基线；
-          - 响应无有效 TTL 时才用 default_ttl 兜底：default_ttl 是「缺省基线」，
-            不再充当上限（旧实现从 default_ttl 起步只向下调，
-            导致 max_ttl 永远不会生效）；
-          - 最后统一 clamp 到 [min_ttl, max_ttl]，使 max_ttl 真正封顶；
+        `negative_ttl` 作为**上限**（用户希望负应答不要缓存太久）：
+          - SOA 允许 900s、negative_ttl=60 → 60（尊重配置上限）
+          - SOA 只允许 5s、negative_ttl=60  → 5（不得超过权威授权时长）
+        拿不到 authority SOA（本地生成的拦截 NXDOMAIN、上游未回 SOA）时
+        退回 negative_ttl。
+        """
+        try:
+            cap = max(1, int(self.negative_ttl))
+            max_ttl = max(1, int(self.max_ttl))
+            for rrset in response.authority:
+                if rrset.rdtype != dns.rdatatype.SOA:
+                    continue
+                for rdata in rrset:
+                    minimum = int(getattr(rdata, "minimum", 0) or 0)
+                    soa_ttl = int(getattr(rrset, "ttl", 0) or 0)
+                    if minimum > 0 and soa_ttl > 0:
+                        allowed = min(soa_ttl, minimum)
+                    elif minimum > 0:
+                        allowed = minimum
+                    elif soa_ttl > 0:
+                        allowed = soa_ttl
+                    else:
+                        break
+                    return max(1, min(allowed, cap, max_ttl))
+                break
+        except Exception:
+            pass
+        return max(1, min(int(self.negative_ttl), int(self.max_ttl)))
+
+    def _calculate_ttl(self, response: dns.message.Message) -> int:
+        """从 DNS 响应中计算缓存 TTL（RFC 2181 §5.1 + 一处显式标注的非标准扩展）
+
+        语义：
+          - 取响应 answer 段中最小的有效 TTL 作为基线（权威授权时长）；
+          - `max_ttl` 是向下的上限钳制（保护本机内存与"最长缓存"意图）；
+          - `min_ttl` 是**缓存 TTL 下限**，但**豁免极短 TTL**：
+              * 上游 TTL > ttl_floor_threshold（默认 5s）→ 不足 min_ttl 的抬到
+                min_ttl（常规 min-cache-ttl 下限保护）；
+              * 上游 TTL <= ttl_floor_threshold → **完全尊重权威原值**，不抬升。
+                这类 1-5 秒的记录通常是 DDNS / 健康检查 / 动态调度，变化极快，
+                强行缓存在原地会让客户端拿到过期数据；
+              * 完全没有 TTL 信息 → 用 max(default_ttl, min_ttl) 兜底；
+          - ⚠ "TTL > 阈值时抬到 min_ttl"这一步是**非标准扩展**，违反 RFC 2181
+            §5.1（"TTL 不得增加"；BIND 的 min-cache-ttl 同样被官方标注为非标准）。
+            把 `cache.ttl_floor_threshold` 设为 0 即完全关闭，回到纯 RFC 行为：
+            此时一律 `min(上游 TTL, max_ttl)`；
           - TTL <= 0 视为不可缓存（返回 0）。
+
+        该函数同时服务**加密上游（DoH/DoT/DoQ）与纯迭代**两条路径：四个前端
+        （plain/DoH/DoT/DoQ）与 resolver_manager 都经由 `cache.set()` 落盘，
+        因此 upstream: enabled 时走的是同一套规则（含同一处抬升豁免逻辑），
+        不会因为"上游是加密的"而不同。
         """
         resp_ttl: Optional[int] = None
         for rrset in response.answer:
@@ -478,12 +562,30 @@ class DNSCache:
             if resp_ttl is None or t < resp_ttl:
                 resp_ttl = t
         if resp_ttl is None:
-            # 无 answer 或无有效 TTL → 用 default_ttl 作为缺省基线
-            resp_ttl = self.default_ttl
+            # 完全没有 TTL 信息来源（空 answer / 无 rrset）→ 兜底基线。
+            # min_ttl 的**唯一**作用点：保证这类条目至少缓存 min_ttl 秒。
+            resp_ttl = max(self.default_ttl, self.min_ttl)
         if resp_ttl <= 0:
             return 0
-        # 真正 clamp 到配置区间：上游 TTL 大于 max_ttl 时被截断（max_ttl 生效）
-        return max(self.min_ttl, min(resp_ttl, self.max_ttl))
+        # RFC 2181 §5.1：只允许向下钳制（max_ttl 封顶），绝不向上抬升。
+        capped = min(resp_ttl, self.max_ttl)
+        # ---- 非标准扩展：min_ttl 下限（豁免极短 TTL）----
+        # 规则：**只有上游 TTL > ttl_floor_threshold（默认 5s）的记录**才把不足
+        #       min_ttl 的缓存寿命抬到 min_ttl；TTL <= 阈值的极短记录**完全尊重
+        #       权威原值**（1-5 秒通常是 DDNS / 健康检查 / 动态调度，变化极快，
+        #       强行原地缓存会让客户端拿到过期数据）。
+        # ⚠ 抬升这一步明确违反 RFC 2181 §5.1（"TTL 不得增加"；BIND 的
+        #   min-cache-ttl 同样被官方标注为非标准扩展）。设
+        #   cache.ttl_floor_threshold: 0 → 关闭，回到纯 RFC 行为（一律只向下钳制）。
+        #   副作用：抬升后缓存寿命变长，get_adjusted_response() 返回给客户端的
+        #   TTL（= 缓存剩余寿命）也随之变大，客户端会被动延长缓存——这正是
+        #   "常规下限保护"想要的效果，但它同时也是同一处 RFC 偏离。
+        threshold = getattr(self, "_ttl_floor_threshold", 0)
+        if (threshold > 0
+                and resp_ttl > threshold
+                and self.min_ttl > capped):
+            capped = min(self.min_ttl, self.max_ttl)
+        return max(1, capped)
 
     async def evict_largest(self, ratio: float = 0.2) -> int:
         """按估算字节大小淘汰最大的 N% 条目（跳过已过期条目）。
@@ -543,9 +645,10 @@ class DNSCache:
         就到期而空转。若上式右侧为负（TTL 极小、advance_ratio 很大时），
         提前量取 0（即不提前，等条目自然到期），不会出现负提前量。
 
-        注意：min_ttl 是「缓存 TTL 下限」，不是「提前量下限」。旧实现用
+        注意：min_ttl 是「无 TTL 信息时的兜底下限」，**不是**「缓存 TTL 下限」，
+        也不参与真实 TTL 的钳制（RFC 2181 §5.1 禁止抬升上游 TTL）。旧实现用
         max(min_ttl, TTL*advance_ratio) 作为提前量，会让所有最终 TTL <= min_ttl
-        的条目（_calculate_ttl 会把上游 TTL < min_ttl 的响应钳到 min_ttl）
+        的条目（旧 _calculate_ttl 会把上游 TTL < min_ttl 的响应钳到 min_ttl）
         提前量被夹到 TTL-1 → 刷新时刻 = 插入后 1 秒，形成「每秒重新查询
         上游一次」的死循环（实测稳态每秒上百次上游查询）。
         """
