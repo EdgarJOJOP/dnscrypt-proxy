@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 SecureDNS Proxy - 安全 DNS 加密代理
 ====================================
@@ -53,7 +53,7 @@ from dns_utils import (
     make_block_response,
 )
 
-from config import Config
+from config import Config, ConfigError
 from cache import DNSCache
 from logger import RequestLogger, TrimFileHandler
 from filter_engine import FilterEngine
@@ -190,6 +190,144 @@ def setup_logging(log_dir: str = "logs", max_log_size_mb: int = 100):
     return root_logger
 
 
+# ======================== CPU 亲和性 ========================
+
+
+def _available_cpu_ids() -> List[int]:
+    """当前进程可用的逻辑 CPU 编号（升序）。
+
+    优先 psutil（Windows / Linux 都支持，且能反映任务管理器、容器、cgroup
+    对可用核的限制）；回退 Linux sched_getaffinity；最后才用 cpu_count。
+    """
+    try:
+        import psutil
+        ids = psutil.Process().cpu_affinity()
+        if ids:
+            return sorted(int(x) for x in ids)
+    except Exception:
+        pass
+    try:
+        if hasattr(os, "sched_getaffinity"):
+            ids = os.sched_getaffinity(0)
+            if ids:
+                return sorted(int(x) for x in ids)
+    except Exception:
+        pass
+    return list(range(os.cpu_count() or 1))
+
+
+def _select_last_cpu_ids(cpu_ids: List[int], count: int) -> List[int]:
+    """从可用 CPU 编号中取**编号最大**的 count 个（末尾优先）。
+
+    例：0-15 共 16 核、count=4 → [12, 13, 14, 15]。
+    count<=0 按 1 处理；count >= 可用数时返回全部（升序）。
+    只按编号取末尾，不假设编号连续（Windows 处理器组 / Linux isolcpus
+    都可能出现 0,1,2,8,9,10 这类不连续编号）。
+    """
+    ids = sorted({int(x) for x in cpu_ids})
+    if not ids:
+        return []
+    n = max(1, int(count))
+    if n >= len(ids):
+        return ids
+    return ids[-n:]
+
+
+def _set_process_cpu_affinity(cpu_ids: List[int]) -> bool:
+    """把当前进程绑定到指定 CPU 集合（进程内所有线程继承）。
+
+    返回是否成功；失败只返回 False、不抛异常——亲和性是性能优化，不应
+    阻止 DNS 服务启动。Windows 上优先 psutil（能正确处理处理器组），
+    Linux 上 psutil 失败时回退 sched_setaffinity。
+    """
+    if not cpu_ids:
+        return False
+    last_error = None
+    try:
+        import psutil
+        psutil.Process().cpu_affinity([int(x) for x in cpu_ids])
+        return True
+    except Exception as e:
+        last_error = e
+    if sys.platform.startswith("linux") and hasattr(os, "sched_setaffinity"):
+        try:
+            os.sched_setaffinity(0, {int(x) for x in cpu_ids})
+            return True
+        except Exception as e:
+            last_error = e
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+            mask = 0
+            for cpu in cpu_ids:
+                mask |= 1 << int(cpu)
+            kernel32 = ctypes.windll.kernel32
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.OpenProcess.argtypes = [
+                wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.SetProcessAffinityMask.argtypes = [
+                wintypes.HANDLE, ctypes.c_size_t]
+            # 用最小权限打开自身进程：psutil 走 PROCESS_ALL_ACCESS，在部分
+            # 受限令牌/作业对象下会 AccessDenied；PROCESS_SET_INFORMATION
+            # 只申请设置亲和性所需的那一个权限。
+            handle = kernel32.OpenProcess(0x0200, False, os.getpid())
+            if handle:
+                try:
+                    if kernel32.SetProcessAffinityMask(
+                            handle, ctypes.c_size_t(mask)):
+                        return True
+                finally:
+                    kernel32.CloseHandle(handle)
+        except Exception as e:
+            last_error = e
+    logging.getLogger("dns-proxy.app").debug(
+        "CPU 亲和性设置失败（目标=%s）: %s", cpu_ids, last_error)
+    return False
+
+
+def apply_cpu_affinity(config, *, cpu_ids=None, setter=None) -> Optional[List[int]]:
+    """按 performance.cpu_core_limit 绑定到编号最末尾的 N 个 CPU 核。
+
+    0-15 共 16 核、cpu_core_limit=4 → 绑定 {12,13,14,15}，线程池也只用
+    4 个线程；这样本进程只抢编号最大的核，把前面的核留给游戏/其它软件。
+    Linux 与 Windows 同语义。设置失败只告警并继续用全部核启动。
+
+    Args:
+        config: Config 对象，读取 effective_cpu_cores / cpu_core_limit。
+        cpu_ids: 测试注入的可用 CPU 列表；None 时自动探测。
+        setter: 测试注入的绑定函数；None 时用 _set_process_cpu_affinity。
+
+    Returns:
+        实际绑定的 CPU 列表；失败/无需绑定时 None。
+    """
+    log = logging.getLogger("dns-proxy.app")
+    try:
+        count = int(getattr(config, "effective_cpu_cores", 1) or 1)
+    except (TypeError, ValueError):
+        count = 1
+    available = list(cpu_ids) if cpu_ids is not None else _available_cpu_ids()
+    target = _select_last_cpu_ids(available, count)
+    if not target:
+        log.warning("CPU 亲和性: 无法确定可用 CPU，跳过绑定")
+        return None
+    ok = (setter or _set_process_cpu_affinity)(target)
+    if not ok:
+        log.warning(
+            "CPU 亲和性: 绑定 %s 失败，继续使用全部可用核"
+            "（Linux 检查 sched_setaffinity 权限 / Windows 安装 psutil）",
+            target,
+        )
+        return None
+    log.info(
+        "CPU 亲和性: 已绑定到核 %s（共 %d 个，cpu_core_limit=%s，"
+        "按编号取末尾；可用编号 %s-%s 共 %d 个）",
+        target, len(target), getattr(config, "cpu_core_limit", 0),
+        min(available), max(available), len(available),
+    )
+    return target
+
+
 # ======================== 主应用 ========================
 
 
@@ -254,14 +392,15 @@ class DNSProxyApp:
         loop.set_exception_handler(_exc_handler)
 
         # 0. 阻塞任务线程池（必须在任何阻塞调用之前配置）
-        #    线程数 = 可用核数 × 2；核数由 performance.cpu_core_limit 决定
-        #    （0 = 总核数-1），不再单独设置线程数开关。
+        #    线程数 = 可用核数（performance.cpu_core_limit，0 = 总核数-1）；
+        #    进程亲和性已在 main_async 里按「编号最末尾的 N 核」绑定，
+        #    这里线程数与之保持一致，不再 ×2 超额占用。
         from task_pool import configure_shared_pool, get_shared_pool
         _cores = self.config.effective_cpu_cores
-        configure_shared_pool(_cores * 2)
+        configure_shared_pool(_cores)
         _pool, _gate = get_shared_pool()
         logger.info(
-            "阻塞任务线程池: 共享 %d 线程（CPU 预算 %d 核 × 2；DNS>NDP>ARP 按优先级）"
+            "阻塞任务线程池: 共享 %d 线程（CPU 预算 %d 核；DNS>NDP>ARP 按优先级）"
             " + NTP 专属 2 + 日志专属 1",
             _gate._limit, _cores,
         )
@@ -1193,6 +1332,11 @@ async def main_async(config_path: Optional[str] = None):
 
     app = DNSProxyApp(config_path)
 
+    # CPU 亲和性：必须在 initialize() 创建线程池之前设置；只使用编号最
+    # 末尾的 effective_cpu_cores 个核（Linux/Windows 同语义），避免与
+    # 其它软件争抢编号最大的核。
+    apply_cpu_affinity(app.config)
+
     # 用配置文件中的 max_log_size 更新文件日志处理器
     try:
         max_size = app.config.logging_max_log_size_mb
@@ -1278,17 +1422,28 @@ def _elevate():
 
 def main():
     """主入口"""
-    # 自动提权：ARP 防护模块需要管理员/root 权限执行 netsh/iptables 等命令
-    _elevate()
-
     config_path = os.environ.get("DNS_PROXY_CONFIG")
     if not config_path:
         config_path = str(PROJECT_ROOT / "config.yaml")
+
+    # 配置文件必须预先存在：不再自动生成默认配置。
+    # 在提权之前检查，避免配置路径写错时先弹一次 UAC/sudo。
+    if not Path(config_path).is_file():
+        print(f"错误：配置文件不存在: {config_path}", file=sys.stderr)
+        print("本程序不会自动生成配置，请先创建 config.yaml 再启动。",
+              file=sys.stderr)
+        sys.exit(2)
+
+    # 自动提权：ARP 防护模块需要管理员/root 权限执行 netsh/iptables 等命令
+    _elevate()
 
     try:
         asyncio.run(main_async(config_path))
     except KeyboardInterrupt:
         pass
+    except (ConfigError, FileNotFoundError) as e:
+        print(f"错误：配置文件无效: {e}", file=sys.stderr)
+        sys.exit(2)
 
 
 if __name__ == "__main__":

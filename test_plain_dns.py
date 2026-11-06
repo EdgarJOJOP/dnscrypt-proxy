@@ -14,7 +14,7 @@ Part A（明文协议，真实 socket 栈）：
   A6 UDP 畸形报文（< 12 字节）→ 不崩溃（无响应或 FORMERR）
   A7 TCP 空帧（length == 0）→ 关闭连接，不挂起
 
-Part B（迭代解析 DNSSEC 攻击向量，离线回放真实签名 wire）：
+Part B（迭代解析 DNSSEC 攻击向量，离线动态签名，永不过期）：
   1  重放他人 NXDOMAIN（NSEC 区间不覆盖）
   2  重放他区 SOA 伪造 NODATA
   3  篡改 answer 记录（签名失效）
@@ -44,6 +44,14 @@ Part B2（DNSSEC 链状态/重试逐分支穷举，离线）：
   B2.7  DS NXDOMAIN + is_del=True → unknown
   B2.8  DS NXDOMAIN + is_del=False 升父级 → insecure
   B2.13 DS NXDOMAIN + is_del=True + 父区 insecure → insecure（CDN 随机子域回归）
+  B2.14 NS 查询不把祖先区 NS（com.cn.）当最终答案（sso.sina.com.cn 回归）
+
+Part B3（域名类型矩阵穷举，离线）：
+  B3.1  gTLD / ccTLD / 中国二级 / 中文域名 / new gTLD / geoTLD / 其他
+        正常查询 owner 与目标类型正确
+  B3.2  各类代表域名：answer 混入祖先区 NS 时继续下钻，不误判重放
+  B3.3  各类代表域名：CNAME + NODATA 返回 owner 正确的 CNAME
+  B3.4  大小写 / 尾点 / IDN（Unicode 与 Punycode）等价 owner 不误判
   B2.9  链查询首次 RRL 失败、退避重试后成功
   B2.10 连续失败 → None + 15s 负缓存（第二次不重查权威）
   B2.11 同 zone 10 并发只构建一次链（single-flight）
@@ -65,6 +73,8 @@ import struct
 import sys
 import time
 
+from cryptography.hazmat.primitives.asymmetric import rsa
+
 import dns.dnssec
 import dns.flags
 import dns.message
@@ -79,7 +89,10 @@ import dns.rdtypes.IN.A
 import dns.rrset
 
 # ============================================================
-# 内嵌测试数据：真实权威返回的响应 wire（base64），保证离线可重复
+# 历史对照样本（真实权威 wire，base64）
+#
+# 当前 Part B 已改为用 _make_offline_fixtures() 现场生成签名，
+# 不再读取这些常量；保留仅用于人工比对真实报文结构。
 # ============================================================
 W_FORWARD = base64.b64decode(  # ietf.org A + RRSIG（正向，签名有效）
     "3T+EAAABAAMAAAABBGlldGYDb3JnAAABAAHADAABAAEAAAEsAARoECxjwAwAAQABAAABLAAEaBAtY8AMAC4AAQAA"
@@ -411,17 +424,121 @@ async def run_part_a(port: int) -> bool:
 
 
 # ============================================================
-# Part B：迭代解析 DNSSEC 攻击向量（离线回放真实签名 wire）
+# Part B：迭代解析 DNSSEC 攻击向量（动态签名，永不过期）
 # ============================================================
-def _load(b64: bytes):
-    return dns.message.from_wire(b64)
+def _new_dnssec_key(flags=257):
+    """生成一把临时 RSA 密钥（测试用 1024 位足够，生成快）。"""
+    priv = rsa.generate_private_key(public_exponent=65537, key_size=1024)
+    key = dns.dnssec.make_dnskey(
+        priv.public_key(), algorithm=8, flags=flags, protocol=3)
+    return priv, key
 
 
-def _dnskey(msg):
-    for rr in msg.answer:
-        if rr.rdtype == dns.rdatatype.DNSKEY:
-            return rr
-    return None
+def _zone_keyset(zone, key, ttl=300):
+    return dns.rrset.from_rdata(dns.name.from_text(zone), ttl, key)
+
+
+def _sign_rrset(rrset, priv, key, signer, now):
+    """以“当前时间 ± 缓冲”签一个 RRset，返回 RRSIG RRset。
+
+    旧测试内嵌真实权威的 base64 wire，签名有效期是固定的（例如到
+    2026-11-05 21:54 UTC）；数据一过期，合法用例会被误判为
+    ``no RRSIGs validated``，测试就成了时间炸弹。这里每次运行都用
+    临时密钥现场签，inception=now-300、expiration=now+86400，
+    攻击向量（篡改/剥离/重放）的语义不变，但数据永不过期。
+    """
+    sig = dns.dnssec.sign(
+        rrset, priv, dns.name.from_text(signer), key,
+        inception=now - 300, expiration=now + 86400, verify=False)
+    return dns.rrset.from_rdata(rrset.name, rrset.ttl, sig)
+
+
+def _make_offline_fixtures(pds):
+    """生成等价于旧静态 wire 的一套动态签名数据。
+
+    返回 (fwd, nx_nsec, nx_nsec3, cname, keys)，结构/owner/签名者与
+    旧数据一致，只是签名时间随运行时刻变化。
+    """
+    now = int(time.time())
+    ietf_priv, ietf_key = _new_dnssec_key()
+    com_priv, com_key = _new_dnssec_key()
+    root_priv, root_key = _new_dnssec_key()
+    pki_priv, pki_key = _new_dnssec_key()
+    keys = {
+        "ietf.org.": _zone_keyset("ietf.org.", ietf_key),
+        "com.": _zone_keyset("com.", com_key),
+        ".": _zone_keyset(".", root_key),
+        "pki.goog.": _zone_keyset("pki.goog.", pki_key),
+    }
+
+    # 1) 正向：ietf.org A + RRSIG
+    fwd = dns.message.make_response(
+        dns.message.make_query("ietf.org", dns.rdatatype.A))
+    a = dns.rrset.from_text("ietf.org.", 300, "IN", "A", "192.0.2.1")
+    fwd.answer.extend(
+        [a, _sign_rrset(a, ietf_priv, ietf_key, "ietf.org.", now)])
+
+    # 2) NXDOMAIN + NSEC（owner=ietf.org，next 覆盖 nonexistent-aaa111）
+    nx_nsec = dns.message.make_response(
+        dns.message.make_query("nonexistent-aaa111.ietf.org",
+                               dns.rdatatype.A))
+    nx_nsec.set_rcode(dns.rcode.NXDOMAIN)
+    soa = dns.rrset.from_text(
+        "ietf.org.", 300, "IN", "SOA",
+        "ns.ietf.org. hostmaster.ietf.org. 1 3600 600 86400 300")
+    nsec = dns.rrset.from_text(
+        "ietf.org.", 300, "IN", "NSEC",
+        "nonexistent-zzz999.ietf.org. A RRSIG NSEC")
+    for rr in (soa, nsec):
+        nx_nsec.authority.extend(
+            [rr, _sign_rrset(rr, ietf_priv, ietf_key, "ietf.org.", now)])
+
+    # 3) NXDOMAIN + NSEC3 opt-out（com.；owner=hash(qname)，位图不含 DS）
+    nx_nsec3 = dns.message.make_response(
+        dns.message.make_query("nonexistent-aaa111.com", dns.rdatatype.A))
+    nx_nsec3.set_rcode(dns.rcode.NXDOMAIN)
+    com_soa = dns.rrset.from_text(
+        "com.", 300, "IN", "SOA",
+        "a.gtld-servers.net. nstld.verisign-grs.com. 1 1800 900 604800 86400")
+    salt = b"\xaa"
+    qname = dns.name.from_text("nonexistent-aaa111.com.")
+
+    def _nsec3_rr(owner_hash, next_hash, flags, bitmap):
+        owner_label = base64.b32hexencode(owner_hash).decode().lower().rstrip("=")
+        next_label = base64.b32hexencode(next_hash).decode().lower().rstrip("=")
+        return dns.rrset.from_text(
+            owner_label + ".com.", 300, "IN", "NSEC3",
+            "1 %d 0 %s %s %s" % (flags, salt.hex(), next_label, bitmap))
+
+    # RFC 5155 §8.9 的 NXDOMAIN 需要三项证明，缺一项会被保守拒绝：
+    #   1) next-closer 区间覆盖 qname 的 hash；
+    #   2) closest-encloser（com.）存在性：某个 NSEC3 owner 恰好等于 hash(com.)；
+    #   3) *.CE wildcard 否定：hash(*.com.) 落在某个 NSEC3 区间内。
+    hq = pds.IterativeResolver._nsec3_hash(qname, salt, 0, 1)
+    hc = pds.IterativeResolver._nsec3_hash(dns.name.from_text("com."), salt, 0, 1)
+    hw = pds.IterativeResolver._nsec3_hash(
+        dns.name.from_text("*.com."), salt, 0, 1)
+
+    def _shift(h, delta):
+        return ((int.from_bytes(h, "big") + delta) % (1 << 160)).to_bytes(20, "big")
+
+    nsec3_q = _nsec3_rr(_shift(hq, -1), _shift(hq, 1), 1, "A RRSIG")
+    nsec3_ce = _nsec3_rr(hc, _shift(hc, 1), 0, "SOA RRSIG NSEC3PARAM")
+    nsec3_wc = _nsec3_rr(_shift(hw, -1), _shift(hw, 1), 1, "A RRSIG")
+    for rr in (com_soa, nsec3_q, nsec3_ce, nsec3_wc):
+        nx_nsec3.authority.extend(
+            [rr, _sign_rrset(rr, com_priv, com_key, "com.", now)])
+
+    # 4) CNAME（c.pki.goog → pki-goog.l.google.com），中间跳用于篡改用例
+    cname = dns.message.make_response(
+        dns.message.make_query("c.pki.goog", dns.rdatatype.A))
+    c = dns.rrset.from_text(
+        "c.pki.goog.", 300, "IN", "CNAME", "pki-goog.l.google.com.")
+    cname.answer.extend(
+        [c, _sign_rrset(c, pki_priv, pki_key, "pki.goog.", now)])
+    cname._cname_chain = [cname.to_wire()]
+    cname._cname_targets = ["pki-goog.l.google.com."]
+    return fwd, nx_nsec, nx_nsec3, cname, keys
 
 
 def _clone(msg):
@@ -502,17 +619,25 @@ async def run_part_b() -> bool:
         print(f"  跳过：无法导入 plain_dns_server（{e}）")
         return True
 
-    fwd = _load(W_FORWARD)
-    nx_nsec = _load(W_NX_NSEC)
-    nx_nsec3 = _load(W_NX_NSEC3)
-    cname = _load(W_CNAME)
-    keys = {
-        "ietf.org.": _dnskey(_load(W_KEY_IETF)),
-        "com.": _dnskey(_load(W_KEY_COM)),
-        ".": _dnskey(_load(W_KEY_ROOT)),
-        "pki.goog.": None,
-    }
+    fwd, nx_nsec, nx_nsec3, cname, keys = _make_offline_fixtures(pds)
     start_ok = len(RESULTS)
+
+    # 0) 泛化性门槛：所有 RRSIG 都必须覆盖“当前运行时刻”，而不是
+    #    依赖某个固定日期。数据由临时密钥现场签，任何一天运行都应成立。
+    _now = int(time.time())
+    _sig_count = 0
+    _sig_ok = True
+    for _section in (fwd.answer, nx_nsec.authority, nx_nsec3.authority):
+        for _rr in _section:
+            if _rr.rdtype != dns.rdatatype.RRSIG:
+                continue
+            for _sig in _rr:
+                _sig_count += 1
+                if not (_sig.inception <= _now < _sig.expiration):
+                    _sig_ok = False
+    check("0  动态签名有效期覆盖当前时间（不依赖固定日期）",
+          _sig_count > 0 and _sig_ok,
+          f"now={_now} sigs={_sig_count}")
 
     async def run(eng, qname, qtype=dns.rdatatype.A):
         return await eng._resolve_verified(qname, qtype, 1)
@@ -1019,6 +1144,45 @@ async def run_part_b_chain() -> bool:
     check("B2.13 DS NXDOMAIN + is_del=True + 父区 insecure → insecure",
           got == "insecure", f"got={got!r}")
 
+    # 14) NS 查询：answer 里混入祖先区 NS（com.cn.）时，不能把它当最终答案
+    #     旧实现只看 rdtype，会把 com.cn. NS 返回给 sso.sina.com.cn NS，
+    #     上层 owner 校验再判“重放攻击”丢弃（实测每 60 秒两条 WARNING）。
+    eng14 = object.__new__(pds.IterativeResolver)
+    eng14.qname_minimization = False
+    eng14.root_servers = ["192.0.2.1"]
+    eng14.max_depth = 8
+    eng14._zone_ns_cache = {}
+    eng14._stats = collections.Counter()
+    eng14._closest_zone_servers = lambda qname, qtype: None
+    calls14 = []
+
+    async def fake_ns(servers, qname, qtype, rdclass=1):
+        calls14.append((qname, qtype))
+        m = dns.message.make_response(
+            dns.message.make_query(qname, qtype, rdclass))
+        if len(calls14) == 1:
+            # 祖先区 NS + 本名的 referral（模拟权威把 com.cn. NS 塞进 answer）
+            m.answer.append(dns.rrset.from_text(
+                "com.cn.", 300, "IN", "NS", "a.dns.cn."))
+            m.authority.append(dns.rrset.from_text(
+                "sso.sina.com.cn.", 300, "IN", "NS",
+                "ns1.sso.sina.com.cn."))
+            m.additional.append(dns.rrset.from_text(
+                "ns1.sso.sina.com.cn.", 300, "IN", "A", "192.0.2.53"))
+            return m
+        m.answer.append(dns.rrset.from_text(
+            f"{qname}.", 300, "IN", "NS", "ns1.sso.sina.com.cn."))
+        return m
+
+    eng14._query_servers = fake_ns
+    out14 = await eng14._iterate("sso.sina.com.cn", dns.rdatatype.NS)
+    owners14 = [str(rr.name).lower() for rr in (out14.answer if out14 else [])]
+    check("B2.14 NS 查询不把祖先区 NS 当最终答案",
+          out14 is not None
+          and "sso.sina.com.cn." in owners14
+          and "com.cn." not in owners14,
+          f"owners={owners14} calls={len(calls14)}")
+
     # 9) 链查询首次 RRL 失败、退避后重试成功 → 不应被当成不可用
     r = _make_trusted_resolver(pds)
     calls = {"n": 0}
@@ -1088,6 +1252,229 @@ async def run_part_b_chain() -> bool:
     ])
     check("B2.12 不同 zone 并发被 semaphore 限制在 4",
           active["peak"] <= 4, f"peak={active['peak']}")
+
+    return all(ok for _, ok in RESULTS[start_ok:])
+
+
+# ============================================================
+# Part B3：域名类型矩阵穷举（离线）
+#
+# 目标：用同一套 mock 迭代链，覆盖 gTLD / ccTLD / 中国二级 / 中文域名 /
+# new gTLD / geoTLD / 其他（根、单标签、arpa、SRV、通配、大小写、尾点、
+# 超长标签），确保：
+#   1. 正常查询返回 owner==qname 的目标类型，不被祖先区 NS 干扰；
+#   2. answer 混入祖先 NS（com.cn. NS 场景）时继续下钻，不判“重放”；
+#   3. CNAME + NODATA（sso.sina.com.cn 场景）返回 owner 正确的 CNAME；
+#   4. 大小写/尾点/IDN 按 DNS 语义等价，不误判 owner 不匹配。
+# ============================================================
+
+_DOMAIN_TYPE_MATRIX = {
+    "gTLD": ["example.com", "example.net", "example.org",
+             "example.info", "example.biz"],
+    "ccTLD": ["example.cn", "example.uk", "example.de",
+              "example.jp", "example.ru"],
+    "中国二级": ["example.com.cn", "example.net.cn", "example.org.cn",
+                 "example.gov.cn", "example.edu.cn"],
+    "中文域名": ["例子.中国", "例子.公司", "例子.网络",
+                 "xn--fsqu00a.xn--fiqs8s", "xn--fsqu00a.xn--55qx5d"],
+    "new gTLD": ["example.app", "example.dev", "example.xyz",
+                 "example.top", "example.shop"],
+    "geoTLD": ["example.nyc", "example.london", "example.berlin",
+               "example.tokyo", "example.asia"],
+    "其他": [".", "localhost", "1.0.0.127.in-addr.arpa",
+             "_sip._tcp.example.com", "*.example.com",
+             "ExAmPlE.CoM", "example.com.", "a" * 63 + ".com"],
+}
+
+
+def _type_qtype(name):
+    if name == ".":
+        return dns.rdatatype.NS
+    if name.endswith(".in-addr.arpa"):
+        return dns.rdatatype.PTR
+    if name.startswith("_sip."):
+        return dns.rdatatype.SRV
+    return dns.rdatatype.A
+
+
+def _type_answer_value(qtype, qname):
+    name = dns.name.from_text(qname)
+    if qtype == dns.rdatatype.A:
+        return "192.0.2.10"
+    if qtype == dns.rdatatype.AAAA:
+        return "2001:db8::1"
+    if qtype == dns.rdatatype.NS:
+        return str(dns.name.from_text("ns1", None) + name)
+    if qtype == dns.rdatatype.PTR:
+        return "host.example."
+    if qtype == dns.rdatatype.SRV:
+        return "0 5 5060 sip.example.com."
+    return '"v=spf1 -all"'
+
+
+def _type_referral(msg, zone, glue_ip):
+    zone = dns.name.from_text(zone) if isinstance(zone, str) else zone
+    ns = dns.name.from_text("ns1", None) + zone
+    msg.authority.append(dns.rrset.from_text(
+        str(zone), 300, "IN", "NS", str(ns)))
+    msg.additional.append(dns.rrset.from_text(
+        str(ns), 300, "IN", "A", glue_ip))
+
+
+def _make_type_engine(pds, mode):
+    """构造只跑 _iterate 的 resolver；responder 按当前跳伪造完整迭代链。"""
+    eng = object.__new__(pds.IterativeResolver)
+    eng.qname_minimization = False
+    eng.root_servers = ["192.0.2.1"]
+    eng.max_depth = 12
+    eng._zone_ns_cache = {}
+    eng._ns_ip_cache = {}
+    eng._stats = collections.Counter()
+    eng._closest_zone_servers = lambda qname, qtype: None
+
+    async def responder(servers, qname, qtype, rdclass=1):
+        q = dns.message.make_query(qname, qtype, rdclass)
+        msg = dns.message.make_response(q)
+        name = dns.name.from_text(qname)
+        labels = [l.decode("ascii") for l in name.labels if l]
+        ip = servers[0]
+
+        if name == dns.name.root:
+            msg.answer.append(dns.rrset.from_text(
+                ".", 300, "IN", "NS", "a.root-servers.net."))
+            return msg
+
+        if ip == "192.0.2.1":
+            if len(labels) <= 1:
+                msg.answer.append(dns.rrset.from_text(
+                    str(name), 300, "IN", dns.rdatatype.to_text(qtype),
+                    _type_answer_value(qtype, qname)))
+                return msg
+            tld = dns.name.from_text(labels[-1])
+            _type_referral(msg, tld, "192.0.2.2")
+            if mode == "ancestor_ns":
+                msg.answer.append(dns.rrset.from_text(
+                    str(tld), 300, "IN", "NS", "ns1." + labels[-1]))
+            return msg
+
+        if ip == "192.0.2.2":
+            if len(labels) <= 2:
+                _type_referral(msg, name, "192.0.2.3")
+            else:
+                _type_referral(msg, name.parent(), "192.0.2.3")
+            return msg
+
+        if ip == "192.0.2.3":
+            _type_referral(msg, name, "192.0.2.4")
+            if mode == "ancestor_ns":
+                tld = dns.name.from_text(labels[-1])
+                msg.answer.append(dns.rrset.from_text(
+                    str(tld), 300, "IN", "NS", "ns1." + labels[-1]))
+            return msg
+
+        if mode == "cname_nodata":
+            target = dns.name.from_text("target", None) + name
+            msg.answer.append(dns.rrset.from_text(
+                str(name), 300, "IN", "CNAME", str(target)))
+            parent = name.parent()
+            msg.authority.append(dns.rrset.from_text(
+                str(parent), 300, "IN", "SOA",
+                "ns1.%s hostmaster.%s 1 3600 600 86400 300"
+                % (str(parent).rstrip("."), str(parent).rstrip("."))))
+            return msg
+
+        msg.answer.append(dns.rrset.from_text(
+            str(name), 300, "IN", dns.rdatatype.to_text(qtype),
+            _type_answer_value(qtype, qname)))
+        return msg
+
+    eng._query_servers = responder
+    return eng
+
+
+async def run_part_b_types() -> bool:
+    print("\n[Part B3] 域名类型矩阵穷举"
+          "（gTLD/ccTLD/中国二级/中文/new gTLD/geoTLD/其他）")
+    try:
+        import plain_dns_server as pds
+    except Exception as e:      # pragma: no cover
+        print(f"  跳过：无法导入 plain_dns_server（{e}）")
+        return True
+
+    start_ok = len(RESULTS)
+
+    # 1) 正常查询：每类所有样本都必须返回 owner==qname 的目标类型
+    for category, domains in _DOMAIN_TYPE_MATRIX.items():
+        bad = []
+        for domain in domains:
+            qtype = _type_qtype(domain)
+            eng = _make_type_engine(pds, "normal")
+            out = await eng._iterate(domain, qtype)
+            owner = dns.name.from_text(domain)
+            if out is None or not any(
+                    rr.rdtype == qtype and rr.name == owner
+                    for rr in out.answer):
+                bad.append(domain)
+        check(f"B3.1 {category} 正常查询 owner/类型正确"
+              f"（{len(domains)} 个）", not bad, f"bad={bad}")
+
+    # 2) 祖先区 NS 混入 answer：每类代表域名不能把祖先 NS 当最终答案
+    for category, domains in _DOMAIN_TYPE_MATRIX.items():
+        domain = next((d for d in domains
+                       if d not in (".", "localhost")), domains[0])
+        qtype = _type_qtype(domain)
+        eng = _make_type_engine(pds, "ancestor_ns")
+        out = await eng._iterate(domain, qtype)
+        owner = dns.name.from_text(domain)
+        bad = []
+        if out is None:
+            bad.append("out=None")
+        else:
+            if not any(rr.rdtype == qtype and rr.name == owner
+                       for rr in out.answer):
+                bad.append("missing owner")
+            labels = [l.decode("ascii") for l in owner.labels if l]
+            if len(labels) >= 2:
+                tld = dns.name.from_text(labels[-1])
+                if any(rr.rdtype == dns.rdatatype.NS and rr.name == tld
+                       for rr in out.answer):
+                    bad.append("ancestor NS leaked")
+        check(f"B3.2 {category} 祖先区 NS 混入不误判（{domain}）",
+              not bad, f"bad={bad}")
+
+    # 3) CNAME + NODATA（sso.sina.com.cn 场景）：每类代表域名返回 CNAME
+    for category, domains in _DOMAIN_TYPE_MATRIX.items():
+        domain = next((d for d in domains
+                       if d not in (".", "localhost")), domains[0])
+        eng = _make_type_engine(pds, "cname_nodata")
+        out = await eng._iterate(domain, dns.rdatatype.A)
+        owner = dns.name.from_text(domain)
+        ok = (out is not None
+              and any(rr.rdtype == dns.rdatatype.CNAME and rr.name == owner
+                      for rr in out.answer))
+        types = [dns.rdatatype.to_text(r.rdtype)
+                 for r in (out.answer if out else [])]
+        check(f"B3.3 {category} CNAME+NODATA 返回 owner 正确的 CNAME"
+              f"（{domain}）", ok, f"answer={types}")
+
+    # 4) 大小写/尾点/IDN 等价性：owner 比较必须按 DNS 语义（大小写不敏感）
+    equiv = [
+        ("ExAmPlE.CoM", "example.com"),
+        ("example.com.", "example.com"),
+        ("例子.中国", "xn--fsqu00a.xn--fiqs8s"),
+        ("XN--FSQU00A.XN--FIQS8S", "例子.中国"),
+    ]
+    bad = []
+    for qname, canonical in equiv:
+        eng = _make_type_engine(pds, "normal")
+        out = await eng._iterate(qname, dns.rdatatype.A)
+        canonical_name = dns.name.from_text(canonical)
+        if out is None or not any(
+                rr.rdtype == dns.rdatatype.A and rr.name == canonical_name
+                for rr in out.answer):
+            bad.append(qname)
+    check("B3.4 大小写/尾点/IDN 等价 owner 不误判", not bad,
+          f"bad={bad}")
 
     return all(ok for _, ok in RESULTS[start_ok:])
 
@@ -1194,6 +1581,7 @@ def main() -> int:
         asyncio.run(run_part_a(args.port))
     asyncio.run(run_part_b())
     asyncio.run(run_part_b_chain())
+    asyncio.run(run_part_b_types())
     if args.real_dnssec:
         asyncio.run(run_part_c())
 

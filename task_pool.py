@@ -249,7 +249,8 @@ def configure_shared_pool(workers: int = 0):
     )
     _SHARED_GATE = PriorityGate(workers)
     logger.info(
-        "阻塞任务共享池: %d 线程（由 performance.cpu_core_limit 推导：核数×2）",
+        "阻塞任务共享池: %d 线程（由 performance.cpu_core_limit 推导："
+        "核数；进程已绑定到编号最末尾的核）",
         workers,
     )
 

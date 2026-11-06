@@ -1977,8 +1977,18 @@ class IterativeResolver:
                 response = await self._query_servers(servers, qname, qtype, rdclass)
             if response is None:
                 return None
-            # 1. answer 段含目标类型 → 完成（返回前复原 question 为原始 qname）
-            if any(rrset.rdtype == qtype for rrset in response.answer):
+            # 1. answer 段含**目标 owner** 的目标类型 → 完成（返回前复原 question）
+            #
+            # 不能只看 rdtype：QNAME 最小化/权威异常时，answer 里可能出现
+            # 祖先区的 NS（实测查询 sso.sina.com.cn NS 时，权威/最小化路径
+            # 返回了 com.cn. NS）。旧实现只看 rdtype，直接把它当最终答案返回，
+            # 上层 _resolve_verified 再按 owner 校验判成“重放攻击”丢弃
+            # （日志每 60 秒两条 WARNING，NS 查询永远失败）。
+            # 只有 owner == 当前 qname（CNAME 跟随后的目标）才算完成；
+            # 祖先 NS 属于 referral 信息，应继续走下钻/NODATA 分支。
+            _answer_owner = dns.name.from_text(qname)
+            if any(rrset.rdtype == qtype and rrset.name == _answer_owner
+                   for rrset in response.answer):
                 try:
                     if response.question and \
                        str(response.question[0].name).rstrip(".") != original_qname.rstrip("."):
