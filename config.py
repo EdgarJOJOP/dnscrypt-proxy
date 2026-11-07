@@ -19,6 +19,7 @@ NDP 防护参数说明（位于 config.yaml network_monitor.ndp_protection）:
 import os
 import time
 import asyncio
+import ipaddress
 from typing import Any, Dict, List, Optional, Callable
 from pathlib import Path
 
@@ -74,6 +75,86 @@ DEFAULT_ROOT_SERVERS = (
 )
 
 
+# ============================================================
+# bootstrap 解析器配置归一化
+#
+# 背景（实测 PyYAML 6.x）：config.yaml 里**不加引号**的 IPv6 地址，只要以
+# "::" 结尾（例如 `- 2402:4e00::`），YAML 1.1 的 plain scalar 规则会把它
+# 误解析成 mapping：{'2402:4e00:': None}。旧代码把该 dict 直接传给
+# PlainDNSResolver，BaseResolver._extract_name 里执行 address.replace(...)
+# 抛 AttributeError → 整个 bootstrap 初始化任务中断 → 上游域名一个 IP 都
+# 解析不到 → DoH/DoT/DoQ 全部不可用（日志表现为「并行任务 [bootstrap DNS]
+# 异常: 'dict' object has no attribute 'replace'」）。
+#
+# 修复原则：
+#   1. 把「单键 + 值 None + key 以冒号结尾」的 mapping 还原成原 IPv6 字符串；
+#   2. 还原结果必须是合法 IP（ipaddress 校验），否则按非法项跳过并警告；
+#   3. 其余非法类型（int/bool/list/多键 dict/None）一律跳过并警告，
+#      绝不让单条坏配置中断整个 bootstrap 初始化。
+# ============================================================
+
+
+def restore_yaml_misparsed_ipv6(item: Any) -> Optional[str]:
+    """把 PyYAML 误解析成 ``{key: None}`` 的「以 :: 结尾的 IPv6」还原成字符串。
+
+    ``- 2402:4e00::`` → ``{'2402:4e00:': None}`` → ``'2402:4e00::'``
+    ``- ::``          → ``{':': None}``          → ``'::'``
+
+    PyYAML 把行尾最后一个 ``:`` 当成 mapping 的 key/value 分隔符，所以解析
+    出来的 key 正好是原字符串去掉最后一个 ``:``；补回即还原。
+    """
+    if not isinstance(item, dict) or len(item) != 1:
+        return None
+    key, value = next(iter(item.items()))
+    if isinstance(key, str) and value is None:
+        return key + ":"
+    return None
+
+
+def normalize_bootstrap_resolvers(raw: Any):
+    """把 upstream.bootstrap_resolvers 归一化成 ``(List[str], List[str])``。
+
+    返回 ``(地址列表, 警告列表)``。覆盖的 YAML 解析分支：
+      * 正常字符串（IPv4、``2400:3200::1``、带引号的 ``"2402:4e00::"``）→ 原样；
+      * 无引号且以 ``::`` 结尾的 IPv6（``2402:4e00::``）→ 从 dict 还原；
+      * 列表混入非法类型（int/bool/list/多键 dict 等）→ 跳过并给出警告；
+      * 标量字符串（漏写 ``-``）→ 包成单元素列表；
+      * 空/缺失（None）→ 空列表。
+    """
+    warnings: List[str] = []
+    if raw is None:
+        return [], warnings
+    if isinstance(raw, str):
+        text = raw.strip()
+        return ([text], warnings) if text else ([], warnings)
+    if not isinstance(raw, list):
+        warnings.append(
+            f"bootstrap_resolvers 不是列表（实际 {type(raw).__name__}: {raw!r}），已忽略")
+        return [], warnings
+    out: List[str] = []
+    for idx, item in enumerate(raw):
+        if isinstance(item, str):
+            text = item.strip()
+            if text:
+                out.append(text)
+            else:
+                warnings.append(f"bootstrap_resolvers[{idx}] 为空字符串，已跳过")
+            continue
+        restored = restore_yaml_misparsed_ipv6(item)
+        if restored is not None:
+            try:
+                ipaddress.ip_address(restored)
+            except ValueError:
+                warnings.append(
+                    f"bootstrap_resolvers[{idx}] 无法识别（{item!r}），已跳过；"
+                    f"如果这是 IPv6 地址，请加引号写成 \"{restored}\"")
+                continue
+            out.append(restored)
+            continue
+        warnings.append(
+            f"bootstrap_resolvers[{idx}] 类型非法（{type(item).__name__}: {item!r}），已跳过")
+    return out, warnings
+
 
 class Config:
     """配置管理"""
@@ -111,8 +192,30 @@ class Config:
             raise ConfigError(
                 f"配置文件为空或顶层不是 mapping: {self._path}")
         self._data = data
+        self._normalize_upstream_bootstrap()
         self._last_mtime = self._path.stat().st_mtime
         self._update_section_snapshots()
+
+    def _normalize_upstream_bootstrap(self) -> None:
+        """把 upstream.bootstrap_resolvers 就地归一化为字符串列表。
+
+        在 _load() 里替换 ``_data``，保证所有读取方（main / network_monitor /
+        plain_dns_server / resolver_manager）拿到的都是 List[str]，不会再把
+        PyYAML 误解析出的 dict 当字符串传给解析器。
+        """
+        upstream = self._data.get("upstream")
+        if not isinstance(upstream, dict):
+            return
+        if "bootstrap_resolvers" not in upstream:
+            return
+        normalized, warns = normalize_bootstrap_resolvers(
+            upstream.get("bootstrap_resolvers"))
+        for w in warns:
+            logger.warning("配置项 bootstrap_resolvers: %s", w)
+        # 保留空列表（而不是删掉 key）：用户显式写了这一段却全部非法时，
+        # 语义就是「没有可用的 bootstrap」，不应静默回退到默认 223.5.5.5
+        # 把配置错误掩盖掉。
+        upstream["bootstrap_resolvers"] = normalized
 
     def _update_section_snapshots(self):
         self._section_snapshots = {}
@@ -267,7 +370,16 @@ class Config:
         return protocols
     @property
     def bootstrap_resolvers(self) -> List[str]:
-        return self._data.get("upstream", {}).get("bootstrap_resolvers", ["223.5.5.5"]) or []
+        """bootstrap DNS 地址列表（已归一化为 List[str]）
+
+        双保险：_load() 时已把 _data 归一化；这里再归一化一次，覆盖
+        update_upstream() 等运行期写入的非法值（例如调用方直接塞了 dict）。
+        """
+        upstream = self._data.get("upstream")
+        raw = (upstream.get("bootstrap_resolvers", ["223.5.5.5"])
+               if isinstance(upstream, dict) else ["223.5.5.5"])
+        normalized, _warns = normalize_bootstrap_resolvers(raw)
+        return normalized or []
     @property
     def upstream_enabled(self) -> bool:
         """加密上游总开关（upstream.enabled）。

@@ -234,7 +234,20 @@ class ResolverManager:
         if not self.config.bootstrap_resolvers:
             logger.warning("未配置 bootstrap 解析器！系统 DNS 自引用（127.0.0.1）可能导致死锁")
         for addr in self.config.bootstrap_resolvers:
-            resolver = PlainDNSResolver(addr, timeout=5.0, concurrency=self.config.connection_pool_size)
+            # 防御：Config 层已把 PyYAML 误解析的 dict 还原成字符串；这里仍
+            # 逐条容错——单条坏配置只跳过该条，绝不让整个 bootstrap 初始化
+            # 任务异常（否则上游域名解析不到 IP，所有加密上游一起不可用）。
+            if not isinstance(addr, str):
+                logger.warning("跳过非法 bootstrap 解析器配置项: %r", addr)
+                continue
+            addr = addr.strip()
+            if not addr:
+                continue
+            try:
+                resolver = PlainDNSResolver(addr, timeout=5.0, concurrency=self.config.connection_pool_size)
+            except Exception as e:
+                logger.warning("创建 bootstrap 解析器 %r 失败，已跳过: %s", addr, e)
+                continue
             self._bootstrap_resolvers.append(UpstreamServer(resolver, "plain"))
 
         # 检查是否有任何上游服务器（加密上游 + 迭代解析上游）

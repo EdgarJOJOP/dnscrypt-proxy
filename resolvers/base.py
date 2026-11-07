@@ -27,8 +27,13 @@ class BaseResolver(abc.ABC):
         self._name = self._extract_name(address)
 
     def _extract_name(self, address: str) -> str:
-        """从地址中提取可读名称（正确支持 IPv6）"""
-        addr = address.replace("https://", "").replace("quic://", "")
+        """从地址中提取可读名称（正确支持 IPv6）
+
+        ``str(address)`` 是防御：即使调用方误传了非字符串（例如 PyYAML 把
+        ``- 2402:4e00::`` 解析成的 dict），也只会得到不美观的名字，而不是在
+        初始化阶段抛 AttributeError 把整个 bootstrap 任务打断。
+        """
+        addr = str(address).replace("https://", "").replace("quic://", "")
         host = addr.split("/")[0]
         # IPv6 地址含多个冒号，直接返回（不按冒号截断）
         if host.count(":") > 1:
