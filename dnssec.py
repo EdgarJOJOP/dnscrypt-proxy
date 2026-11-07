@@ -459,6 +459,12 @@ class DNSSECValidator:
             return False
         if target == owner or target == nxt:
             return False
+        if owner == nxt:
+            # 自指记录（单名 zone）不覆盖任何 hash。缺这个判断时
+            # `target > owner or target < nxt` 在 owner==nxt 时几乎恒真，
+            # 会把任意 target 判成“被覆盖”，与
+            # IterativeResolver._nsec3_interval_check 的语义不一致。
+            return False
         if owner < nxt:
             return owner < target < nxt
         return target > owner or target < nxt

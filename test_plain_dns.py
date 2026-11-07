@@ -1183,6 +1183,70 @@ async def run_part_b_chain() -> bool:
           and "com.cn." not in owners14,
           f"owners={owners14} calls={len(calls14)}")
 
+    # 15) CNAME 目标区未签名 + 无 NSEC NODATA → 放行（ocsp.pki.goog 回归）
+    #     ocsp.pki.goog CNAME → pki-goog.l.google.com；pki.goog 有 DS，
+    #     但 l.google.com / google.com 未签名，NODATA 本来就没有 NSEC。
+    _f, _n1, _n2, cname_t, keys_t = _make_offline_fixtures(pds)
+
+    async def run_chain(eng, qname, qtype=dns.rdatatype.A):
+        return await eng._resolve_verified(qname, qtype, 1)
+
+    eng15 = _make_engine(_clone(cname_t), keys_t,
+                         {"pki-goog.l.google.com.": "insecure"}, pds)
+    out15 = await run_chain(eng15, "c.pki.goog")
+    check("B2.15 CNAME 目标区 insecure + 无 NSEC NODATA → 放行",
+          out15 is not None,
+          f"stats={ {k: v for k, v in dict(eng15._stats).items() if v} }")
+
+    eng16 = _make_engine(_clone(cname_t), keys_t,
+                         {"pki-goog.l.google.com.": "secure"}, pds)
+    out16 = await run_chain(eng16, "c.pki.goog")
+    check("B2.16 CNAME 目标区 secure + 无 NSEC NODATA → 拒绝", out16 is None,
+          f"stats={ {k: v for k, v in dict(eng16._stats).items() if v} }")
+
+    eng17 = _make_engine(_clone(cname_t), keys_t,
+                         {"pki-goog.l.google.com.": "unknown"}, pds)
+    out17 = await run_chain(eng17, "c.pki.goog")
+    check("B2.17 CNAME 目标区 unknown + 无 NSEC NODATA → 拒绝", out17 is None,
+          f"stats={ {k: v for k, v in dict(eng17._stats).items() if v} }")
+
+    # 18) NSEC3 原语统一：plain 与 dnssec.py 对同一输入必须给出相同结果
+    _name = dns.name.from_text("example.com.")
+    _salt = b"\xaa"
+    _h_plain = pds.IterativeResolver._nsec3_hash(_name, _salt, 10, 1)
+    _h_dnssec = pds.DNSSECValidator._nsec3_hash(_name, _salt, 10, 1)
+    check("B2.18 _nsec3_hash 单一实现（plain 与 dnssec 一致）",
+          _h_plain == _h_dnssec and len(_h_plain) == 20,
+          f"plain={_h_plain.hex()} dnssec={_h_dnssec.hex()}")
+
+    # 19) NSEC3 owner-hash 解码一致
+    _label = base64.b32hexencode(_h_dnssec).decode().lower().rstrip("=")
+    _owner = dns.name.from_text(_label + ".com.")
+    _owner_plain = pds.IterativeResolver._nsec3_owner_hash(_owner)
+    _owner_dnssec = pds.DNSSECValidator._nsec3_owner_hash(_owner)
+    check("B2.19 _nsec3_owner_hash 单一实现（plain 与 dnssec 一致）",
+          _owner_plain == _owner_dnssec == _h_dnssec,
+          f"plain={_owner_plain.hex()} dnssec={_owner_dnssec.hex()}")
+
+    # 20) NSEC/NSEC3 类型位图解析一致
+    _next = base64.b32hexencode(b"\x00" * 20).decode().lower().rstrip("=")
+    _rd = dns.rdata.from_text("IN", "NSEC3",
+                              "1 0 10 aa %s A RRSIG" % _next)
+    _has_a = pds.IterativeResolver._nsec_has_type(_rd, dns.rdatatype.A)
+    _has_ds = pds.IterativeResolver._nsec_has_type(_rd, dns.rdatatype.DS)
+    _has_a_d = pds.DNSSECValidator._nsec_has_type(_rd, dns.rdatatype.A)
+    check("B2.20 _nsec_has_type 单一实现（位图 A=True DS=False）",
+          _has_a is True and _has_ds is False and _has_a == _has_a_d,
+          f"A={_has_a} DS={_has_ds} dnssecA={_has_a_d}")
+
+    # 21) NSEC3 区间自指保护：owner == next 不能覆盖任何 target
+    _self = b"\x05" * 20
+    check("B2.21 NSEC3 区间自指记录不覆盖任何 hash",
+          pds.DNSSECValidator._hash_in_interval(
+              b"\x06" * 20, _self, _self) is False
+          and pds.IterativeResolver._nsec3_interval_check(
+              b"\x06" * 20, _self, _self) is False)
+
     # 9) 链查询首次 RRL 失败、退避后重试成功 → 不应被当成不可用
     r = _make_trusted_resolver(pds)
     calls = {"n": 0}

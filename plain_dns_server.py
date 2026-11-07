@@ -2726,97 +2726,15 @@ class IterativeResolver:
 
     # ---------- 公开入口 ----------
 
-    @staticmethod
-    def _nsec_has_type(nsec_rdata, rdtype: int) -> bool:
-        """检查 NSEC/NSEC3 rdata 的类型位图是否包含指定类型。
+    # NSEC/NSEC3 类型位图解析复用 dnssec.py 的唯一实现。
+    _nsec_has_type = staticmethod(DNSSECValidator._nsec_has_type)
 
-        NSEC（RFC 4034 §4.1.2）：windows 属性是标准 (window, bitmap) 位图。
-        NSEC3（RFC 5155 §3.2）：windows 属性格式不同，改用 to_text 解析
-        类型列表（to_text 输出的尾部是类型助记符，权威可靠）。
-        """
-        try:
-            from dns.rdtypes.ANY.NSEC3 import NSEC3 as NSEC3Cls
-            if isinstance(nsec_rdata, NSEC3Cls):
-                txt = nsec_rdata.to_text()
-                parts = txt.split()
-                # NSEC3 to_text 格式: algorithm iterations flags salt next [types]
-                # 前 5 个字段（algorithm/iterations/flags/salt/next-hash）是数字或
-                # hash 文本，可能被 from_text 误解析为类型码（algorithm=1→A）。
-                # 跳过前 5 个字段，仅从第 6 个起解析类型助记符。
-                parsed_any = False
-                for p in parts[5:]:
-                    try:
-                        parsed_any = True
-                        if dns.rdatatype.from_text(p) == rdtype:
-                            return True
-                    except Exception:
-                        continue
-                # 类型列表非空且不含目标类型 → 位图明确无该类型，返回 False。
-                # 仅类型列表为空（NSEC3 最小记录，无类型字段）才隐含 NS+NSEC3。
-                if parsed_any:
-                    return False
-                # NSEC3 最小记录（RFC 5155 §3.2.1）：默认类型 = NS + RRSIG + NSEC3
-                return rdtype in (dns.rdatatype.NS, dns.rdatatype.RRSIG,
-                                  dns.rdatatype.NSEC3)
-            # NSEC：标准位图
-            for window, bitmap in nsec_rdata.windows:
-                if rdtype // 256 == window:
-                    byte = rdtype % 256 // 8
-                    bit = 0x80 >> (rdtype % 8)
-                    return bool(bitmap[byte] & bit) if byte < len(bitmap) else False
-        except Exception:
-            return False
-        return False
+    # NSEC3 原语统一使用 dnssec.DNSSECValidator 的实现（iterations 上限 150
+    # 也在那里），避免 plain_dns_server 与 dnssec.py 各写一份、行为不一致。
+    _nsec3_hash = staticmethod(DNSSECValidator._nsec3_hash)
 
-    # NSEC3 迭代次数上限（RFC 9276 §3：建议 0；BIND 等实现的硬上限是 150）。
-    # 超过此值直接视为"无法验证"（返回 b"" → 上层按 bogus 拒绝，fail-closed）。
-    # 原因：iterations 完全由**响应**里的 NSEC3 rdata 决定，恶意/被劫持的权威
-    # 可以返回 iterations=65535，使每次 hash 变成 65536 次 SHA-1；而一个负应答
-    # 里会多次调用本函数（closest-encloser、wildcard、DS 存在性…），且这些调用
-    # 跑在**事件循环线程**里（同步），足以把整个 DNS 服务卡死（CPU 放大 DoS）。
-    _NSEC3_MAX_ITERATIONS = 150
-
-    @staticmethod
-    def _nsec3_hash(name: dns.name.Name, salt: bytes, iterations: int,
-                    algorithm: int) -> bytes:
-        """RFC 5155 §5 NSEC3 hash 计算：SHA-1 迭代（algorithm=1）。
-        owner name 用 canonical wire（RFC 4034 §6.2 小写形式）——
-        大小写混合 qname 的 hash 才能与权威一致。
-
-        iterations 超过 `_NSEC3_MAX_ITERATIONS` 时返回 b""（=无法验证），
-        防止响应驱动的 CPU 放大攻击（见常量注释）。
-        """
-        import hashlib
-        if algorithm != 1:
-            return b""
-        try:
-            if iterations < 0 or iterations > IterativeResolver._NSEC3_MAX_ITERATIONS:
-                return b""
-        except Exception:
-            return b""
-        h = name.to_wire(canonicalize=True)
-        try:
-            for _ in range(iterations + 1):
-                h = hashlib.sha1(h + salt).digest()
-            return h
-        except Exception:
-            return b""
-
-    @staticmethod
-    def _nsec3_owner_hash(nsec3_owner: dns.name.Name) -> bytes:
-        """NSEC3 owner name 的 hash bytes：owner 是 base32hex（RFC 4648）编码的
-        单 label（可能带 .zone 后缀），取第一个 label 解码。"""
-        import base64
-        try:
-            label = str(nsec3_owner).split(".")[0].upper()
-            # base32hex: 0-9A-V，标准 base32 是 A-Z2-7 → 转换
-            table = str.maketrans("0123456789ABCDEFGHIJKLMNOPQRSTUV",
-                                  "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567")
-            b32 = label.translate(table)
-            pad = "=" * ((8 - len(b32) % 8) % 8)
-            return base64.b32decode(b32 + pad)
-        except Exception:
-            return b""
+    # NSEC3 owner-hash 解码同样复用 dnssec.py 的唯一实现。
+    _nsec3_owner_hash = staticmethod(DNSSECValidator._nsec3_owner_hash)
 
     @staticmethod
     def _nsec_proves_no_type(nsec_rdata, nsec_owner: dns.name.Name,
@@ -2877,42 +2795,12 @@ class IterativeResolver:
         return IterativeResolver._nsec3_proves_no_type(
             nsec3_rdata, owner_hash, target, dns.rdatatype.DS)
 
-    @staticmethod
-    def _nsec3_interval_check(target_hash: bytes, owner_hash: bytes,
-                              next_hash: bytes) -> bool:
-        """NSEC3 区间覆盖检查（RFC 5155 §8.4）：
-        target_hash 落在 (owner_hash, next_hash) 开区间（或回绕）为覆盖。
+    # 区间覆盖语义与 dnssec.py 的 _hash_in_interval 完全一致（含自指保护）；
+    # 不再在 plain_dns_server 里复制一份边界判断。
+    _nsec3_interval_check = staticmethod(DNSSECValidator._hash_in_interval)
 
-        边界语义（安全关键）：
-        - target_hash == owner_hash：不覆盖（owner 存在，是链中真实名字）
-        - target_hash == next_hash：不覆盖！next_hash 恰是下一条 NSEC3 记录的
-          owner → target 真实存在，不能证明其不存在（闭区间可重放前驱 NSEC3
-          让真实存在域名判 NXDOMAIN、并让 secure 委托判 insecure 绕过 DNSSEC）
-        与 NSEC 分支 _nsec_covers（owner < target < next）保持一致。
-        """
-        try:
-            if target_hash == owner_hash:
-                return False
-            if target_hash == next_hash:
-                return False  # next 是下一条记录的 owner → 存在
-            if owner_hash < next_hash:
-                return owner_hash < target_hash < next_hash
-            # 回绕：target 落在 (owner, 末尾) 或 (开头, next)
-            if next_hash == owner_hash:
-                return False  # 自指记录（单名 zone）不覆盖任何 hash
-            return target_hash > owner_hash or target_hash < next_hash
-        except Exception:
-            return False
-
-    @staticmethod
-    def _nsec3_optout(nsec3_rdata) -> bool:
-        """NSEC3 opt-out 位检查（RFC 5155 §3.1.2.1：flags 第二位）。
-        opt-out 设置的 NSEC3 区间覆盖证明不可靠（opt-out 子区无 NSEC3 记录、
-        位图无 NS/DS 标记）——RFC 5155 §8.4-§8.8 要求拒绝其覆盖证明。"""
-        try:
-            return bool(getattr(nsec3_rdata, "flags", 0) & 0x01)
-        except Exception:
-            return False
+    # Opt-Out 位解析复用 dnssec.py 的实现。
+    _nsec3_optout = staticmethod(DNSSECValidator._nsec3_optout)
 
     @staticmethod
     def _nsec3_proves_no_type(nsec3_rdata, owner_hash: bytes,
@@ -4300,6 +4188,23 @@ class IterativeResolver:
                         except Exception:
                             pass
                     if not target_nsec_nodata:
+                        # CNAME 目标区**未签名**时，NODATA 本来就不会有
+                        # NSEC/NSEC3（未签名区不发布否定证明）。此时缺 NSEC
+                        # 是合法的，不能按“删除攻击”拒绝——实测
+                        # ocsp.pki.goog AAAA → pki-goog.l.google.com
+                        # （pki.goog 签名区 CNAME 到 google.com 未签名区），
+                        # 8.8.8.8 返回 CNAME+RRSIG+SOA、无 NSEC，被误判。
+                        # 目标区 secure / unknown 时仍保持拒绝（真正的删除
+                        # 攻击或无法证明，不能放）。
+                        tgt_status = await self._zone_signed_status(tgt_name)
+                        if tgt_status in ("insecure", "error"):
+                            self._stats["insecure"] += 1
+                            self._stats["success"] += 1
+                            logger.debug(
+                                "DNSSEC CNAME 目标区未签名（%s），NODATA 无 NSEC "
+                                "合法，放行: %s", tgt_status, _safe_qname(tgt_name),
+                            )
+                            return resp
                         self._stats["bogus"] += 1
                         logger.warning(
                             "DNSSEC answer 含 CNAME 但目标类型 %s 缺失且无签名 "
