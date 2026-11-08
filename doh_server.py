@@ -256,6 +256,10 @@ class DoHFrontend:
         self._servers: List[asyncio.AbstractServer] = []
         self._quic_servers: List[object] = []
         self._client: Optional[httpx.AsyncClient] = None
+        # 已成功监听的 HTTP/3 端口，按地址族区分（"IPv4"/"IPv6"）。
+        # 只有对应地址族的 QUIC 监听真的起来，才在 TCP 响应里发 Alt-Svc；
+        # 否则浏览器会去连一个不存在的 UDP 端口，白白多一次失败。
+        self._h3_listeners: Dict[str, int] = {}
 
     # ==================== 生命周期 ====================
 
@@ -416,6 +420,7 @@ class DoHFrontend:
                 logger.warning("DoH HTTP/3 %s 启动异常（跳过）: %s", label, e)
                 continue
             self._quic_servers.append(server)
+            self._h3_listeners[label] = port
             h3_listening.append(
                 f"https://{self._display_host(host, label)}:{port}{self.doh_path}"
             )
@@ -440,6 +445,27 @@ class DoHFrontend:
         if host.startswith("127."):
             return False
         return True
+
+    # Alt-Svc 的 ma（RFC 7838，单位秒）。与阿里/Cloudflare 的 DoH 一致取 86400。
+    ALT_SVC_MAX_AGE = 86400
+
+    def _alt_svc_for(self, local_ip: Optional[str]) -> Optional[Tuple[str, str]]:
+        """返回通知客户端「本 origin 支持 h3」的 Alt-Svc 响应头
+
+        Firefox 的 DoH 通道（TRRServiceChannel）在响应状态 < 500 时会解析
+        `Alt-Svc`，把 h3 映射写入 Alt-Svc 缓存；后续 DoH 查询即直接走 QUIC。
+        没有这个头时浏览器只会看到 ALPN=h2（即使服务端 UDP/QUIC 已经在监听）。
+
+        只对「该客户端实际连入的地址族」宣告，避免 IPv6 的 QUIC 没起来时
+        仍让 [::1] 客户端去连一个不存在的 UDP 端口。
+        """
+        if not self.protocols.http3 or not self._h3_listeners:
+            return None
+        family = "IPv6" if local_ip and ":" in local_ip else "IPv4"
+        port = self._h3_listeners.get(family)
+        if port is None:
+            return None
+        return ("alt-svc", f'h3=":{port}"; ma={self.ALT_SVC_MAX_AGE}')
 
     def _create_h3_protocol(self, quic, stream_handler=None):
         return _H3Protocol(quic, frontend=self, stream_handler=stream_handler)
@@ -482,10 +508,13 @@ class DoHFrontend:
         try:
             ssl_object = writer.get_extra_info("ssl_object")
             alpn = ssl_object.selected_alpn_protocol() if ssl_object else None
+            sockname = writer.get_extra_info("sockname")
+            local_ip = sockname[0] if sockname else None
+            alt_svc = self._alt_svc_for(local_ip)
             if self._pick_protocol(alpn) == "h2":
-                await self._serve_h2(reader, writer, peer_ip)
+                await self._serve_h2(reader, writer, peer_ip, alt_svc)
             else:
-                await self._serve_h11(reader, writer, peer_ip)
+                await self._serve_h11(reader, writer, peer_ip, alt_svc)
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
             pass
         except asyncio.IncompleteReadError:
@@ -510,6 +539,7 @@ class DoHFrontend:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
         peer_ip: str,
+        alt_svc: Optional[Tuple[str, str]] = None,
     ):
         conn = h11.Connection(h11.SERVER)
         while True:
@@ -569,6 +599,11 @@ class DoHFrontend:
             if not any(k.lower() == b"content-length" for k, _ in response_headers):
                 response_headers.append(
                     (b"content-length", str(len(payload)).encode("ascii"))
+                )
+            # HTTP/1.1 客户端（含 Firefox 首次 DoH 引导）靠这个头得知 h3 可用
+            if alt_svc is not None:
+                response_headers.append(
+                    (b"alt-svc", alt_svc[1].encode("latin-1"))
                 )
 
             try:
@@ -630,6 +665,7 @@ class DoHFrontend:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
         peer_ip: str,
+        alt_svc: Optional[Tuple[str, str]] = None,
     ):
         conn = H2Connection(
             config=H2Configuration(client_side=False, header_encoding="utf-8")
@@ -714,7 +750,8 @@ class DoHFrontend:
                         continue
                     task = asyncio.ensure_future(
                         self._respond_h2(
-                            conn, writer, lock, waiters, stream_id, stream, peer_ip
+                            conn, writer, lock, waiters, stream_id, stream,
+                            peer_ip, alt_svc,
                         )
                     )
                     tasks.add(task)
@@ -768,6 +805,7 @@ class DoHFrontend:
         stream_id: int,
         stream: dict,
         peer_ip: str,
+        alt_svc: Optional[Tuple[str, str]] = None,
     ):
         method = ""
         path = ""
@@ -789,6 +827,9 @@ class DoHFrontend:
             response_headers = list(headers)
             if not any(k.lower() == "content-length" for k, _ in response_headers):
                 response_headers.append(("content-length", str(len(body))))
+            # 浏览器（Firefox/Chromium）会在 h2 响应里学习 h3，无需客户端配置
+            if alt_svc is not None:
+                response_headers.append(alt_svc)
             async with lock:
                 conn.send_headers(
                     stream_id,

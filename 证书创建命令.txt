@@ -1,1 +1,2 @@
-openssl req -x509 -nodes -days 365 -newkey rsa:4096 -keyout certs/localhost.key -out certs/localhost.crt -config openssl.conf -extensions v3_req
+openssl req -x509 -nodes -days 365 -newkey ec -pkeyopt ec_paramgen_curve:secp384r1 -keyout certs/localhost.key -out certs/localhost.crt -sha384 -config openssl.conf -extensions v3_req
+
