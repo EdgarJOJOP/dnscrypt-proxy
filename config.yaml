@@ -181,6 +181,17 @@ upstream:
     # 默认 false：多数国内 DoH 上游（阿里/腾讯等）即使客户端带 DO=1 也不返回
     # RRSIG，开启后会导致几乎所有域名解析失败；仅在确认所有上游都支持
     # DNSSEC 数据传输时再开启。
+    #
+    # 本项**同时作用于迭代解析上游**（iterative:）。纯迭代模式下如果链路
+    # 根本不提供 DNSSEC 记录（实测：根区 `. DNSKEY` 被中间盒回成
+    # NXDOMAIN、应答里没有任何 RRSIG/NSEC3），strict 验证连内置信任锚都
+    # 建立不起来，此时：
+    #   false → 按「未验证放行」处理，并每 60 秒打一条 WARNING 说明链路
+    #           不支持 DNSSEC（不再逐域名丢弃 → 日志里的「严格模式丢弃 +
+    #           迭代解析连续 N 轮全部失败」不会再出现）；
+    #   true  → 保持 fail-closed，所有应答一律 SERVFAIL（安全优先）。
+    # 想确认真实防护效果：把本项设为 true 后能正常解析，才说明这条链路
+    # 真的在做 DNSSEC 验证（例如改用会下发 DNSSEC 记录的加密上游）。
     require_rrsig: false
 
 # ============================================================
@@ -232,8 +243,58 @@ iterative:
   # 严格 DNSSEC：签名链验证失败（bogus）时丢弃响应返回 SERVFAIL
   # false = 跳过多余的 DNSKEY/DS 链验证（实测同一批域名快 2-3 倍）；
   # 未签名/无法证明的响应直接放行（安全性与"上游不返回 DNSSEC 记录"时一致）。
+  #
+  # 补充（链路完全不提供 DNSSEC 记录时，2026-11-10）：
+  #   strict_dnssec=true 需要**根区 DNSKEY 能被内置信任锚验签**才能工作。
+  #   纯迭代模式没有加密上游可回退，如果本机链路/上游不下发 DNSSEC 记录
+  #   （实测形态：根区 `. DNSKEY` 回 NXDOMAIN、DS 的 NODATA 只有 SOA、
+  #   应答里没有任何 RRSIG），本程序会：
+  #     * 在启动预热的 WARNING 里明确说明「本链路/上游不下发 DNSSEC 记录」；
+  #     * 按 upstream.dnssec.require_rrsig 决定放行还是 SERVFAIL：
+  #         false（默认）→ 记为 dnssec_absent 并「未验证放行」（服务可用）；
+  #         true          → fail-closed，全部 SERVFAIL（安全优先）；
+  #     * 每 60 秒自动重探一次根区 DNSKEY，链路恢复后立即回到完整验证。
+  #   实测效果：IPv4 被镜像、IPv6 正常的线路上，改走真族后 nic.cz / isc.org /
+  #   org DS 等签名域名判 secure，dnssec-failed.org 被正确丢弃 —— 纯迭代、
+  #   不需要任何 DoH/DoT/DoQ。
   strict_dnssec: true
-  # 全局确认：迭代结果与加密上游结果做一致性交叉验证（已废弃，仅保留兼容）
+  # ------------------------------------------------------------
+  # 地址族策略（中国大陆网络的现实：**没有真正的 IPv4 根服务器**，
+  #   发往 198.41.0.4 / 192.5.5.241 等 IPv4 根 IP 的查询由境内镜像应答，
+  #   镜像不下发任何 DNSSEC 记录——根 `. DNSKEY` 甚至回 NXDOMAIN；
+  #   而 IPv6 方向通常直达真实权威。取证命令：test_dnssec_iterative_e2e.py --forensic）
+  #   auto   默认。自动判定哪一族"真的到达权威"：
+  #            · 用根 `. DNSKEY` 的 AA=1 + OPT 回声 DO + answer 含 DNSKEY 判定
+  #              （缓存 600s，结论变化才告警）；
+  #            · 只判定出一族为真时，解析的**每一跳**都优先走真族
+  #              （该跳没有真族地址时自动回退全族，可用性不降）。
+  #   ipv4   强制只用 IPv4（例如只有 v4 可用；镜像链路上 DNSSEC 通常不可验证）。
+  #   ipv6   强制只用 IPv6（想让 DNSSEC 真正生效就选这个）。
+  # 注意：DNSSEC 的信任链验证**始终走真族**（即使 family=ipv4），
+  #   否则镜像链路上永远算不出证据，等于放弃验证能力。
+  family: auto
+  # 「不是真权威的地址族」（境内 IPv4 镜像）这条路径的验证策略：
+  #   strict      默认。维持 strict DNSSEC 判定：镜像链路上通常拿不到证据，
+  #               于是按 upstream.dnssec.require_rrsig 决定放行/丢弃；
+  #               **只有这一档会为每条"代答族未验证放行"打 WARNING**。
+  #   corroborate **最大有效能防中间人**（推荐与 family=ipv4 搭配）：
+  #               凡是走了镜像族的应答，都用真族（IPv6）把同一问题重解析一遍：
+  #                 - 一致   → 采用真族答案，照常做 DNSSEC 验签（强度最高）；
+  #                 - 不一致 → 判定镜像在篡改：丢弃镜像答案、改用真族答案，
+  #                            并打「⚠️ 疑似中间人」WARNING；
+  #                 - 真族拿不到该名字（该权威只有 IPv4）→ 按 require_rrsig
+  #                            降级放行，并标记 hijacked_path（未验证）。
+  #               本档**不再逐域名打印**"代答族降级放行"告警（已逐条印证过，
+  #               只有判出不一致时才告警），避免日志刷屏。
+  #   none        只保可用性：镜像答案直接放行（标记 hijacked_path），
+  #               同样**不打印**上述逐域名告警。不建议。
+  #               统计里能看到 corroborated / mismatch / hijacked_path 三个计数。
+  #
+  # 本机现状（实测，2026-11-10）：IPv4 镜像 + IPv6 直达权威，故取
+  #   family: auto（自动走 IPv6 做 DNSSEC 验证）
+  #   ipv4_verify: corroborate（回退到 IPv4 的每一跳都用 IPv6 真族交叉印证）
+  ipv4_verify: corroborate
+  # 迭代结果与加密上游结果做一致性交叉验证（已废弃，仅保留兼容）
   cross_verify: false
 
 cache:

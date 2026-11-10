@@ -901,6 +901,49 @@ class Config:
         return max(1, min(4, value))
 
     @property
+    def plain_dns_iterative_family(self) -> str:
+        """根/TLD/权威的地址族策略（iterative.family，默认 auto）
+
+        auto = 自动判定哪一族真的能到达权威（见 IterativeResolver.
+               _probe_family_integrity）；两族都正常时不限定族。
+        ipv4 = 强制只用 IPv4（境内网络常见：v6 不通或不被信任）。
+        ipv6 = 强制只用 IPv6（境内 IPv4 根 IP 由镜像应答、不带 DNSSEC 时用）。
+        非法值一律退回 auto（绝不因为手误把解析打死）。
+        """
+        try:
+            value = str(self._iterative_section().get("family", "auto")).strip().lower()
+        except Exception:
+            value = "auto"
+        return value if value in ("auto", "ipv4", "ipv6") else "auto"
+
+    @property
+    def plain_dns_iterative_ipv4_verify(self) -> str:
+        """「无 DNSSEC 能力的地址族」路径的验证策略（iterative.ipv4_verify）
+
+        背景（境内实测）：IPv4 根服务器 IP 由境内镜像应答，镜像不下发任何
+        DNSSEC 记录（根 `. DNSKEY` 甚至回 NXDOMAIN），因此这条路径上
+        strict DNSSEC 在数学上不可能通过；而 IPv6 方向通常直达真实权威。
+
+          strict      = 维持 strict DNSSEC 判定（不可验证 → 按
+                        upstream.dnssec.require_rrsig 决定放行/丢弃）。
+          corroborate = **最大有效能防中间人**：这类应答（连同整条链）必须再用
+                        「真族」（通常是 IPv6）重解析同一问题做交叉印证——
+                        真族答案可用 DNSSEC 验签，两者不一致即判为疑似中间人
+                        并丢弃；真族拿不到该名字时按 require_rrsig 降级放行
+                        并在日志里标注「未验证」。
+          none        = 不做额外校验（只保可用性，不建议）。
+
+        非法值一律退回 strict（安全优先，绝不因手误静默降级）。
+        """
+        try:
+            value = str(
+                self._iterative_section().get("ipv4_verify", "strict")
+            ).strip().lower()
+        except Exception:
+            value = "strict"
+        return value if value in ("strict", "corroborate", "none") else "strict"
+
+    @property
     def filter_rules_urls(self) -> List[str]:
         return self._clean_rule_entries(self._data.get("filter", {}).get("rules_urls"))
     @property

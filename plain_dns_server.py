@@ -60,6 +60,25 @@ asyncio 每个 Task 有独立 context，所以不同域名的并发解析互不�
 """
 
 
+_FAMILY_ONLY_CTX: contextvars.ContextVar = contextvars.ContextVar(
+    "iterative_family_only", default=""
+)
+"""本域名本次解析**优先使用**的地址族："4" / "6" / ""（不限定）
+
+为什么需要：实测有的网络里 IPv4/53 被路由器/运营商/安全软件接管——连
+`192.0.2.1`（RFC 5737 TEST-NET 死地址）都能拿到应答，而 IPv6/53 直接到达
+真实根服务器（`AA=1`、`OPT` 有、`DO` 回声、`answer` 带 DNSKEY+RRSIG）。
+这种链路上 IPv4 应答全是伪造的、且不含任何 DNSSEC 记录；若两族混用，
+IPv4 那台"本地设备"的应答总是先到（微秒级），真实 IPv6 应答被丢弃，
+DNSSEC 永远判不出来。
+
+处置：启动/预热时判定各族是否真的到达权威（见 `_probe_family_integrity`），
+若只有一族是真的，就用本 ContextVar 让该域名的**每一跳**优先走那一族
+（该跳没有可用地址时自动回退全族，保证可用性不降级）。
+asyncio 每个 Task 独立 context，域名之间互不影响。
+"""
+
+
 def _consume_future_exc(fut: asyncio.Future) -> None:
     """消费 future 的异常（不取 result，只取 exception 消除告警）
 
@@ -184,6 +203,21 @@ class _ChainUnavailable(Exception):
     现在这类情形单独抛出：`_get_trusted_dnskey` 会先清负缓存重试一次，
     仍失败才标记为"暂时不可用"，由调用方按 error 语义处理（放行 + debug，
     与 `_zone_signed_status` 返回 "error" 时的策略一致）。
+    """
+
+
+class _DnssecAbsent(_ChainUnavailable):
+    """链路/上游**确定性不提供 DNSSEC 记录**（不是超时，也不是伪造）
+
+    与父类 `_ChainUnavailable` 的区别只在"要不要重试"：
+      * 父类表示"这次没取到证据"（超时、限速、权威不可达）→ 退避重试有意义；
+      * 本类表示"对端明确回了不带 DNSSEC 材料的应答"（实测：根区 `. DNSKEY`
+        被中间盒直接回 NXDOMAIN，或 DNSKEY 应答里完全没有 RRSIG）→ 同一台
+        权威再问 3 次不会有任何不同结果，重试纯属浪费往返（每次链构建多
+        4 次根/TLD 查询）。
+
+    仍然继承 `_ChainUnavailable`，因此记账/负缓存/放行语义与原来完全一致，
+    只有 `_get_trusted_dnskey` 的退避循环会据此提前结束。
     """
 
 
@@ -1160,6 +1194,75 @@ class IterativeResolver:
                 "RRSIG/DS 链，所有无签名应答将按「无法证明」处理；"
                 "请执行 pip install cryptography", _crypto_err,
             )
+        # ============================================================
+        # 「本链路到底能不能做 DNSSEC 验证」的能力证据
+        # ------------------------------------------------------------
+        # 纯迭代模式没有加密上游可回退，所以 strict_dnssec 一旦建立不起信任链，
+        # 整机解析就会全盘 SERVFAIL（日志表现为：所有域名都报「应答没有签名
+        # (RRSIG)，也没有能证明该域名本就未签名的 NSEC/NSEC3」，紧接着
+        # 「纯迭代模式：迭代解析连续 N 轮全部失败」）。实测这类环境的共同点
+        # 是**链路根本不提供 DNSSEC 材料**：根区 `. DNSKEY` 被中间盒回成
+        # NXDOMAIN / 应答里没有任何 RRSIG / DS 的 NODATA 只有 SOA 没有 NSEC3。
+        #
+        # 此时 strict 验证在数学上不可能成功（连根信任锚都验证不了），继续
+        # 逐域名判「无法证明」既救不了安全，又让服务完全不可用。
+        # 处置与 resolver 层 dnssec.py 的既有语义保持一致：
+        #   * require_rrsig=false（默认）：按「未验证放行」处理 + 节流告警；
+        #   * require_rrsig=true（安全优先）：仍然 fail-closed 丢弃。
+        # `_dnssec_evidence` 记录最近一次根区自举的结论（ok/absent/
+        # bogus_root/unavailable），`_dnssec_avail_cache` 是它的 TTL 缓存：
+        # 不可用状态 60s 后重探，"网络被修好"能自动恢复完整验证。
+        try:
+            self._require_rrsig = bool(self.config.dnssec_require_rrsig)
+        except Exception:
+            self._require_rrsig = False
+        self._dnssec_evidence = "unknown"
+        self._dnssec_evidence_detail = ""
+        self._dnssec_avail_cache: tuple = ("", 0.0)
+        # 「链路不提供 DNSSEC 记录 → 降级放行」告警的节流状态
+        self._absent_warn_last = 0.0
+        self._absent_warn_merged = 0
+        self._absent_detail_logged = False
+        # 地址族完整性：{"4"/"6": "genuine"/"hijacked"/"unreachable"}。
+        # 用来识别「某一族 53 端口被中间设备代答」——实测 IPv4 被接管、
+        # IPv6 直达权威的网络，只有换到真族才能拿到 DNSSEC 记录。
+        self._family_verdicts: Dict[str, str] = {}
+        self._family_probe_at = 0.0
+        # 地址族策略（iterative.family：auto/ipv4/ipv6）与「无 DNSSEC 能力的
+        # 地址族」的验证策略（iterative.ipv4_verify：strict/corroborate/none）
+        try:
+            self._family_policy = str(
+                config.plain_dns_iterative_family or "auto").lower()
+        except Exception:
+            self._family_policy = "auto"
+        if self._family_policy not in ("auto", "ipv4", "ipv6"):
+            self._family_policy = "auto"
+        try:
+            self._ipv4_verify = str(
+                config.plain_dns_iterative_ipv4_verify or "strict").lower()
+        except Exception:
+            self._ipv4_verify = "strict"
+        if self._ipv4_verify not in ("strict", "corroborate", "none"):
+            self._ipv4_verify = "strict"
+        # 强制族优先：policy=ipv4/ipv6 时直接锁定，不做自动判定
+        self._preferred_family = {
+            "ipv4": "4", "ipv6": "6",
+        }.get(self._family_policy, "")
+        if self._family_policy != "auto":
+            logger.warning(
+                "迭代地址族策略: iterative.family=%s → 强制只用 IPv%s"
+                "（自动族判定不再改变该选择；IPv4 镜像链路上 DNSSEC 通常不可"
+                "验证，可用 iterative.ipv4_verify=corroborate 做交叉印证）",
+                self._family_policy, self._preferred_family)
+        if self._ipv4_verify != "strict":
+            logger.warning(
+                "迭代 IPv4 验证策略: iterative.ipv4_verify=%s → 对「不是真权威"
+                "的地址族」的应答%s", self._ipv4_verify,
+                "改用真族交叉印证（不一致即丢弃）"
+                if self._ipv4_verify == "corroborate" else "不做额外校验")
+        # 「该应答走了被代答的地址族 → 未验证放行」告警的节流状态
+        self._hijack_warn_last = 0.0
+        self._hijack_warn_merged = 0
         try:
             self._dnssec.set_dns_query_callback(self._dnssec_query_callback)
         except Exception:
@@ -1167,6 +1270,17 @@ class IterativeResolver:
         self._stats = {
             "queries": 0, "success": 0, "fail": 0,
             "bogus": 0, "insecure": 0, "secure": 0, "depth_exceeded": 0,
+            # 因「本链路不提供任何 DNSSEC 材料」而降级放行的次数
+            # （require_rrsig=false 时的可用性降级，见 _dnssec_availability）
+            "dnssec_absent": 0,
+            # 因「该应答走了已被判定为代答的地址族」而降级放行的次数
+            # （见 _probe_family_integrity / _report_hijacked_path）
+            "hijacked_path": 0,
+            # 交叉印证（iterative.ipv4_verify=corroborate）：
+            #   corroborated = 用真族成功交叉印证（不一致时也计入，另加 mismatch）
+            #   mismatch     = 镜像族答案与真族不一致（疑似中间人，已改用真族答案）
+            "corroborated": 0,
+            "mismatch": 0,
         }
         # 「应答无签名且无法证明该域名未签名」告警的节流状态：
         # 严格模式下这类丢弃可能每秒几十条，必须合并输出，否则日志被刷爆。
@@ -1314,8 +1428,175 @@ class IterativeResolver:
             hint="请检查链路是否存在 DNS 劫持/代理，或换用会下发 DNSSEC 记录的上游。",
         )
 
-    # ---------- 单跳查询（同步，to_thread 包装） ----------
+    def _report_dnssec_absent(self, qname: str, backend_missing: bool = False):
+        """链路完全不提供 DNSSEC 材料 → 按 require_rrsig=false 降级放行（60s 一条）
 
+        与 `_report_unsigned_unknown` 的区别（措辞与处置都不同）：
+          * `_report_unsigned_unknown`：**已能**做 DNSSEC 验证，但这一个应答既
+            没签名也没否定证明 → 无法证明，strict 丢弃（可能是剥离攻击）；
+          * 本函数：**整条链路**都拿不到 DNSSEC 材料（根 DNSKEY 都验证不了，
+            根区甚至回 NXDOMAIN）→ strict 在这个环境下不可能成功，按
+            `dnssec.require_rrsig=false` 的语义放行（未经验签）并明确告知。
+        节流：60 秒一条 WARNING，其余降为 DEBUG 并合并计数，避免刷爆日志。
+        """
+        now = time.monotonic()
+        last = getattr(self, "_absent_warn_last", 0.0)
+        if now - last >= 60.0:
+            merged = getattr(self, "_absent_warn_merged", 0)
+            self._absent_warn_last = now
+            self._absent_warn_merged = 0
+            suffix = f"（最近 60 秒同类共 {merged + 1} 次）" if merged else ""
+            _ev = getattr(self, "_dnssec_evidence", "unknown")
+            if backend_missing:
+                reason = (
+                    "本机缺少 DNSSEC 验签后端（cryptography），无法验证任何签名"
+                )
+                hint = "请执行 pip install cryptography 以恢复 DNSSEC 验证。"
+            elif _ev == "unavailable":
+                reason = (
+                    "根区 DNSKEY 查询失败，DNSSEC 信任链无法建立（暂时取不到证据）"
+                )
+                hint = (
+                    "这是网络/上游暂时不可用，不是伪造；已按可用性放行，"
+                    "恢复后会自动回到完整验证。"
+                )
+            else:
+                reason = (
+                    "本链路/上游不下发任何 DNSSEC 记录（根区 DNSKEY 缺失或没有 "
+                    "RRSIG），strict 模式没有可用的信任源"
+                )
+                hint = (
+                    "已按 upstream.dnssec.require_rrsig=false 的语义放行（未经"
+                    "验签）；如需对这种链路拒绝服务，请把 require_rrsig 设为 "
+                    "true，或改用会下发 DNSSEC 记录的上游。"
+                )
+                # 首次（每条 WARNING 周期内只一次）附上"对端到底回了什么"，
+                # 便于区分「链路剥掉 DNSSEC」与「本机查询缺 DO」
+                if not getattr(self, "_absent_detail_logged", False):
+                    hint += "（实测根区 DNSKEY 应答: %s）" % (
+                        getattr(self, "_dnssec_evidence_detail", "") or "未知")
+                    self._absent_detail_logged = True
+            logger.warning(
+                "DNSSEC 无法验证，降级放行 %s%s：%s。%s",
+                _safe_qname(qname), suffix, reason, hint,
+            )
+        else:
+            self._absent_warn_merged += 1
+            logger.debug(
+                "DNSSEC 无法验证，降级放行（已合并计数）: %s", _safe_qname(qname),
+            )
+
+    def _report_hijacked_path(self, qname: str, answer_ip: str):
+        """该应答来自已被判定为「中间设备代答」的地址族 → 未验证放行
+
+        **只在 `iterative.ipv4_verify=strict` 时告警**：
+          * corroborate：镜像族的每一条应答都已经用真族重解析同一问题印证过
+            （不一致会由 `_report_dnssec_mismatch` 单独打「疑似中间人」告警），
+            单独再为"这条没验证"刷一条 WARNING 纯属噪音；
+          * none：本来就是"只保可用性、不做额外校验"，逐条告警更没有意义；
+          * strict：用户主动选择了"维持严格判定"，此时必须让他看到
+            "这条数据没验证过、原因是代答族"。
+        统计计数（`hijacked_path`）在调用方无条件累加，因此静默不影响可观测性。
+        节流：strict 下 60 秒一条 WARNING，其余降为 DEBUG 并合并计数。
+        """
+        _mode = getattr(self, "_ipv4_verify", "strict")
+        if _mode != "strict":
+            logger.debug(
+                "DNSSEC 未验证放行（代答族，ipv4_verify=%s 不告警）: %s ← %s",
+                _mode, _safe_qname(qname), answer_ip)
+            return
+        now = time.monotonic()
+        last = getattr(self, "_hijack_warn_last", 0.0)
+        if now - last >= 60.0:
+            merged = getattr(self, "_hijack_warn_merged", 0)
+            self._hijack_warn_last = now
+            self._hijack_warn_merged = 0
+            suffix = f"（最近 60 秒同类共 {merged + 1} 次）" if merged else ""
+            logger.warning(
+                "DNSSEC 无法验证，降级放行 %s%s：应答来自已被判定为「中间设备"
+                "代答」的地址族（来源 %s，AA/OPT 均不符合真权威形态），该族"
+                "不可能下发 DNSSEC 记录。已按 require_rrsig=false 的语义放行"
+                "（未经验签）；如需 fail-closed，请把 upstream.dnssec."
+                "require_rrsig 设为 true",
+                _safe_qname(qname), suffix, answer_ip,
+            )
+        else:
+            self._hijack_warn_merged += 1
+            logger.debug("DNSSEC 无法验证，降级放行（代答族，已合并计数）: %s",
+                         _safe_qname(qname))
+
+    async def _resolve_over_genuine(self, qname: str, qtype: int,
+                                    rdclass: int) -> Optional[dns.message.Message]:
+        """在与当前不同的**真族**上重解析同一问题（用于交叉印证镜像答案）
+
+        背景：境内 IPv4 根服务器 IP 由镜像应答、镜像不下发 DNSSEC；IPv6 方向
+        通常直达真实权威。`iterative.ipv4_verify=corroborate` 时，凡是走过
+        非真族（`_hijacked_path`）的应答，都要在这里用真族重解析一次：
+          * 真族答案随后走完整 DNSSEC 验签（这是"最大有效能"的验证强度）；
+          * 两者内容不一致 → 说明镜像在说谎 → 调用方丢弃并告警；
+          * 真族拿不到（该名字的权威只有 IPv4）→ 返回 None，由调用方按
+            `require_rrsig` 降级放行并标注未验证。
+
+        返回 None 表示"无法交叉印证"。只读操作，不修改缓存/统计。
+        """
+        _policy = getattr(self, "_family_policy", "auto")
+        cur = (_FAMILY_ONLY_CTX.get("")
+               or getattr(self, "_preferred_family", "") or "")
+        # 选「与当前不同、且判定为 genuine」的那一族做印证源
+        # （这样 family=ipv4 强制走镜像时，仍能用 IPv6 真族去印证）
+        _verdicts = getattr(self, "_family_verdicts", None) or {}
+        alt = ""
+        for fam in ("6", "4"):
+            if fam != cur and _verdicts.get(fam) == "genuine":
+                alt = fam
+                break
+        if not alt:
+            return None
+        if not any(self._family_of(ip) == alt for ip in self.root_servers):
+            return None
+        # 交叉印证的**耗时上限**与失败负缓存：
+        # 对「权威只有 IPv4」（境内大量站点）的域名，真族根本走不到最后，
+        # 每次都为它跑一遍完整 v6 链会白付几秒延迟。这里给单次尝试设上限
+        # （≤2s），失败按 域名+类型 缓存 60 秒，避免同一域名反复空跑。
+        _ck = "%s|%d" % (str(qname).rstrip(".").lower(), int(qtype))
+        _now = time.time()
+        _fail = getattr(self, "_corrob_fail", None)
+        if _fail is None:
+            _fail = {}
+            self._corrob_fail = _fail
+        if _fail.get(_ck, 0.0) > _now:
+            return None
+        _budget = max(0.8, min(2.0, float(getattr(self, "timeout", 2.0))))
+        token = _FAMILY_ONLY_CTX.set(alt)
+        try:
+            alt_resp = await asyncio.wait_for(
+                self._iterate(qname, qtype, 0, rdclass), timeout=_budget)
+        except Exception:
+            alt_resp = None
+        finally:
+            _FAMILY_ONLY_CTX.reset(token)
+        if alt_resp is None or getattr(alt_resp, "_hijacked_path", False):
+            if len(_fail) > 2048:
+                _fail.clear()
+            _fail[_ck] = _now + 60.0
+            return None
+        return alt_resp
+
+    def _report_dnssec_mismatch(self, qname: str, answer_ip: str):
+        """镜像族答案与真族答案不一致 → 疑似中间人（已改用真族答案）
+
+        这是 `iterative.ipv4_verify=corroborate` 的核心告警：境内 IPv4 镜像
+        即使伪造得很像真权威（AA/OPT/DO 齐全），只要它与 IPv6 真族的答案
+        不一致，就说明它在说谎。此时我们**不采信镜像**，直接把真族答案交给
+        后续 DNSSEC 验签，因此数据仍然是正确的——告警的意义是提示这条链路上
+        确实存在篡改行为，值得排查（路由/代理/运营商）。
+        """
+        logger.warning(
+            "⚠️ 疑似中间人: %s 的 IPv4 镜像答案与 IPv6 真族不一致（来源 %s）"
+            " → 已丢弃镜像答案，改用真族答案（随后按 DNSSEC 验签）",
+            _safe_qname(qname), answer_ip)
+
+    # ---------- 单跳查询（同步，to_thread 包装） ----------
     def _query_one(self, server_ip: str, qname: str, qtype: int,
                    rdclass: int = 1) -> Optional[dns.message.Message]:
         """向指定服务器发送非递归查询（RD=0, DO=1），TC 时回退 TCP。"""
@@ -1479,6 +1760,37 @@ class IterativeResolver:
                         resp = None
                     if resp is not None:
                         self._record_server_health(ip, _elapsed)
+                        # 「是谁回的这个响应」——供 DNSSEC 证据诊断使用。
+                        # 真实权威：AA=1、RA=0、RD 不回显；
+                        # 递归代答/中间盒：AA=0、RA=1，甚至完全没有 OPT。
+                        # 这些只是**诊断元数据**，不参与任何安全判定。
+                        try:
+                            resp._answer_ip = str(ip)
+                            resp._answer_aa = bool(resp.flags & dns.flags.AA)
+                            resp._answer_ra = bool(resp.flags & dns.flags.RA)
+                            resp._answer_rd_echo = bool(
+                                resp.flags & dns.flags.RD)
+                            # 已知该地址族被中间设备代答 → 标到应答上：
+                            # 这类应答不可能带 DNSSEC 证明（代答设备不发），
+                            # 由 `_resolve_verified` 按可用性策略处理。
+                            resp._answer_family = self._family_of(ip)
+                            _fv = getattr(self, "_family_verdicts", None) or {}
+                            _fam_bad = _fv.get(resp._answer_family) == "hijacked"
+                            if getattr(self, "_ipv4_verify", "strict") == "corroborate":
+                                # corroborate：整个"非真族"都要用真族交叉印证，
+                                # 所以按族标记（不要求应答形态也可疑）
+                                resp._hijacked_path = _fam_bad
+                            else:
+                                # strict/none：只有「该族被判代答」**且**这条应答
+                                # 形态也不像真权威（没回声 OPT/DO，或权威应答
+                                # 却没有 AA）才标记。两个条件同时成立才标记，
+                                # 是为了不误伤：有些网络只有**境外** IPv4/53 被
+                                # 劫持、境内权威仍可正常访问，那种真权威应答会带
+                                # AA+OPT+DO，不应被当成伪造而放弃验证。
+                                resp._hijacked_path = (
+                                    _fam_bad and self._looks_fake(resp))
+                        except Exception:
+                            pass
                         logger.debug(
                             "迭代查询: %s 响应 %s (rcode=%s, answer=%d, authority=%d)",
                             ip, _safe_qname(qname), dns.rcode.to_text(resp.rcode()),
@@ -1943,6 +2255,20 @@ class IterativeResolver:
             servers, started_from_cache = _cached_start
         cname_targets: List[str] = []
         cname_chain: List[bytes] = []  # 中间跳 CNAME 响应 wire（供上层验签，防 target 篡改）
+        # 本次迭代链里是否有**任何一跳**用了「已被判定为中间设备代答」的地址族。
+        # 只要有一跳是代答族的应答，整条链的数据都不可信（代答设备不下发
+        # DNSSEC），上层据此按 require_rrsig 决定放行/丢弃，而不是误判成
+        # "签名被剥离"后把本可解析的域名打成 SERVFAIL。
+        _chain_hijacked = [False]
+
+        def _ret(msg):
+            try:
+                if msg is not None and (_chain_hijacked[0]
+                                        or getattr(msg, "_hijacked_path", False)):
+                    msg._hijacked_path = True
+            except Exception:
+                pass
+            return msg
         # QNAME 最小化（RFC 9156）：向当前区只问「下一级名字」，中间级用 NS 查询，
         # 到最终名才用原 qtype——根/TLD 看不到完整查询名（隐私），也少发无用查询。
         # 缓存起跳时当前区未知，跳过最小化；一旦发现区名没推进，也自动回退全名，
@@ -1967,7 +2293,29 @@ class IterativeResolver:
                 except Exception:
                     _minimize = False
                     _q_name, _q_type = qname, qtype
-            response = await self._query_servers(servers, _q_name, _q_type, rdclass)
+            # 族优先（见 `_FAMILY_ONLY_CTX`）：若已判定某一族被中间设备代答、
+            # 另一族才是真权威，本跳**先只用真族**——因为代答设备是本地设备、
+            # 应答在微秒级，两族混发时它永远先到，真实权威的 DNSSEC 记录会被丢。
+            # 真族在本跳没有可用地址（或全部失败）时立刻回退全族：
+            # 宁可这一次拿不到 DNSSEC，也不能把域名解析变成失败。
+            _pref = (_FAMILY_ONLY_CTX.get("")
+                     or getattr(self, "_preferred_family", "") or "")
+            _pref_servers: List[str] = []
+            if _pref and len(servers) > 1:
+                _cand = [ip for ip in servers if self._family_of(ip) == _pref]
+                if 0 < len(_cand) < len(servers):
+                    _pref_servers = _cand
+            response = None
+            if _pref_servers:
+                response = await self._query_servers(
+                    _pref_servers, _q_name, _q_type, rdclass)
+                if response is None:
+                    logger.debug(
+                        "迭代解析: %s 优先族 IPv%s 本跳全部失败，回退全族",
+                        _safe_qname(qname), _pref)
+            if response is None:
+                response = await self._query_servers(
+                    servers, _q_name, _q_type, rdclass)
             if response is None and started_from_cache:
                 # 缓存里的权威已失效/换 IP：回退到根重新走完整链路，功能不降级
                 logger.debug("缓存区权威不可达，回退根服务器重试: %s", _safe_qname(qname))
@@ -1977,6 +2325,11 @@ class IterativeResolver:
                 response = await self._query_servers(servers, qname, qtype, rdclass)
             if response is None:
                 return None
+            try:
+                if getattr(response, "_hijacked_path", False):
+                    _chain_hijacked[0] = True
+            except Exception:
+                pass
             # 1. answer 段含**目标 owner** 的目标类型 → 完成（返回前复原 question）
             #
             # 不能只看 rdtype：QNAME 最小化/权威异常时，answer 里可能出现
@@ -2001,7 +2354,7 @@ class IterativeResolver:
                     response._cname_chain = list(cname_chain)
                 except Exception:
                     pass
-                return response
+                return _ret(response)
             # 2. NXDOMAIN → 返回（负应答）
             has_soa = any(rrset.rdtype == dns.rdatatype.SOA for rrset in response.authority)
             has_ns_ref = any(rrset.rdtype == dns.rdatatype.NS for rrset in response.authority)
@@ -2020,7 +2373,7 @@ class IterativeResolver:
                     # 名字与 QTYPE 都要复原成客户端原始查询（中间名+NS 会被
                     # 客户端判为 question 不匹配而丢弃）
                     self._restore_question(response, original_qname, qtype)
-                    return response
+                    return _ret(response)
             # 2. NXDOMAIN → 返回（负应答）
             #
             # ⚠ 必须复原 question：QNAME 最小化下，向权威发送的是 qname 的
@@ -2033,7 +2386,7 @@ class IterativeResolver:
             #   NXDOMAIN / NODATA 两条 return 漏掉，是本次端到端测试发现的。
             if response.rcode() == dns.rcode.NXDOMAIN:
                 self._restore_question(response, original_qname, qtype)
-                return response
+                return _ret(response)
             # 2b. 权威负应答（NODATA）：authority 段有 SOA（zone 权威的否定应答），
             #     无 NS referral → 直接返回，避免 _extract_next_servers 死循环
             #     注意：answer 可能含 CNAME + authority NSEC（RFC 4035 §5.2 同响应
@@ -2053,7 +2406,7 @@ class IterativeResolver:
                 except Exception:
                     pass
                 self._restore_question(response, original_qname, qtype)
-                return response
+                return _ret(response)
             # 3. CNAME 链（最多跟随 8 跳）——owner 必须等于当前 qname（防注入）
             cname = self._extract_cname(response, expected_owner=qname)
             if cname is not None:
@@ -2067,7 +2420,7 @@ class IterativeResolver:
                     # 直接返回 CNAME 响应：上层看到“无 DS、无匹配否定证明”，
                     # 会按“普通名”继续升到 jsdelivr.net 判断（未签名 → 放行）。
                     self._restore_question(response, original_qname, qtype)
-                    return response
+                    return _ret(response)
                 cname_targets.append(cname)
                 try:
                     cname_chain.append(response.to_wire())  # 保存供上层验签
@@ -2381,6 +2734,285 @@ class IterativeResolver:
             self._ds_inflight.pop(k, None)
             n = n.parent()
 
+    @staticmethod
+    def _describe_resp(msg) -> str:
+        """一句话描述响应形态——用于证明「链路到底回了什么、是谁回的」
+
+        为什么需要：`absent`（链路不提供 DNSSEC）与「我们自己的查询没带 DO」
+        必须能被区分开，否则只能靠外部抓包。这里把关键字段打出来：
+          * rcode / 各段 rrset 数 / 是否带 OPT / 是否回声 DO / payload；
+          * 若是本进程收到的真实响应（`_query_servers` 会打标）：来源 IP、
+            AA/RA 位、RD 是否回显 —— 真权威是 AA=1/RA=0，递归代答或中间盒
+            是 AA=0/RA=1；
+          * authority 段前几个 rrset 的 owner/type（例如只有 `com. SOA`
+            就说明"否定证明"缺失）。
+
+        典型对照：
+          * 真权威对 DO=1 的 `. DNSKEY`：rcode=NOERROR / answer≥1 /
+            OPT=有 / DO回声=True / AA=1 / RA=0；
+          * 被中间盒接管：rcode=NXDOMAIN 或只有 SOA / OPT=无 / DO回声=False /
+            AA=0 / RA=1。
+        本函数只做描述，不参与任何判定。
+        """
+        try:
+            opt = msg.opt
+            do_echo = bool(msg.ednsflags & dns.flags.DO)
+            parts = []
+            ip = getattr(msg, "_answer_ip", None)
+            if ip:
+                parts.append("来自=%s" % ip)
+            aa = getattr(msg, "_answer_aa", None)
+            ra = getattr(msg, "_answer_ra", None)
+            rd_e = getattr(msg, "_answer_rd_echo", None)
+            if aa is not None:
+                parts.append("AA=%d RA=%d RD回声=%d"
+                             % (1 if aa else 0, 1 if ra else 0,
+                                1 if rd_e else 0))
+            parts.append("rcode=%s" % dns.rcode.to_text(msg.rcode()))
+            parts.append("answer=%d authority=%d additional=%d"
+                         % (len(msg.answer), len(msg.authority),
+                            len(msg.additional)))
+            parts.append("OPT=%s DO回声=%s payload=%s"
+                         % ("有" if opt is not None else "无", do_echo,
+                            msg.payload if opt is not None else "-"))
+            if msg.authority:
+                parts.append("authority=[%s]" % ", ".join(
+                    "%s %s" % (str(x.name), dns.rdatatype.to_text(x.rdtype))
+                    for x in msg.authority[:3]))
+            return " | ".join(parts)
+        except Exception as e:      # pragma: no cover
+            return "（无法描述响应: %r）" % (e,)
+
+    def _set_dnssec_evidence(self, state: str, detail: str = "") -> None:
+        """记录「本链路能否提供可验证的 DNSSEC 材料」的证据
+
+        只由**根区 DNSKEY 自举**的结果产生（根是整条链的唯一信任锚，根都
+        验证不了，任何下级签名都不可能验证）：
+          * "ok"          根 DNSKEY 已用内置信任锚验签通过 → 链可用；
+          * "absent"      根区应答里没有 DNSKEY，或 DNSKEY 没有 RRSIG
+                          → 链路根本不提供 DNSSEC 记录（缺失，不是伪造）；
+          * "bogus_root"  根 DNSKEY 有 RRSIG 但验签失败 → 真攻击/配置错误；
+          * "unavailable" 根 DNSKEY 查询失败（超时/不可达）→ 暂时取不到证据。
+        只有 "absent" 会被 `_resolve_verified` 当作降级放行的依据，其余状态
+        一律维持原有严格判定（bogus_root 更不能放行）。
+
+        `detail`：产生该结论时的响应形态（见 `_describe_resp`），会写进
+        `_dnssec_evidence_detail` 并出现在启动预热告警里，让运维不必抓包就能
+        区分「链路剥掉了 DNSSEC」与「本机查询没带 DO（本程序实测不会发生）」。
+        """
+        try:
+            _old = getattr(self, "_dnssec_evidence", "unknown")
+            if state != _old:
+                logger.debug("DNSSEC 链路能力证据: %s → %s", _old, state)
+            self._dnssec_evidence = state
+            if detail:
+                self._dnssec_evidence_detail = str(detail)
+            # 证据变化时作废可用性 TTL 缓存，避免旧的 "ok" 在链坏掉后
+            # 还继续生效（反之亦然）。
+            self._dnssec_avail_cache = ("", 0.0)
+        except Exception:
+            pass
+
+    async def _dnssec_availability(self) -> str:
+        """本链路 DNSSEC 材料的可用性：ok / absent / bogus_root / unavailable
+
+        带 TTL 缓存：ok 30 分钟，absent 60 秒，其余 30 秒后重探——「网络或上游
+        被修好」时能在 1 分钟内自动回到完整 DNSSEC 验证，不需要重启进程。
+
+        注意：本方法**只返回证据，不做判定**。是否据此放行由调用方按
+        `require_rrsig` 决定（见 `_resolve_verified`），保持安全策略集中。
+        """
+        now = time.time()
+        try:
+            state, expire_at = getattr(self, "_dnssec_avail_cache", ("", 0.0))
+        except Exception:
+            state, expire_at = "", 0.0
+        if state and now < expire_at:
+            return state
+        # 证据过期/从未取过 → 走一次根 DNSKEY 自举（内部有 single-flight、
+        # 失败重试与 15s 负缓存，最多每 60s 真正落到权威一次）。
+        #
+        # ★ DNSSEC 链验证**永远走真族**：若用户把 iterative.family 强制成
+        #   镜像族（例如 ipv4），链验证仍然必须在真族（IPv6）上做——否则
+        #   镜像链路永远"算不出"证据，等于把验证能力白送掉。答案本身可以
+        #   来自策略族，但"证明"必须来自真族。
+        _verdicts = getattr(self, "_family_verdicts", None) or {}
+        _pref = getattr(self, "_preferred_family", "") or ""
+        _genuine = next((f for f in ("6", "4")
+                         if _verdicts.get(f) == "genuine" and f != _pref), "")
+        _tok = _FAMILY_ONLY_CTX.set(_genuine) if _genuine else None
+        try:
+            try:
+                ok = await self._get_trusted_dnskey(dns.name.root)
+            except Exception:
+                ok = None
+            if ok is None and getattr(self, "_dnssec_evidence", "") == "absent":
+                # 「拿不到 DNSSEC 记录」有两种可能，必须先分清：
+                #   a) 整条链路都拿不到（真没有）；
+                #   b) 只是**某一地址族**被中间设备代答（实测：IPv4/53 连
+                #      TEST-NET 死地址都有人应答，而 IPv6/53 是真实根服务器）。
+                # b 情形下换族就能拿到完整 DNSSEC，不该把整机降级。
+                _fam = await self._ensure_family_preference()
+                if _fam:
+                    try:
+                        ok = await self._get_trusted_dnskey(dns.name.root)
+                    except Exception:
+                        ok = None
+        finally:
+            if _tok is not None:
+                _FAMILY_ONLY_CTX.reset(_tok)
+        state = "ok" if ok is not None else (
+            getattr(self, "_dnssec_evidence", "") or "unknown")
+        if state == "ok":
+            ttl = 1800.0
+        elif state == "absent":
+            ttl = 60.0
+        else:
+            ttl = 30.0
+        self._dnssec_avail_cache = (state, now + ttl)
+        return state
+
+    # ---------- 地址族完整性（识别「某一族被中间设备代答」） ----------
+
+    @staticmethod
+    def _family_of(ip) -> str:
+        """地址族："6" = IPv6，"4" = IPv4"""
+        return "6" if ":" in str(ip) else "4"
+
+    @staticmethod
+    def _looks_fake(resp) -> bool:
+        """应答形态是否**明显不是**真权威发出来的（用于标记"该跳不可信"）
+
+        判据（都是真权威必须满足的硬性形态，RFC 1035 / 6891 / 4035）：
+          * 我们查询带了 EDNS+DO，真权威应答必然带 OPT 并回声 DO；
+            没有 OPT、或 OPT 里 DO=0 → 不是真权威（或它根本不懂 DNSSEC）；
+          * 有 answer 或 SOA（=权威应答）却没有 AA 位 → 不是权威应答
+            （referral 本来就没有 AA，不算）。
+        只用于**降低误判**：调用方要求「该族已被判定为代答」且本函数为真，
+        才会把应答标成走了代答族。宁可漏标（走正常验证），不可错标。
+        """
+        try:
+            if resp.opt is None:
+                return True
+            if not (resp.ednsflags & dns.flags.DO):
+                return True
+            has_data = bool(resp.answer) or any(
+                x.rdtype == dns.rdatatype.SOA for x in resp.authority)
+            is_referral = (not resp.answer) and any(
+                x.rdtype == dns.rdatatype.NS for x in resp.authority)
+            if has_data and not is_referral and not (resp.flags & dns.flags.AA):
+                return True
+            return False
+        except Exception:
+            return False
+
+    async def _probe_family_integrity(self, family: str) -> str:
+        """判定某一地址族的 53 端口是否**真的到达权威服务器**
+
+        判据（对根区 `. DNSKEY`，DO=1，取该族前 2 台根做样本）：
+          * "genuine"     : AA=1 **且** 应答带 OPT+DO 回声 **且** answer 含 DNSKEY
+                            （真权威对根 DNSKEY 的必然形态，RFC 4035 §2.2）；
+          * "hijacked"    : 有应答但不满足上面任一条
+                            （典型：NXDOMAIN、AA=0、没有 OPT、无 DNSKEY）；
+          * "unreachable" : 该族没有根 IP，或样本全部无应答。
+
+        只做诊断，不修改任何状态；调用方据此决定是否换族。
+        """
+        ips = [ip for ip in self.root_servers
+               if self._family_of(ip) == family][:2]
+        if not ips:
+            return "unreachable"
+        saw_any = False
+        for ip in ips:
+            try:
+                resp = await self._query_one_async(
+                    ip, ".", dns.rdatatype.DNSKEY, 1)
+            except Exception:
+                resp = None
+            if resp is None:
+                continue
+            saw_any = True
+            try:
+                has_dnskey = any(
+                    x.rdtype == dns.rdatatype.DNSKEY for x in resp.answer)
+                opt_ok = (resp.opt is not None
+                          and bool(resp.ednsflags & dns.flags.DO))
+                aa = bool(resp.flags & dns.flags.AA)
+                if aa and opt_ok and has_dnskey:
+                    logger.debug("地址族 IPv%s 完整性探测: %s 是真权威（AA=1, "
+                                 "OPT+DO 回声, DNSKEY 在应答里）", family, ip)
+                    return "genuine"
+                logger.debug(
+                    "地址族 IPv%s 完整性探测: %s 的应答不是真权威"
+                    "（%s）→ 有设备代答", family, ip,
+                    self._describe_resp(resp))
+            except Exception:
+                continue
+        return "hijacked" if saw_any else "unreachable"
+
+    async def _ensure_family_preference(self) -> str:
+        """在「DNSSEC 证据=absent」时检查是否只是某一族被代答，并选出真族
+
+        返回优先族（"4"/"6"），"" 表示不限定（两族都不能用，或两族都正常）。
+        探测结果缓存 600 秒，避免每次失败都重新探测；选中族发生变化时清掉
+        DNSSEC 链的负缓存，让下一次根 DNSKEY 查询立刻走新族重试。
+        """
+        now = time.time()
+        if now - getattr(self, "_family_probe_at", 0.0) < 600.0:
+            return getattr(self, "_preferred_family", "") or ""
+        self._family_probe_at = now
+        verdicts: Dict[str, str] = {}
+        for fam in ("4", "6"):
+            try:
+                verdicts[fam] = await self._probe_family_integrity(fam)
+            except Exception:
+                verdicts[fam] = "unreachable"
+        self._family_verdicts = verdicts
+        v4, v6 = verdicts.get("4"), verdicts.get("6")
+        # 强制族策略优先于自动判定：用户显式指定 family=ipv4/ipv6 时尊重它
+        # （探测结果仍保留在 _family_verdicts 里，供「哪些应答不是真权威」
+        #  的标记与交叉印证使用）。
+        _policy = getattr(self, "_family_policy", "auto")
+        if _policy == "ipv4":
+            pref = "4"
+        elif _policy == "ipv6":
+            pref = "6"
+        elif v4 == "genuine" and v6 != "genuine":
+            pref = "4"
+        elif v6 == "genuine" and v4 != "genuine":
+            pref = "6"
+        else:
+            pref = ""
+        changed = (pref != (getattr(self, "_preferred_family", "") or ""))
+        self._preferred_family = pref
+        if pref and _policy == "auto":
+            _bad = "6" if pref == "4" else "4"
+            _msg = ("地址族完整性: IPv%s 的应答不是来自真权威（%s）→ 判定被中间"
+                    "设备代答；IPv%s 直达权威 → 迭代解析每一跳改走 IPv%s，"
+                    "以恢复 DNSSEC 验证")
+            _args = (_bad, self._family_verdicts.get(_bad, "?"), pref, pref)
+            if changed:
+                logger.warning(_msg, *_args)      # 只在结论变化时告警，避免刷屏
+            else:
+                logger.debug(_msg, *_args)
+        elif v4 or v6:
+            if all(x == "hijacked" for x in (v4, v6) if x):
+                logger.warning(
+                    "地址族完整性: IPv4 与 IPv6 的 53 端口都被中间设备代答"
+                    "（AA=0/无 OPT/无 DNSSEC）→ 本机无法获得任何 DNSSEC 记录")
+            elif "genuine" in (v4, v6):
+                logger.debug("地址族完整性: 两族都能到真权威 → 不限定族")
+        if changed:
+            # 换族后必须让根 DNSKEY 立刻重试，而不是等 15s 负缓存过期
+            try:
+                self._dnskey_retry_after.pop(".", None)
+                self._chain_unavailable.discard(".")
+                self._verified_zone_cache.pop(".", None)
+            except Exception:
+                pass
+            self._dnssec_avail_cache = ("", 0.0)
+        return pref
+
     async def _get_trusted_dnskey(self, zone_name: dns.name.Name) -> Optional[dns.rrset.RRset]:
         """DNSSEC 链验证入口（缓存 + single-flight + 失败重试/负缓存）
 
@@ -2449,6 +3081,11 @@ class IterativeResolver:
                             "%s: %s", attempt + 1, len(delays) + 1,
                             _safe_qname(zone_name), e,
                         )
+                        if isinstance(e, _DnssecAbsent):
+                            # 对端**确定性**不提供 DNSSEC 材料（根 DNSKEY 缺失/
+                            # 无 RRSIG）：同一权威重试 3 次没有任何意义，
+                            # 立即结束退避循环（仍按链不可用记账 + 15s 负缓存）。
+                            break
                 if last_error is not None:
                     if len(retry_after) > 512:
                         retry_after.clear()
@@ -2488,11 +3125,48 @@ class IterativeResolver:
         只预热根区：根 DNSKEY 是整条链的第一级，验证并缓存后，后续 TLD
         只需查自己的 DS/DNSKEY。预热失败不抛出、不影响服务（下一次查询
         仍会按重试/负缓存逻辑再试）。
+
+        预热同时把「本链路能否做 DNSSEC」的结论打出来（2026-11-10）：
+        纯迭代模式下这是最关键的一条诊断——如果链路上游根本不提供 DNSSEC
+        记录，strict 验证永远不可能成功，运维必须马上知道（否则只能看到
+        满屏「严格模式丢弃」和「迭代解析连续失败」）。
         """
         try:
             await self._get_trusted_dnskey(dns.name.root)
         except Exception as e:
             logger.debug("DNSSEC 根区预热失败（不影响服务）: %s", e)
+        try:
+            state = await self._dnssec_availability()
+        except Exception:
+            return
+        if state == "ok":
+            logger.info("DNSSEC 预热通过：根区 DNSKEY 已用内置信任锚验签，"
+                        "strict 模式可做完整链验证")
+        elif state == "absent":
+            _detail = getattr(self, "_dnssec_evidence_detail", "") or "（无）"
+            if self._require_rrsig:
+                logger.error(
+                    "DNSSEC 预热失败：本链路/上游不下发 DNSSEC 记录（根区 DNSKEY "
+                    "缺失或无 RRSIG），而 require_rrsig=true → 严格模式将对所有"
+                    "域名返回 SERVFAIL（fail-closed）。请改用会下发 DNSSEC 记录的"
+                    "上游，或把 upstream.dnssec.require_rrsig 设为 false。"
+                    "实测根区 DNSKEY 应答: %s", _detail)
+            else:
+                logger.warning(
+                    "DNSSEC 预热：本链路/上游不下发 DNSSEC 记录（根区 DNSKEY "
+                    "缺失或无 RRSIG），strict 模式无信任源可用 → 按 "
+                    "require_rrsig=false 降级为「未验证放行」（不再逐域名丢弃）。"
+                    "如需 fail-closed，请把 upstream.dnssec.require_rrsig 设为 true。"
+                    "实测根区 DNSKEY 应答: %s（本程序查询确实带 EDNS+DO=1，"
+                    "所以这是对端/path 未回 DNSSEC 记录，不是本地查询缺 DO）",
+                    _detail)
+        elif state == "bogus_root":
+            logger.error(
+                "DNSSEC 预热失败：根区 DNSKEY 的 RRSIG 验签失败（伪造/时钟错/"
+                "算法不支持）→ 所有依赖该信任锚的应答都会被判 bogus 丢弃")
+        else:
+            logger.warning("DNSSEC 预热：根区 DNSKEY 暂时取不到（%s）→ 相关应答"
+                           "按「链不可用」放行，恢复后自动回到完整验证", state)
 
     async def _get_trusted_dnskey_uncached(
         self, zone_name: dns.name.Name
@@ -2531,12 +3205,28 @@ class IterativeResolver:
         # 2. 查询根区 DNSKEY（含 KSK+ZSK），用根锚 KSK 验证其 RRSIG → 得到完整根密钥
         root_dnskey_resp = await self._iterate(".", dns.rdatatype.DNSKEY, 0)
         if root_dnskey_resp is None:
+            # 查询失败（超时/不可达）：这是「暂时取不到证据」，不是"链路没有
+            # DNSSEC"，不能作为降级放行的依据，仍按链不可用退避重试。
+            self._set_dnssec_evidence("unavailable")
             raise _ChainUnavailable("根区 DNSKEY 查询失败")
         root_dnskey_rrset = self._extract_dnskey_rrset(root_dnskey_resp)
         if root_dnskey_rrset is None:
-            raise _ChainUnavailable("根区 DNSKEY 响应不含 DNSKEY（上游返回不完整）")
+            # 根区应答里连 DNSKEY 都没有（实测中间盒把 `. DNSKEY` 直接回
+            # NXDOMAIN）。这是「本链路不提供 DNSSEC 材料」的确定性证据：
+            # 同一台权威重试 3 次结果不会变，用 _DnssecAbsent 跳过退避重试
+            # （记账/负缓存语义不变），并让 _resolve_verified 能据此降级。
+            self._set_dnssec_evidence(
+                "absent", detail=self._describe_resp(root_dnskey_resp))
+            raise _DnssecAbsent(
+                "根区 DNSKEY 响应不含 DNSKEY（本链路不提供 DNSSEC 记录）")
         root_rrsig = self._find_rrsig_for(root_dnskey_resp, root_dnskey_rrset)
         if root_rrsig is None:
+            # 有 DNSKEY 但没有 RRSIG：同样是"链路不下发 DNSSEC 记录"的确证
+            # （DO=1 的应答理应对 DNSKEY 签名，RFC 4035 §2.2）。
+            self._set_dnssec_evidence(
+                "absent",
+                detail=("DNSKEY rrset 存在但没有 RRSIG；" +
+                        self._describe_resp(root_dnskey_resp)))
             return None
         try:
             dns.dnssec.validate(root_dnskey_rrset, root_rrsig, trusted)
@@ -2547,8 +3237,12 @@ class IterativeResolver:
             raise _ChainUnavailable(
                 "DNSSEC 验签后端不可用（请安装 cryptography）") from e
         except (dns.dnssec.ValidationFailure, KeyError) as e:
+            # 有签名但验不过 = 真 bogus（伪造/算法不支持/时钟错），
+            # 这条证据绝不能用来降级放行。
+            self._set_dnssec_evidence("bogus_root")
             self._warn_dnssec_once("root_dnskey", ".", "DNSSEC 根区 DNSKEY 验证失败: %s", e)
             return None
+        self._set_dnssec_evidence("ok")
         trusted[dns.name.root] = root_dnskey_rrset  # 含 ZSK，供后续验证子区 DS
         # 根 DNSKEY 已验证：立即入缓存，避免每个新域名都重查一次 ". DNSKEY"
         try:
@@ -3400,7 +4094,25 @@ class IterativeResolver:
                         t.cancel()
                     t.add_done_callback(_consume_future_exc)
 
-    async def _resolve_verified(self, qname: str, qtype: int, rdclass: int) -> Optional[dns.message.Message]:
+    async def _resolve_verified(self, qname: str, qtype: int,
+                                rdclass: int) -> Optional[dns.message.Message]:
+        """`_resolve_verified_inner` 的**上下文隔离包装**
+
+        `_FAMILY_ONLY_CTX` 是 per-query 的优先族标记，用 ContextVar 传递到
+        `_iterate` 的每一跳。如果只在内部 set 而不还原，同一个 asyncio Task
+        里后续的调用（以及直接调 `_dnssec_availability()` / `_get_trusted_dnskey()`
+        的预热、测试）会**继承上一条查询的族选择**，表现为"明明已经改走 IPv6，
+        下一次又去问 IPv4 镜像"。这里统一 save/restore，保证不串味。
+        """
+        _tok = _FAMILY_ONLY_CTX.set(
+            getattr(self, "_preferred_family", "") or "")
+        try:
+            return await self._resolve_verified_inner(qname, qtype, rdclass)
+        finally:
+            _FAMILY_ONLY_CTX.reset(_tok)
+
+    async def _resolve_verified_inner(self, qname: str, qtype: int,
+                                      rdclass: int) -> Optional[dns.message.Message]:
         """resolve 的内部实现：迭代 + DNSSEC 严格验证（受外层 total_timeout 约束）。
 
         注：曾尝试"主链与 DNSSEC 链并行预取"（预取根/TLD/父区的 DS+DNSKEY），
@@ -3413,6 +4125,14 @@ class IterativeResolver:
             # 每个域名解析入口重置"本次解析禁用 IPv6"标记（per-query 语义）
             _V6_DISABLED_CTX.set(False)
             self._last_release = ""
+            # ★ 必须在**取答案之前**确定地址族（缓存 600s，未到期只是一次
+            #   时间比较）：否则首条查询的应答会在"还不知道哪族被代答"时
+            #   就拿回来，既无法标记 `_hijacked_path`，也无法走交叉印证。
+            try:
+                await self._ensure_family_preference()
+            except Exception:
+                pass
+            _FAMILY_ONLY_CTX.set(getattr(self, "_preferred_family", "") or "")
             resp = await self._iterate(qname, qtype, 0, rdclass)
             # CDN 调度域名兜底：迭代拿不到最终答案时，用 bootstrap DNS 递归一次。
             # 典型场景：bilibili 的 i1/s2/s3/static.hdslb.com → CNAME 到腾讯
@@ -3424,6 +4144,14 @@ class IterativeResolver:
                 fb = await self._bootstrap_recursive(qname, qtype, rdclass)
                 if fb is not None and fb.answer:
                     fb._bootstrap_fallback = True
+                    # 继承「这条链是否走过被代答的地址族」标记：兜底应答本身
+                    # 也不带 DNSSEC，标记必须保留，否则会在严格判定里被当成
+                    # "剥离攻击"丢弃（bootstrap 分支另有放行，标记更准确）。
+                    try:
+                        fb._hijacked_path = bool(
+                            getattr(resp, "_hijacked_path", False))
+                    except Exception:
+                        pass
                     # 兜底响应**不再直接返回**：与迭代响应走同一套 DNSSEC 校验。
                     # 兜底用的是明文 bootstrap DNS（UDP，无加密、无认证），若原样
                     # 放行，攻击者只需污染 bootstrap 应答即可向签名区注入伪造记录、
@@ -3436,6 +4164,128 @@ class IterativeResolver:
                 return None
             if not self.strict_dnssec:
                 self._stats["success"] += 1
+                return resp
+
+            # ============================================================
+            # 先确定「哪一个地址族真的能到权威」（自动，缓存 600s）
+            # ------------------------------------------------------------
+            # 这一步**与 DNSSEC 是否可用无关**，纯粹为了避免把伪造族的应答
+            # 混进验证链：实测 IPv4/53 被中间设备代答、IPv6/53 直达权威时，
+            # 两族混发会让每一条签名都"验不过"（IPv4 代答微秒级先到），
+            # 表现为「bogus 一堆、secure 一个都没有」，而单独走 IPv6 时
+            # nic.cz / isc.org 等都能判 secure。
+            # 判定结果为空（两族都正常）时不限定族，行为与以前完全一致。
+            # ============================================================
+            # 每 600s 复核一次（网络可能被修好，也可能刚被劫持）；未到期时
+            # 本调用只是一次时间比较，开销可忽略。
+            try:
+                await self._ensure_family_preference()
+            except Exception:
+                pass
+
+            # ============================================================
+            # 交叉印证（iterative.ipv4_verify=corroborate）——**先于降级闸门**
+            # ------------------------------------------------------------
+            # 境内 IPv4 根 IP 由镜像应答、镜像不带 DNSSEC；IPv6 通常直达权威。
+            # 若这条应答（连同整条链）走了镜像族，就用真族把同一问题重解析一遍：
+            #   · 一致 → 采用真族答案，随后照常做 DNSSEC 验签（强度最高）；
+            #   · 不一致 → 镜像在说谎：丢弃镜像答案、改用真族答案并告警；
+            #   · 真族拿不到该名字 → 保持镜像答案，落到下面的降级闸门。
+            # 必须放在"链路无 DNSSEC → 降级放行"之前，否则镜像链路上永远
+            # 走不到这一步，等于放弃了唯一的验证机会。
+            # ============================================================
+            if (getattr(self, "_ipv4_verify", "strict") == "corroborate"
+                    and getattr(resp, "_hijacked_path", False)):
+                _alt = await self._resolve_over_genuine(qname, qtype, rdclass)
+                if _alt is not None:
+                    try:
+                        _same = (answer_set_fingerprint(resp.to_wire())
+                                 == answer_set_fingerprint(_alt.to_wire()))
+                    except Exception:
+                        _same = False
+                    self._stats["corroborated"] = (
+                        self._stats.get("corroborated", 0) + 1)
+                    if _same:
+                        logger.debug(
+                            "交叉印证通过: %s（镜像族答案与真族一致，改用真族答案）",
+                            _safe_qname(qname))
+                    else:
+                        self._stats["mismatch"] = (
+                            self._stats.get("mismatch", 0) + 1)
+                        self._report_dnssec_mismatch(
+                            qname, getattr(resp, "_answer_ip", "?"))
+                    self._last_release = ""
+                    resp = _alt        # 真族答案：交给下面的严格判定
+                else:
+                    logger.debug(
+                        "交叉印证不可用: %s（真族拿不到该名字，按未验证放行）",
+                        _safe_qname(qname))
+
+            # ============================================================
+            # ★ 降级闸门：本链路完全不提供 DNSSEC 材料时按 require_rrsig 放行
+            # ------------------------------------------------------------
+            # 现象（2026-11-10 用户日志，纯迭代模式）：每个域名都报
+            #   「DNSSEC 严格模式丢弃 <域名>：应答没有签名(RRSIG)，也没有能
+            #     证明「该域名本就未签名」的 NSEC/NSEC3 记录」
+            # 紧跟着「纯迭代模式：迭代解析连续 3 轮全部失败」——服务实际瘫痪。
+            #
+            # 根因不是逐条判定写错，而是**这条链路根本拿不到 DNSSEC 记录**：
+            #   * 根区 `. DNSKEY` 直接回 NXDOMAIN（或 DNSKEY 没有 RRSIG）；
+            #   * DS 的 NODATA 应答只有 SOA，没有 NSEC3 否定证明；
+            #   * 应答里没有任何 RRSIG。
+            # 连内置信任锚都验证不了，strict 验证在数学上不可能成功，
+            # `_zone_signed_status` 只能一路给 unknown → 全部丢弃。
+            #
+            # 这与 `dnssec.require_rrsig=false`（默认值）的文档语义完全一致：
+            # 「不因上游不下发 DNSSEC 记录而丢弃」（resolver 层 dnssec.py 早就
+            # 是这么做的，见 DNSSECQueryWrapper.validate_response）。因此这里
+            # 同样只在**根信任锚确定无法建立**（证据 = absent）或**验签后端
+            # 缺失**时降级放行，并给一条 60 秒节流的 WARNING 说明清楚；
+            # 一旦 require_rrsig=true，则维持 fail-closed（丢弃 = SERVFAIL），
+            # 由用户显式选择安全优先。
+            #
+            # 安全性：不放宽任何**可判定**的情形——只要根链能验证（"ok"），
+            # 下面原有的逐 owner 判定（签名区无 RRSIG = 剥离攻击、unknown =
+            # 无法证明 → 丢弃）全部照旧；根 DNSKEY 验签失败（"bogus_root"）
+            # 更不会走到这里。
+            # ============================================================
+            if not getattr(self, "_require_rrsig", False):
+                if not getattr(self, "_dnssec_crypto_ok", True):
+                    self._stats["dnssec_absent"] = self._stats.get("dnssec_absent", 0) + 1
+                    self._stats["insecure"] += 1
+                    self._stats["success"] += 1
+                    self._last_release = "dnssec_absent"
+                    self._report_dnssec_absent(qname, backend_missing=True)
+                    return resp
+                if await self._dnssec_availability() == "absent":
+                    self._stats["dnssec_absent"] = self._stats.get("dnssec_absent", 0) + 1
+                    self._stats["insecure"] += 1
+                    self._stats["success"] += 1
+                    self._last_release = "dnssec_absent"
+                    self._report_dnssec_absent(qname)
+                    return resp
+
+            # ============================================================
+            # 该应答来自「已被判定为中间设备代答」的地址族
+            # ------------------------------------------------------------
+            # 典型场景（实测）：IPv4/53 被路由器/运营商接管，IPv6/53 直达权威。
+            # 绝大多数域名我们已改走真族（见 `_FAMILY_ONLY_CTX`），但仍可能
+            # 有某一跳只有 IPv4 地址（该权威没有 AAAA glue）→ 只能从代答设备
+            # 拿应答。这种数据**不可能**有 DNSSEC 证明（代答设备不下发），
+            # 严格判定只会把它丢掉（纯迭代模式下就是 SERVFAIL）。
+            # 处置与 `dnssec_absent` 完全一致：require_rrsig=false 时按
+            # 「未验证放行」并给节流告警（可用性优先，语义与配置文档一致）；
+            # require_rrsig=true 时继续走下面的严格判定（丢弃 = fail-closed）。
+            # ============================================================
+            if (not getattr(self, "_require_rrsig", False)
+                    and getattr(resp, "_hijacked_path", False)):
+                self._stats["hijacked_path"] = (
+                    self._stats.get("hijacked_path", 0) + 1)
+                self._stats["insecure"] += 1
+                self._stats["success"] += 1
+                self._last_release = "hijacked_path"
+                self._report_hijacked_path(
+                    qname, getattr(resp, "_answer_ip", "?"))
                 return resp
 
             # 收集所有 RRSIG 的 signer（签名者区）——含最终响应与 CNAME 中间跳
