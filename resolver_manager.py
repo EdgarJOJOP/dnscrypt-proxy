@@ -175,6 +175,8 @@ class ResolverManager:
         # 连续全部失败计数器与静默模式（阶段1：智能退避 + 日志压制）
         self._consecutive_all_failed_counter: int = 0       # 连续全部失败轮数
         self._all_failed_start_time: float = 0.0            # 首次全部失败时间戳
+        # 上一次「连续失败轮」递增的时间戳：同一 1 秒窗口内的并发失败只算 1 轮
+        self._last_failed_round_at: float = 0.0
         self._silent_mode: bool = False                     # 静默模式：抑制所有日志
         self._last_silent_probe_time: float = 0.0           # 末次探活时间
         self._silent_probe_interval: float = 60.0           # 探活间隔（秒）
@@ -233,7 +235,20 @@ class ResolverManager:
         # 1. 创建 bootstrap 解析器（普通 DNS）
         if not self.config.bootstrap_resolvers:
             logger.warning("未配置 bootstrap 解析器！系统 DNS 自引用（127.0.0.1）可能导致死锁")
-        for addr in self.config.bootstrap_resolvers:
+        bootstrap_addrs = list(self.config.bootstrap_resolvers)
+        # 复用启动期迭代解析器的 bootstrap 可达性探测：不可达的服务器
+        # 不再在每次解析上游域名时按 5s 超时逐个重试。
+        _alive = getattr(
+            getattr(self, "_iterative_resolver", None),
+            "_bootstrap_alive", None)
+        if _alive:
+            _ordered = [a for a in bootstrap_addrs if a in _alive]
+            if _ordered:
+                bootstrap_addrs = _ordered
+                if len(_ordered) < len(self.config.bootstrap_resolvers):
+                    logger.info("bootstrap 启动筛选: 使用可达 %d/%d 台",
+                                len(_ordered), len(self.config.bootstrap_resolvers))
+        for addr in bootstrap_addrs:
             # 防御：Config 层已把 PyYAML 误解析的 dict 还原成字符串；这里仍
             # 逐条容错——单条坏配置只跳过该条，绝不让整个 bootstrap 初始化
             # 任务异常（否则上游域名解析不到 IP，所有加密上游一起不可用）。
@@ -668,7 +683,8 @@ class ResolverManager:
                                        shared_resolver=self._shared_doh_resolver,
                                        protocols=doh_protocols,
                                        ech_enabled=bool(ech_config),
-                                       ech_config=ech_config)
+                                       ech_config=ech_config,
+                                       ciphers=self.config.tls_ciphers)
             else:
                 resolver = DoHResolver(url, timeout=timeout,
                                        connection_pool_size=self.config.connection_pool_size,
@@ -677,7 +693,8 @@ class ResolverManager:
                                        ca_path=ca_path or "",
                                        shared_session=self._shared_doh_session,
                                        shared_resolver=self._shared_doh_resolver,
-                                       protocols=doh_protocols)
+                                       protocols=doh_protocols,
+                                       ciphers=self.config.tls_ciphers)
             self._upstream_servers.append(UpstreamServer(resolver, "doh"))
 
         # DoT
@@ -709,12 +726,14 @@ class ResolverManager:
                     resolver = DoTResolver(h, port=p, timeout=timeout, connect_ips=cached_ips,
                                            concurrency=self.config.connection_pool_size,
                                            ca_path=ca_path or "",
-                                           connection_pool_size=self.config.connection_pool_size)
+                                           connection_pool_size=self.config.connection_pool_size,
+                                           ciphers=self.config.tls_ciphers)
             else:
                 resolver = DoTResolver(h, port=p, timeout=timeout, connect_ips=cached_ips,
                                        concurrency=self.config.connection_pool_size,
                                        ca_path=ca_path or "",
-                                       connection_pool_size=self.config.connection_pool_size)
+                                       connection_pool_size=self.config.connection_pool_size,
+                                       ciphers=self.config.tls_ciphers)
             self._upstream_servers.append(UpstreamServer(resolver, "dot"))
 
         # DoQ
@@ -1213,6 +1232,7 @@ class ResolverManager:
             if self._consecutive_all_failed_counter > 0 or self._silent_mode:
                 self._consecutive_all_failed_counter = 0
                 self._all_failed_start_time = 0.0
+                self._last_failed_round_at = 0.0
                 self._silent_mode = False
             return result
 
@@ -1221,7 +1241,16 @@ class ResolverManager:
             return None
 
         self._last_all_failed_time = asyncio.get_event_loop().time()
-        self._consecutive_all_failed_counter += 1
+        # 「连续轮」按**失败时间窗口**计数，而不是按失败查询个数计数。
+        # 旧实现每个失败查询 +1：浏览器同时打开 18 个域名、上游抖动一次，
+        # 18 个并发查询在 1 秒内全部失败就把计数推到 18，NetworkMonitor 会
+        # 打「连续 18 轮全部失败」并触发 ARP/NDP 深度诊断——实际只持续了
+        # 不到 1 秒，是误报（日志里 01:47:45→01:47:46 计数 1→18 即此）。
+        # 现在同一 1 秒窗口内的并发失败只算 1 轮；持续失败才逐秒累加。
+        _prev_round_at = getattr(self, "_last_failed_round_at", 0.0)
+        if (self._last_all_failed_time - _prev_round_at) >= 1.0:
+            self._consecutive_all_failed_counter += 1
+            self._last_failed_round_at = self._last_all_failed_time
         if self._consecutive_all_failed_counter == 1:
             self._all_failed_start_time = self._last_all_failed_time
             self._silent_mode = False  # 首次失败时确保退出静默模式
@@ -1310,6 +1339,7 @@ class ResolverManager:
                     self._last_all_failed_time = 0.0
                     self._consecutive_all_failed_counter = 0
                     self._all_failed_start_time = 0.0
+                    self._last_failed_round_at = 0.0
                     self._silent_mode = False
                     self._retry_version += 1
                     return result

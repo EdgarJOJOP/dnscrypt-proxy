@@ -7,6 +7,7 @@ DNSSEC 验证模块
 """
 
 import asyncio
+import contextvars
 import struct
 import logging
 import threading
@@ -23,6 +24,13 @@ import dns.rcode
 import dns.flags
 import dns.exception
 import dns.resolver
+
+# 每次 validate_response 独立的“链查询是否遇到非权威应答”标记。
+# 不能用实例属性：DNSSECValidator 被所有并发查询共享，A 查询在 await
+# DS 查询期间设置 True，B 查询随后把它重置/读取，会互相污染，导致
+# 合法未签名域名被误判 bogus 或攻击应答被误放行。
+_LINK_UNTRUSTED: contextvars.ContextVar = contextvars.ContextVar(
+    "dnssec_link_untrusted", default=False)
 import dns.rdata
 
 logger = logging.getLogger("dns-proxy.dnssec")
@@ -133,6 +141,9 @@ class DNSSECValidator:
         self._zone_ds_cache: Dict[str, Tuple[Optional[bool], float]] = {}
         # 防刷屏：默认 fail-open 下的“上游响应不带 RRSIG”提示全局只打印一次
         self._warned_no_rrsig = False
+        # 链路级信任源可用性（根锚 → 根 DNSKEY 验证）：缓存 30 分钟 / 60 秒
+        self._root_avail = False
+        self._root_avail_expire = 0.0
         # 「name 是否为父区委托点」缓存：name → (bool, expire_at)。
         # 用于 DS NODATA 无否定证明时区分「委托点 apex」与「区内普通名」，
         # 防止把父区自己的 DS 误当成子区已签名（详见 _zone_has_ds_uncached）。
@@ -149,6 +160,12 @@ class DNSSECValidator:
                 "本地 RRSIG/DS 链验证将无法进行，严格模式不会把结果判为 secure；"
                 "请执行 pip install cryptography", _crypto_err,
             )
+        # 「链查询是否遇到非权威应答」是**每次验证独立**的 ContextVar，
+        # 见模块顶部 _LINK_UNTRUSTED；不能放实例属性（并发共享会串味）。
+        # 已验证为 signed 的区（signer 名）：用于防“先验通过、后剥离签名”
+        # 的降级攻击——同一区后续无 RRSIG 时必须仍判 bogus，不能因为
+        # 链路暂时拿不到否定证明就放行。
+        self._signed_zones: set = set()
         self._zone_cache_lock = asyncio.Lock()
         self._stats: Dict[str, Any] = {
             "validated": 0,
@@ -222,9 +239,15 @@ class DNSSECValidator:
         self,
         query_bytes: bytes,
         response_bytes: bytes,
+        cname_hop: bool = False,
     ) -> Tuple[bool, str, Dict[str, Any]]:
         """
         验证 DNS 响应的 DNSSEC 状态
+
+        `cname_hop=True`：这是 CNAME 链的**中间跳**（只有 CNAME、没有最终
+        答案）。此时只验证 RRset 签名/所在区状态，不做「负应答必须有
+        SOA+NSEC/NSEC3」的语义校验——中间跳本来就没有最终答案。
+        最终响应仍必须走完整负应答语义（重放防护）。
 
         返回:
             (是否安全, 状态描述, 详细信息)
@@ -246,6 +269,9 @@ class DNSSECValidator:
         question = query.question[0] if query.question else None
         if question is None:
             return True, "indeterminate", {"reason": "无问题部分"}
+
+        # 每次验证重新采样“链查询是否遇到非权威应答”
+        _LINK_UNTRUSTED.set(False)
 
         # 检查 AD 位 - 上游已经验证过
         ad_bit = bool(response.flags & dns.flags.AD)
@@ -272,7 +298,9 @@ class DNSSECValidator:
         #   strict   - 始终本地验证 RRSIG 签名链（安全但较慢）
         if has_rrsig and (self.mode == "strict" or not ad_bit):
             try:
-                is_valid = await self._validate_locally(response, question.name)
+                is_valid = await self._validate_locally(
+                    response, question.name, question.rdtype,
+                    cname_hop=cname_hop)
                 if is_valid is True:
                     self._stats["validated"] += 1
                     return True, "secure", {
@@ -284,6 +312,23 @@ class DNSSECValidator:
                     return False, "bogus", {
                         **result_info,
                         "detail": f"本地 DNSSEC 验证失败 (mode={self.mode})",
+                    }
+                else:
+                    # 验签后端缺失 + require_rrsig=true：安全优先，fail-closed
+                    if self.require_rrsig and not getattr(
+                            self, "_crypto_ok", True):
+                        self._stats["bogus"] += 1
+                        return False, "bogus", {
+                            **result_info,
+                            "detail": "验签后端缺失且 require_rrsig=true（fail-closed）",
+                        }
+                    # 有 RRSIG 但链上暂时取不到 key（indeterminate）：
+                    # 不是伪造，按可用性放行；绝不能落到下面“无 RRSIG”的
+                    # 严格分支（那会把冷启动链超时判成签名被剥离）。
+                    self._stats["indeterminate"] += 1
+                    return True, "indeterminate", {
+                        **result_info,
+                        "detail": "链暂时不可用（indeterminate，不判 bogus）",
                     }
             except dns.dnssec.ValidationFailure as e:
                 self._stats["bogus"] += 1
@@ -316,31 +361,79 @@ class DNSSECValidator:
                 "detail": "AD 位已设置（上游已验证）",
             }
 
-        # strict 模式：无 RRSIG 且无 AD 时的处理
+        # strict 模式：无 RRSIG 时的统一语义（2026-11-14 统一验证链）
         #
-        # 实测：阿里/腾讯等国内 DoH 上游即使收到 DO=1 也不返回 RRSIG，
-        # 因此“无 RRSIG”并不能证明“签名被剥离”。默认 fail-open（insecure 放行，
-        # 仅记日志）；只有显式开启 require_rrsig 时才按 bogus 拒绝。
-        if self.mode == "strict" and self.require_rrsig:
+        # 用户确认：**已证明整条链没有签名（insecure）才放行**；
+        #   - 父区有 DS（secure）→ 无 RRSIG = 签名被剥离 → bogus；
+        #   - 无法证明（unknown，例如链路上的 NSEC3 被剥离）→ fail-closed。
+        # 旧实现按 require_rrsig=false 一律 fail-open，会让“重放无签名应答”
+        # 通过，与 test_plain_dns D6 的安全回归直接冲突。
+        if self.mode == "strict":
+            # 链路级降级：根锚/根 DNSKEY 都不可用 → 本链路根本不提供
+            # DNSSEC 材料（absent），按 require_rrsig=false 的语义放行。
+            # 这与“unknown（有根锚但拿不到否定证明）”必须区分：后者 fail-closed。
+            if not await self._root_chain_available():
+                if self.require_rrsig:
+                    self._stats["bogus"] += 1
+                    return False, "bogus", {
+                        **result_info,
+                        "detail": "链路不提供 DNSSEC 材料且 require_rrsig=true（fail-closed）",
+                    }
+                self._stats["insecure"] += 1
+                return True, "insecure", {
+                    **result_info,
+                    "detail": "链路不提供 DNSSEC 材料（根锚不可用），降级放行",
+                }
             has_ds = await self._zone_has_ds(question.name)
-            if has_ds is True:
+            if has_ds is False:
+                self._stats["insecure"] += 1
+                return True, "insecure", {
+                    **result_info,
+                    "detail": "父区已证明无 DS（未签名链，合法放行）",
+                }
+            # 该名字所在区此前已通过验签：现在无 RRSIG = 剥离/降级攻击。
+            # 即使链路暂时拿不到否定证明，也不能按“镜像不可验证”放行。
+            # （父区已证明无 DS 的情况已在上面放行，优先级更高。）
+            try:
+                _nm = question.name
+                _known_signed = any(
+                    _nm == _z or _nm.is_subdomain(_z)
+                    for _z in getattr(self, "_signed_zones", ()))
+            except Exception:
+                _known_signed = False
+            if _known_signed:
                 self._stats["bogus"] += 1
                 return False, "bogus", {
                     **result_info,
-                    "detail": "父区有 DS 但响应无 RRSIG（签名被剥离）",
+                    "detail": "该区此前已验证签名，本次无 RRSIG（剥离/降级攻击）",
                 }
-        elif self.mode == "strict" and not self._warned_no_rrsig:
-            # 默认 fail-open：该响应无论如何都会按 insecure 放行，因此这里不再
-            # 逐级查询 DS（其结果仅用于措辞，却要给每个新域名增加多次 DNS 往返），
-            # 并且整条提示全局只打印一次，避免日志刷屏。
-            self._warned_no_rrsig = True
-            logger.warning(
-                "DNSSEC：strict 模式下检测到上游响应不带 RRSIG"
-                "（上游可能不支持 DNSSEC 数据传输），已按 insecure 放行；"
-                "此提示全局只显示一次（首个示例域名: %s）。"
-                "如需拒绝此类响应，请开启 dnssec.require_rrsig",
-                question.name,
-            )
+            # 父区 DS 应答是**非权威**的（AA=0：递归镜像/中间盒）：
+            # 否定证明不是“被剥离”，而是这条路根本拿不到证明。按配置
+            # require_rrsig=false 的可用性语义放行（标记 insecure），
+            # 避免合法未签名域名被永久判 bogus；require_rrsig=true 仍 fail-closed。
+            if (not self.require_rrsig
+                    and _LINK_UNTRUSTED.get()):
+                self._stats["insecure"] += 1
+                return True, "insecure", {
+                    **result_info,
+                    "detail": (
+                        "父区 DS 应答非权威（链路剥离 DNSSEC 证明），"
+                        "require_rrsig=false 按未验证放行"),
+                }
+            self._stats["bogus"] += 1
+            return False, "bogus", {
+                **result_info,
+                "detail": (
+                    "无 RRSIG 且无法证明未签名"
+                    "（父区有 DS 或无可验证的否定证明）"),
+            }
+
+        # 非 strict（ad_check）：无 DNSSEC 记录按 insecure 放行
+        self._stats["insecure"] += 1
+        return True, "insecure", {
+            **result_info,
+            "detail": "区域未签名（无 DNSSEC）",
+        }
 
         # 无 DNSSEC 记录，认为是 insecure（未签名）
         self._stats["insecure"] += 1
@@ -348,6 +441,28 @@ class DNSSECValidator:
             **result_info,
             "detail": "区域未签名（无 DNSSEC）",
         }
+
+    async def _root_chain_available(self) -> bool:
+        """链路是否具备可用的 DNSSEC 信任源（根锚 → 根 DNSKEY 验证成功）
+
+        用途：strict 模式无 RRSIG 时区分两种语义：
+          * 根锚/根 DNSKEY 都不可用（absent）→ 本链路根本不提供 DNSSEC
+            材料，按 require_rrsig=false 降级放行（可用性）；
+          * 根锚可用、但拿不到该名字的否定证明（unknown）→ fail-closed。
+        后者是“可能被剥离”，不能放行（test_plain_dns D6）。
+        """
+        now = time.time()
+        if now < getattr(self, "_root_avail_expire", 0.0):
+            return getattr(self, "_root_avail", False)
+        ok = False
+        try:
+            status, _keys = await self._get_verified_zone_keys(dns.name.root)
+            ok = (status == "secure")
+        except Exception:
+            ok = False
+        self._root_avail = ok
+        self._root_avail_expire = now + (1800.0 if ok else 60.0)
+        return ok
 
     async def _zone_has_ds(self, qname: dns.name.Name) -> Optional[bool]:
         """逐级向上查询父区 DS，判断该名字所在区是否应为签名区。
@@ -358,6 +473,16 @@ class DNSSECValidator:
         """
         if self._dns_query_callback is None:
             return None
+        # 父区已被证明未签名 → 本名字一定在未签名树下，无需再为它单独
+        # 查 DS/否定证明。否则镜像链路偶尔拿不到 NSEC3 时，同一未签名
+        # 域名会时好时坏（coinglass 生产日志即此形态）。
+        # 根的直接子区（如 com.）不能套用：根没有 DS，但根是信任锚。
+        if qname != dns.name.root and qname.parent() != dns.name.root:
+            try:
+                if await self._parent_is_insecure(qname):
+                    return False
+            except Exception:
+                pass
         cache_key = str(qname).lower()
         cached = self._zone_ds_cache.get(cache_key)
         if cached is not None and time.time() < cached[1]:
@@ -477,6 +602,124 @@ class DNSSECValidator:
         except Exception:
             return False
 
+    @staticmethod
+    def _nsec_covers(nsec_rdata, nsec_owner: dns.name.Name,
+                     target: dns.name.Name) -> bool:
+        """NSEC 是否覆盖 target（NXDOMAIN 纯区间语义，RFC 4034 §4.1.1）
+
+        从 plain_dns_server 迁移：owner < target < next（canonical 序）。
+        owner==target 时 NSEC 存在本身证明 target 存在（NODATA 语义），
+        不属于 NXDOMAIN 覆盖；next==target 同理（下一条记录存在）。
+        自指记录（owner==next，单名 zone）不覆盖任何名字。
+        """
+        try:
+            nxt = nsec_rdata.next
+            if nsec_owner == target:
+                return False
+            if target == nxt:
+                return False
+            if nsec_owner < target < nxt:
+                return True
+            if nxt <= nsec_owner:
+                if nxt == nsec_owner:
+                    return False
+                return target > nsec_owner or target < nxt
+            return False
+        except Exception:
+            return False
+
+    def _validate_negative_semantics(self, response, qname: dns.name.Name,
+                                     qtype: int,
+                                     verified_ids=None) -> Optional[bool]:
+        """负应答（NXDOMAIN/NODATA）的 NSEC/NSEC3 区间语义校验
+
+        从 `plain_dns_server` 迁移到 dnssec.py——签名验证只能证明
+        「这条 NSEC/SOA 是某区真实签署的」，不能证明「它覆盖/匹配本次
+        qname」。缺这一层，攻击者可以重放任意签名区的 NSEC + SOA 伪造
+        否定应答（test_plain_dns Part B 用例 1/2/9 就是这类攻击）。
+
+        返回 True=否定证明成立；False=不成立（重放/跨区/缺少 SOA 等）；
+        None=响应里没有 NSEC/NSEC3（调用方按“无证明”处理）。
+
+        `verified_ids`：已通过链验签的 rrset id() 集合；传入时只采纳这些，
+        防止有效 NSEC 旁混入伪造 NSEC 让本函数采纳。
+
+        SOA 归属按 RFC 2308 §2.1 先完整扫描再判定（**与 RRset 顺序无关**）：
+        com 对 `googleapis.com DS` 的真实顺序是 [NSEC3, RRSIG, SOA, RRSIG]，
+        顺序依赖的旧实现会误判「(无SOA)」。
+        """
+        qn_final = qname
+        try:
+            for rrset in response.answer:
+                if rrset.rdtype != dns.rdatatype.CNAME:
+                    continue
+                for rd in rrset:
+                    try:
+                        qn_final = rd.target
+                    except Exception:
+                        pass
+        except Exception:
+            qn_final = qname
+        soa_zone = None
+        for rrset in response.authority:
+            if rrset.rdtype != dns.rdatatype.SOA:
+                continue
+            try:
+                if qn_final == rrset.name or qn_final.is_subdomain(rrset.name):
+                    soa_zone = rrset.name
+                    break
+            except Exception:
+                continue
+        # 权威负应答必须含 SOA（RFC 2308 §2.1）；没有 SOA 就无法绑定
+        # 权威 zone，NSEC 可以被任意区重放 → 直接失败。
+        if soa_zone is None:
+            return False
+        is_nxdomain = (response.rcode() == dns.rcode.NXDOMAIN)
+        has_nsec = False
+        semantic_ok = False
+        for rrset in response.authority:
+            if rrset.rdtype not in (dns.rdatatype.NSEC, dns.rdatatype.NSEC3):
+                continue
+            if verified_ids is not None and id(rrset) not in verified_ids:
+                continue
+            has_nsec = True
+            try:
+                if not rrset.name.is_subdomain(soa_zone):
+                    continue
+            except Exception:
+                continue
+            for rd in rrset:
+                if rrset.rdtype == dns.rdatatype.NSEC:
+                    if is_nxdomain:
+                        if self._nsec_covers(rd, rrset.name, qn_final):
+                            semantic_ok = True
+                    else:
+                        # NODATA：owner 必须等于被查名且位图不含 qtype
+                        if rrset.name == qn_final and not self._nsec_has_type(rd, qtype):
+                            semantic_ok = True
+                else:
+                    th = self._nsec3_hash(
+                        qn_final, rd.salt, rd.iterations, rd.algorithm)
+                    oh = self._nsec3_owner_hash(rrset.name)
+                    if not th or not oh:
+                        continue
+                    if is_nxdomain:
+                        if self._hash_in_interval(th, oh, rd.next):
+                            semantic_ok = True
+                    else:
+                        if oh == th and not self._nsec_has_type(rd, qtype):
+                            semantic_ok = True
+                        elif (qtype == dns.rdatatype.DS
+                              and self._nsec3_optout(rd)
+                              and self._hash_in_interval(th, oh, rd.next)):
+                            # RFC 5155 §8.6：opt-out 区间覆盖 + DS 查询
+                            # = 该委托没有 DS 的合法 NODATA 证明。
+                            semantic_ok = True
+        if not has_nsec:
+            return None
+        return semantic_ok
+
+
     def _ds_nodata_proves_insecure(self, resp, name: dns.name.Name,
                                    verified_ids=None) -> bool:
         """DS 查询的 NODATA 响应是否**数学上**证明 name 没有 DS
@@ -561,8 +804,27 @@ class DNSSECValidator:
                     self._dns_query_callback(q.to_wire()), timeout=2.0
                 )
                 if resp_bytes is None:
+                    # DS 查询失败 ≠ 这个 CNAME/普通名“无法证明未签名”。
+                    # 直接 return None 会让 CNAME 目标（如 api.live.bilibili.com）
+                    # 永久被判 bogus。先区分「父区委托点」与「区内普通名」：
+                    #   * 普通名/CNAME owner：DS 本来就不存在，必须升父级；
+                    #   * 委托点：没有否定证明，只能返回 None（无法证明）。
+                    is_del = await self._name_is_delegation(name)
+                    if is_del is False:
+                        name = name.parent()
+                        continue
+                    if await self._parent_is_insecure(name):
+                        return False
                     return None
                 resp = dns.message.from_wire(resp_bytes)
+                try:
+                    # 真权威对 DS 查询必须置 AA；AA=0 说明这条应答来自
+                    # 递归镜像/中间盒（实测 hk/com.hk 方向），其“无 NSEC 的
+                    # NODATA”不能当作“签名被剥离”的证据。
+                    if not (resp.flags & dns.flags.AA):
+                        _LINK_UNTRUSTED.set(True)
+                except Exception:
+                    pass
             except Exception:
                 return None
             # 只采纳通过父区已信任 DNSKEY 验签的 DS/NSEC/NSEC3。
@@ -857,7 +1119,8 @@ class DNSSECValidator:
         return "secure", keys
 
     async def _validate_locally(
-        self, response: dns.message.Message, qname: dns.name.Name
+        self, response: dns.message.Message, qname: dns.name.Name,
+        qtype: int = dns.rdatatype.A, cname_hop: bool = False,
     ) -> Optional[bool]:
         """本地 DNSSEC 链验证（三态）
 
@@ -909,6 +1172,7 @@ class DNSSECValidator:
 
         # 3. 用可信 keys 验签 answer / authority 中的 RRset
         validated = False
+        validated_ids = set()
         for section in (response.answer, response.authority):
             for rrset in section:
                 if rrset.rdtype == dns.rdatatype.RRSIG:
@@ -963,6 +1227,7 @@ class DNSSECValidator:
                 try:
                     dns.dnssec.validate(rrset, rrsig_set, keys)
                     validated = True
+                    validated_ids.add(id(rrset))
                 except dns.dnssec.ValidationFailure as e:
                     logger.debug("DNSSEC 验签失败 (%s): %s", rrset.name, e)
                     return False
@@ -970,7 +1235,55 @@ class DNSSECValidator:
                     logger.debug("DNSSEC 验证异常 (%s): %s", rrset.name, e)
                     indeterminate = True
 
+        # 负应答语义校验（从 plain_dns_server 迁移）：
+        # 签名只证明 NSEC/SOA 是某区真实签署的，还必须证明它覆盖/匹配
+        # 本次 qname（RFC 4035 §5.4）。否则重放任意签名区的 NSEC+SOA
+        # 就能伪造否定应答。
+        try:
+            is_negative = (
+                response.rcode() in (dns.rcode.NXDOMAIN, dns.rcode.NOERROR)
+                and not any(rr.rdtype == qtype for rr in response.answer)
+            )
+        except Exception:
+            is_negative = False
+        if is_negative and not cname_hop:
+            # 先取 CNAME 终点：负应答由**最后一跳权威**产生，SOA/NSEC
+            # 绑定的是终点所在区（不是原始查询名）。
+            _tgt = qname
+            try:
+                for _rr in response.answer:
+                    if _rr.rdtype == dns.rdatatype.CNAME:
+                        _tgt = _rr[0].target
+            except Exception:
+                _tgt = qname
+            if await self._zone_has_ds(_tgt) is False:
+                # 目标区已证明未签名：未签名区本来就不发布 NSEC/NSEC3，
+                # 负应答没有否定证明是合法的（典型：CNAME 到未签名 CDN）。
+                return True
+            neg = self._validate_negative_semantics(
+                response, qname, qtype, validated_ids)
+            if neg is False:
+                logger.debug(
+                    "DNSSEC 负应答语义校验失败（重放/跨区/缺SOA）: %s", qname)
+                return False
+            if neg is None and not indeterminate:
+                logger.debug("DNSSEC 负应答缺 NSEC/NSEC3 否定证明: %s", qname)
+                return False
+
         if validated:
+            try:
+                for section in (response.answer, response.authority):
+                    for rrset in section:
+                        if id(rrset) not in validated_ids:
+                            continue
+                        sigs = self._find_rrsig_for(response, section, rrset)
+                        if sigs:
+                            for s in sigs:
+                                self._signed_zones.add(s.signer)
+                if len(self._signed_zones) > 2048:
+                    self._signed_zones.clear()
+            except Exception:
+                pass
             return True
         return None if indeterminate else False
 

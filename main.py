@@ -76,6 +76,25 @@ LOG_FORMAT = "[%(asctime)s] %(levelname)s [%(name)s] %(message)s"
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
+def apply_dnssec_config(config, validators) -> None:
+    """把 upstream.dnssec.* 同步到已在运行的 validator 实例。
+
+    配置热加载只重建 `_data`，validator 的 enabled/mode/require_rrsig 是
+    启动时快照；不显式同步的话，运行中把 dnssec.mode 改成 ad_check（或
+    关掉/打开 require_rrsig）不会生效，与 config.yaml 的“支持热加载”矛盾。
+    只同步这三个语义开关，不清缓存、不中断在途验证。
+    """
+    for v in validators:
+        if v is None:
+            continue
+        try:
+            v.enabled = bool(config.dnssec_enabled)
+            v.mode = str(config.dnssec_mode)
+            v.require_rrsig = bool(config.dnssec_require_rrsig)
+        except Exception:
+            continue
+
+
 class _SanitizeLogFilter(logging.Filter):
     """日志注入防护：清洗日志格式化参数中的不可见/控制字符。
 
@@ -474,6 +493,15 @@ class DNSProxyApp:
             from plain_dns_server import IterativeResolver
             self.iterative_resolver = IterativeResolver(self.config)
             logger.info("  迭代解析器已创建（根→TLD→权威 + DNSSEC 严格验证，作为上游参与优选）")
+            # 主根/镜像根鉴别：随机不存在 TLD 的 NXDOMAIN + NSEC 必须能被
+            # 根 DNSKEY 验签并覆盖该名字。只有通过者用于链验证。
+            try:
+                await self.iterative_resolver.probe_root_authenticity()
+                # 启动时同时筛掉“不能提供 NSEC3/RRSIG/DS 证明”的 bootstrap，
+                # 避免运行期每次缺证明都把全部递归上游重试一遍。
+                await self.iterative_resolver.probe_bootstrap_capabilities()
+            except Exception as e:
+                logger.debug("根/bootstrap 能力探测失败（不影响启动）: %s", e)
             if not self.config.upstream_enabled:
                 logger.info("  加密上游总开关 upstream.enabled=false → 不创建 DoH/DoT/DoQ，"
                             "全部查询只走迭代解析上游（DNSSEC 验证链仍按 upstream.dnssec 完整生效）")
@@ -809,7 +837,14 @@ class DNSProxyApp:
                 )
                 return 1
 
-        results = await asyncio.gather(*[_sweep_one(k) for k in cache_keys])
+        results = await asyncio.gather(
+            *[_sweep_one(k) for k in cache_keys], return_exceptions=True)
+        # 单条缓存损坏/被并发删除不应让整轮清扫中断（旧实现会丢掉异常后的
+        # 所有条目，规则放宽后仍残留旧拦截）。
+        errors = [r for r in results if isinstance(r, BaseException)]
+        if errors:
+            logger.warning("缓存扫描有 %d 条失败（其余继续）: %s",
+                           len(errors), errors[0])
         purged = sum(1 for r in results if r == 2)
         logger.info("缓存并行扫描完成: %d 条, 清理旧拦截 %d 条",
                     len(cache_keys), purged)
@@ -837,6 +872,17 @@ class DNSProxyApp:
         logger = logging.getLogger("dns-proxy.app")
         if changed_sections is None:
             changed_sections = set()
+
+        # upstream.dnssec.* 运行期同步（其余 upstream 配置如服务器列表
+        # 仍需重启，但安全开关不应悄悄失效）。
+        if "upstream" in changed_sections or "iterative" in changed_sections:
+            apply_dnssec_config(self.config, (
+                self._dnssec_validator,
+                getattr(self.iterative_resolver, "_dnssec", None),
+            ))
+            logger.info("DNSSEC 运行期配置已同步: enabled=%s mode=%s require_rrsig=%s",
+                        self.config.dnssec_enabled, self.config.dnssec_mode,
+                        self.config.dnssec_require_rrsig)
 
         if not self.filter_engine:
             return
@@ -1089,13 +1135,20 @@ class DNSProxyApp:
         # 启动后台任务
         self._config_reload_task = asyncio.create_task(self._config_reload_loop())
         self._cache_cleanup_task = asyncio.create_task(self._cache_cleanup_loop())
-        if self.config.cache_prefetch_enabled:
-            self._cache_prefetch_task = asyncio.create_task(self._cache_prefetch_loop())
+        # 预刷新循环常驻启动：循环内部每轮检查 cache.prefetch.enabled。
+        # 旧实现只在启动时该值为 true 才创建任务，运行中把
+        # cache.prefetch.enabled 从 false 改 true（配置声明支持热加载）
+        # 不会生效——任务根本不存在。
+        self._cache_prefetch_task = asyncio.create_task(self._cache_prefetch_loop())
         self._ntp_calibrate_task = asyncio.create_task(self._ntp_calibrate_loop())
         logger.info("  - NTP 定时校准: 每 %d 秒", DRIFT_SAMPLE_INTERVAL)
 
         # 启动过滤规则定时更新（如果配置了远程 URL）
-        if self.config.filter_update_interval > 0 and self.config.filter_rules_urls:
+        # filter.enabled=false 时不能启动：否则会继续按 update_interval 下载
+        # 远程规则，并在到点后触发 _schedule_restart（无谓重启服务）。
+        if (self.config.filter_enabled
+                and self.config.filter_update_interval > 0
+                and self.config.filter_rules_urls):
             rule_files = self.config.filter_rules_files
             full_paths = [str(PROJECT_ROOT / f) for f in rule_files]
             # 注册更新回调：定时更新规则后自动扫描 DNS 缓存

@@ -79,6 +79,19 @@ asyncio 每个 Task 独立 context，域名之间互不影响。
 """
 
 
+_CHAIN_ONLY_CTX: contextvars.ContextVar = contextvars.ContextVar(
+    "iterative_chain_only", default=False
+)
+"""DNSSEC 链查询（DS/DNSKEY/NS）是否强制只用真族。
+
+`iterative.ipv4_verify=corroborate` 只对“解析答案”做真族交叉印证；如果
+链验证的 DS/DNSKEY 查询在真族超时/无地址时回退到 IPv4 镜像，就会拿镜像
+数据去验签——镜像可能剥离 DNSSEC，等于让被代答的族参与验证。
+本标记为 True 时 `_iterate` 的族回退被禁用：真族不可用 → 链查询失败
+（dnssec.py 判 indeterminate/bogus），绝不用镜像族的应答。
+"""
+
+
 def _consume_future_exc(fut: asyncio.Future) -> None:
     """消费 future 的异常（不取 result，只取 exception 消除告警）
 
@@ -183,42 +196,6 @@ def _safe_qname(qname: str) -> str:
     LAN 客户端可经 qname 注入控制序列/伪造日志行——info 级日志进
     控制台与 proxy.log，须清洗后再记录）"""
     return "".join(c if 0x20 <= ord(c) < 0x7F else "?" for c in str(qname))
-
-
-class _ChainUnavailable(Exception):
-    """DNSSEC 链上某一跳**查询失败 / 响应不完整** —— 无法判定真伪，不等于 bogus
-
-    为什么要把这种情形与"验证失败"分开（RFC 4035 §5.2 的安全判定必须是
-    二元的：要么验证通过，要么判 bogus；但"没拿到数据"不属于任何一方）：
-
-      * 验证失败（DS digest 不匹配、签名不通过、DNSKEY 自签失败）→ 真 bogus，
-        必须拒绝并告警。
-      * 查询失败（超时、权威不可达、响应缺 DNSKEY/含 referral）→ 只是这次
-        没取到证据。旧实现把它和 bogus 混在一起 `return None`，调用方一律判
-        bogus 并打 WARNING —— 实测一次 DNS 抖动就让 verisign.com / nic.se
-        这类正常签名域名随机 SERVFAIL 并刷警告。
-      * `_iterate_ds_cached` 还会把失败负缓存 60 秒，把一次抖动放大成整分钟
-        的持续失败。
-
-    现在这类情形单独抛出：`_get_trusted_dnskey` 会先清负缓存重试一次，
-    仍失败才标记为"暂时不可用"，由调用方按 error 语义处理（放行 + debug，
-    与 `_zone_signed_status` 返回 "error" 时的策略一致）。
-    """
-
-
-class _DnssecAbsent(_ChainUnavailable):
-    """链路/上游**确定性不提供 DNSSEC 记录**（不是超时，也不是伪造）
-
-    与父类 `_ChainUnavailable` 的区别只在"要不要重试"：
-      * 父类表示"这次没取到证据"（超时、限速、权威不可达）→ 退避重试有意义；
-      * 本类表示"对端明确回了不带 DNSSEC 材料的应答"（实测：根区 `. DNSKEY`
-        被中间盒直接回 NXDOMAIN，或 DNSKEY 应答里完全没有 RRSIG）→ 同一台
-        权威再问 3 次不会有任何不同结果，重试纯属浪费往返（每次链构建多
-        4 次根/TLD 查询）。
-
-    仍然继承 `_ChainUnavailable`，因此记账/负缓存/放行语义与原来完全一致，
-    只有 `_get_trusted_dnskey` 的退避循环会据此提前结束。
-    """
 
 
 # 迭代解析起点：IANA 根服务器（复用 config 内置常量，避免重复定义）
@@ -1175,15 +1152,20 @@ class IterativeResolver:
                 + (self.timeout + 1.0) * _per_hop_max * self.max_depth * 0.5,
             ),
         )
-        # 独立 DNSSEC 验证器（内置根信任锚），回调指向迭代解析自身 → 全链自举
-        self._dnssec = dnssec_validator or DNSSECValidator(enabled=True, mode="strict")
+        # 独立 DNSSEC 验证器（内置根信任锚），回调指向迭代解析自身 → 全链自举。
+        # 必须按 upstream.dnssec.* 构造：config.yaml 明确说明该段“对全部上游
+        # 完整生效——包括 iterative:”。旧实现硬编码 enabled=True/mode="strict"，
+        # 用户把 dnssec 关掉或改成 ad_check / require_rrsig=true 时迭代链路
+        # 仍按 strict 跑，配置与行为不一致。
+        self._dnssec = dnssec_validator or DNSSECValidator(
+            enabled=bool(getattr(config, "dnssec_enabled", True)),
+            mode=str(getattr(config, "dnssec_mode", "strict")),
+            require_rrsig=bool(getattr(config, "dnssec_require_rrsig", False)),
+        )
         # DNSSEC 数学验签后端（dnspython 依赖 cryptography）。
-        # 缺失时 dns.dnssec.validate() 抛 ImportError，旧代码把它当普通异常吞掉，
-        # 导致 _get_trusted_dnskey() 全部返回 None；随后 _zone_signed_status()
-        # 无法验证父区 NSEC3 否定证明，会一路升到祖先区、把祖先的 DS 误当成
-        # “本区已签名”，最终输出“签名被剥离”的假告警并丢弃合法应答。
-        # 这里启动时显式检测并告警；_get_trusted_dnskey() 也会快速返回 None，
-        # 让上层按 unknown（无法证明）处理，而不是误判 secure。
+        # 缺失时 dns.dnssec.validate() 抛 ImportError；链验证全部在 dnssec.py，
+        # 它会显式检测并把结果判为 indeterminate（而不是误判 secure/bogus）。
+        # 这里只记录本机能力，供上层按 require_rrsig 决定放行/丢弃。
         self._dnssec_crypto_ok = True
         try:
             import cryptography  # noqa: F401
@@ -1209,25 +1191,23 @@ class IterativeResolver:
         # 处置与 resolver 层 dnssec.py 的既有语义保持一致：
         #   * require_rrsig=false（默认）：按「未验证放行」处理 + 节流告警；
         #   * require_rrsig=true（安全优先）：仍然 fail-closed 丢弃。
-        # `_dnssec_evidence` 记录最近一次根区自举的结论（ok/absent/
-        # bogus_root/unavailable），`_dnssec_avail_cache` 是它的 TTL 缓存：
-        # 不可用状态 60s 后重探，"网络被修好"能自动恢复完整验证。
+        # `_dnssec_evidence` 记录最近一次统一验证链的结论（ok/absent/
+        # bogus_root/unavailable）；链本身的缓存与 TTL 全部由 dnssec.py 维护
+        # （_root_avail / _verified_zone_cache），"网络被修好"能自动恢复。
         try:
             self._require_rrsig = bool(self.config.dnssec_require_rrsig)
         except Exception:
             self._require_rrsig = False
         self._dnssec_evidence = "unknown"
         self._dnssec_evidence_detail = ""
-        self._dnssec_avail_cache: tuple = ("", 0.0)
-        # 「链路不提供 DNSSEC 记录 → 降级放行」告警的节流状态
-        self._absent_warn_last = 0.0
-        self._absent_warn_merged = 0
-        self._absent_detail_logged = False
         # 地址族完整性：{"4"/"6": "genuine"/"hijacked"/"unreachable"}。
         # 用来识别「某一族 53 端口被中间设备代答」——实测 IPv4 被接管、
         # IPv6 直达权威的网络，只有换到真族才能拿到 DNSSEC 记录。
         self._family_verdicts: Dict[str, str] = {}
         self._family_probe_at = 0.0
+        # 上一次族探测是否两族都给出确定结论（决定把结论缓存 600s 还是 60s，
+        # 见 `_ensure_family_preference`：unreachable 只是探测失败，不是结论）
+        self._family_probe_reliable = False
         # 地址族策略（iterative.family：auto/ipv4/ipv6）与「无 DNSSEC 能力的
         # 地址族」的验证策略（iterative.ipv4_verify：strict/corroborate/none）
         try:
@@ -1271,7 +1251,7 @@ class IterativeResolver:
             "queries": 0, "success": 0, "fail": 0,
             "bogus": 0, "insecure": 0, "secure": 0, "depth_exceeded": 0,
             # 因「本链路不提供任何 DNSSEC 材料」而降级放行的次数
-            # （require_rrsig=false 时的可用性降级，见 _dnssec_availability）
+            # （require_rrsig=false 时，由统一验证链判为 insecure 后降级）
             "dnssec_absent": 0,
             # 因「该应答走了已被判定为代答的地址族」而降级放行的次数
             # （见 _probe_family_integrity / _report_hijacked_path）
@@ -1282,10 +1262,6 @@ class IterativeResolver:
             "corroborated": 0,
             "mismatch": 0,
         }
-        # 「应答无签名且无法证明该域名未签名」告警的节流状态：
-        # 严格模式下这类丢弃可能每秒几十条，必须合并输出，否则日志被刷爆。
-        self._unknown_warn_last = 0.0
-        self._unknown_warn_merged = 0
         self._ns_ip_cache: Dict[str, List[str]] = {}
         # 权威服务器健康度：ip -> (EWMA 往返耗时秒, 连续失败次数)
         # 目的：每跳默认只并行 2 台候选，而根/TLD 权威常有 20+ 台、其中部分是
@@ -1302,58 +1278,34 @@ class IterativeResolver:
         self._cookie_secret: bytes = os.urandom(16)
         self._server_cookies: Dict[str, bytes] = {}
         self._cookie_disabled: set = set()
-        # 已验证 zone 的 DNSKEY 缓存（避免每域名重复全链迭代流量）
-        # 值: (rrset, 失效时间戳)，按缓存条目 TTL 失效，避免 DNSKEY 轮换后旧缓存致 bogus
-        self._verified_zone_cache: Dict[str, tuple] = {}
         # 区域权威服务器缓存：zone 名 -> (权威 IP 列表, 失效时间戳)
         # 作用：CNAME 目标/同一 TLD 的后续查询不必再从根逐跳（实测一次
         # www.baidu.com 会为 CNAME 目标重复走 root→com.→baidu.com）。
         # 只缓存 referral 给出的 NS+glue（与解析器自身的 NS 缓存同源），TTL 取 NS TTL。
         self._zone_ns_cache: Dict[str, tuple] = {}
-        # 「name 是否为父区的委托点（有 NS 记录）」缓存：name -> (bool, 失效时间)
-        # 用途：DS 查询返回 NODATA 且没有 NSEC/NSEC3 否定证明时，必须区分
-        #   - n 是委托点 apex：不能继续升父级（否则会把父区自己的 DS 当成
-        #     n 所在区已签名，制造“签名被剥离”假告警）；
-        #   - n 只是当前区内的普通名：必须继续升到所在区 apex 才能判断。
-        # 正/负结果都缓存，避免未签名区的每个子名都多一次 NS 查询。
-        self._delegation_cache: Dict[str, tuple] = {}
-        # DS 响应缓存：zone 名 -> (响应, 失效时间戳)
-        # `_get_trusted_dnskey` 与 `_zone_signed_status` 会各查一次同一 zone 的 DS；
-        # 实测 www.baidu.com 的 DS(baidu.com) 被查了 3 次、每次 200ms+。
+        # DS 响应缓存：zone 名 -> (响应, 失效时间戳)。
+        # DNSSECValidator 的 DS 查询回调经过 `_iterate_ds_cached`，同一 zone
+        # 的并发查询合并为一次（single-flight），失败短负缓存 5s。
         self._ds_cache: Dict[str, tuple] = {}
-        # DNSSEC 链查询的 single-flight 表：zone 名 -> Future
-        # 冷启动高并发时（如浏览器一次打开 30 个站点），每个域名都要验证
-        # 根/TLD 的 DNSKEY 与 DS，若不合并，同一 zone 会被并发查几十次——
-        # 根/TLD 权威会因 RRL 限速而大面积超时（表现为「解析卡 3s+ 后失败」）。
-        self._dnskey_inflight: Dict[str, asyncio.Future] = {}
         self._ds_inflight: Dict[str, asyncio.Future] = {}
-        # DNSSEC 链构建的并发闸门：single-flight 只合并同一 zone；冷启动时
-        # root/cn/com/... 等不同 zone 的链构建仍会并发访问权威，同一源 IP
-        # 的突发查询容易被 RRL 限速。这里把同时进行的链构建限制在 4 个，
-        # 其余在 semaphore 上排队（惰性创建，避免绑定错误的 event loop）。
-        self._dnskey_semaphore: Optional[asyncio.Semaphore] = None
-        # 链构建失败后的短负缓存：zone -> 可再次尝试的时间戳。
-        # 一次限速/超时后若每个新查询都立刻重试同一权威，只会把限速窗口
-        # 无限拉长；15s 内直接复用“暂时不可用”结论（按 error 放行），
-        # 到期后自动重新尝试，避免既误杀又持续打爆权威。
-        self._dnskey_retry_after: Dict[str, float] = {}
-        # 失败重试退避（秒）：初始 + 3 次重试，覆盖权威瞬时超时/RRL。
-        # 每次附加 0~50ms 抖动，避免多个并发链同步重试再次撞限速。
-        self._dnskey_retry_delays = (0.15, 0.4, 0.9)
-        # DNSSEC 告警去重：{(tag, zone)} 已告警过。
-        # 同一 zone 的链验证失败是**持续状态**（KSK 轮换、上游剥离 RRSIG、
-        # 权威配置错误…），每次查询都打一条 WARNING 只会刷屏把真问题淹掉
-        # （实测 sc./io. 每秒数条）。首个 WARNING 保留，后续降为 DEBUG。
-        self._dnssec_warned = set()
-        # 因「查询失败」导致链暂时不可用的 zone（不等于 bogus）。调用方据此
-        # 按 error 语义放行而不是判伪造（见 _ChainUnavailable 的说明）。
-        self._chain_unavailable = set()
         # 最近一次 _resolve_verified 的放行原因（"chain_unavailable" / "bootstrap" /
         # "insecure" / "secure" / ""）。resolve() 的重试据此判断"第二次放行"是否
         # 只是查询失败/兜底造成的降级，避免把首次已判 bogus 的结论放过去。
         self._last_release = ""
+        # DNSSEC 统一验证丢弃告警的 60s 合并状态（防客户端重试刷屏）
+        self._dnssec_drop_warn_last = 0.0
+        self._dnssec_drop_warn_merged = 0
         # bootstrap 递归兜底的并发闸门（只用于 CDN 调度域名 NODATA 场景）
         self._bootstrap_sem = asyncio.Semaphore(4)
+        # 启动期 bootstrap 能力探测：哪些递归上游能返回 NSEC3/RRSIG/DS
+        # 证明、哪些只能普通解析、哪些完全不可达。None = 尚未探测；
+        # 探到空列表时不要在每次链查询里反复重试全部 bootstrap。
+        self._bootstrap_probe_at = 0.0
+        self._bootstrap_probe_expire = 0.0
+        self._bootstrap_dnssec_resolvers: Optional[List[str]] = None
+        self._bootstrap_alive: Optional[List[str]] = None
+        self._bootstrap_probe_detail: Dict[str, str] = {}
+        self._bootstrap_probe_task: Optional[asyncio.Task] = None
         # **迭代 UDP 并发闸门**（2026-10-30）：`_query_one_async` 走原生 asyncio
         # 数据报端点，**不经过 task_pool 的 PriorityGate**，所以原来没有任何上限。
         # 浏览器一次开几个标签就能并发几十个域名，每跳又并行 hop_parallel(2) 台
@@ -1377,114 +1329,6 @@ class IterativeResolver:
     @property
     def stats(self) -> Dict[str, Any]:
         return dict(self._stats)
-
-    def _report_dnssec_drop(self, qname: str, reason: str, hint: str):
-        """节流输出「严格模式丢弃应答」告警
-
-        严格模式下这类丢弃可能每秒几十条：60 秒内只输出一条 warning，
-        其余同类事件降级为 debug；恢复输出时附带被合并的条数，避免刷爆日志。
-        """
-        now = time.monotonic()
-        if now - self._unknown_warn_last >= 60.0:
-            merged = self._unknown_warn_merged
-            self._unknown_warn_last = now
-            self._unknown_warn_merged = 0
-            suffix = f"（最近 60 秒同类共 {merged + 1} 次）" if merged else ""
-            logger.warning(
-                "DNSSEC 严格模式丢弃 %s%s：%s%s",
-                _safe_qname(qname), suffix, reason, hint,
-            )
-        else:
-            self._unknown_warn_merged += 1
-            logger.debug(
-                "DNSSEC 严格模式丢弃（已合并计数）: %s — %s",
-                _safe_qname(qname), reason,
-            )
-
-    def _report_unsigned_unknown(self, qname: str):
-        """应答既无签名、也无法证明「该域名本就未签名」→ 严格模式丢弃
-
-        用大白话说清楚：上游返回的应答既没有数字签名（RRSIG），也没有能证明
-        「这个域名本来就不在 DNSSEC 保护范围内」的否定证明（NSEC/NSEC3）。
-        既无法验证、也无法证明无需验证，严格模式就当作「可能被篡改」丢弃。
-        """
-        self._report_dnssec_drop(
-            qname,
-            reason=(
-                "应答没有签名(RRSIG)，也没有能证明「该域名本就未签名」的 "
-                "NSEC/NSEC3 记录，无法确认应答未被篡改。"
-            ),
-            hint="常见原因是所用上游不返回 DNSSEC 记录，可换用会下发 DNSSEC 记录的上游。",
-        )
-
-    def _report_dnssec_stripped(self, qname: str):
-        """该域名所在区已启用 DNSSEC，但应答完全没有签名 → 疑似签名被剥离"""
-        self._report_dnssec_drop(
-            qname,
-            reason=(
-                "该域名所在区域已启用 DNSSEC，但应答里完全没有数字签名(RRSIG)，"
-                "说明签名可能在传输途中被剥离，无法确认应答未被篡改。"
-            ),
-            hint="请检查链路是否存在 DNS 劫持/代理，或换用会下发 DNSSEC 记录的上游。",
-        )
-
-    def _report_dnssec_absent(self, qname: str, backend_missing: bool = False):
-        """链路完全不提供 DNSSEC 材料 → 按 require_rrsig=false 降级放行（60s 一条）
-
-        与 `_report_unsigned_unknown` 的区别（措辞与处置都不同）：
-          * `_report_unsigned_unknown`：**已能**做 DNSSEC 验证，但这一个应答既
-            没签名也没否定证明 → 无法证明，strict 丢弃（可能是剥离攻击）；
-          * 本函数：**整条链路**都拿不到 DNSSEC 材料（根 DNSKEY 都验证不了，
-            根区甚至回 NXDOMAIN）→ strict 在这个环境下不可能成功，按
-            `dnssec.require_rrsig=false` 的语义放行（未经验签）并明确告知。
-        节流：60 秒一条 WARNING，其余降为 DEBUG 并合并计数，避免刷爆日志。
-        """
-        now = time.monotonic()
-        last = getattr(self, "_absent_warn_last", 0.0)
-        if now - last >= 60.0:
-            merged = getattr(self, "_absent_warn_merged", 0)
-            self._absent_warn_last = now
-            self._absent_warn_merged = 0
-            suffix = f"（最近 60 秒同类共 {merged + 1} 次）" if merged else ""
-            _ev = getattr(self, "_dnssec_evidence", "unknown")
-            if backend_missing:
-                reason = (
-                    "本机缺少 DNSSEC 验签后端（cryptography），无法验证任何签名"
-                )
-                hint = "请执行 pip install cryptography 以恢复 DNSSEC 验证。"
-            elif _ev == "unavailable":
-                reason = (
-                    "根区 DNSKEY 查询失败，DNSSEC 信任链无法建立（暂时取不到证据）"
-                )
-                hint = (
-                    "这是网络/上游暂时不可用，不是伪造；已按可用性放行，"
-                    "恢复后会自动回到完整验证。"
-                )
-            else:
-                reason = (
-                    "本链路/上游不下发任何 DNSSEC 记录（根区 DNSKEY 缺失或没有 "
-                    "RRSIG），strict 模式没有可用的信任源"
-                )
-                hint = (
-                    "已按 upstream.dnssec.require_rrsig=false 的语义放行（未经"
-                    "验签）；如需对这种链路拒绝服务，请把 require_rrsig 设为 "
-                    "true，或改用会下发 DNSSEC 记录的上游。"
-                )
-                # 首次（每条 WARNING 周期内只一次）附上"对端到底回了什么"，
-                # 便于区分「链路剥掉 DNSSEC」与「本机查询缺 DO」
-                if not getattr(self, "_absent_detail_logged", False):
-                    hint += "（实测根区 DNSKEY 应答: %s）" % (
-                        getattr(self, "_dnssec_evidence_detail", "") or "未知")
-                    self._absent_detail_logged = True
-            logger.warning(
-                "DNSSEC 无法验证，降级放行 %s%s：%s。%s",
-                _safe_qname(qname), suffix, reason, hint,
-            )
-        else:
-            self._absent_warn_merged += 1
-            logger.debug(
-                "DNSSEC 无法验证，降级放行（已合并计数）: %s", _safe_qname(qname),
-            )
 
     def _report_hijacked_path(self, qname: str, answer_ip: str):
         """该应答来自已被判定为「中间设备代答」的地址族 → 未验证放行
@@ -1595,6 +1439,216 @@ class IterativeResolver:
             "⚠️ 疑似中间人: %s 的 IPv4 镜像答案与 IPv6 真族不一致（来源 %s）"
             " → 已丢弃镜像答案，改用真族答案（随后按 DNSSEC 验签）",
             _safe_qname(qname), answer_ip)
+
+    def _warn_dnssec_drop(self, qname: str, status: str, detail: str = "",
+                          cname_hop: bool = False):
+        """DNSSEC 统一验证丢弃告警：60 秒合并，避免客户端重试刷屏
+
+        客户端（浏览器/系统解析器）对 SERVFAIL 会以亚秒级重试；一次真实
+        丢弃会在几秒内产生几十条完全相同的 WARNING。旧实现每条都打
+        WARNING（且 resolve 内部还会重试一次），日志被单一域名淹没。这里
+        全局 60 秒最多一条 WARNING，其余降 DEBUG 并累计次数。
+        """
+        now = time.monotonic()
+        last = getattr(self, "_dnssec_drop_warn_last", 0.0)
+        merged = getattr(self, "_dnssec_drop_warn_merged", 0)
+        if now - last >= 60.0:
+            self._dnssec_drop_warn_last = now
+            self._dnssec_drop_warn_merged = 0
+            suffix = f"（最近 60 秒同类共 {merged + 1} 次）" if merged else ""
+            logger.warning(
+                "DNSSEC 统一验证丢弃 %s%s%s：%s（%s）",
+                _safe_qname(qname),
+                "（CNAME 中间跳）" if cname_hop else "",
+                suffix, status, detail,
+            )
+        else:
+            self._dnssec_drop_warn_merged = merged + 1
+            logger.debug(
+                "DNSSEC 统一验证丢弃（已合并计数）: %s%s status=%s detail=%s",
+                _safe_qname(qname),
+                "（CNAME 中间跳）" if cname_hop else "", status, detail,
+            )
+
+    # ---------- 主根 / 镜像根鉴别 ----------
+
+    async def _probe_one_root(self, ip: str) -> bool:
+        """判断某个根 IP 是否能提供**可验证的根区否定证明**
+
+        镜像根可以转发 `. DNSKEY`（甚至带回真实 RRSIG），但它无法为随机
+        名字现场生成根区签名的 NSEC；用随机不存在 TLD 的 NXDOMAIN 查询，
+        要求 NSEC 的 RRSIG 能被根 DNSKEY 验签且区间覆盖该随机名，即可把
+        “真根/可提供完整链的转发根”与“只回缓存/伪造数据的镜像根”分开。
+        """
+        import secrets
+        v = self._dnssec
+        anchor = v._root_anchor_rrset()
+        if anchor is None:
+            return False
+        try:
+            q = dns.message.make_query(".", dns.rdatatype.DNSKEY,
+                                       want_dnssec=True)
+            q.flags &= ~dns.flags.RD
+            r = await asyncio.wait_for(
+                dns.asyncquery.udp(q, ip, timeout=2.0), timeout=3.0)
+            dk = next((rr for rr in r.answer
+                       if rr.rdtype == dns.rdatatype.DNSKEY), None)
+            sig = next((rr for rr in r.answer
+                        if rr.rdtype == dns.rdatatype.RRSIG
+                        and rr.covers == dns.rdatatype.DNSKEY), None)
+            if dk is None or sig is None:
+                return False
+            dns.dnssec.validate(dk, sig, {dns.name.root: anchor})
+            # 随机名查询可能被镜像“碰巧转发成功”，也可能瞬时抖动；
+            # 连续两次都拿不到可验证的根 NSEC 才判镜像。
+            return (await self._probe_root_nsec(ip, dk)
+                    or await self._probe_root_nsec(ip, dk))
+        except Exception:
+            return False
+
+    async def _probe_root_nsec(self, ip: str, dk) -> bool:
+        """随机不存在 TLD：NXDOMAIN + 根签名 NSEC 且覆盖该名字"""
+        import secrets
+        try:
+            label = "nx-" + secrets.token_hex(6) + "."
+            qn = dns.name.from_text(label)
+            q = dns.message.make_query(qn, dns.rdatatype.A,
+                                       want_dnssec=True)
+            q.flags &= ~dns.flags.RD
+            r = await asyncio.wait_for(
+                dns.asyncquery.udp(q, ip, timeout=2.0), timeout=3.0)
+            if r.rcode() != dns.rcode.NXDOMAIN:
+                return False
+            nsec = next((rr for rr in r.authority
+                         if rr.rdtype == dns.rdatatype.NSEC), None)
+            nsig = next((rr for rr in r.authority
+                         if rr.rdtype == dns.rdatatype.RRSIG
+                         and rr.covers == dns.rdatatype.NSEC), None)
+            if nsec is None or nsig is None:
+                return False
+            dns.dnssec.validate(nsec, nsig, {dns.name.root: dk})
+
+            def _covers(rd) -> bool:
+                try:
+                    owner = nsec.name
+                    nxt = rd.next
+                    if owner == qn or qn == nxt:
+                        return False
+                    if owner < nxt:
+                        return owner < qn < nxt
+                    if nxt < owner:
+                        return qn > owner or qn < nxt
+                    return False
+                except Exception:
+                    return False
+
+            return any(_covers(rd) for rd in nsec)
+        except Exception:
+            return False
+
+    async def probe_root_authenticity(self) -> set:
+        """探测全部根 IP，记录真正能提供根区证明的集合（缓存 600s）"""
+        now = time.time()
+        if (getattr(self, "_genuine_roots", None) is not None
+                and now < getattr(self, "_root_probe_expire", 0.0)):
+            return set(self._genuine_roots)
+        roots = list(self.root_servers)
+        results = await asyncio.gather(
+            *[self._probe_one_root(ip) for ip in roots],
+            return_exceptions=True)
+        genuine = {ip for ip, ok in zip(roots, results) if ok is True}
+        self._genuine_roots = genuine
+        self._mirror_roots = set(roots) - genuine
+        self._root_probe_expire = now + (600.0 if genuine else 60.0)
+        if genuine:
+            logger.info("根服务器鉴别: 真根 %d 台 %s；镜像 %d 台 %s",
+                        len(genuine), ", ".join(sorted(genuine)),
+                        len(self._mirror_roots),
+                        ", ".join(sorted(self._mirror_roots)))
+        else:
+            logger.warning("根服务器鉴别: 没有可提供根区签名证明的根 "
+                           "（全部为镜像/被代答）→ DNSSEC 链不可用")
+        return genuine
+
+    # ---------- bootstrap 递归上游能力探测 ----------
+
+    async def _probe_bootstrap_one(self, ip: str) -> tuple:
+        """探测单台 bootstrap：是否可达、能否给出 RRSIG、DS 否定证明"""
+        async def _ask(qname: str, qtype: int):
+            try:
+                q = dns.message.make_query(qname, qtype, want_dnssec=True)
+                q.flags |= dns.flags.RD | dns.flags.CD
+                return await asyncio.wait_for(
+                    dns.asyncquery.udp(q, ip, timeout=2.0), timeout=2.5)
+            except Exception:
+                return None
+
+        signed, proof = await asyncio.gather(
+            _ask("www.cloudflare.com.", dns.rdatatype.A),
+            _ask("deepseek.com.", dns.rdatatype.DS),
+        )
+        alive = signed is not None or proof is not None
+        has_sig = (signed is not None
+                   and self._has_dnssec_material(signed, dns.rdatatype.A))
+        has_proof = (proof is not None
+                     and self._has_dnssec_material(proof, dns.rdatatype.DS))
+        return ip, alive, has_sig, has_proof
+
+    async def probe_bootstrap_capabilities(self) -> List[str]:
+        """启动时筛选 bootstrap 递归上游，避免每次缺证明都重试全部服务器
+
+        判定：
+          * has_sig   ：对签名域名返回 RRSIG（说明不会剥离签名）；
+          * has_proof ：对未签名区的 DS 查询返回 NSEC3/NSEC + RRSIG
+                        （能提供“无 DS”的否定证明）。
+        只有 has_proof 的服务器进入 `_bootstrap_dnssec_resolvers`，供
+        `_bootstrap_dnssec_query()` 专用；可达服务器进入 `_bootstrap_alive`，
+        供普通递归兜底优先使用。
+        """
+        resolvers = [str(s) for s in getattr(
+            getattr(self, "config", None), "bootstrap_resolvers", []) or []]
+        if not resolvers:
+            self._bootstrap_dnssec_resolvers = []
+            self._bootstrap_alive = []
+            return []
+        results = await asyncio.gather(
+            *[self._probe_bootstrap_one(ip) for ip in resolvers],
+            return_exceptions=True)
+        proof: List[str] = []
+        alive: List[str] = []
+        detail: Dict[str, str] = {}
+        for ip, res in zip(resolvers, results):
+            if isinstance(res, tuple) and len(res) == 4:
+                _, ok, sig, prf = res
+                if prf:
+                    proof.append(ip)
+                    detail[ip] = "DNSSEC证明"
+                elif sig:
+                    detail[ip] = "仅签名"
+                elif ok:
+                    detail[ip] = "普通解析"
+                else:
+                    detail[ip] = "不可达"
+                if ok:
+                    alive.append(ip)
+            else:
+                detail[ip] = "探测异常"
+        self._bootstrap_dnssec_resolvers = proof
+        self._bootstrap_alive = alive
+        self._bootstrap_probe_detail = detail
+        self._bootstrap_probe_at = time.time()
+        self._bootstrap_probe_expire = self._bootstrap_probe_at + 600.0
+        if proof:
+            logger.info("bootstrap 能力探测: 可提供 DNSSEC 证明 %d 台 %s；"
+                        "普通可达 %d 台；不可用 %d 台",
+                        len(proof), ", ".join(proof),
+                        len(alive), len(resolvers) - len(alive))
+        else:
+            logger.warning(
+                "bootstrap 能力探测: 没有上游能返回 NSEC3/RRSIG/DS 证明 "
+                "（可用 %d/%d 台）；链查询将只依赖迭代真根，不再反复重试 "
+                "无证明的 bootstrap", len(alive), len(resolvers))
+        return proof
 
     # ---------- 单跳查询（同步，to_thread 包装） ----------
     def _query_one(self, server_ip: str, qname: str, qtype: int,
@@ -1758,6 +1812,20 @@ class IterativeResolver:
                         resp = task.result()
                     except Exception:
                         resp = None
+                    if resp is not None and not self._response_is_plausible(
+                            resp, qname, qtype):
+                        # 答非所问（典型：DS 查询回 A、空 NOERROR、SERVFAIL）：
+                        # 不能“先回者胜”，否则会覆盖另一台真权威的 referral，
+                        # 让上游链验证永远拿不到否定证明。按失败处理并换下一台。
+                        logger.debug(
+                            "迭代查询: %s 的应答与查询语义不符（qname=%s "
+                            "qtype=%s, rcode=%s, answer=%s），丢弃并换服务器: %s",
+                            ip, _safe_qname(qname),
+                            dns.rdatatype.to_text(qtype),
+                            dns.rcode.to_text(resp.rcode()),
+                            [(str(r.name), dns.rdatatype.to_text(r.rdtype))
+                             for r in resp.answer][:3], ip)
+                        resp = None
                     if resp is not None:
                         self._record_server_health(ip, _elapsed)
                         # 「是谁回的这个响应」——供 DNSSEC 证据诊断使用。
@@ -1777,9 +1845,16 @@ class IterativeResolver:
                             _fv = getattr(self, "_family_verdicts", None) or {}
                             _fam_bad = _fv.get(resp._answer_family) == "hijacked"
                             if getattr(self, "_ipv4_verify", "strict") == "corroborate":
-                                # corroborate：整个"非真族"都要用真族交叉印证，
-                                # 所以按族标记（不要求应答形态也可疑）
-                                resp._hijacked_path = _fam_bad
+                                # corroborate：整个"非真族"都要用真族交叉印证；
+                                # 另外，即使族探测判为 genuine，**单条应答**若
+                                # 形态不是真权威（无 AA / 无 OPT 回声 / 递归式
+                                # RA+RD），也必须按未验证路径处理——实测部分
+                                # 网络会只劫持特定域名（如 google.com.hk），
+                                # 根 DNSKEY 探测仍显示 v6 genuine，但该域名的
+                                # 权威应答其实是递归镜像（AA=0/RA=1），继续
+                                # 当“可信数据”验签只会得到 bogus 并刷屏。
+                                resp._hijacked_path = bool(
+                                    _fam_bad or self._looks_fake(resp))
                             else:
                                 # strict/none：只有「该族被判代答」**且**这条应答
                                 # 形态也不像真权威（没回声 OPT/DO，或权威应答
@@ -1858,6 +1933,56 @@ class IterativeResolver:
                     and qq.rdclass == rq.rdclass)
         except Exception:
             return True
+
+    @staticmethod
+    def _response_is_plausible(resp, qname: str, qtype: int) -> bool:
+        """应答是否**语义上**回答了本次查询（防止采纳伪造/错配应答）
+
+        仅校验 question 段（`_response_matches_query`）不够：实测部分根/TLD
+        IP 被中间设备接管后，会对 `google.com.hk DS` 返回一条
+        `google.com.hk A`（AA=1、question 也回显 DS），question 校验完全
+        通过，但它是**答非所问**。`_iterate` 随后既找不到 DS、也找不到
+        referral，只能返回 None → 父区否定证明永远取不到 → 合法未签名域名
+        被误判 bogus。
+
+        判定（任一成立即视为有效）：
+          * answer 含 owner==qname 的 qtype 记录（正向答案）；
+          * answer 含 owner==qname 的 CNAME（CNAME 链的一跳）；
+          * authority 含 SOA 且其 owner 是 qname 祖先（NODATA/NXDOMAIN）；
+          * authority 含 NS 且其 owner 是 qname 祖先（referral）。
+        其它形态（如 DS 查询回 A、空 NOERROR、SERVFAIL）一律丢弃并换服务器。
+        """
+        try:
+            rcode = resp.rcode()
+            if rcode not in (dns.rcode.NOERROR, dns.rcode.NXDOMAIN):
+                return False
+            try:
+                qn = dns.name.from_text(qname)
+            except Exception:
+                return False
+            for rrset in resp.answer:
+                try:
+                    if rrset.name != qn:
+                        continue
+                    # ANY（255）本来就要返回 qname 的任意类型记录；
+                    # 只按 qtype==255 匹配会把合法 ANY 应答全部丢掉。
+                    if (qtype == dns.rdatatype.ANY
+                            or rrset.rdtype in (qtype, dns.rdatatype.CNAME)):
+                        return True
+                except Exception:
+                    continue
+            for rrset in resp.authority:
+                try:
+                    if rrset.rdtype not in (dns.rdatatype.SOA,
+                                            dns.rdatatype.NS):
+                        continue
+                    if qn == rrset.name or qn.is_subdomain(rrset.name):
+                        return True
+                except Exception:
+                    continue
+            return False
+        except Exception:
+            return False
 
     # ---------- DNS Cookie（RFC 7873） ----------
 
@@ -2246,6 +2371,19 @@ class IterativeResolver:
             return None
         original_qname = qname  # CNAME 跟随会改变 qname，需在返回时复原 question
         servers: List[str] = list(self.root_servers)
+        # 根起跳只使用“能提供根区签名证明”的 IP（真根/可完整转发的根）；
+        # 镜像根虽然能回 DNSKEY 形态，但随机 NSEC 验不过，拿它做迭代起点
+        # 会把伪造 A/referral 带进整条链。没有可用真根时才退回全量。
+        if _CHAIN_ONLY_CTX.get():
+            _genuine = getattr(self, "_genuine_roots", None)
+            if _genuine:
+                servers = [ip for ip in servers if ip in _genuine] or list(_genuine)
+        else:
+            _genuine = getattr(self, "_genuine_roots", None)
+            if _genuine:
+                _sel = [ip for ip in servers if ip in _genuine]
+                if _sel:
+                    servers = _sel
         # 优先从「最近已知区的权威」起跳：同一 TLD / CNAME 目标可省掉
         # root→TLD 两跳（实测每次约 100-500ms）。DS 查询必须从父区起跳
         # （DS 由父区权威持有），因此 _closest_zone_servers 对 DS 强制上移一级。
@@ -2271,9 +2409,15 @@ class IterativeResolver:
             return msg
         # QNAME 最小化（RFC 9156）：向当前区只问「下一级名字」，中间级用 NS 查询，
         # 到最终名才用原 qtype——根/TLD 看不到完整查询名（隐私），也少发无用查询。
+        # ★ DS 查询**不做最小化**：DS 记录在父区，最小化会把「arpa. NS」问成
+        #   权威答案（部分递归型根/镜像会这样回），迭代器拿不到 referral，
+        #   最终 DS 查询返回 None，导致 ipv4only.arpa 这类合法未签名委托被
+        #   判成 bogus。DS 必须直接把完整名字发给父区权威。
         # 缓存起跳时当前区未知，跳过最小化；一旦发现区名没推进，也自动回退全名，
         # 避免把"实现不规范的权威"变成解析失败。
-        _minimize = bool(getattr(self, "qname_minimization", True)) and not started_from_cache
+        _minimize = (bool(getattr(self, "qname_minimization", True))
+                     and not started_from_cache
+                     and qtype != dns.rdatatype.DS)
         current_zone = dns.name.root
         for _hop in range(self.max_depth - depth):
             # A2（已降级 debug）：每跳过程日志——需查看时设 DEBUG 级
@@ -2298,25 +2442,53 @@ class IterativeResolver:
             # 应答在微秒级，两族混发时它永远先到，真实权威的 DNSSEC 记录会被丢。
             # 真族在本跳没有可用地址（或全部失败）时立刻回退全族：
             # 宁可这一次拿不到 DNSSEC，也不能把域名解析变成失败。
+            # 本机没有全局 IPv6：本跳直接剔除 v6 地址，避免每跳先等 v6 超时。
+            # （族偏好 _pref 为空时也必须剔除，否则 v4-only 主机仍会发 v6。）
+            if not getattr(self, "_has_ipv6", False):
+                _v4only = [ip for ip in servers if self._family_of(ip) == "4"]
+                if _v4only:
+                    servers = _v4only
             _pref = (_FAMILY_ONLY_CTX.get("")
                      or getattr(self, "_preferred_family", "") or "")
             _pref_servers: List[str] = []
-            if _pref and len(servers) > 1:
+            if _pref:
                 _cand = [ip for ip in servers if self._family_of(ip) == _pref]
-                if 0 < len(_cand) < len(servers):
+                if _cand:
+                    # 只要是“优先族”的地址就用它——即使本跳全部服务器都是
+                    # 该族也必须用。旧条件 `0 < len(_cand) < len(servers)`
+                    # 在全为 v6 的权威上会得到空列表，链验证随后以为
+                    # “本跳没有真族权威”直接失败，导致 arpa. 等 v6-only
+                    # 链的 DS/DNSKEY 永远取不到，合法未签名域名被判 bogus。
                     _pref_servers = _cand
             response = None
+            _chain_only = bool(_CHAIN_ONLY_CTX.get())
             if _pref_servers:
                 response = await self._query_servers(
                     _pref_servers, _q_name, _q_type, rdclass)
                 if response is None:
+                    if _chain_only:
+                        # 链验证强制真族：真族本跳无应答时**不得**回退镜像族，
+                        # 否则会拿被代答族的数据去验签（等于没验证）。
+                        logger.debug(
+                            "DNSSEC 链验证: %s 真族 IPv%s 本跳无应答 → "
+                            "不回退镜像族", _safe_qname(qname), _pref)
+                        return None
                     logger.debug(
                         "迭代解析: %s 优先族 IPv%s 本跳全部失败，回退全族",
                         _safe_qname(qname), _pref)
+            elif _chain_only and _pref:
+                logger.debug(
+                    "DNSSEC 链验证: %s 本跳无真族 IPv%s 权威 → 不使用镜像族",
+                    _safe_qname(qname), _pref)
+                return None
             if response is None:
                 response = await self._query_servers(
                     servers, _q_name, _q_type, rdclass)
             if response is None and started_from_cache:
+                if _chain_only:
+                    # 链验证不走“缓存失效→回退根”的可用性降级：
+                    # 回退后仍可能落到镜像族，必须让验证失败而不是伪造成功。
+                    return None
                 # 缓存里的权威已失效/换 IP：回退到根重新走完整链路，功能不降级
                 logger.debug("缓存区权威不可达，回退根服务器重试: %s", _safe_qname(qname))
                 self._zone_ns_cache.clear()
@@ -2414,7 +2586,7 @@ class IterativeResolver:
                     # DS 查询**不跟随 CNAME**（RFC 4035 §2.4：DS 与 CNAME 不能
                     # 共存；CNAME owner 处没有 DS）。若继续跟到目标区，会把
                     # 目标区的 NSEC3/SOA 当成该名字的否定证明，父区 key 与
-                    # owner 错配，_zone_signed_status() 只能判 unknown。
+                    # owner 错配，dnssec.py 的链状态只能判 unknown。
                     # 典型：cdn.jsdelivr.net（CNAME 到 fastly/cloudflare）被
                     # 误判 unknown → CNAME 链中间跳被丢弃。
                     # 直接返回 CNAME 响应：上层看到“无 DS、无匹配否定证明”，
@@ -2498,7 +2670,22 @@ class IterativeResolver:
         if qtype == dns.rdatatype.DS:
             if name == dns.name.root:
                 return None
-            name = name.parent()
+            # RFC 4035 §3.1.4.1：DS RRset 由**直接父区**的权威回答。
+            # 因此只允许命中 qname.parent() 自身缓存的权威，绝不能向上
+            # 找到祖父区——例如 update.googleapis.com 的 DS 不能由 .com
+            # 的权威回答：.com 对孙域只会返回 referral，而某些上游/镜像会把
+            # referral 精简成「SOA-only NODATA」，dnssec.py 会把它
+            # 当成“无法证明” → 严格模式丢弃合法应答。
+            parent = name.parent()
+            entry = self._zone_ns_cache.get(str(parent).lower())
+            if entry is not None:
+                servers, expire_at = entry
+                if time.time() < expire_at and servers:
+                    return list(servers), True
+                self._zone_ns_cache.pop(str(parent).lower(), None)
+            # 父区权威没有缓存 → 返回 None，让 _iterate 从根开始按
+            # 根→TLD→父区 的完整链路走（QNAME 最小化会自然收敛到父区）。
+            return None
         now = time.time()
         while name != dns.name.root:
             entry = self._zone_ns_cache.get(str(name).lower())
@@ -2559,12 +2746,11 @@ class IterativeResolver:
             pass
 
     async def _iterate_ds_cached(self, zone_name) -> Optional[dns.message.Message]:
-        """DS 查询（带 zone 级缓存）
+        """DS 查询（带 zone 级缓存 + single-flight）
 
-        `_get_trusted_dnskey` 与 `_zone_signed_status` 会对同一 zone 各查一次
-        DS（实测 www.baidu.com 的 DS(baidu.com) 被查 3 次、每次 200ms+）。
-        这里按 zone 缓存响应：TTL 取响应里最小的 rrset TTL（60s-1h）；
-        失败也缓存 60s，避免对同一失败目标反复重试。
+        供 DNSSECValidator 的查询回调使用：同一 zone 的并发 DS 查询合并为
+        一次；TTL 取响应里最小的 rrset TTL（60s-1h），失败短负缓存 5s，
+        避免对同一失败目标反复重试。
         """
         key = str(zone_name).lower()
         entry = self._ds_cache.get(key)
@@ -2586,6 +2772,17 @@ class IterativeResolver:
         self._ds_inflight[key] = fut
         try:
             resp = await self._iterate(str(zone_name), dns.rdatatype.DS, 0)
+            # 迭代链被镜像代答时常常没有 NSEC/NSEC3/RRSIG；改从递归
+            # bootstrap 取带 DNSSEC 材料的原始报文，仍由 dnssec.py 本地验签。
+            if resp is None or not self._has_dnssec_material(
+                    resp, dns.rdatatype.DS):
+                try:
+                    _fb = await self._bootstrap_dnssec_query(
+                        str(zone_name), dns.rdatatype.DS)
+                except Exception:
+                    _fb = None
+                if _fb is not None:
+                    resp = _fb
         except asyncio.CancelledError:
             if not fut.done():
                 fut.set_result(None)
@@ -2618,37 +2815,22 @@ class IterativeResolver:
         self._ds_inflight.pop(key, None)
         return resp
 
-    def _warn_dnssec_once(self, tag: str, zone_name, msg: str, *args) -> bool:
-        """DNSSEC 告警去重：同一 (tag, zone) 只打一次 WARNING，其余降 DEBUG
-
-        返回 True 表示这次真的打了 WARNING（调用方一般不关心）。
-        DNSSEC 链验证失败对同一 zone 是**持续状态**：KSK 轮换窗口、权威配置
-        错误、上游剥离 RRSIG……每次查询都重复告警没有新信息，反而把日志淹掉
-        （实测 sc./io. 每秒数条、全是同一句）。这里首个 WARNING 保留完整明细，
-        后续同 zone 的重复事件进 DEBUG，便于需要时用 DEBUG 级查看频率。
-        """
-        key = f"{tag}|{zone_name}"
-        if key in self._dnssec_warned:
-            logger.debug(msg, *args)
-            return False
-        if len(self._dnssec_warned) > 512:
-            # 有界：zone 名来自查询（半可控），超限清空重建，不无限增长
-            self._dnssec_warned.clear()
-        self._dnssec_warned.add(key)
-        logger.warning(msg, *args)
-        return True
-
     def _invalidate_zone_cache(self, qname: str):
-        """丢弃 qname 各级后缀的区域权威/DS 缓存
+        """丢弃 qname 各级后缀的区域权威/DS/已验证 DNSKEY 缓存
 
-        DNSSEC 判定异常（签名区无签名 / 无法证明未签名 / 链验证失败）时调用：
-        这条链路上拿到的 referral 与 DS 可能已被中间人操纵，不应再作为后续
-        查询的起跳点（否则错误会被缓存放大到 TTL 到期）。
+        判定 bogus 时调用：这条链路上拿到的 referral 与 DS 可能已被中间人
+        操纵，不应再作为后续查询的起跳点（否则错误会被缓存放大到 TTL 到期）。
+        DNSSEC 链验证的唯一缓存现在在 dnssec.py，因此这里一并作废。
         """
         try:
             name = dns.name.from_text(qname)
         except Exception:
             return
+        try:
+            self._dnssec.clear_zone_cache()
+            self._dnssec._root_avail_expire = 0.0
+        except Exception:
+            pass
         while name != dns.name.root:
             key = str(name).lower()
             self._zone_ns_cache.pop(key, None)
@@ -2664,75 +2846,6 @@ class IterativeResolver:
             if rrset.rdtype == dns.rdatatype.DNSKEY:
                 return rrset
         return None
-
-    @staticmethod
-    def _ds_matches_key(ds_rdata, zone_name: dns.name.Name, dnskey_rdata) -> bool:
-        """RFC 4034 §5.1.4：计算 DNSKEY 的 DS digest 并与 DS 记录比对。
-        digest = hash( canonical_owner_wire || DNSKEY_rdata_wire )"""
-        try:
-            import hashlib
-            owner_wire = zone_name.to_wire(canonicalize=True)
-            key_wire = dnskey_rdata.to_wire()
-            if ds_rdata.digest_type == 1:      # SHA-1
-                digest = hashlib.sha1(owner_wire + key_wire).digest()
-            elif ds_rdata.digest_type == 2:    # SHA-256
-                digest = hashlib.sha256(owner_wire + key_wire).digest()
-            elif ds_rdata.digest_type == 4:    # SHA-384
-                digest = hashlib.sha384(owner_wire + key_wire).digest()
-            else:
-                return False
-            return digest == ds_rdata.digest
-        except Exception:
-            return False
-
-    @staticmethod
-    def _find_rrsig_for(msg, rrset) -> Optional[dns.rrset.RRset]:
-        """按 covers 查找 rrset 对应的 RRSIG（dnspython 2.x 要求），
-        同时搜索 answer 与 authority 段。
-
-        ★ 报文若带 `_insecure_signers` 标记（该响应含「父区无 DS」的区签出的
-        RRSIG），这里自动把那些 signer 的 RRSIG 过滤掉：insecure 委托的签名
-        无法沿 DS 链验证，RFC 4035 §5.2 要求按未签名处理，留着只会让
-        `dns.dnssec.validate()` 抛 KeyError 把合法应答判成 bogus。
-        过滤后一条不剩 → 返回 None，等价于「该 RRset 没有签名」，后续代码
-        会走既有的「按所在区 DS 状态判定」逻辑。集中在这里做，可同时覆盖
-        answer / authority / CNAME 中间跳 / 否定证明的全部验签点。
-        """
-        insecure = getattr(msg, "_insecure_signers", None)
-        for section in (msg.answer, msg.authority):
-            try:
-                sigs = msg.find_rrset(
-                    section, rrset.name, rrset.rdclass,
-                    dns.rdatatype.RRSIG, covers=rrset.rdtype, create=False,
-                )
-            except KeyError:
-                continue
-            if not insecure:
-                return sigs
-            kept = [s for s in sigs if s.signer not in insecure]
-            if not kept:
-                return None
-            if len(kept) == len(sigs):
-                return sigs
-            out = dns.rrset.RRset(sigs.name, sigs.rdclass,
-                                  dns.rdatatype.RRSIG, covers=sigs.covers)
-            for s in kept:
-                out.add(s)
-            return out
-        return None
-
-    def _clear_ds_cache_for_chain(self, zone_name: dns.name.Name) -> None:
-        """只清理 zone 及其父级链的 DS 缓存，保留其它 zone 的有效缓存。
-
-        旧实现失败时 `_ds_cache.clear()` 会把其它 zone 刚建立的有效缓存
-        一起扔掉，下一批查询又全部重查，反而放大权威限速。
-        """
-        n = zone_name
-        while n != dns.name.root:
-            k = str(n).lower()
-            self._ds_cache.pop(k, None)
-            self._ds_inflight.pop(k, None)
-            n = n.parent()
 
     @staticmethod
     def _describe_resp(msg) -> str:
@@ -2783,95 +2896,6 @@ class IterativeResolver:
         except Exception as e:      # pragma: no cover
             return "（无法描述响应: %r）" % (e,)
 
-    def _set_dnssec_evidence(self, state: str, detail: str = "") -> None:
-        """记录「本链路能否提供可验证的 DNSSEC 材料」的证据
-
-        只由**根区 DNSKEY 自举**的结果产生（根是整条链的唯一信任锚，根都
-        验证不了，任何下级签名都不可能验证）：
-          * "ok"          根 DNSKEY 已用内置信任锚验签通过 → 链可用；
-          * "absent"      根区应答里没有 DNSKEY，或 DNSKEY 没有 RRSIG
-                          → 链路根本不提供 DNSSEC 记录（缺失，不是伪造）；
-          * "bogus_root"  根 DNSKEY 有 RRSIG 但验签失败 → 真攻击/配置错误；
-          * "unavailable" 根 DNSKEY 查询失败（超时/不可达）→ 暂时取不到证据。
-        只有 "absent" 会被 `_resolve_verified` 当作降级放行的依据，其余状态
-        一律维持原有严格判定（bogus_root 更不能放行）。
-
-        `detail`：产生该结论时的响应形态（见 `_describe_resp`），会写进
-        `_dnssec_evidence_detail` 并出现在启动预热告警里，让运维不必抓包就能
-        区分「链路剥掉了 DNSSEC」与「本机查询没带 DO（本程序实测不会发生）」。
-        """
-        try:
-            _old = getattr(self, "_dnssec_evidence", "unknown")
-            if state != _old:
-                logger.debug("DNSSEC 链路能力证据: %s → %s", _old, state)
-            self._dnssec_evidence = state
-            if detail:
-                self._dnssec_evidence_detail = str(detail)
-            # 证据变化时作废可用性 TTL 缓存，避免旧的 "ok" 在链坏掉后
-            # 还继续生效（反之亦然）。
-            self._dnssec_avail_cache = ("", 0.0)
-        except Exception:
-            pass
-
-    async def _dnssec_availability(self) -> str:
-        """本链路 DNSSEC 材料的可用性：ok / absent / bogus_root / unavailable
-
-        带 TTL 缓存：ok 30 分钟，absent 60 秒，其余 30 秒后重探——「网络或上游
-        被修好」时能在 1 分钟内自动回到完整 DNSSEC 验证，不需要重启进程。
-
-        注意：本方法**只返回证据，不做判定**。是否据此放行由调用方按
-        `require_rrsig` 决定（见 `_resolve_verified`），保持安全策略集中。
-        """
-        now = time.time()
-        try:
-            state, expire_at = getattr(self, "_dnssec_avail_cache", ("", 0.0))
-        except Exception:
-            state, expire_at = "", 0.0
-        if state and now < expire_at:
-            return state
-        # 证据过期/从未取过 → 走一次根 DNSKEY 自举（内部有 single-flight、
-        # 失败重试与 15s 负缓存，最多每 60s 真正落到权威一次）。
-        #
-        # ★ DNSSEC 链验证**永远走真族**：若用户把 iterative.family 强制成
-        #   镜像族（例如 ipv4），链验证仍然必须在真族（IPv6）上做——否则
-        #   镜像链路永远"算不出"证据，等于把验证能力白送掉。答案本身可以
-        #   来自策略族，但"证明"必须来自真族。
-        _verdicts = getattr(self, "_family_verdicts", None) or {}
-        _pref = getattr(self, "_preferred_family", "") or ""
-        _genuine = next((f for f in ("6", "4")
-                         if _verdicts.get(f) == "genuine" and f != _pref), "")
-        _tok = _FAMILY_ONLY_CTX.set(_genuine) if _genuine else None
-        try:
-            try:
-                ok = await self._get_trusted_dnskey(dns.name.root)
-            except Exception:
-                ok = None
-            if ok is None and getattr(self, "_dnssec_evidence", "") == "absent":
-                # 「拿不到 DNSSEC 记录」有两种可能，必须先分清：
-                #   a) 整条链路都拿不到（真没有）；
-                #   b) 只是**某一地址族**被中间设备代答（实测：IPv4/53 连
-                #      TEST-NET 死地址都有人应答，而 IPv6/53 是真实根服务器）。
-                # b 情形下换族就能拿到完整 DNSSEC，不该把整机降级。
-                _fam = await self._ensure_family_preference()
-                if _fam:
-                    try:
-                        ok = await self._get_trusted_dnskey(dns.name.root)
-                    except Exception:
-                        ok = None
-        finally:
-            if _tok is not None:
-                _FAMILY_ONLY_CTX.reset(_tok)
-        state = "ok" if ok is not None else (
-            getattr(self, "_dnssec_evidence", "") or "unknown")
-        if state == "ok":
-            ttl = 1800.0
-        elif state == "absent":
-            ttl = 60.0
-        else:
-            ttl = 30.0
-        self._dnssec_avail_cache = (state, now + ttl)
-        return state
-
     # ---------- 地址族完整性（识别「某一族被中间设备代答」） ----------
 
     @staticmethod
@@ -2919,10 +2943,16 @@ class IterativeResolver:
         只做诊断，不修改任何状态；调用方据此决定是否换族。
         """
         ips = [ip for ip in self.root_servers
-               if self._family_of(ip) == family][:2]
+               if self._family_of(ip) == family][:3]
         if not ips:
             return "unreachable"
+        # 本机没有全局 IPv6 时，v6 根根本不可达：直接判 unreachable，
+        # 不做无意义的 UDP 查询（旧实现会每轮等 socket/超时）。
+        if family == "6" and not getattr(self, "_has_ipv6", False):
+            return "unreachable"
         saw_any = False
+        genuine_any = False
+        _known = getattr(self, "_genuine_roots", None)
         for ip in ips:
             try:
                 resp = await self._query_one_async(
@@ -2932,6 +2962,30 @@ class IterativeResolver:
             if resp is None:
                 continue
             saw_any = True
+            # 已有根鉴别结果时直接复用，**不要**在请求路径里为每台根再跑
+            # 两次随机 NSEC（否则首次查询可能多等十几秒）。只有尚未鉴别
+            # （_known is None）才现场探测。
+            try:
+                if _known is not None:
+                    if ip in _known:
+                        genuine_any = True
+                        continue
+                elif getattr(self, "_root_probe_enabled", True):
+                    if await self._probe_one_root(ip):
+                        genuine_any = True
+                        logger.debug("地址族 IPv%s 完整性探测: %s 提供可验证"
+                                     "根区否定证明 → genuine", family, ip)
+                        continue
+                else:
+                    has_dnskey = any(
+                        x.rdtype == dns.rdatatype.DNSKEY for x in resp.answer)
+                    opt_ok = (resp.opt is not None
+                              and bool(resp.ednsflags & dns.flags.DO))
+                    if (resp.flags & dns.flags.AA) and opt_ok and has_dnskey:
+                        genuine_any = True
+                        continue
+            except Exception:
+                pass
             try:
                 has_dnskey = any(
                     x.rdtype == dns.rdatatype.DNSKEY for x in resp.answer)
@@ -2939,15 +2993,18 @@ class IterativeResolver:
                           and bool(resp.ednsflags & dns.flags.DO))
                 aa = bool(resp.flags & dns.flags.AA)
                 if aa and opt_ok and has_dnskey:
-                    logger.debug("地址族 IPv%s 完整性探测: %s 是真权威（AA=1, "
-                                 "OPT+DO 回声, DNSKEY 在应答里）", family, ip)
-                    return "genuine"
-                logger.debug(
-                    "地址族 IPv%s 完整性探测: %s 的应答不是真权威"
-                    "（%s）→ 有设备代答", family, ip,
-                    self._describe_resp(resp))
+                    logger.debug("地址族 IPv%s 完整性探测: %s 的 DNSKEY 形态"
+                                 "像真权威，但根区 NSEC 验证失败 → 镜像",
+                                 family, ip)
+                else:
+                    logger.debug(
+                        "地址族 IPv%s 完整性探测: %s 的应答不是真权威"
+                        "（%s）→ 有设备代答", family, ip,
+                        self._describe_resp(resp))
             except Exception:
                 continue
+        if genuine_any:
+            return "genuine"
         return "hijacked" if saw_any else "unreachable"
 
     async def _ensure_family_preference(self) -> str:
@@ -2958,16 +3015,69 @@ class IterativeResolver:
         DNSSEC 链的负缓存，让下一次根 DNSKEY 查询立刻走新族重试。
         """
         now = time.time()
-        if now - getattr(self, "_family_probe_at", 0.0) < 600.0:
+        # 探测结论的“可信度”决定缓存时长：两族都给出确定结论
+        # （genuine/hijacked）→ 缓存 10 分钟；任一族 unreachable（探测本身
+        # 失败：启动预热未完成、偶发丢包、探测超时）→ 只缓存 60 秒后重探。
+        #
+        # 旧实现一律缓存 600 秒。启动时一次探测超时就把「族选择为空」固化
+        # 10 分钟：期间每一跳两族混发，被中间设备代答的 IPv4 微秒级先回且
+        # 不带任何 DNSSEC 记录，strict 判定只能一路 unknown → 整片域名被
+        # 丢弃（日志里「严格模式丢弃 + 迭代解析连续 N 轮全部失败」）。
+        _probe_ttl = 600.0 if getattr(self, "_family_probe_reliable", False) else 60.0
+        if now - getattr(self, "_family_probe_at", 0.0) < _probe_ttl:
             return getattr(self, "_preferred_family", "") or ""
         self._family_probe_at = now
         verdicts: Dict[str, str] = {}
-        for fam in ("4", "6"):
-            try:
-                verdicts[fam] = await self._probe_family_integrity(fam)
-            except Exception:
-                verdicts[fam] = "unreachable"
+        _known_roots = getattr(self, "_genuine_roots", None)
+        if getattr(self, "_root_probe_enabled", True) and _known_roots is not None:
+            # 已有逐 IP 根鉴别结果：直接按真根集合判定族，**不再**为每台根
+            # 发 DNSKEY 探测。否则首个客户端查询要串行等 2~6 台根 × 超时。
+            def _family_status(fam: str) -> str:
+                ips = [ip for ip in self.root_servers
+                       if self._family_of(ip) == fam]
+                if not ips:
+                    return "unreachable"
+                if fam == "6" and not getattr(self, "_has_ipv6", False):
+                    return "unreachable"
+                return ("genuine" if any(ip in _known_roots for ip in ips)
+                        else "hijacked")
+
+            verdicts = {"4": _family_status("4"),
+                        "6": _family_status("6")}
+        else:
+            _fam_res = await asyncio.gather(
+                self._probe_family_integrity("4"),
+                self._probe_family_integrity("6"),
+                return_exceptions=True,
+            )
+            for fam, res in zip(("4", "6"), _fam_res):
+                verdicts[fam] = res if isinstance(res, str) else "unreachable"
         self._family_verdicts = verdicts
+        # 根级真实性：只有能提供“随机 NXDOMAIN + 根签名 NSEC”的 IP 才可用于
+        # 根起跳/链验证。族级 DNSKEY 形态可能被镜像转发伪造，不能作为唯一判据。
+        try:
+            _genuine = getattr(self, "_genuine_roots", None)
+            if _genuine is None:
+                if getattr(self, "_root_probe_enabled", True):
+                    _genuine = await self.probe_root_authenticity()
+                else:
+                    _genuine = set()
+            elif (getattr(self, "_root_probe_enabled", True)
+                  and time.time() >= getattr(self, "_root_probe_expire", 0.0)):
+                # 已过期：后台重探，绝不在客户端查询的关键路径上同步等
+                # 多台根 × 两次随机 NSEC（首查可能被拖 10s+）。
+                _t = getattr(self, "_root_probe_task", None)
+                if _t is None or _t.done():
+                    self._root_probe_task = asyncio.create_task(
+                        self.probe_root_authenticity())
+        except Exception:
+            _genuine = set()
+        v4g = any(":" not in ip for ip in _genuine)
+        v6g = any(":" in ip for ip in _genuine)
+        # 「两族都给出了确定结论」才算可靠探测；unreachable 是**探测失败**，
+        # 不是“该族没有真权威”，不能当成结论固化。
+        self._family_probe_reliable = all(
+            verdicts.get(f) in ("genuine", "hijacked") for f in ("4", "6"))
         v4, v6 = verdicts.get("4"), verdicts.get("6")
         # 强制族策略优先于自动判定：用户显式指定 family=ipv4/ipv6 时尊重它
         # （探测结果仍保留在 _family_verdicts 里，供「哪些应答不是真权威」
@@ -2977,6 +3087,10 @@ class IterativeResolver:
             pref = "4"
         elif _policy == "ipv6":
             pref = "6"
+        elif v6g and not v4g:
+            pref = "6"
+        elif v4g and not v6g:
+            pref = "4"
         elif v4 == "genuine" and v6 != "genuine":
             pref = "4"
         elif v6 == "genuine" and v4 != "genuine":
@@ -3002,368 +3116,137 @@ class IterativeResolver:
                     "（AA=0/无 OPT/无 DNSSEC）→ 本机无法获得任何 DNSSEC 记录")
             elif "genuine" in (v4, v6):
                 logger.debug("地址族完整性: 两族都能到真权威 → 不限定族")
+            elif v4 == "hijacked" and v6 == "unreachable":
+                logger.warning(
+                    "地址族完整性: IPv4 被中间设备代答、IPv6 不可达/未启用 "
+                    "→ 没有可用的真族；纯 IPv4 环境无法建立 DNSSEC 链，"
+                    "将按 upstream.dnssec.require_rrsig 策略处理"
+                    "（false=未验证放行，true=fail-closed）")
         if changed:
-            # 换族后必须让根 DNSKEY 立刻重试，而不是等 15s 负缓存过期
+            # 换族后必须让根 DNSKEY 立刻重试，而不是等负缓存过期。
+            # DNSSEC 链缓存现在只在 dnssec.py，清它的根可用性缓存即可。
             try:
-                self._dnskey_retry_after.pop(".", None)
-                self._chain_unavailable.discard(".")
-                self._verified_zone_cache.pop(".", None)
+                self._dnssec._verified_zone_cache.pop(dns.name.root, None)
+                self._dnssec._root_avail = False
+                self._dnssec._root_avail_expire = 0.0
             except Exception:
                 pass
-            self._dnssec_avail_cache = ("", 0.0)
         return pref
 
-    async def _get_trusted_dnskey(self, zone_name: dns.name.Name) -> Optional[dns.rrset.RRset]:
-        """DNSSEC 链验证入口（缓存 + single-flight + 失败重试/负缓存）
-
-        冷启动并发时（浏览器一次打开几十个站点），每个域名都要验证根/TLD 的
-        DNSKEY；若各查一遍，同一 zone 会被并发查几十次，根/TLD 权威因 RRL
-        限速而大面积超时。这里把同一 zone 的并发请求合并成一次；不同 zone
-        再通过 semaphore 限制同时进行的链构建数，避免同一源 IP 的突发查询
-        触发 RRL。
-
-        失败处理（2026-11-06）：一次 DNSKEY/DS 超时或 RRL 不代表签名被剥离，
-        所以按 0.15/0.4/0.9s 退避重试；仍失败才记 15s 负缓存并按 error
-        （链不可用）放行，15s 后自动重新尝试。负缓存只避免“每个新查询都
-        立刻重打同一权威”，不会把暂时故障永久固化为放行。
-        """
-        key = str(zone_name).lower()
-        if not self._dnssec_crypto_ok:
-            # 验签后端缺失：任何 DNSKEY 都无法被数学验证，直接返回 None。
-            # 调用方必须按 unknown（无法证明）处理，绝不能据此判 secure/bogus。
-            return None
-        cached = self._verified_zone_cache.get(key)
-        if cached is not None and time.time() < cached[1]:
-            return cached[0]
-        retry_after = getattr(self, "_dnskey_retry_after", None)
-        if retry_after is None:
-            retry_after = {}
-            self._dnskey_retry_after = retry_after
-        if time.time() < retry_after.get(key, 0.0):
-            # 负缓存期内：不再打同一 zone 的权威，调用方按 error 放行；
-            # 到期后这里会自动重新走完整重试。
-            self._stats["chain_unavailable"] = (
-                self._stats.get("chain_unavailable", 0) + 1)
-            return None
-        inflight = self._dnskey_inflight.get(key)
-        if inflight is not None:
-            try:
-                return await asyncio.shield(inflight)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                return None
-        fut = asyncio.get_running_loop().create_future()
-        self._dnskey_inflight[key] = fut
-        sem = getattr(self, "_dnskey_semaphore", None)
-        if sem is None:
-            sem = asyncio.Semaphore(4)
-            self._dnskey_semaphore = sem
-        result = None
-        try:
-            async with sem:
-                delays = tuple(getattr(
-                    self, "_dnskey_retry_delays", (0.15, 0.4, 0.9)))
-                last_error = None
-                for attempt, delay in enumerate((0.0,) + delays):
-                    if delay:
-                        # 抖动：多个并发链/实例不会在同一毫秒重试而再次撞 RRL。
-                        await asyncio.sleep(delay + random.uniform(0.0, 0.05))
-                    try:
-                        result = await self._get_trusted_dnskey_uncached(zone_name)
-                        last_error = None
-                        break
-                    except _ChainUnavailable as e:
-                        last_error = e
-                        self._clear_ds_cache_for_chain(zone_name)
-                        logger.debug(
-                            "DNSSEC 链暂时不可用（attempt=%d/%d），退避后重试: "
-                            "%s: %s", attempt + 1, len(delays) + 1,
-                            _safe_qname(zone_name), e,
-                        )
-                        if isinstance(e, _DnssecAbsent):
-                            # 对端**确定性**不提供 DNSSEC 材料（根 DNSKEY 缺失/
-                            # 无 RRSIG）：同一权威重试 3 次没有任何意义，
-                            # 立即结束退避循环（仍按链不可用记账 + 15s 负缓存）。
-                            break
-                if last_error is not None:
-                    if len(retry_after) > 512:
-                        retry_after.clear()
-                    retry_after[key] = time.time() + 15.0
-                    if len(self._chain_unavailable) > 512:
-                        self._chain_unavailable.clear()
-                    self._chain_unavailable.add(key)
-                    self._stats["chain_unavailable"] = (
-                        self._stats.get("chain_unavailable", 0) + 1)
-                    logger.debug(
-                        "DNSSEC 链暂时不可用（15s 负缓存，非 bogus）: %s: %s",
-                        _safe_qname(zone_name), last_error,
-                    )
-                    result = None
-                else:
-                    # 成功（或确定性地 insecure / 验证失败）→ 清掉失败标记
-                    retry_after.pop(key, None)
-                    self._chain_unavailable.discard(key)
-        except asyncio.CancelledError:
-            if not fut.done():
-                fut.set_result(None)
-            self._dnskey_inflight.pop(key, None)
-            raise
-        except Exception:
-            if not fut.done():
-                fut.set_result(None)
-            self._dnskey_inflight.pop(key, None)
-            return None
-        if not fut.done():
-            fut.set_result(result)
-        self._dnskey_inflight.pop(key, None)
-        return result
-
     async def warmup_dnssec_chain(self) -> None:
-        """启动后台预热根区 DNSKEY，降低冷启动首个查询的链构建失败率。
+        """启动后台预热根区 DNSKEY（统一验证链：由 dnssec.py 完成全链验证）。
 
-        只预热根区：根 DNSKEY 是整条链的第一级，验证并缓存后，后续 TLD
-        只需查自己的 DS/DNSKEY。预热失败不抛出、不影响服务（下一次查询
-        仍会按重试/负缓存逻辑再试）。
-
-        预热同时把「本链路能否做 DNSSEC」的结论打出来（2026-11-10）：
-        纯迭代模式下这是最关键的一条诊断——如果链路上游根本不提供 DNSSEC
-        记录，strict 验证永远不可能成功，运维必须马上知道（否则只能看到
-        满屏「严格模式丢弃」和「迭代解析连续失败」）。
+        plain_dns_server 不再自己验证 DNSKEY；这里只触发一次
+        dnssec.DNSSECValidator._get_verified_zone_keys(root)，让根锚/根
+        DNSKEY 进入 dnssec.py 的缓存，并输出链路能力诊断。
         """
         try:
-            await self._get_trusted_dnskey(dns.name.root)
+            status, _keys = await self._dnssec._get_verified_zone_keys(
+                dns.name.root)
         except Exception as e:
             logger.debug("DNSSEC 根区预热失败（不影响服务）: %s", e)
-        try:
-            state = await self._dnssec_availability()
-        except Exception:
             return
-        if state == "ok":
-            logger.info("DNSSEC 预热通过：根区 DNSKEY 已用内置信任锚验签，"
-                        "strict 模式可做完整链验证")
-        elif state == "absent":
-            _detail = getattr(self, "_dnssec_evidence_detail", "") or "（无）"
-            if self._require_rrsig:
-                logger.error(
-                    "DNSSEC 预热失败：本链路/上游不下发 DNSSEC 记录（根区 DNSKEY "
-                    "缺失或无 RRSIG），而 require_rrsig=true → 严格模式将对所有"
-                    "域名返回 SERVFAIL（fail-closed）。请改用会下发 DNSSEC 记录的"
-                    "上游，或把 upstream.dnssec.require_rrsig 设为 false。"
-                    "实测根区 DNSKEY 应答: %s", _detail)
-            else:
-                logger.warning(
-                    "DNSSEC 预热：本链路/上游不下发 DNSSEC 记录（根区 DNSKEY "
-                    "缺失或无 RRSIG），strict 模式无信任源可用 → 按 "
-                    "require_rrsig=false 降级为「未验证放行」（不再逐域名丢弃）。"
-                    "如需 fail-closed，请把 upstream.dnssec.require_rrsig 设为 true。"
-                    "实测根区 DNSKEY 应答: %s（本程序查询确实带 EDNS+DO=1，"
-                    "所以这是对端/path 未回 DNSSEC 记录，不是本地查询缺 DO）",
-                    _detail)
-        elif state == "bogus_root":
+        if status == "secure":
+            logger.info(
+                "DNSSEC 预热通过：根区 DNSKEY 已由 dnssec.py 全链验证，"
+                "strict 模式可做完整链验证")
+        elif status == "bogus":
             logger.error(
-                "DNSSEC 预热失败：根区 DNSKEY 的 RRSIG 验签失败（伪造/时钟错/"
-                "算法不支持）→ 所有依赖该信任锚的应答都会被判 bogus 丢弃")
+                "DNSSEC 预热失败：根区 DNSKEY 验签失败（伪造/时钟错/算法不支持）")
         else:
-            logger.warning("DNSSEC 预热：根区 DNSKEY 暂时取不到（%s）→ 相关应答"
-                           "按「链不可用」放行，恢复后自动回到完整验证", state)
+            logger.warning(
+                "DNSSEC 预热：根区 DNSKEY 暂时不可用（%s）→ 相关应答按链不可用"
+                "处理；恢复后自动回到完整验证", status)
 
-    async def _get_trusted_dnskey_uncached(
-        self, zone_name: dns.name.Name
-    ) -> Optional[dns.rrset.RRset]:
-        """从内置 IANA 根信任锚出发，沿 DS→DNSKEY 链逐级数学验证，
-        返回 zone 的已信任 DNSKEY RRset；任一级验证失败返回 None。
-
-        信任链（RFC 4035）：
-          根锚 KSK → 验证根区 DNSKEY（含 ZSK）→ ZSK 验证 TLD 的 DS 签名
-          → DS digest 匹配 TLD DNSKEY → TLD ZSK 验证子域 DS → ... → zone DNSKEY
-        中间人即使伪造 DNSKEY/DS 响应，没有父区私钥就无法通过签名验证。
-        """
-        # 根区没有父区（DS 链为空），但仍需"用内置根锚验证根 DNSKEY"再返回，
-        # 因此不再提前返回 None；否则调用方拿不到根密钥，root 签名的 NSEC/
-        # RRset 无法验证 → 合法响应被误判 bogus。
-        # 缓存命中：已验证过的 zone 直接返回（TTL 未过期），避免重复全链迭代流量
-        cached = self._verified_zone_cache.get(str(zone_name).lower())
-        if cached is not None:
-            rrset, expire_at = cached
-            if time.time() < expire_at:
-                return rrset
-            self._verified_zone_cache.pop(str(zone_name).lower(), None)
-        # 1. 根锚 KSK → RRset 格式（dnspython dns.dnssec 要求）
-        trusted: Dict = {}
-        for root_name, alg_map in self._dnssec._root_keys.items():
-            root_rrset = dns.rrset.RRset(root_name, dns.rdataclass.IN, dns.rdatatype.DNSKEY)
-            if isinstance(alg_map, dict):
-                for rdata_list in alg_map.values():
-                    for rd in rdata_list:
-                        root_rrset.add(rd)
+    @staticmethod
+    def _has_dnssec_material(msg, qtype: int) -> bool:
+        """响应是否含可供本地验签的 DNSSEC 材料（RRSIG/NSEC/NSEC3/DNSKEY）"""
+        try:
+            if qtype == dns.rdatatype.NS:
+                return any(rr.rdtype == dns.rdatatype.NS
+                           for section in (msg.answer, msg.authority)
+                           for rr in section)
+            # 只认与本次查询/否定证明相关的 RRSIG；一条无关的
+            # CNAME/RRSIG 不能当作“链材料”。
+            if qtype == dns.rdatatype.DS:
+                wanted = {dns.rdatatype.DS, dns.rdatatype.NSEC,
+                          dns.rdatatype.NSEC3}
             else:
-                for rd in alg_map:
-                    root_rrset.add(rd)
-            trusted[root_name] = root_rrset
-
-        # 2. 查询根区 DNSKEY（含 KSK+ZSK），用根锚 KSK 验证其 RRSIG → 得到完整根密钥
-        root_dnskey_resp = await self._iterate(".", dns.rdatatype.DNSKEY, 0)
-        if root_dnskey_resp is None:
-            # 查询失败（超时/不可达）：这是「暂时取不到证据」，不是"链路没有
-            # DNSSEC"，不能作为降级放行的依据，仍按链不可用退避重试。
-            self._set_dnssec_evidence("unavailable")
-            raise _ChainUnavailable("根区 DNSKEY 查询失败")
-        root_dnskey_rrset = self._extract_dnskey_rrset(root_dnskey_resp)
-        if root_dnskey_rrset is None:
-            # 根区应答里连 DNSKEY 都没有（实测中间盒把 `. DNSKEY` 直接回
-            # NXDOMAIN）。这是「本链路不提供 DNSSEC 材料」的确定性证据：
-            # 同一台权威重试 3 次结果不会变，用 _DnssecAbsent 跳过退避重试
-            # （记账/负缓存语义不变），并让 _resolve_verified 能据此降级。
-            self._set_dnssec_evidence(
-                "absent", detail=self._describe_resp(root_dnskey_resp))
-            raise _DnssecAbsent(
-                "根区 DNSKEY 响应不含 DNSKEY（本链路不提供 DNSSEC 记录）")
-        root_rrsig = self._find_rrsig_for(root_dnskey_resp, root_dnskey_rrset)
-        if root_rrsig is None:
-            # 有 DNSKEY 但没有 RRSIG：同样是"链路不下发 DNSSEC 记录"的确证
-            # （DO=1 的应答理应对 DNSKEY 签名，RFC 4035 §2.2）。
-            self._set_dnssec_evidence(
-                "absent",
-                detail=("DNSKEY rrset 存在但没有 RRSIG；" +
-                        self._describe_resp(root_dnskey_resp)))
-            return None
-        try:
-            dns.dnssec.validate(root_dnskey_rrset, root_rrsig, trusted)
-        except ImportError as e:
-            # 验签后端缺失不是“验证失败/bogus”：标记链不可用，让上层按
-            # unknown 处理（不得据此判 secure，也不得丢弃为伪造）。
-            logger.error("DNSSEC 根区 DNSKEY 无法验签：%s", e)
-            raise _ChainUnavailable(
-                "DNSSEC 验签后端不可用（请安装 cryptography）") from e
-        except (dns.dnssec.ValidationFailure, KeyError) as e:
-            # 有签名但验不过 = 真 bogus（伪造/算法不支持/时钟错），
-            # 这条证据绝不能用来降级放行。
-            self._set_dnssec_evidence("bogus_root")
-            self._warn_dnssec_once("root_dnskey", ".", "DNSSEC 根区 DNSKEY 验证失败: %s", e)
-            return None
-        self._set_dnssec_evidence("ok")
-        trusted[dns.name.root] = root_dnskey_rrset  # 含 ZSK，供后续验证子区 DS
-        # 根 DNSKEY 已验证：立即入缓存，避免每个新域名都重查一次 ". DNSKEY"
-        try:
-            if len(self._verified_zone_cache) > 512:
-                self._verified_zone_cache.clear()
-            self._verified_zone_cache["."] = (
-                root_dnskey_rrset,
-                time.time() + float(getattr(root_dnskey_rrset, "ttl", 3600) or 3600),
-            )
+                wanted = {qtype}
+            return any(rr.rdtype == dns.rdatatype.RRSIG
+                       and rr.covers in wanted
+                       for section in (msg.answer, msg.authority)
+                       for rr in section)
         except Exception:
-            pass
+            return False
 
-        # 3. 逐级向下的祖先路径：TLD → ... → zone
-        path = []
-        n = zone_name
-        while n != dns.name.root:
-            path.append(n)
-            n = n.parent()
-        path.reverse()
-
-        for cur_zone in path:
-            # 3a+3b 并行：DS 由父区权威持有、DNSKEY 由本区权威持有，两者互不依赖
-            # （3c 才用 DS 校验 DNSKEY），并发可以把这一级的两个 RTT 合成一个。
-            # 境内外 TLD 权威 RTT 常 200-300ms，这一项对首次解析很显著。
-            ds_resp, dnskey_resp = await asyncio.gather(
-                self._iterate_ds_cached(cur_zone),
-                self._iterate(str(cur_zone), dns.rdatatype.DNSKEY, 0),
-            )
-            if ds_resp is None:
-                # 查询失败 ≠ 无 DS（insecure）：不能据此判 bogus，也不能当作
-                # insecure（那是反向伪造面）→ 抛「暂时不可用」交给上层重试/降级
-                raise _ChainUnavailable(f"{_safe_qname(cur_zone)} 的 DS 查询失败")
-            ds_rrset = None
-            for rrset in ds_resp.answer:
-                if rrset.rdtype == dns.rdatatype.DS:
-                    ds_rrset = rrset
-                    break
-            if ds_rrset is None:
-                return None  # 无 DS（insecure 委托）→ 严格模式拒绝
-            rrsig_set = self._find_rrsig_for(ds_resp, ds_rrset)
-            if rrsig_set is None:
-                return None
+    def _schedule_bootstrap_reprobe(self) -> None:
+        """后台重探 bootstrap 能力，不在请求路径等待"""
+        if time.time() < getattr(self, "_bootstrap_probe_expire", 0.0):
+            return
+        task = getattr(self, "_bootstrap_probe_task", None)
+        if task is None or task.done():
             try:
-                dns.dnssec.validate(ds_rrset, rrsig_set, trusted)
-            except (dns.dnssec.ValidationFailure, KeyError) as e:
-                self._warn_dnssec_once("ds_sig", cur_zone,
-                                       "DNSSEC DS 验证失败 %s: %s",
-                                       _safe_qname(cur_zone), e)
-                return None
-            # 3b. cur_zone 的 DNSKEY（已在上面的 gather 中并发取回）
-            if dnskey_resp is None:
-                raise _ChainUnavailable(f"{_safe_qname(cur_zone)} 的 DNSKEY 查询失败")
-            dnskey_rrset = self._extract_dnskey_rrset(dnskey_resp)
-            if dnskey_rrset is None:
-                raise _ChainUnavailable(
-                    f"{_safe_qname(cur_zone)} 的 DNSKEY 响应不含 DNSKEY（上游返回不完整）")
-            # 3c. 用已验证 DS 的 digest 匹配 DNSKEY —— **收集全部**匹配的 key。
-            #     父子区在 KSK 轮换窗口内会同时发布两条 DS（旧 KSK + 新 KSK），
-            #     而 DNSKEY RRset 的自签 RRSIG 只由其中一把签发；更麻烦的是
-            #     权威返回的 DS 顺序**不固定**（同一 zone 连续两次查询可能顺序
-            #     相反）。只取"第一个匹配到的 key"就会在约一半情况下拿到没签
-            #     自签的那把 → dns.dnssec 抛 "no RRSIGs validated" → 误判 bogus
-            #     + 每次查询一条告警刷屏。
-            #     实测 sc.：DS={2539, 35612}，RRSIG(DNSKEY) 由 35612 签发，
-            #     DS 顺序为 [2539,35612] 时旧逻辑必然失败、[35612,2539] 时才成功。
-            #     安全性不变：能进入 trusted 的 key 必须匹配**已验签**的 DS，
-            #     攻击者自造的 key 拿不到 DS digest，仍被拒绝。
-            auth_keys = []
-            for key_rdata in dnskey_rrset:
-                for ds in ds_rrset:
-                    if self._ds_matches_key(ds, cur_zone, key_rdata):
-                        auth_keys.append(key_rdata)
-                        break
-            if not auth_keys:
-                self._warn_dnssec_once(
-                    "ds_mismatch", cur_zone,
-                    "DNSSEC DS/DNSKEY digest 不匹配: %s（伪造 DNSKEY 被拦截）",
-                    _safe_qname(cur_zone))
-                return None
-            # 3d. 用 DS 授权的 key 验证 DNSKEY rrset 自身的 RRSIG（signer=cur_zone，
-            #     KSK 与 ZSK 可同时签名）→ 证明该 DNSKEY 集合完整可信（含 ZSK）
-            dnskey_rrsig = self._find_rrsig_for(dnskey_resp, dnskey_rrset)
-            if dnskey_rrsig is None:
-                return None
-            ksk_rrset = dns.rrset.RRset(cur_zone, dns.rdataclass.IN, dns.rdatatype.DNSKEY)
-            for key_rdata in auth_keys:
-                ksk_rrset.add(key_rdata)
-            try:
-                dns.dnssec.validate(dnskey_rrset, dnskey_rrsig, {cur_zone: ksk_rrset})
-            except (dns.dnssec.ValidationFailure, KeyError) as e:
-                self._warn_dnssec_once(
-                    "dnskey_selfsig", cur_zone,
-                    "DNSSEC DNSKEY 自签验证失败 %s: %s", _safe_qname(cur_zone), e)
-                return None
-            # 3e. 该级验证通过 → 信任整个 DNSKEY rrset（含 ZSK），作为下一级的信任来源
-            trusted[cur_zone] = dnskey_rrset
-            # 同时缓存这一级：同一次查询里多个 signer（如 com. 与 baidu.com.）
-            # 会各自重做完整链条，逐级缓存后第二次直接命中（实测省 300-600ms）
-            try:
-                if len(self._verified_zone_cache) > 512:
-                    self._verified_zone_cache.clear()
-                self._verified_zone_cache[str(cur_zone).lower()] = (
-                    dnskey_rrset,
-                    time.time() + float(getattr(dnskey_rrset, "ttl", 3600) or 3600),
-                )
-            except Exception:
+                self._bootstrap_probe_task = asyncio.create_task(
+                    self.probe_bootstrap_capabilities())
+            except RuntimeError:
+                # 无运行中的事件循环（测试/同步上下文）
                 pass
 
-        # 结果：zone 自身的 DNSKEY rrset（zone==root 时即第 2 步用根锚验证过的根密钥）
-        result_rrset = trusted.get(zone_name) or root_dnskey_rrset        # 缓存已验证 zone 的 DNSKEY（有界：超 512 条清空，避免内存膨胀；
-        # 失效时间 = 当前时间 + DNSKEY rrset TTL，DNSKEY 轮换后自动重新验证）
-        if len(self._verified_zone_cache) > 512:
-            self._verified_zone_cache.clear()
-        ttl = getattr(result_rrset, "ttl", 3600) or 3600
-        self._verified_zone_cache[str(zone_name).lower()] = (result_rrset, time.time() + ttl)
-        return result_rrset
+    async def _bootstrap_dnssec_query(
+            self, qname: str, qtype: int) -> Optional[dns.message.Message]:
+        """从递归 bootstrap 上游取**带 DNSSEC 材料**的应答
+
+        中国网络里 IPv4 迭代链常被镜像代答，拿不到父区 NSEC/NSEC3 否定证明
+        或 DNSKEY/RRSIG；但配置里的递归上游（如 52.80.66.66）可能返回完整的
+        NSEC3+RRSIG。这里只负责取回原始报文，是否可信仍由 dnssec.py 用
+        DNSKEY 逐级验签决定；没有签名材料的应答不会作为链证据。
+        """
+        _probed = getattr(self, "_bootstrap_dnssec_resolvers", None)
+        if _probed is not None:
+            self._schedule_bootstrap_reprobe()
+        if _probed is None:
+            # 尚未做启动探测（测试/旧调用路径）：退回配置全量
+            resolvers = [str(s) for s in getattr(
+                getattr(self, "config", None), "bootstrap_resolvers", []) or []]
+        elif _probed:
+            resolvers = list(_probed)
+        else:
+            # 探测已确认没有上游能提供证明：不再每次链查询重试全部 bootstrap
+            self._schedule_bootstrap_reprobe()
+            return None
+        if not resolvers:
+            return None
+
+        async def _one(ip: str):
+            try:
+                q = dns.message.make_query(qname, qtype, want_dnssec=True)
+                q.flags |= dns.flags.RD | dns.flags.CD
+                r = await asyncio.wait_for(
+                    dns.asyncquery.udp(q, ip, timeout=2.0), timeout=2.5)
+                return r if self._has_dnssec_material(r, qtype) else None
+            except Exception:
+                return None
+
+        results = await asyncio.gather(
+            *[_one(ip) for ip in resolvers], return_exceptions=True)
+        for r in results:
+            if isinstance(r, dns.message.Message):
+                return r
+        return None
 
     async def _dnssec_query_callback(self, query_bytes: bytes) -> Optional[bytes]:
         """DNSSECValidator 的 DNSKEY 查询回调：迭代查询 DNSKEY 并做 DS 链验证。
         仅返回经过数学信任链验证的 DNSKEY 响应（防止伪造 DNSKEY + 重签名绕过）。"""
+        # 链验证查询强制走真族（ipv4_verify=corroborate 的完整覆盖）：
+        # 真族不可用时 chain-only 让 _iterate 直接失败，不回退镜像族。
+        _chain_tok = _CHAIN_ONLY_CTX.set(True)
         try:
+            if not getattr(self, "_preferred_family", ""):
+                try:
+                    await self._ensure_family_preference()
+                except Exception:
+                    pass
             msg = dns.message.from_wire(query_bytes)
             if not msg.question:
                 return None
@@ -3388,35 +3271,34 @@ class IterativeResolver:
                 # 安全判定仍由 DS/NSEC 验签完成。
                 ns_resp = await self._iterate(str(zone), dns.rdatatype.NS, 0)
                 if ns_resp is None:
+                    ns_resp = await self._bootstrap_dnssec_query(
+                        str(zone), dns.rdatatype.NS)
+                if ns_resp is None:
                     return None
                 ns_resp.id = msg.id
                 return ns_resp.to_wire()
-            # 链验证获取可信 DNSKEY（若已缓存直接命中）
-            verified_rrset = await self._get_trusted_dnskey(zone)
-            if verified_rrset is None:
-                self._warn_dnssec_once(
-                    "chain", zone,
-                    "DNSSEC 链验证失败，拒绝信任 %s 的 DNSKEY", _safe_qname(zone))
-                return None
-            # 必须返回**原始 DNSKEY 响应（含 RRSIG）**，不能只构造一个
-            # 仅含 DNSKEY rrset 的响应：调用方 DNSSECValidator._query_rrset_ex()
-            # 需要按 covers=DNSKEY 找 RRSIG 才能继续验签；旧实现丢掉 RRSIG，
-            # 导致 _get_verified_zone_keys() 永远 indeterminate（require_rrsig
-            # 路径因此完全失效）。
+            # DNSKEY：直接返回**原始迭代响应（含 RRSIG）**，验签由
+            # dnssec.py 的 _get_verified_zone_keys() 完成——plain_dns 不再
+            # 参与任何 DNSSEC 验证（统一验证链，2026-11-14）。
             raw = await self._iterate(str(zone), dns.rdatatype.DNSKEY, 0)
+            if (raw is None
+                    or not self._has_dnssec_material(
+                        raw, dns.rdatatype.DNSKEY)
+                    or self._extract_dnskey_rrset(raw) is None):
+                _fb = await self._bootstrap_dnssec_query(
+                    str(zone), dns.rdatatype.DNSKEY)
+                if _fb is not None:
+                    raw = _fb
             if raw is None:
                 return None
-            raw_rrset = self._extract_dnskey_rrset(raw)
-            if raw_rrset is None:
-                return None
-            if ({str(rd) for rd in raw_rrset}
-                    != {str(rd) for rd in verified_rrset}):
-                # 原始响应的 DNSKEY 与已验签集合不一致 → 拒绝（防掉包）
+            if self._extract_dnskey_rrset(raw) is None:
                 return None
             raw.id = msg.id
             return raw.to_wire()
         except Exception:
             return None
+        finally:
+            _CHAIN_ONLY_CTX.reset(_chain_tok)
 
     # ---------- 公开入口 ----------
 
@@ -3430,461 +3312,12 @@ class IterativeResolver:
     # NSEC3 owner-hash 解码同样复用 dnssec.py 的唯一实现。
     _nsec3_owner_hash = staticmethod(DNSSECValidator._nsec3_owner_hash)
 
-    @staticmethod
-    def _nsec_proves_no_type(nsec_rdata, nsec_owner: dns.name.Name,
-                             target: dns.name.Name, rdtype: int) -> bool:
-        """NSEC 是否证明 target 无指定类型 rdtype（NODATA 否定语义，RFC 4034 §4.1.1）：
-        - NSEC owner 必须等于被查名 target（NODATA 场景）
-        - 类型位图必须不含 rdtype（查询类型——防攻击者用位图含 A 的 NSEC
-          重放为 NODATA 吞掉真实 A 记录）
-        防止重放父区公开有效 NSEC（签名有效但语义不符）伪造 insecure/NODATA。
-        """
-        try:
-            if nsec_owner != target:
-                return False
-            return not IterativeResolver._nsec_has_type(nsec_rdata, rdtype)
-        except Exception:
-            return False
-
-    @staticmethod
-    def _nsec_proves_no_ds(nsec_rdata, nsec_owner: dns.name.Name,
-                           target: dns.name.Name) -> bool:
-        """NSEC 是否证明 target 无 DS（委托无 DS 语义）——_nsec_proves_no_type 的特例。"""
-        return IterativeResolver._nsec_proves_no_type(
-            nsec_rdata, nsec_owner, target, dns.rdatatype.DS)
-
-    @staticmethod
-    def _nsec_covers(nsec_rdata, nsec_owner: dns.name.Name,
-                     target: dns.name.Name) -> bool:
-        """NSEC 是否覆盖 target（NXDOMAIN 纯区间语义，RFC 4034 §4.1.1）：
-        owner < target < next（canonical 序）。注意：owner==target 时 NSEC 存在
-        本身证明 target 存在（NODATA 语义），不属于 NXDOMAIN 覆盖——必须为 False，
-        否则重放 owner==qname 的真实 NSEC 可让真实存在的域名被判 NXDOMAIN。
-        """
-        try:
-            nxt = nsec_rdata.next
-            if nsec_owner == target:
-                return False  # NSEC 存在 → target 存在，非 NXDOMAIN 证明
-            if target == nxt:
-                return False  # next 是链首存在名 → target 存在，非 NXDOMAIN 证明
-            if nsec_owner < target < nxt:
-                return True
-            # 回绕（owner 是排序末尾，next 是排序开头）
-            if nxt <= nsec_owner:
-                if nxt == nsec_owner:
-                    return False  # 自指记录（单名 zone）不覆盖任何名字
-                return target > nsec_owner or target < nxt
-            return False
-        except Exception:
-            return False
-
-    @staticmethod
-    def _nsec3_proves_no_ds(nsec3_rdata, owner_hash: bytes, target: dns.name.Name) -> bool:
-        """NSEC3 是否证明 target 无 DS（RFC 5155 §8.4 语义）：
-        - 计算 target 的 NSEC3 hash
-        - hash 必须落在 [owner_hash, next_hash) 区间（或回绕）
-        - 类型位图不含 DS（43）
-        防止重放父区公开有效 NSEC3 伪造 insecure。
-        """
-        return IterativeResolver._nsec3_proves_no_type(
-            nsec3_rdata, owner_hash, target, dns.rdatatype.DS)
-
     # 区间覆盖语义与 dnssec.py 的 _hash_in_interval 完全一致（含自指保护）；
     # 不再在 plain_dns_server 里复制一份边界判断。
     _nsec3_interval_check = staticmethod(DNSSECValidator._hash_in_interval)
 
     # Opt-Out 位解析复用 dnssec.py 的实现。
     _nsec3_optout = staticmethod(DNSSECValidator._nsec3_optout)
-
-    @staticmethod
-    def _nsec3_proves_no_type(nsec3_rdata, owner_hash: bytes,
-                              target: dns.name.Name, rdtype: int) -> bool:
-        """NSEC3 是否证明 target 无指定类型 rdtype（RFC 5155 §8.4 NODATA 语义）：
-        - hash 落在 (owner_hash, next_hash] 区间（或回绕）——注意 owner 本身
-          存在（其 hash 对应真实名字），target_hash == owner_hash 必须 False，
-          与 NSEC 的 owner==target 同理；next_hash 是闭边界
-        - 类型位图不含 rdtype（查询类型——防位图含 A 的 NSEC3 重放吞真实 A）
-        """
-        try:
-            target_hash = IterativeResolver._nsec3_hash(
-                target, nsec3_rdata.salt, nsec3_rdata.iterations,
-                nsec3_rdata.algorithm,
-            )
-            if not target_hash:
-                return False
-            next_hash = nsec3_rdata.next  # 原始 bytes
-            # NODATA 语义（RFC 5155 §8.5）：target == owner → 该名字存在，
-            # 位图不含 rdtype 即证明 NODATA；target 落在开区间 → 不存在（NXDOMAIN）
-            if target_hash == owner_hash:
-                return not IterativeResolver._nsec_has_type(nsec3_rdata, rdtype)
-            # RFC 5155 §8.4-8.8：opt-out 位（flags & 0x01）设置的 NSEC3 区间覆盖
-            # 证明不可靠（opt-out 子区无 NSEC3 记录）——保守拒绝
-            if getattr(nsec3_rdata, "flags", 0) & 0x01:
-                return False
-            covered = IterativeResolver._nsec3_interval_check(
-                target_hash, owner_hash, next_hash)
-            return covered and not IterativeResolver._nsec_has_type(
-                nsec3_rdata, rdtype)
-        except Exception:
-            return False
-
-    async def _parent_is_insecure(self, name: dns.name.Name) -> bool:
-        """父区是否已被证明为未签名（insecure）。
-
-        DNSSEC 是逐区 opt-in：父区未签名时，子区/委托点不可能通过 DS 链
-        获得签名信任（没有父区 DS）。此时子区 NSEC/NSEC3 否定证明本来
-        就不存在，不能因为“没有证明”判 unknown 丢弃——应直接判 insecure。
-        典型：services.mozilla.com（父区 mozilla.com 未签名）、
-        opencdn*.jomodns.com（父区 jomodns.com 未签名）。
-        """
-        try:
-            if name == dns.name.root:
-                return False
-            return await self._zone_signed_status(name.parent()) == "insecure"
-        except Exception:
-            return False
-
-    async def _is_delegation(self, name: dns.name.Name) -> Optional[bool]:
-        """name 是否是父区的委托点（父区存在 owner==name 的 NS 记录）
-
-        为什么需要它：DS 查询返回 NODATA 时，响应里的 SOA owner 只说明
-        “哪个区回答了这次查询”，无法区分 name 是「该区的委托子区」还是
-        「该区内的普通名」（两者的 SOA owner 都等于 name.parent()）。
-        而这两者的后续处理完全相反：
-          - 委托子区：DS 由父区持有；父区无 DS 且无否定证明 = 无法证明，
-            必须停在 name，绝不能升到父区把父区自己的 DS 当成 name 已签名；
-          - 区内普通名：DS 本来就不存在，必须继续升到所在区 apex 再判断。
-
-        判定方式：向 name 查 NS。委托点的 NS 由父区 referral/子区 apex 返回，
-        owner 等于 name；普通名返回 NODATA（没有 owner==name 的 NS）。
-        优先复用 `_zone_ns_cache`（解析过程中已缓存的 referral），避免额外 RTT。
-        返回 True/False/None（查询失败，无法判定）。
-        """
-        key = str(name).lower()
-        cached = self._delegation_cache.get(key)
-        if cached is not None and time.time() < cached[1]:
-            return cached[0]
-        # 解析过程中已缓存过该区的权威 → 它一定是被委派的区
-        ent = self._zone_ns_cache.get(key)
-        if ent is not None and time.time() < ent[1] and ent[0]:
-            self._delegation_cache[key] = (True, time.time() + 300)
-            return True
-        try:
-            resp = await self._iterate(str(name), dns.rdatatype.NS, 0)
-        except Exception:
-            resp = None
-        if resp is None:
-            return None
-        result = False
-        try:
-            for section in (resp.answer, resp.authority):
-                for rrset in section:
-                    if rrset.rdtype == dns.rdatatype.NS and rrset.name == name:
-                        result = True
-                        break
-                if result:
-                    break
-        except Exception:
-            return None
-        if len(self._delegation_cache) > 2048:
-            self._delegation_cache.clear()
-        self._delegation_cache[key] = (result, time.time() + 300)
-        return result
-
-    async def _retry_ds_once(self, name: dns.name.Name) -> Optional[dns.message.Message]:
-        """清掉 name 的 DS 缓存并重查一次（争取拿到父区的 NSEC/NSEC3 否定证明）
-
-        某些权威在限速/精简响应时会返回不带 DNSSEC 记录的 NODATA（只有 SOA），
-        这不是“该名字没有 DS”的数学证明。重查一次通常能拿到完整否定证明；
-        仍拿不到时由调用方按 unknown 处理，不得升父级或判 secure。
-        """
-        key = str(name).lower()
-        self._ds_cache.pop(key, None)
-        self._ds_inflight.pop(key, None)
-        try:
-            return await self._iterate_ds_cached(name)
-        except Exception:
-            return None
-
-    async def _zone_signed_status(self, zone_name: dns.name.Name) -> str:
-        """判定 qname 所在区域的 DNSSEC 签名状态（防 downgrade 剥离攻击）。
-        沿父区链逐级查询祖先委托点的 DS（DS 由父区权威回答）：
-        - 'secure'   : 某祖先委托点有 DS（父区签名）→ qname 位于签名区
-        - 'insecure' : 某祖先委托点无 DS，且父区用 NSEC/NSEC3 否定记录
-                       数学验证证明该委托无 DS → 未签名委托，qname 位于未签名区
-        - 'unknown'  : 全程无法证明 → 剥离风险，严格模式应丢弃
-        """
-        # 从 qname 自身开始，逐级向根检查每个名字的 DS。
-        # 注意：qname 自身若是 zone apex 也有 DS（如 example.net），
-        # 从 parent 起跳会漏查导致未签名 apex 被误判 secure 丢弃。
-        n = zone_name if zone_name != dns.name.root else None
-        visited: set = set()
-        while n is not None and n != dns.name.root and n not in visited:
-            visited.add(n)
-            ds_resp = await self._iterate_ds_cached(n)
-            if ds_resp is None:
-                # 查询失败 ≠ 无法证明：DS 查询超时/失败时不能据此判定
-                # 「无法确认应答未被篡改」，否则冷启动（DNSSEC 链缓存尚未建立）
-                # 会把本可解析的域名整片丢弃（纯迭代模式没有加密上游兜底，
-                # 表现为「部分站点完全打不开」）。交由上层按 insecure 放行并记日志。
-                # 但若父区已被证明未签名，则本名字一定在未签名树下：
-                # 直接判 insecure，避免 CNAME 链/owner 检查把 error 当丢弃。
-                if await self._parent_is_insecure(n):
-                    return "insecure"
-                return "error"
-            # DS 存在 → 签名委托
-            if any(rrset.rdtype == dns.rdatatype.DS for rrset in ds_resp.answer):
-                return "secure"
-            # NXDOMAIN：该名字不存在（区间证明）。不能无条件升父级——父区
-            # 自己的 DS 只能证明父区签名，不能证明这个名字所在区签名；升上去
-            # 会把“名字不存在”误判成 secure，进而输出“签名被剥离”的假告警。
-            # 但也不能一律 unknown：DS 查询不跟随 CNAME，像 p.ssl.qhimg.com
-            # 这类 CNAME 名的 DS 查询会返回 NXDOMAIN，而它实际位于未签名区
-            # qhimg.com，必须继续升到所在区才能正确放行。因此仍按“是否委托点”
-            # 区分：普通名 → 升父级；委托点/无法判定 → unknown（停）。
-            if ds_resp.rcode() == dns.rcode.NXDOMAIN:
-                is_del = await self._is_delegation(n)
-                if is_del is False:
-                    n = n.parent()
-                    continue
-                # 即使 n 看起来是委托点，只要父区已被证明未签名，n 一定
-                # 在未签名树下（未签名区不发布 DS/NSEC3）。不能因为
-                # “n 不存在且像委托点”就把 CDN 随机子域整片丢弃。
-                # 实测 v9e169o.edge.mountaintoys.cn：_is_delegation 因
-                # _zone_ns_cache 命中返回 True，父区 mountaintoys.cn 已
-                # insecure，旧代码在这里直接 unknown → 严格模式丢弃；
-                # 父区未签名时 DS NXDOMAIN 是合法的（该名字本就不存在）。
-                if await self._parent_is_insecure(n):
-                    return "insecure"
-                return "unknown"
-            # 无 DS：仅当该名字是 zone apex（响应 SOA owner == 查询名）且父区用
-            # NSEC/NSEC3 否定记录 + 有效签名证明"该 apex 委托无 DS" 才判 insecure。
-            # 非 apex 名（如 www.example.com）的 DS 查询返回 NODATA 是其所在区
-            # 的否定，不代表该名未签名——须升父级继续。
-            # 判断 n 是否是 zone apex（父区的委托点）：DS 记录只存在父区，
-            # DS 查询恒由父区权威回答（authority SOA owner 是父区，非 n）。
-            # 正确判据：响应的 NSEC/NSEC3 RRSIG signer == n.parent()（父区签名
-            # 否定该名无 DS）→ n 是父区的委托点/apex。若响应无 NSEC（纯 NODATA
-            # SOA，signer 是父区），n 是父区内普通名 → 升父级。
-            has_nsec = any(
-                rrset.rdtype in (dns.rdatatype.NSEC, dns.rdatatype.NSEC3)
-                for section in (ds_resp.answer, ds_resp.authority)
-                for rrset in section
-            )
-            if not has_nsec:
-                # 无 NSEC/NSEC3 否定证明：这是本次误报的关键分支。
-                #
-                # 旧逻辑在这里直接 n=n.parent()，于是 OpenCDN/360 这类
-                # “父区（.com/.cn）有 DS、子区本来未签名”的域名会一路升到
-                # 父区，把父区自己的 DS 当成“子区已签名”，最终输出
-                # “该域名所在区域已启用 DNSSEC 但应答无 RRSIG → 签名被剥离”。
-                # 实际上子区根本没有 DS，应答合法。
-                #
-                # 正确语义：先判断 n 是「父区的委托点」还是「当前区内的普通名」。
-                #   - 委托点：父区无 DS 且没有否定证明 = 无法证明，返回 unknown，
-                #     绝不能升父级（父区 DS 与它无关）；
-                #   - 普通名：DS 本来就不存在，必须升到所在区 apex 再判断。
-                # 某些权威限速/精简响应时会把带 DO 的 NODATA 退化成“只有 SOA”，
-                # 这时先重查一次，争取拿到完整否定证明（通常换一台权威即可）。
-                is_del = await self._is_delegation(n)
-                if is_del is True:
-                    retry_resp = await self._retry_ds_once(n)
-                    if retry_resp is not None:
-                        ds_resp = retry_resp
-                        has_nsec = any(
-                            rrset.rdtype in (dns.rdatatype.NSEC, dns.rdatatype.NSEC3)
-                            for section in (ds_resp.answer, ds_resp.authority)
-                            for rrset in section
-                        )
-                    if not has_nsec:
-                        # 委托点没有父区否定证明：如果父区本身已被证明
-                        # 未签名，那么本区一定也在未签名树下（不可能有 DS），
-                        # 直接判 insecure；只有父区签名时才真的“无法证明”。
-                        if await self._parent_is_insecure(n):
-                            return "insecure"
-                        return "unknown"
-                elif is_del is False:
-                    n = n.parent()
-                    continue
-                else:
-                    # 连“是否委托点”都无法判定：先看父区是否未签名
-                    if await self._parent_is_insecure(n):
-                        return "insecure"
-                    return "unknown"
-            is_apex = False
-            if has_nsec:
-                # 检查 NSEC/NSEC3 的 signer 是否为 n.parent() 且 owner 是 n
-                # （父区对委托点 n 的"无 DS"否定）。owner 位图需含 NS（委托点
-                # 特征）或 n 是父区直接子域——区分"apex 委托无 DS"与
-                # "zone 内普通名无 DS 记录"（如 www.example.com 在 example.com 内）。
-                # 安全：先验证 NSEC/NSEC3 的 RRSIG 签名有效（防攻击者伪造
-                # 无签名 NSEC 冒充父区委托否定——签名验证用父区已信任 DNSKEY）。
-                for rrset in ds_resp.answer + ds_resp.authority:
-                    if rrset.rdtype not in (
-                            dns.rdatatype.NSEC, dns.rdatatype.NSEC3):
-                        continue
-                    rrsig_set = self._find_rrsig_for(ds_resp, rrset)
-                    if rrsig_set is None:
-                        continue  # 无签名 NSEC → 不认作父区委托否定
-                    try:
-                        parent_keys_ap = await self._get_trusted_dnskey(n.parent())
-                        if parent_keys_ap is None:
-                            continue
-                        dns.dnssec.validate(
-                            rrset, rrsig_set, {n.parent(): parent_keys_ap})
-                    except (dns.dnssec.ValidationFailure, KeyError, Exception):
-                        continue  # 签名无效 → 不认作父区委托否定
-                    # signer == n.parent() 且 owner == n
-                    signer_ok = False
-                    for rrsig in rrsig_set:
-                        try:
-                            if str(rrsig.signer).rstrip(".").lower() == \
-                               str(n.parent()).rstrip(".").lower():
-                                signer_ok = True
-                                break
-                        except Exception:
-                            continue
-                    if not signer_ok:
-                        continue
-                    # NSEC：owner == n 且位图含 NS（委托点）→ apex
-                    if rrset.rdtype == dns.rdatatype.NSEC and rrset.name == n:
-                        for rdata in rrset:
-                            if self._nsec_has_type(rdata, dns.rdatatype.NS):
-                                is_apex = True
-                                break
-                    # NSEC3：owner hash == n 的 hash 且位图含 NS → apex
-                    elif rrset.rdtype == dns.rdatatype.NSEC3:
-                        oh3 = self._nsec3_owner_hash(rrset.name)
-                        th3 = None
-                        for rdata in rrset:
-                            th3 = self._nsec3_hash(
-                                n, rdata.salt, rdata.iterations, rdata.algorithm)
-                            if oh3 and th3 and oh3 == th3 and \
-                               self._nsec_has_type(rdata, dns.rdatatype.NS):
-                                is_apex = True
-                                break
-                    if is_apex:
-                        break
-            if not is_apex:
-                # 未匹配 owner==n 的 NSEC，但 NSEC/NSEC3 可能区间覆盖 n 且位图
-                # 含 NS（n 是父区的 opt-out 委托点）——检查区间覆盖的 NSEC
-                # 是否证明 n 是委托点且无 DS（insecure 委托）。
-                nsec_valid = False
-                parent_keys = None
-                try:
-                    parent_keys = await self._get_trusted_dnskey(n.parent())
-                    if parent_keys is not None:
-                        for rrset in ds_resp.answer + ds_resp.authority:
-                            if rrset.rdtype not in (
-                                    dns.rdatatype.NSEC, dns.rdatatype.NSEC3):
-                                continue
-                            rrsig_set = self._find_rrsig_for(ds_resp, rrset)
-                            if rrsig_set is None:
-                                continue
-                            dns.dnssec.validate(rrset, rrsig_set,
-                                                {n.parent(): parent_keys})
-                            for rdata in rrset:
-                                if rrset.rdtype == dns.rdatatype.NSEC:
-                                    # 区间覆盖 n 且位图含 NS（委托点）
-                                    if self._nsec_covers(rdata, rrset.name, n) and \
-                                       self._nsec_has_type(rdata, dns.rdatatype.NS) and \
-                                       not self._nsec_has_type(
-                                           rdata, dns.rdatatype.DS):
-                                        nsec_valid = True
-                                elif rrset.rdtype == dns.rdatatype.NSEC3:
-                                    oh3 = self._nsec3_owner_hash(rrset.name)
-                                    th3 = self._nsec3_hash(
-                                        n, rdata.salt, rdata.iterations,
-                                        rdata.algorithm)
-                                    if oh3 and th3 and \
-                                       self._nsec3_interval_check(
-                                           th3, oh3, rdata.next):
-                                        # RFC 5155 §8.6：opt-out 区间覆盖证明
-                                        # “区间内可能存在被省略的未签名委托”，
-                                        # **不要求**覆盖记录位图含 NS（位图描述
-                                        # 的是 owner 名，不是被覆盖的委托名）。
-                                        # 非 opt-out 的区间覆盖才是 NXDOMAIN
-                                        # 证明，不能拿来推断 DS NODATA。
-                                        if self._nsec3_optout(rdata):
-                                            nsec_valid = True
-                                        elif self._nsec_has_type(
-                                                rdata, dns.rdatatype.NS) and \
-                                             not self._nsec_has_type(
-                                                rdata, dns.rdatatype.DS):
-                                            nsec_valid = True
-                except Exception:
-                    nsec_valid = False
-                if nsec_valid:
-                    return "insecure"  # opt-out 委托点无 DS → 未签名区
-                if parent_keys is None:
-                    # 父区 DNSKEY 取不到（验签后端缺失 / 链查询失败）：
-                    # 无法验证否定证明。若父区已证明未签名，则本名字一定
-                    # 在未签名树下；否则绝不能升父级把父区 DS 当 secure。
-                    #
-                    # 返回 "error" 而不是 "unknown"：这是**本机取不到父区
-                    # DNSKEY**（链暂时不可用），不是“应答缺少否定证明”。
-                    # 两者必须区分：unknown 会被调用方判为可丢弃，冷启动
-                    # （根/TLD DNSKEY 查询限速/超时）会把合法未签名域名整片
-                    # 丢弃（实测 mountaintoys.cn 的 CDN 子域 60 秒被丢 86 次）；
-                    # error 与 `_iterate_ds_cached` 查询失败同级，按可用性放行。
-                    if await self._parent_is_insecure(n):
-                        return "insecure"
-                    return "error"
-                is_del = await self._is_delegation(n)
-                if is_del is False:
-                    # n 只是当前区内的普通名：DS 本来就不存在，升到所在区 apex
-                    n = n.parent()
-                    continue
-                # n 是委托点（或无法判定）：有 NSEC 但语义不成立 → 无法证明
-                if await self._parent_is_insecure(n):
-                    return "insecure"
-                return "unknown"
-            if has_nsec:
-                # 验证 NSEC/NSEC3 的 RRSIG（父区 DNSKEY 签名）且语义正确：
-                # NSEC owner 必须等于被查名 target 且类型位图不含 DS
-                # （防重放父区公开有效 NSEC——签名有效但区间不覆盖——伪造 insecure）
-                nsec_valid = False
-                parent_keys = None
-                try:
-                    parent_keys = await self._get_trusted_dnskey(n.parent())
-                    if parent_keys is not None:
-                        for rrset in ds_resp.answer + ds_resp.authority:
-                            if rrset.rdtype not in (dns.rdatatype.NSEC, dns.rdatatype.NSEC3):
-                                continue
-                            rrsig_set = self._find_rrsig_for(ds_resp, rrset)
-                            if rrsig_set is None:
-                                continue
-                            dns.dnssec.validate(rrset, rrsig_set,
-                                                {n.parent(): parent_keys})
-                            # 语义校验：NSEC owner == 被查名 && 位图不含 DS
-                            for rdata in rrset:
-                                if rrset.rdtype == dns.rdatatype.NSEC and \
-                                   self._nsec_proves_no_ds(rdata, rrset.name, n):
-                                    nsec_valid = True
-                                elif rrset.rdtype == dns.rdatatype.NSEC3:
-                                    # NSEC3：计算被查名 hash，验证落在
-                                    # [owner, next) 区间且位图不含 DS（RFC 5155）
-                                    owner_hash = self._nsec3_owner_hash(rrset.name)
-                                    if owner_hash and self._nsec3_proves_no_ds(
-                                            rdata, owner_hash, n):
-                                        nsec_valid = True
-                except (dns.dnssec.ValidationFailure, KeyError, Exception):
-                    nsec_valid = False
-                if nsec_valid:
-                    return "insecure"  # 父区签名证明该委托无 DS → 未签名区
-                if parent_keys is None:
-                    # 父区 DNSKEY 取不到（链暂时不可用）：与上面的 3122 分支
-                    # 同一语义，返回 error 而不是 unknown——否则冷启动时会把
-                    # 合法未签名域名当成“可能被篡改”丢弃。
-                    if await self._parent_is_insecure(n):
-                        return "insecure"
-                    return "error"
-                # NSEC 签名验证失败或语义不符 → 无法证明（剥离/重放风险）
-                return "unknown"
-            # 理论上不可达（无证明已在上面处理）；保守返回 unknown，
-            # 不再盲目升父级（父区 DS 不能证明本名字所在区签名）。
-            return "unknown"
-        return "unknown"
 
     @property
     def name(self) -> str:
@@ -3925,6 +3358,7 @@ class IterativeResolver:
         首次解析任何域名都要现查 `. DNSKEY` + `<tld>. DS` + `<tld>. DNSKEY`；
         TLD 权威多在境外（RTT 200-300ms），合计 400-600ms。
         启动后在后台跑本方法，用户第一次访问时这些已在缓存里。
+        验证全部交给 dnssec.DNSSECValidator；这里只触发它的链缓存。
         逐级串行执行（避免启动瞬间打出查询风暴）；失败只记 debug，不影响功能。
         """
         zones = [dns.name.root]
@@ -3935,12 +3369,12 @@ class IterativeResolver:
                 continue
         for zone in zones:
             try:
-                await self._get_trusted_dnskey(zone)
+                await self._dnssec._get_verified_zone_keys(zone)
             except Exception as e:
                 logger.debug("迭代预热 %s 失败: %s", zone, e)
         logger.info(
-            "迭代解析预热完成: 已验证 zone %d 个（DNSKEY/DS 已缓存）",
-            len(self._verified_zone_cache),
+            "迭代解析预热完成: 已验证 zone %d 个（dnssec.py DNSKEY/DS 已缓存）",
+            len(getattr(self._dnssec, "_verified_zone_cache", {})),
         )
 
     async def resolve(self, qname: str, qtype: int, rdclass: int = 1) -> Optional[dns.message.Message]:
@@ -4035,6 +3469,10 @@ class IterativeResolver:
         风暴时把 bootstrap DNS 打爆。
         """
         servers = [str(s) for s in (self.config.bootstrap_resolvers or [])]
+        # 启动探测到的可达集合优先；空/未探测才回退配置全量
+        _alive = getattr(self, "_bootstrap_alive", None)
+        if _alive:
+            servers = [s for s in servers if s in _alive] or list(_alive)
         if not servers:
             return None
         q = dns.message.make_query(qname, qtype, rdclass=rdclass, want_dnssec=True)
@@ -4094,13 +3532,256 @@ class IterativeResolver:
                         t.cancel()
                     t.add_done_callback(_consume_future_exc)
 
+    async def _resolve_verified_unified(self, qname: str, qtype: int,
+                                        rdclass: int) -> Optional[dns.message.Message]:
+        """统一验证入口：迭代只负责解析，DNSSEC 验证全部交给 dnssec.py。
+
+        2026-11-14：plain_dns_server 不再实现任何链验证（DS→DNSKEY→RRSIG、
+        负应答 NSEC/NSEC3 语义、SOA 归属、opt-out 等）。唯一实现是
+        dnssec.DNSSECValidator.validate_response()；迭代器只把原始响应
+        （含 RRSIG/NSEC/NSEC3）交给它。
+        """
+        _V6_DISABLED_CTX.set(False)
+        self._last_release = ""
+        try:
+            await self._ensure_family_preference()
+        except Exception:
+            pass
+        _FAMILY_ONLY_CTX.set(getattr(self, "_preferred_family", "") or "")
+        resp = await self._iterate(qname, qtype, 0, rdclass)
+        if self._needs_bootstrap_fallback(resp, qtype):
+            fb = await self._bootstrap_recursive(qname, qtype, rdclass)
+            if fb is not None and fb.answer:
+                fb._bootstrap_fallback = True
+                try:
+                    fb._hijacked_path = bool(
+                        getattr(resp, "_hijacked_path", False))
+                except Exception:
+                    pass
+                resp = fb
+        if resp is None:
+            self._stats["fail"] += 1
+            return None
+        if not self.strict_dnssec:
+            self._stats["success"] += 1
+            return resp
+        # upstream.dnssec.enabled=false：全局关闭 DNSSEC 验证。
+        # 必须在这里就返回，不能继续走下面的根链预检：根 DNSKEY 验签失败
+        # （bogus_root）会让“已经关闭验证”的响应仍被丢弃，且每次查询都白跑
+        # 一遍 DNSKEY/DS。配置注释明确这是全局开关。
+        if not getattr(self._dnssec, "enabled", True):
+            self._stats["success"] += 1
+            self._last_release = "dnssec_disabled"
+            return resp
+        # bootstrap 递归兜底是**明文、无 DNSSEC**的可用性路径：仅在迭代
+        # 整体失败/NODATA 时启用。它返回的无签名应答不能当“签名被剥离”
+        # 判 bogus（否则迭代被劫持时所有域名都会 SERVFAIL，等于兜底失效）。
+        # require_rrsig=false 时按未验证放行；true 时继续走严格验签。
+        if (not getattr(self, "_require_rrsig", False)
+                and getattr(resp, "_bootstrap_fallback", False)):
+            try:
+                _sig = any(
+                    rr.rdtype == dns.rdatatype.RRSIG
+                    for sec in (resp.answer, resp.authority)
+                    for rr in sec)
+            except Exception:
+                _sig = False
+            if not _sig:
+                # 但若父区已明确有 DS（该名字本应签名），不能拿明文兜底
+                # 数据绕过 DNSSEC（dnssec-failed.org 这类必须仍被丢弃）。
+                try:
+                    _has_ds = await self._dnssec._zone_has_ds(
+                        dns.name.from_text(qname))
+                except Exception:
+                    _has_ds = None
+                if _has_ds is not True:
+                    self._stats["insecure"] += 1
+                    self._stats["success"] += 1
+                    self._last_release = "bootstrap"
+                    return resp
+        # ---- 代答族/链路降级策略（与验证算法无关，保持原有可观测性）----
+        # 1) corroborate：镜像族答案用真族重解析印证（不一致即改用真族）
+        _was_hijacked = bool(getattr(resp, "_hijacked_path", False))
+        if (getattr(self, "_ipv4_verify", "strict") == "corroborate"
+                and _was_hijacked):
+            _was_hijacked = True
+            _alt = await self._resolve_over_genuine(qname, qtype, rdclass)
+            if _alt is not None:
+                try:
+                    _same = (
+                        answer_set_fingerprint(
+                            resp.to_wire(origin=dns.name.root))
+                        == answer_set_fingerprint(
+                            _alt.to_wire(origin=dns.name.root)))
+                except Exception:
+                    _same = False
+                self._stats["corroborated"] = (
+                    self._stats.get("corroborated", 0) + 1)
+                if _same:
+                    logger.debug(
+                        "交叉印证通过: %s（改用真族答案）", _safe_qname(qname))
+                else:
+                    self._stats["mismatch"] = (
+                        self._stats.get("mismatch", 0) + 1)
+                    try:
+                        self._report_dnssec_mismatch(
+                            qname, getattr(resp, "_answer_ip", "?"))
+                    except Exception:
+                        pass
+                resp = _alt
+            else:
+                logger.debug(
+                    "交叉印证不可用: %s（按未验证放行）", _safe_qname(qname))
+        # 1b) ipv4_verify=none：配置明确“只保可用性、不做额外校验”，
+        # 镜像族应答直接未验证放行（I4 的镜像形态伪装得很好，无法区分）。
+        if (getattr(self, "_ipv4_verify", "strict") == "none"
+                and getattr(resp, "_answer_family", "") == "4"
+                and (getattr(self, "_family_verdicts", {}) or {}).get("4")
+                == "hijacked"):
+            self._stats["hijacked_path"] = (
+                self._stats.get("hijacked_path", 0) + 1)
+            self._stats["insecure"] += 1
+            self._stats["success"] += 1
+            self._last_release = "hijacked_path"
+            try:
+                self._report_hijacked_path(
+                    qname, getattr(resp, "_answer_ip", "?"))
+            except Exception:
+                pass
+            return resp
+        # 2) 根信任源三态：secure→继续；bogus→真攻击，绝不降级放行；
+        #    insecure/indeterminate→链路不提供 DNSSEC 材料（absent），
+        #    按 require_rrsig 决定放行/丢弃。
+        #    不能只用 `_root_chain_available()` 的 bool：它把“根 DNSKEY
+        #    验签失败（bogus）”和“暂时取不到（absent）”合并成 False，
+        #    会让伪造的根 DNSKEY 在 require_rrsig=false 下被当成可用性
+        #    降级放行（安全回归）。
+        try:
+            _root_status, _root_keys = await self._dnssec._get_verified_zone_keys(
+                dns.name.root)
+        except Exception:
+            _root_status = "indeterminate"
+        if _root_status == "bogus":
+            self._stats["bogus"] += 1
+            self._last_release = "bogus"
+            self._dnssec_evidence = "bogus_root"
+            self._warn_dnssec_drop(
+                qname, "bogus_root", "根区 DNSKEY 验签失败（伪造/配置错误）")
+            return None
+        if _root_status != "secure":
+            if getattr(self, "_require_rrsig", False):
+                self._stats["bogus"] += 1
+                self._last_release = "bogus"
+                return None
+            self._stats["dnssec_absent"] = (
+                self._stats.get("dnssec_absent", 0) + 1)
+            self._stats["insecure"] += 1
+            self._stats["success"] += 1
+            self._dnssec_evidence = "absent"
+            self._last_release = "dnssec_absent"
+            return resp
+        # 3) 代答族降级（require_rrsig=false）：按配置未验证放行
+        if (not getattr(self, "_require_rrsig", False)
+                and getattr(resp, "_hijacked_path", False)):
+            self._stats["hijacked_path"] = (
+                self._stats.get("hijacked_path", 0) + 1)
+            self._stats["insecure"] += 1
+            self._stats["success"] += 1
+            self._last_release = "hijacked_path"
+            try:
+                self._report_hijacked_path(
+                    qname, getattr(resp, "_answer_ip", "?"))
+            except Exception:
+                pass
+            return resp
+        try:
+            q = dns.message.make_query(qname, qtype, want_dnssec=True)
+            ok, status, info = await self._dnssec.validate_response(
+                q.to_wire(), resp.to_wire(origin=dns.name.root))
+        except Exception as e:
+            logger.debug("DNSSEC 统一验证异常: %s", e)
+            self._stats["fail"] += 1
+            return None
+        if not ok:
+            # corroborate 用真族重解析后仍是**完全无 RRSIG**的应答：
+            # 说明这条链路对该名字不提供 DNSSEC 材料（实测 google.com.hk：
+            # 镜像与真族都回无签名 A），不是“签名被剥离”。按
+            # require_rrsig=false 的可用性语义放行并标记未验证，避免
+            # 永久 SERVFAIL + 客户端重试刷屏；require_rrsig=true 不覆盖。
+            try:
+                _no_sig = not any(
+                    rr.rdtype == dns.rdatatype.RRSIG
+                    for sec in (resp.answer, resp.authority)
+                    for rr in sec)
+            except Exception:
+                _no_sig = False
+            if (not getattr(self, "_require_rrsig", False)
+                    and _was_hijacked and _no_sig):
+                self._stats["hijacked_path"] = (
+                    self._stats.get("hijacked_path", 0) + 1)
+                self._stats["insecure"] += 1
+                self._stats["success"] += 1
+                self._last_release = "hijacked_path"
+                return resp
+            self._stats["bogus"] += 1
+            self._last_release = status
+            self._warn_dnssec_drop(qname, status, info.get("detail", ""))
+            return None
+        # CNAME 中间跳：迭代器把每一跳的原始响应保存在 _cname_chain；
+        # 逐跳交给同一个 dnssec.py 验证（同一实现，不另写一套）。
+        for wire in getattr(resp, "_cname_chain", []) or []:
+            try:
+                cm = dns.message.from_wire(wire)
+                if not cm.question:
+                    continue
+                qq = dns.message.make_query(
+                    str(cm.question[0].name), cm.question[0].rdtype,
+                    want_dnssec=True)
+                ok2, st2, info2 = await self._dnssec.validate_response(
+                    qq.to_wire(), wire, cname_hop=True)
+            except Exception:
+                continue
+            if not ok2:
+                self._stats["bogus"] += 1
+                self._last_release = st2
+                self._warn_dnssec_drop(
+                    qname, st2, info2.get("detail", ""), cname_hop=True)
+                return None
+        if status == "secure":
+            try:
+                resp.flags |= dns.flags.AD
+            except Exception:
+                pass
+            self._stats["secure"] += 1
+            self._dnssec_evidence = "ok"
+        else:
+            self._stats["insecure"] += 1
+        _detail = str(info.get("detail", "")) if isinstance(info, dict) else ""
+        if status == "insecure" and "链路不提供" in _detail:
+            self._stats["dnssec_absent"] = (
+                self._stats.get("dnssec_absent", 0) + 1)
+            self._dnssec_evidence = "absent"
+            self._last_release = "dnssec_absent"
+        elif status == "indeterminate" and not getattr(
+                self._dnssec, "_crypto_ok", True):
+            # 验签后端缺失（本机无法验证任何签名）与“链路不提供材料”
+            # 同一处置：require_rrsig=false 时按 absent 放行。
+            self._stats["dnssec_absent"] = (
+                self._stats.get("dnssec_absent", 0) + 1)
+            self._dnssec_evidence = "absent"
+            self._last_release = "dnssec_absent"
+        else:
+            self._last_release = status
+        self._stats["success"] += 1
+        return resp
+
     async def _resolve_verified(self, qname: str, qtype: int,
                                 rdclass: int) -> Optional[dns.message.Message]:
         """`_resolve_verified_inner` 的**上下文隔离包装**
 
         `_FAMILY_ONLY_CTX` 是 per-query 的优先族标记，用 ContextVar 传递到
         `_iterate` 的每一跳。如果只在内部 set 而不还原，同一个 asyncio Task
-        里后续的调用（以及直接调 `_dnssec_availability()` / `_get_trusted_dnskey()`
+        里后续的调用（以及直接调 dnssec.py 链查询 `_get_verified_zone_keys()`
         的预热、测试）会**继承上一条查询的族选择**，表现为"明明已经改走 IPv6，
         下一次又去问 IPv4 镜像"。这里统一 save/restore，保证不串味。
         """
@@ -4122,1537 +3803,8 @@ class IterativeResolver:
         DS/DNSKEY 并行 + DS 缓存 + 启动 warmup 已足够）。
         """
         try:
-            # 每个域名解析入口重置"本次解析禁用 IPv6"标记（per-query 语义）
-            _V6_DISABLED_CTX.set(False)
-            self._last_release = ""
-            # ★ 必须在**取答案之前**确定地址族（缓存 600s，未到期只是一次
-            #   时间比较）：否则首条查询的应答会在"还不知道哪族被代答"时
-            #   就拿回来，既无法标记 `_hijacked_path`，也无法走交叉印证。
-            try:
-                await self._ensure_family_preference()
-            except Exception:
-                pass
-            _FAMILY_ONLY_CTX.set(getattr(self, "_preferred_family", "") or "")
-            resp = await self._iterate(qname, qtype, 0, rdclass)
-            # CDN 调度域名兜底：迭代拿不到最终答案时，用 bootstrap DNS 递归一次。
-            # 典型场景：bilibili 的 i1/s2/s3/static.hdslb.com → CNAME 到腾讯
-            # 调度域名（*.tdnsv5.com），其权威对迭代查询直接返回 NODATA
-            # （实测 1.12.0.17 等：NOERROR/answer=0），只有递归服务器能拿到 A。
-            # 纯迭代模式下这类域名必然解析失败（图床/静态资源全挂），
-            # 因此仅在「没有 qtype 记录且非 NXDOMAIN」时兜底一次。
-            if self._needs_bootstrap_fallback(resp, qtype):
-                fb = await self._bootstrap_recursive(qname, qtype, rdclass)
-                if fb is not None and fb.answer:
-                    fb._bootstrap_fallback = True
-                    # 继承「这条链是否走过被代答的地址族」标记：兜底应答本身
-                    # 也不带 DNSSEC，标记必须保留，否则会在严格判定里被当成
-                    # "剥离攻击"丢弃（bootstrap 分支另有放行，标记更准确）。
-                    try:
-                        fb._hijacked_path = bool(
-                            getattr(resp, "_hijacked_path", False))
-                    except Exception:
-                        pass
-                    # 兜底响应**不再直接返回**：与迭代响应走同一套 DNSSEC 校验。
-                    # 兜底用的是明文 bootstrap DNS（UDP，无加密、无认证），若原样
-                    # 放行，攻击者只需污染 bootstrap 应答即可向签名区注入伪造记录、
-                    # 绕过整条 strict_dnssec 信任链（真实的降级攻击面）。
-                    # 因此：带 RRSIG → 正常链验签；无 RRSIG → 按区域 DNSSEC 状态
-                    # 判定（签名区拒绝，未签名/无法证明时按可用性兜底放行）。
-                    resp = fb
-            if resp is None:
-                self._stats["fail"] += 1
-                return None
-            if not self.strict_dnssec:
-                self._stats["success"] += 1
-                return resp
-
-            # ============================================================
-            # 先确定「哪一个地址族真的能到权威」（自动，缓存 600s）
-            # ------------------------------------------------------------
-            # 这一步**与 DNSSEC 是否可用无关**，纯粹为了避免把伪造族的应答
-            # 混进验证链：实测 IPv4/53 被中间设备代答、IPv6/53 直达权威时，
-            # 两族混发会让每一条签名都"验不过"（IPv4 代答微秒级先到），
-            # 表现为「bogus 一堆、secure 一个都没有」，而单独走 IPv6 时
-            # nic.cz / isc.org 等都能判 secure。
-            # 判定结果为空（两族都正常）时不限定族，行为与以前完全一致。
-            # ============================================================
-            # 每 600s 复核一次（网络可能被修好，也可能刚被劫持）；未到期时
-            # 本调用只是一次时间比较，开销可忽略。
-            try:
-                await self._ensure_family_preference()
-            except Exception:
-                pass
-
-            # ============================================================
-            # 交叉印证（iterative.ipv4_verify=corroborate）——**先于降级闸门**
-            # ------------------------------------------------------------
-            # 境内 IPv4 根 IP 由镜像应答、镜像不带 DNSSEC；IPv6 通常直达权威。
-            # 若这条应答（连同整条链）走了镜像族，就用真族把同一问题重解析一遍：
-            #   · 一致 → 采用真族答案，随后照常做 DNSSEC 验签（强度最高）；
-            #   · 不一致 → 镜像在说谎：丢弃镜像答案、改用真族答案并告警；
-            #   · 真族拿不到该名字 → 保持镜像答案，落到下面的降级闸门。
-            # 必须放在"链路无 DNSSEC → 降级放行"之前，否则镜像链路上永远
-            # 走不到这一步，等于放弃了唯一的验证机会。
-            # ============================================================
-            if (getattr(self, "_ipv4_verify", "strict") == "corroborate"
-                    and getattr(resp, "_hijacked_path", False)):
-                _alt = await self._resolve_over_genuine(qname, qtype, rdclass)
-                if _alt is not None:
-                    try:
-                        _same = (answer_set_fingerprint(resp.to_wire())
-                                 == answer_set_fingerprint(_alt.to_wire()))
-                    except Exception:
-                        _same = False
-                    self._stats["corroborated"] = (
-                        self._stats.get("corroborated", 0) + 1)
-                    if _same:
-                        logger.debug(
-                            "交叉印证通过: %s（镜像族答案与真族一致，改用真族答案）",
-                            _safe_qname(qname))
-                    else:
-                        self._stats["mismatch"] = (
-                            self._stats.get("mismatch", 0) + 1)
-                        self._report_dnssec_mismatch(
-                            qname, getattr(resp, "_answer_ip", "?"))
-                    self._last_release = ""
-                    resp = _alt        # 真族答案：交给下面的严格判定
-                else:
-                    logger.debug(
-                        "交叉印证不可用: %s（真族拿不到该名字，按未验证放行）",
-                        _safe_qname(qname))
-
-            # ============================================================
-            # ★ 降级闸门：本链路完全不提供 DNSSEC 材料时按 require_rrsig 放行
-            # ------------------------------------------------------------
-            # 现象（2026-11-10 用户日志，纯迭代模式）：每个域名都报
-            #   「DNSSEC 严格模式丢弃 <域名>：应答没有签名(RRSIG)，也没有能
-            #     证明「该域名本就未签名」的 NSEC/NSEC3 记录」
-            # 紧跟着「纯迭代模式：迭代解析连续 3 轮全部失败」——服务实际瘫痪。
-            #
-            # 根因不是逐条判定写错，而是**这条链路根本拿不到 DNSSEC 记录**：
-            #   * 根区 `. DNSKEY` 直接回 NXDOMAIN（或 DNSKEY 没有 RRSIG）；
-            #   * DS 的 NODATA 应答只有 SOA，没有 NSEC3 否定证明；
-            #   * 应答里没有任何 RRSIG。
-            # 连内置信任锚都验证不了，strict 验证在数学上不可能成功，
-            # `_zone_signed_status` 只能一路给 unknown → 全部丢弃。
-            #
-            # 这与 `dnssec.require_rrsig=false`（默认值）的文档语义完全一致：
-            # 「不因上游不下发 DNSSEC 记录而丢弃」（resolver 层 dnssec.py 早就
-            # 是这么做的，见 DNSSECQueryWrapper.validate_response）。因此这里
-            # 同样只在**根信任锚确定无法建立**（证据 = absent）或**验签后端
-            # 缺失**时降级放行，并给一条 60 秒节流的 WARNING 说明清楚；
-            # 一旦 require_rrsig=true，则维持 fail-closed（丢弃 = SERVFAIL），
-            # 由用户显式选择安全优先。
-            #
-            # 安全性：不放宽任何**可判定**的情形——只要根链能验证（"ok"），
-            # 下面原有的逐 owner 判定（签名区无 RRSIG = 剥离攻击、unknown =
-            # 无法证明 → 丢弃）全部照旧；根 DNSKEY 验签失败（"bogus_root"）
-            # 更不会走到这里。
-            # ============================================================
-            if not getattr(self, "_require_rrsig", False):
-                if not getattr(self, "_dnssec_crypto_ok", True):
-                    self._stats["dnssec_absent"] = self._stats.get("dnssec_absent", 0) + 1
-                    self._stats["insecure"] += 1
-                    self._stats["success"] += 1
-                    self._last_release = "dnssec_absent"
-                    self._report_dnssec_absent(qname, backend_missing=True)
-                    return resp
-                if await self._dnssec_availability() == "absent":
-                    self._stats["dnssec_absent"] = self._stats.get("dnssec_absent", 0) + 1
-                    self._stats["insecure"] += 1
-                    self._stats["success"] += 1
-                    self._last_release = "dnssec_absent"
-                    self._report_dnssec_absent(qname)
-                    return resp
-
-            # ============================================================
-            # 该应答来自「已被判定为中间设备代答」的地址族
-            # ------------------------------------------------------------
-            # 典型场景（实测）：IPv4/53 被路由器/运营商接管，IPv6/53 直达权威。
-            # 绝大多数域名我们已改走真族（见 `_FAMILY_ONLY_CTX`），但仍可能
-            # 有某一跳只有 IPv4 地址（该权威没有 AAAA glue）→ 只能从代答设备
-            # 拿应答。这种数据**不可能**有 DNSSEC 证明（代答设备不下发），
-            # 严格判定只会把它丢掉（纯迭代模式下就是 SERVFAIL）。
-            # 处置与 `dnssec_absent` 完全一致：require_rrsig=false 时按
-            # 「未验证放行」并给节流告警（可用性优先，语义与配置文档一致）；
-            # require_rrsig=true 时继续走下面的严格判定（丢弃 = fail-closed）。
-            # ============================================================
-            if (not getattr(self, "_require_rrsig", False)
-                    and getattr(resp, "_hijacked_path", False)):
-                self._stats["hijacked_path"] = (
-                    self._stats.get("hijacked_path", 0) + 1)
-                self._stats["insecure"] += 1
-                self._stats["success"] += 1
-                self._last_release = "hijacked_path"
-                self._report_hijacked_path(
-                    qname, getattr(resp, "_answer_ip", "?"))
-                return resp
-
-            # 收集所有 RRSIG 的 signer（签名者区）——含最终响应与 CNAME 中间跳
-            signers: set = set()
-            for section in (resp.answer, resp.authority):
-                for rrset in section:
-                    if rrset.rdtype == dns.rdatatype.RRSIG:
-                        for rrsig in rrset:
-                            signers.add(rrsig.signer)
-            cname_chain_msgs: List = []
-            for wire in getattr(resp, "_cname_chain", []) or []:
-                try:
-                    cm = dns.message.from_wire(wire)
-                    cname_chain_msgs.append(cm)
-                    for section in (cm.answer, cm.authority):
-                        for rrset in section:
-                            if rrset.rdtype == dns.rdatatype.RRSIG:
-                                for rrsig in rrset:
-                                    signers.add(rrsig.signer)
-                except Exception:
-                    pass
-
-            if not signers:
-                # 无 RRSIG：防剥离攻击。
-                #
-                # ★ 判定必须按**应答里每个 RRset 自己的 owner** 所在区的 DS 状态，
-                #   不能只看 qname（实测误判：c.pki.goog 的 qname 所在 pki.goog
-                #   有 DS = secure，但它是 CNAME 到 pki-goog.l.google.com
-                #   （l.google.com 无 DS = insecure），最终 A 记录没有 RRSIG
-                #   完全合法 —— 旧逻辑只看 qname 就判"签名被剥离"并丢弃，
-                #   日志里出现"该域名所在区域已启用 DNSSEC，但应答里完全没有
-                #   数字签名"这种与实际不符的描述）。
-                #
-                #   逐 owner 判定同时保住安全性：攻击者若剥掉签名并伪造
-                #   「qname CNAME 到未签名区」，CNAME 的 owner 仍是 qname、
-                #   仍在 secure 区 → 依旧判剥离拒绝（见下方 _stripped_owners）。
-                _owner_status = []
-                try:
-                    _targets = [rr.name for rr in resp.answer
-                                if rr.rdtype != dns.rdatatype.RRSIG]
-                except Exception:
-                    _targets = []
-                if not _targets:
-                    # 空应答（NODATA/NXDOMAIN）：退回按 qname 判定，
-                    # 与"否定证明必须被签名"的既有语义一致
-                    try:
-                        _targets = [dns.name.from_text(qname)]
-                    except Exception:
-                        _targets = []
-                _seen = set()
-                for _nm in _targets:
-                    _k = str(_nm).lower()
-                    if _k in _seen:
-                        continue
-                    _seen.add(_k)
-                    try:
-                        _zs = await self._zone_signed_status(_nm)
-                    except Exception:
-                        _zs = "unknown"
-                    _owner_status.append((_nm, _zs))
-
-                _stripped_owners = [(n, s) for n, s in _owner_status if s == "secure"]
-                _unknown_owners = [(n, s) for n, s in _owner_status if s == "unknown"]
-                _insecure_owners = [(n, s) for n, s in _owner_status if s in ("insecure", "error")]
-
-                if _stripped_owners:
-                    # 有 RRset 的 owner 明确位于签名区却没有签名 → 剥离攻击
-                    #
-                    # ★ 例外：bootstrap 递归兜底响应。迭代失败时（冷启动/权威不可达）
-                    #   会用明文 bootstrap 递归兜底，那份应答本来就不带 RRSIG，
-                    #   不能按"签名被剥离"丢弃 —— 否则第一次 attempt 必然 bogus
-                    #   （实测 c.pki.goog 冷启动：_iterate 返回 None → 兜底拿到
-                    #   含 CNAME 的未签名应答 → owner 在 pki.goog(secure) → 误判
-                    #   剥离 + 打 WARNING，靠后面的重试才成功）。与下方 unknown
-                    #   分支对兜底响应的处理保持一致。
-                    if getattr(resp, "_bootstrap_fallback", False):
-                        self._stats["insecure"] += 1
-                        self._stats["success"] += 1
-                        logger.debug(
-                            "DNSSEC: bootstrap 兜底响应无签名（迭代失败后的可用性兜底）"
-                            ": %s，按可用性放行（未经验签）", _safe_qname(qname))
-                        self._last_release = "bootstrap"
-                        return resp
-                    self._stats["bogus"] += 1
-                    self._report_dnssec_stripped(qname)
-                    self._invalidate_zone_cache(qname)
-                    return None
-                if _insecure_owners and not _unknown_owners:
-                    self._stats["insecure"] += 1
-                    self._stats["success"] += 1
-                    return resp
-                if _unknown_owners and not _insecure_owners:
-                    # unknown：既没有签名、也没有"该域名本就未签名"的证明。
-                    # 例外：bootstrap 递归兜底响应。兜底本身是可用性措施（迭代对
-                    # 某些 CDN 调度域名只回 NODATA），若把它一并丢弃，这类域名在
-                    # 纯迭代模式下就永远 SERVFAIL；而能走到这里说明区域状态
-                    # **无法证明**（secure 已在上面拒绝），因此放行并留 debug。
-                    if getattr(resp, "_bootstrap_fallback", False):
-                        self._stats["insecure"] += 1
-                        self._stats["success"] += 1
-                        logger.debug(
-                            "DNSSEC: bootstrap 兜底响应无签名、区域状态无法证明: %s，"
-                            "按可用性放行（未经验签）", _safe_qname(qname))
-                        self._last_release = "bootstrap"
-                        return resp
-                    self._stats["bogus"] += 1
-                    self._report_unsigned_unknown(qname)
-                    self._invalidate_zone_cache(qname)
-                    return None
-
-                # 混合：部分 owner 已证明未签名（insecure/error），其余无法证明
-                # （unknown）。没有 secure owner → 不是剥离攻击；按可用性放行
-                # 并留 debug（与 `answer_unsigned` 分支对 insecure/error 的放行
-                # 策略一致，不新增攻击面：攻击者同样只能靠阻断 DS 查询触发）。
-                self._stats["insecure"] += 1
-                self._stats["success"] += 1
-                logger.debug(
-                    "DNSSEC: %s 无 RRSIG，各 owner 状态混合"
-                    "（已证明未签名 %d 个 / 无法证明 %d 个）→ 按可用性放行",
-                    _safe_qname(qname), len(_insecure_owners), len(_unknown_owners))
-                return resp
-
-            # 对每个 signer 做链验证，收集可信 keys（{signer: DNSKEY RRset}）
-            #
-            # **并行**（2026-10-30）：CNAME 链常跨 2-3 个签名区（例：
-            # rockstargames.com → edgekey.net → akamaiedge.net，或
-            # bilibili → bilivideo），原实现挨个 await，每级 DNSKEY/DS 各一次
-            # 迭代（30-300ms），串行累加就是主要的冷解析延迟。
-            # `_get_trusted_dnskey` 自带缓存 + single-flight，并发调用安全：
-            # 同一 zone 的多个 signer 只会真的查一次。
-            trusted_keys: Dict = {}
-            # 父区无 DS（insecure 委托）的签名者：其 RRSIG 无法也无需验证
-            insecure_signers: set = set()
-            # 链「暂时不可用」（查询失败，重试也没成功）的签名者：不判 bogus
-            chain_unavailable_signers: set = set()
-            _signer_list = list(signers)
-            _keys_results = await asyncio.gather(
-                *[self._get_trusted_dnskey(s) for s in _signer_list],
-                return_exceptions=True,
-            )
-            for signer, _rrset in zip(_signer_list, _keys_results):
-                if isinstance(_rrset, BaseException):
-                    _rrset = None
-                if signer == dns.name.root:
-                    # 根区密钥来自内置信任锚（RFC 4033 §6）：用根锚验证根 DNSKEY 后
-                    # 才能验签 root 签名的 RRset。之前直接 continue 会让 trusted_keys
-                    # 缺 root → 验签 KeyError → 合法响应被误判 bogus（可用性缺陷）。
-                    if _rrset is None:
-                        self._stats["bogus"] += 1
-                        self._warn_dnssec_once(
-                            "root_signer", ".",
-                            "DNSSEC 根区 DNSKEY 验证失败，拒绝签名响应")
-                        return None
-                    trusted_keys[signer] = _rrset
-                    continue
-                if _rrset is None:
-                    if str(signer).lower() in getattr(self, "_chain_unavailable", ()):
-                        # 链暂时不可用（DS/DNSKEY 查询失败且重试失败）= 这次没取到
-                        # 证据，不是伪造。按可用性放行，不判 bogus、不告警
-                        # （与 _zone_signed_status 返回 "error" 时的策略一致）。
-                        chain_unavailable_signers.add(signer)
-                        continue
-                    # 链上取不到 key 要先分清原因：
-                    #   * 父区**没有 DS**（insecure 委托）→ 该区本来就不在 DNSSEC
-                    #     信任链上，RFC 4035 §5.2 要求把它当「未签名」处理。
-                    #     Cloudflare 等托管商默认给区签名、但域名没在注册商提交
-                    #     DS 时就是这种 island of security（实测 netsarang.net.：
-                    #     Cloudflare 签、net. 用 NSEC3 证明无 DS）。旧实现一律判
-                    #     bogus 并拒绝 → 这类域名全部失效 + 每查询一条警告。
-                    #   * 父区**有 DS** 但链验证失败 → 真 bogus（伪造/过期），拒绝。
-                    try:
-                        zs = await self._zone_signed_status(signer)
-                    except Exception:
-                        zs = "unknown"
-                    if zs in ("insecure", "error"):
-                        # insecure：父区无 DS（数学证明）；error：DS 查询失败。
-                        # 两者都无权要求验签，按未签名处理（与下方"无 RRSIG"分支
-                        # 对 insecure/error 的放行策略保持一致，不新增攻击面：
-                        # 攻击者同样可以让 DS 查询失败来触发这条放行）。
-                        insecure_signers.add(signer)
-                        logger.debug(
-                            "DNSSEC: %s 的父区无 DS（%s）→ 其签名按未签名处理"
-                            "（RFC 4035 §5.2），不判 bogus", _safe_qname(signer), zs)
-                        continue
-                    self._stats["bogus"] += 1
-                    self._warn_dnssec_once(
-                        "signer_chain", signer,
-                        "DNSSEC 链验证失败，拒绝 %s 的签名响应", _safe_qname(signer))
-                    self._invalidate_zone_cache(qname)
-                    return None
-                trusted_keys[signer] = _rrset
-
-            if chain_unavailable_signers:
-                # 有签名者的链因查询失败而暂时无法验证：整条响应按可用性放行
-                # （不设 AD 位），与 `_zone_signed_status == "error"` 同策略。
-                # 注意：这里**不**判 bogus、不打 WARNING —— 不能把"没取到证据"
-                # 说成"检测到伪造"。
-                self._stats["insecure"] += 1
-                self._stats["success"] += 1
-                logger.debug(
-                    "DNSSEC: %s 的签名者链暂时不可用（查询失败，非伪造）→ 放行: %s",
-                    _safe_qname(qname),
-                    ",".join(sorted(_safe_qname(s) for s in chain_unavailable_signers)),
-                )
-                self._last_release = "chain_unavailable"
-                return resp
-
-            if insecure_signers:
-                # 标记报文：`_find_rrsig_for` 会据此忽略这些未签名区的签名，
-                # 后续所有验签 / 否定证明 / CNAME 中间跳分支统一按「该 RRset
-                # 没有签名」处理，走既有的 DS 状态判定（insecure 放行）。
-                # 不需要改写报文本身（dnspython 2.8 的 Message 没有 delete_rrset），
-                # 客户端仍能拿到原始 RRSIG。
-                resp._insecure_signers = insecure_signers
-                for cm in cname_chain_msgs:
-                    cm._insecure_signers = insecure_signers
-                logger.debug(
-                    "DNSSEC: %s 的签名者位于未签名区（%s，父区无 DS）"
-                    "→ 按 RFC 4035 §5.2 视作未签名处理",
-                    _safe_qname(qname),
-                    ",".join(sorted(_safe_qname(s) for s in insecure_signers)),
-                )
-
-            # 关键安全约束 0：CNAME 链中间跳的 CNAME RRset 必须签名有效（若所在
-            # zone 是签名区）。中间跳响应在 _iterate 中被丢弃，MITM 可篡改 CNAME
-            # target（owner 不变）静默重定向——这里对链上每跳的 CNAME RRset 独立验签。
-            for cm in cname_chain_msgs:
-                for rrset in cm.answer:
-                    if rrset.rdtype != dns.rdatatype.CNAME:
-                        continue
-                    rrsig_set = self._find_rrsig_for(cm, rrset)
-                    if rrsig_set is None:
-                        # 无签名：仅未签名区（insecure）合法；签名区（secure）或
-                        # 无法证明（unknown）一律拒绝——与主流程 unknown 丢弃一致，
-                        # 防 MITM 注入"无 DS"响应把签名区误导为 unknown 后剥离签名
-                        try:
-                            zs = await self._zone_signed_status(rrset.name)
-                        except Exception:
-                            zs = "unknown"
-                        if zs != "insecure":
-                            self._stats["bogus"] += 1
-                            logger.warning(
-                                "DNSSEC CNAME 链中间跳无签名（%s）: %s", zs, _safe_qname(rrset.name))
-                            self._invalidate_zone_cache(qname)
-                            return None
-                        continue  # 未签名区 CNAME 无签名是合法的
-                    try:
-                        dns.dnssec.validate(rrset, rrsig_set, trusted_keys)
-                    except (dns.dnssec.ValidationFailure, KeyError) as e:
-                        self._stats["bogus"] += 1
-                        logger.warning("DNSSEC CNAME 链中间跳签名验证失败 %s: %s",
-                                       _safe_qname(rrset.name), e)
-                        self._invalidate_zone_cache(qname)
-                        return None
-                    # wildcard 检测（RFC 4035 §5.3.3）：该跳 CNAME RRset 的
-                    # RRSIG labels < owner labels → wildcard 展开——需该跳响应
-                    # 有 owner 无精确记录的 NSEC/NSEC3 否定证明（防 MITM 用
-                    # 真实签名 wildcard CNAME 替代精确 CNAME 重定向）。
-                    rr_labels = len(rrset.name.labels) - 1
-                    for rrsig in rrsig_set:
-                        if rrsig.labels >= rr_labels:
-                            continue
-                        # wildcard 展开：检查该跳响应 authority 的 NSEC/NSEC3
-                        # 是否证明 rrset.name 无精确 CNAME 记录，且 NSEC signer
-                        # == 该跳 CNAME RRSIG signer（signer 归属，防父区 NSEC
-                        # 冒充子区否定证明——与主应答分支 wc_signer_zone 对称）
-                        wc_hop_signer = str(rrsig.signer).rstrip(".").lower()
-                        wc_hop_ok = False
-                        for h_rr in cm.authority:
-                            if h_rr.rdtype not in (
-                                    dns.rdatatype.NSEC, dns.rdatatype.NSEC3):
-                                continue
-                            h_rrsig = self._find_rrsig_for(cm, h_rr)
-                            if h_rrsig is None:
-                                continue
-                            try:
-                                dns.dnssec.validate(h_rr, h_rrsig, trusted_keys)
-                            except (dns.dnssec.ValidationFailure, KeyError):
-                                continue
-                            # signer 归属：NSEC signer == 该跳 CNAME RRSIG signer
-                            h_sig_ok = False
-                            for hs in h_rrsig:
-                                if str(hs.signer).rstrip(".").lower() == wc_hop_signer:
-                                    h_sig_ok = True
-                                    break
-                            if not h_sig_ok:
-                                continue
-                            for hd in h_rr:
-                                if h_rr.rdtype == dns.rdatatype.NSEC:
-                                    # 仅区间覆盖证明 next closer 不存在（RFC 5155
-                                    # §8.6）；NODATA（owner==rrset.name 位图无 CNAME）
-                                    # 不适用——真实存在名字+真实签名 wildcard CNAME
-                                    # 组合会被误判（重定向注入）。
-                                    if self._nsec_covers(hd, h_rr.name, rrset.name):
-                                        # 委托点检查（与主 wildcard/NXDOMAIN 分支
-                                        # 对称）：区间覆盖 NSEC owner 为委托点则
-                                        # 不能作为"无精确记录"证明
-                                        h_deleg2 = (
-                                            self._nsec_has_type(
-                                                hd, dns.rdatatype.NS)
-                                            and not self._nsec_has_type(
-                                                hd, dns.rdatatype.SOA)
-                                        ) or self._nsec_has_type(
-                                            hd, dns.rdatatype.DS)
-                                        if not h_deleg2:
-                                            # RFC 5155 §8.8：中间跳 wildcard 正向
-                                            # 应答只需 next-closer 区间覆盖；owner
-                                            # 可为同 zone 兄弟名（跨区重放已由
-                                            # signer==wc_hop_signer 归属封死）
-                                            wc_hop_ok = True
-                                else:
-                                    h_oh = self._nsec3_owner_hash(h_rr.name)
-                                    h_th = self._nsec3_hash(
-                                        rrset.name, hd.salt, hd.iterations,
-                                        hd.algorithm)
-                                    if h_oh and h_th and \
-                                       not self._nsec3_optout(hd) and (
-                                            self._nsec3_interval_check(
-                                                h_th, h_oh, hd.next)):
-                                        # opt-out 委托检查（与 NSEC 分支对称）
-                                        h_deleg = (
-                                            self._nsec_has_type(
-                                                hd, dns.rdatatype.NS)
-                                            and not self._nsec_has_type(
-                                                hd, dns.rdatatype.SOA)
-                                        ) or self._nsec_has_type(
-                                            hd, dns.rdatatype.DS)
-                                        if not h_deleg:
-                                            # RFC 5155 §8.8：中间跳 wildcard 正向应答
-                                            # 只需 next-closer 区间覆盖；CE exact-match
-                                            # 与 *.CE 否定属 NXDOMAIN 语义不适用
-                                            #（*.CE 真实存在不可被区间否定）
-                                            wc_hop_ok = True
-                                            break
-                        if not wc_hop_ok:
-                            self._stats["bogus"] += 1
-                            logger.warning(
-                                "DNSSEC CNAME 链中间跳 wildcard 展开缺 NSEC 否定"
-                                "证明: %s", _safe_qname(rrset.name),
-                            )
-                            return None
-
-            # 验证所有非 RRSIG RRset 的签名（answer + authority）
-            # 关键安全约束 1：answer 段每个 RRset 必须单独有有效 RRSIG，
-            # 缺失即拒绝（防止攻击者剥离 answer RRSIG 后由 authority 段
-            # 真实重放的签名兜底绕过——部分剥离攻击）。
-            # 关键安全约束 2：RRset owner 必须与 qname 或 CNAME 链目标匹配
-            # （防止攻击者重放任意已签名 RRset 充当任意查询的答案，RFC 4035 §5.3）。
-            # 合法 owner 集合：原始 qname + 响应中 CNAME 链的所有目标（含跨区多跳
-            # 跟随累积的 target，来自 _iterate 保存的 _cname_targets）
-            legal_owners = {dns.name.from_text(qname)}
-            try:
-                for rrset in resp.answer:
-                    if rrset.rdtype != dns.rdatatype.CNAME:
-                        continue
-                    for rd in rrset:
-                        legal_owners.add(rd.target)
-                for t in getattr(resp, "_cname_targets", []) or []:
-                    legal_owners.add(dns.name.from_text(str(t)))
-                # L13 修复：不再向 legal_owners 加入 *.zone wildcard 名——
-                # wire 级 wildcard 合成应答的 owner 是展开后的查询名（RFC 4035 §3.1.3），
-                # 权威不会返回字面 *.zone 记录；下方对 owner 含 '*' 的 RRset 显式拒绝，
-                # 原 wildcard 加入逻辑为不可达死代码（审计 L13）。
-            except Exception:
-                pass
-            answer_unsigned: List[dns.rrset.RRset] = []
-            answer_validated = False
-            for rrset in resp.answer:
-                if rrset.rdtype == dns.rdatatype.RRSIG:
-                    continue
-                # owner 校验：answer RRset 的 owner 必须属于合法集合。
-                # 显式拒绝 owner 含 '*' 字面的 RRset：wire 级 wildcard 合成应答
-                # 的 owner 是展开后的查询名（RFC 4035 §3.1.3），owner 含 '*' 的
-                # RRset 是伪造（权威不会返回字面 *.zone 记录）。
-                if "*" in str(rrset.name):
-                    self._stats["bogus"] += 1
-                    logger.warning(
-                        "DNSSEC answer owner 含字面 *（伪造 wildcard 记录）: %s",
-                        _safe_qname(rrset.name),
-                    )
-                    return None
-                if rrset.name not in legal_owners:
-                    self._stats["bogus"] += 1
-                    logger.warning(
-                        "DNSSEC answer owner 不匹配（重放攻击）: %s 不属于 %s 的合法链",
-                        _safe_qname(rrset.name), _safe_qname(qname),
-                    )
-                    return None
-                rrsig_set = self._find_rrsig_for(resp, rrset)
-                if rrsig_set is None:
-                    answer_unsigned.append(rrset)
-                    continue
-                # RFC 4035 §5.3.1：RRSIG.signer 必须是包含 RRset owner 的
-                # zone apex；仅凭 signer 的 DNSKEY 验签不足以证明归属。
-                try:
-                    if not rrset.name.is_subdomain(rrsig_set[0].signer):
-                        self._stats["bogus"] += 1
-                        logger.warning(
-                            "DNSSEC answer RRSIG signer 不覆盖 owner: %s signer=%s",
-                            _safe_qname(rrset.name), rrsig_set[0].signer)
-                        return None
-                except Exception:
-                    self._stats["bogus"] += 1
-                    return None
-                try:
-                    dns.dnssec.validate(rrset, rrsig_set, trusted_keys)
-                    answer_validated = True
-                except (dns.dnssec.ValidationFailure, KeyError) as e:
-                    self._stats["bogus"] += 1
-                    logger.warning("DNSSEC answer 签名验证失败 %s (%s): %s",
-                                   _safe_qname(rrset.name), rrset.rdtype, e)
-                    return None
-
-            if answer_unsigned:
-                # answer 段某个 RRset 无 RRSIG：**不能一律判剥离攻击**——
-                # CNAME 链常跨到未签名区（实测 www.ripe.net →
-                # e337066.dscb.akamaiedge.net、c0.pki.goog →
-                # www3.l.google.com：akamaiedge.net / l.google.com 本身无 DS =
-                # insecure，无签名完全合法）。原实现把所有这类应答判成
-                # "部分剥离攻击"直接丢弃，纯迭代模式无加密上游可回退 → 这些
-                # 域名必 SERVFAIL（真实日志里的 c0.pki.goog 即此）。
-                # 改为逐个按 owner 所在 zone 的 DS 状态判定（与"整个响应无
-                # RRSIG"分支同一套判据，安全性不降级）：
-                #   insecure → 合法未签名，放行该 RRset
-                #   error    → DS 链查询失败（冷启动/权威不可达），按可用性放行
-                #   secure   → 签名区被剥离 RRSIG，真实的降级攻击 → 拒绝
-                #   unknown  → 无法证明，保守拒绝
-                _stripped = []
-                for rr in answer_unsigned:
-                    try:
-                        zs = await self._zone_signed_status(rr.name)
-                    except Exception:
-                        zs = "unknown"
-                    if zs in ("insecure", "error"):
-                        logger.debug(
-                            "DNSSEC: %s 无 RRSIG，但所在区域判定为 %s → 按未签名放行",
-                            _safe_qname(str(rr.name)), zs,
-                        )
-                        continue
-                    _stripped.append(rr)
-                if _stripped:
-                    # 例外：bootstrap 兜底响应（明文递归、本来不带 RRSIG），
-                    # 不能按剥离攻击丢弃 —— 与「完全无 RRSIG」分支同一策略
-                    if getattr(resp, "_bootstrap_fallback", False):
-                        self._stats["insecure"] += 1
-                        self._stats["success"] += 1
-                        logger.debug(
-                            "DNSSEC: bootstrap 兜底响应部分 RRset 无签名: %s，"
-                            "按可用性放行（未经验签）", _safe_qname(qname))
-                        self._last_release = "bootstrap"
-                        _stripped = []
-                    else:
-                        self._stats["bogus"] += 1
-                        logger.warning(
-                            "DNSSEC answer 段存在无签名 RRset（剥离攻击）: %s %s",
-                            _safe_qname(qname), [str(r.name) for r in _stripped][:3],
-                        )
-                        return None
-
-            if answer_unsigned and not answer_validated:
-                # answer 段有数据但**全部**未签名，且上面已逐个确认它们所在区域
-                # 是 insecure（或 DS 链查询失败按可用性放行）→ 这是「未签名区的
-                # 正应答」，合法。典型：www.ripe.net → e337066.dscb.akamaiedge.net
-                # （签名区 CNAME 到未签名 Akamai 区）、c0.pki.goog →
-                # www3.l.google.com。**不能**再按负应答要求 SOA/NSEC 否定证明——
-                # 正应答本来就没有，原逻辑会把它当"伪造负应答"丢弃。
-                self._stats["insecure"] += 1
-                self._stats["success"] += 1
-                logger.debug(
-                    "DNSSEC: %s 的正应答全部落在未签名区（%d 个 RRset），按 insecure 放行",
-                    _safe_qname(qname), len(answer_unsigned),
-                )
-                return resp
-
-            if answer_validated:
-                # answer 段全部签名验证通过 → secure
-                # wildcard inexact-match 校验（RFC 4035 §5.3.3）：wildcard 合成应答
-                # 的 owner 是展开后的查询名（wire 无 *.zone，RFC 4035 §3.1.3），
-                # 检测须用 RRSIG labels 字段：rrsig.labels < qname 的 label 数
-                # 表示签名覆盖通配名（如 *.example.com 签 www.example.com 时
-                # labels=2 < qname labels=3）。命中后需 authority 有 qname 的
-                # NSEC/NSEC3 否定证明（qname 自身无精确记录）——否则真实签名
-                # wildcard 记录可被重放替代精确应答。
-                wildcard_used = False
-                for rrset in resp.answer:
-                    if rrset.rdtype == dns.rdatatype.RRSIG:
-                        continue
-                    rrsig_w = self._find_rrsig_for(resp, rrset)
-                    if rrsig_w is None:
-                        continue
-                    # RFC 4035 §5.3.3：比较每个 RRset 自身 owner 的 labels
-                    # （CNAME 链目标与 qname 不同——按 owner 逐个比较防漏检/误报）
-                    rr_labels = len(rrset.name.labels) - 1
-                    for rrsig in rrsig_w:
-                        if rrsig.labels < rr_labels:
-                            wildcard_used = True
-                            break
-                    if wildcard_used:
-                        break
-                if wildcard_used:
-                    # wildcard 记录的签名 zone = rrsig signer（用于 signer 归属）
-                    wc_signer_zone = None
-                    for rrset in resp.answer:
-                        if rrset.rdtype == dns.rdatatype.RRSIG:
-                            continue
-                        rrsig_w = self._find_rrsig_for(resp, rrset)
-                        if rrsig_w is None:
-                            continue
-                        rr_labels = len(rrset.name.labels) - 1
-                        for rrsig in rrsig_w:
-                            if rrsig.labels < rr_labels:
-                                wc_signer_zone = str(rrsig.signer).rstrip(".").lower()
-                                break
-                        if wc_signer_zone:
-                            break
-                    # RFC 4035 §5.3.3：否定证明对象是**触发 wildcard 的 RRset 自身
-                    # owner**（CNAME 目标场景中非 qname）——对每个 wildcard 展开
-                    # RRset 用其 owner 做"无精确记录"否定证明，任一失败即拒绝。
-                    wc_rrsets = []
-                    for rrset in resp.answer:
-                        if rrset.rdtype == dns.rdatatype.RRSIG:
-                            continue
-                        rrsig_w = self._find_rrsig_for(resp, rrset)
-                        if rrsig_w is None:
-                            continue
-                        rr_labels = len(rrset.name.labels) - 1
-                        if any(rrsig.labels < rr_labels for rrsig in rrsig_w):
-                            wc_rrsets.append(rrset)
-                    for wc_rr in wc_rrsets:
-                        wc_target = wc_rr.name  # 该 RRset 自身 owner（非 qname）
-                        # signer 归属：按该 RRset 自身 RRSIG signer 计算
-                        #（跨区双 wildcard CNAME 链时后续 RRset 不再误拒）
-                        wc_signer_zone = None
-                        rrsig_w2 = self._find_rrsig_for(resp, wc_rr)
-                        if rrsig_w2 is not None:
-                            rr_labels2 = len(wc_rr.name.labels) - 1
-                            for rrsig2 in rrsig_w2:
-                                if rrsig2.labels < rr_labels2:
-                                    wc_signer_zone = str(rrsig2.signer).rstrip(
-                                        ".").lower()
-                                    break
-                        wildcard_proven = False
-                        for a_rr in resp.authority:
-                            if a_rr.rdtype not in (
-                                    dns.rdatatype.NSEC, dns.rdatatype.NSEC3):
-                                continue
-                            a_rrsig = self._find_rrsig_for(resp, a_rr)
-                            if a_rrsig is None:
-                                continue
-                            try:
-                                dns.dnssec.validate(a_rr, a_rrsig, trusted_keys)
-                            except (dns.dnssec.ValidationFailure, KeyError):
-                                continue
-                            # signer 归属：NSEC/NSEC3 signer 必须等于 wildcard answer
-                            # RRset 的 RRSIG signer（wildcard 记录的签名 zone）——
-                            # 防跨区重放任意签名区的 NSEC 证明无精确记录。
-                            if wc_signer_zone:
-                                sig_ok = False
-                                for rrsig in a_rrsig:
-                                    if str(rrsig.signer).rstrip(".").lower() == \
-                                       wc_signer_zone:
-                                        sig_ok = True
-                                        break
-                                if not sig_ok:
-                                    continue  # 跨区 NSEC → 不认作本 zone 证明
-                            for ad in a_rr:
-                                if a_rr.rdtype == dns.rdatatype.NSEC:
-                                    # wc_target 无精确记录：仅区间覆盖证明 next closer
-                                    # 不存在（RFC 5155 §8.6）——NODATA 语义
-                                    # （owner==wc_target 位图无类型）不适用：真实存在的
-                                    # 名字 + 真实签名 wildcard 组合会被误判为合法
-                                    # wildcard 展开（数据注入）。
-                                    if self._nsec_covers(ad, a_rr.name, wc_target):
-                                        nsec_owner_deleg = (
-                                            self._nsec_has_type(
-                                                ad, dns.rdatatype.NS)
-                                            and not self._nsec_has_type(
-                                                ad, dns.rdatatype.SOA)
-                                        ) or self._nsec_has_type(
-                                            ad, dns.rdatatype.DS)
-                                        if not nsec_owner_deleg:
-                                            # RFC 5155 §8.8：wildcard 正向应答只需
-                                            # next-closer 区间覆盖；owner 可为同 zone
-                                            # 兄弟名（跨区重放已由 signer==wc_signer_zone
-                                            # 归属封死）
-                                            wildcard_proven = True
-                                            break
-                                else:
-                                    oh = self._nsec3_owner_hash(a_rr.name)
-                                    th = self._nsec3_hash(
-                                        wc_target, ad.salt, ad.iterations, ad.algorithm)
-                                    if oh and th and \
-                                       not self._nsec3_optout(ad) and (
-                                            self._nsec3_interval_check(
-                                                th, oh, ad.next)):
-                                        # opt-out 委托检查（与 NSEC 分支对称）：
-                                        # 位图含 NS 且不含 SOA，或含 DS → 委托点，
-                                        # NSEC3 区间覆盖不能作为"无精确记录"证明
-                                        nsec3_deleg = (
-                                            self._nsec_has_type(
-                                                ad, dns.rdatatype.NS)
-                                            and not self._nsec_has_type(
-                                                ad, dns.rdatatype.SOA)
-                                        ) or self._nsec_has_type(
-                                            ad, dns.rdatatype.DS)
-                                        if not nsec3_deleg:
-                                            # RFC 5155 §8.8 / RFC 4035 §5.3.4：wildcard
-                                            # 正向应答只需 next-closer 区间覆盖证明
-                                            #（*.CE 真实存在，其 hash 是链上 owner，
-                                            # 无需也不能被区间否定；CE exact-match
-                                            # 属 NXDOMAIN 负应答语义，不适用于此）
-                                            wildcard_proven = True
-                                            break
-                        # 关键：逐个 wildcard RRset 校验（循环内判定）——任一未证明即拒绝，
-                        # 否则含多个 wildcard RRset 时只有最后一个被校验（重放绕过）。
-                        if not wildcard_proven:
-                            self._stats["bogus"] += 1
-                            logger.warning(
-                                "DNSSEC wildcard 响应缺 %s 无精确记录证明"
-                                "（重放替代精确应答）: %s", _safe_qname(wc_target), _safe_qname(qname),
-                            )
-                            return None
-                # 关键安全约束：answer 含 CNAME 但无目标类型（A/AAAA）RRset 时，
-                # 目标 RRset 可能被整体删除（非"无签名"）——须有 NSEC/NSEC3
-                # 证明目标 NODATA 才放行，否则拒绝（防吞真实 A/AAAA）。
-                has_target_type = any(
-                    rrset.rdtype == qtype for rrset in resp.answer)
-                has_cname = any(
-                    rrset.rdtype == dns.rdatatype.CNAME for rrset in resp.answer)
-                if has_cname and not has_target_type:
-                    # 可能合法：CNAME 目标同 zone 且真实无目标类型——权威返回
-                    # CNAME(签名) + SOA + NSEC(owner=目标, 位图无 qtype)（RFC 4035
-                    # §5.2）。检查 authority 是否有目标的 NSEC NODATA 证明。
-                    target_nsec_nodata = False
-                    # 目标提取：优先 _cname_targets，否则从 answer CNAME RRset 提取
-                    tgt = None
-                    if hasattr(resp, "_cname_targets") and resp._cname_targets:
-                        tgt = resp._cname_targets[-1]
-                    if tgt is None:
-                        for rrset in resp.answer:
-                            if rrset.rdtype != dns.rdatatype.CNAME:
-                                continue
-                            for rd in rrset:
-                                tgt = str(rd.target)
-                                break
-                            if tgt:
-                                break
-                    if tgt is not None:
-                        try:
-                            tgt_name = dns.name.from_text(str(tgt))
-                            # signer 归属：NSEC signer 须 == SOA owner zone
-                            # （与负应答分支对称，防跨区重放）
-                            cname_soa_zone: Optional[dns.name.Name] = None
-                            for s_rr in resp.authority:
-                                if s_rr.rdtype == dns.rdatatype.SOA:
-                                    cname_soa_zone = s_rr.name
-                                    break
-                            for a_rr in resp.authority:
-                                # 支持 NSEC 与 NSEC3 的 NODATA 证明
-                                if a_rr.rdtype not in (
-                                        dns.rdatatype.NSEC, dns.rdatatype.NSEC3):
-                                    continue
-                                # 关键：NSEC/NSEC3 必须签名有效（防剥离 A 后塞无签名
-                                # NSEC 绕过）——与负应答分支同等要求
-                                a_rrsig = self._find_rrsig_for(resp, a_rr)
-                                if a_rrsig is None:
-                                    continue
-                                try:
-                                    dns.dnssec.validate(a_rr, a_rrsig, trusted_keys)
-                                except (dns.dnssec.ValidationFailure, KeyError):
-                                    continue
-                                # signer==SOA owner zone 归属校验
-                                if cname_soa_zone is not None:
-                                    sig_ok = False
-                                    for rrsig in a_rrsig:
-                                        if str(rrsig.signer).rstrip(".").lower() == \
-                                           str(cname_soa_zone).rstrip(".").lower():
-                                            sig_ok = True
-                                            break
-                                    if not sig_ok:
-                                        continue
-                                for ad in a_rr:
-                                    if a_rr.rdtype == dns.rdatatype.NSEC:
-                                        # 委托点检查（与主分支对称）：位图含 NS
-                                        # 且不含 SOA，或含 DS → 委托点 NSEC 不能
-                                        # 作为目标"无类型/NXDOMAIN"证明
-                                        tgt_ns_deleg = (
-                                            self._nsec_has_type(
-                                                ad, dns.rdatatype.NS)
-                                            and not self._nsec_has_type(
-                                                ad, dns.rdatatype.SOA)
-                                        ) or self._nsec_has_type(
-                                            ad, dns.rdatatype.DS)
-                                        if tgt_ns_deleg:
-                                            continue
-                                        # NODATA（owner==目标 位图无 qtype）或
-                                        # NXDOMAIN（区间覆盖目标）均合法
-                                        if self._nsec_proves_no_type(
-                                                ad, a_rr.name, tgt_name, qtype):
-                                            target_nsec_nodata = True
-                                            break
-                                        if self._nsec_covers(
-                                                ad, a_rr.name, tgt_name):
-                                            # RFC 8020 语义：owner 与目标同 zone
-                                            #（跨区重放已由 signer==cname_soa_zone
-                                            # 归属封死；真实 NSEC owner 可为兄弟名）
-                                            if cname_soa_zone is None or \
-                                               a_rr.name.is_subdomain(cname_soa_zone):
-                                                # M4 修复：RFC 8020 —— 权威签名 NSEC
-                                                # 区间覆盖 CNAME 目标即目标 NXDOMAIN 的
-                                                # 合法证明（signer==SOA zone 已在上方校验），
-                                                # 直接认可；原代码错误套用 RFC 4035 §5.3.3
-                                                # 正向 wildcard 应答的 CE+*.CE 双证明，
-                                                # 误拒仅返回单 NSEC 覆盖的标准负应答。
-                                                target_nsec_nodata = True
-                                                break
-                                    else:
-                                        oh = self._nsec3_owner_hash(a_rr.name)
-                                        th = self._nsec3_hash(
-                                            tgt_name, ad.salt, ad.iterations,
-                                            ad.algorithm)
-                                        # NSEC3 opt-out 委托检查（与主分支对称）
-                                        tgt_n3_deleg = (
-                                            self._nsec_has_type(
-                                                ad, dns.rdatatype.NS)
-                                            and not self._nsec_has_type(
-                                                ad, dns.rdatatype.SOA)
-                                        ) or self._nsec_has_type(
-                                            ad, dns.rdatatype.DS)
-                                        if tgt_n3_deleg:
-                                            continue
-                                        if oh and th and th == oh and \
-                                           not self._nsec_has_type(ad, qtype):
-                                            target_nsec_nodata = True
-                                            break
-                                        # NSEC3 区间覆盖（NXDOMAIN 语义，与 NSEC
-                                        # 分支对称）：目标不存在。M4 修复后直接认可
-                                        #（签名 + opt-out 排除 + signer 归属已校验）。
-                                        if oh and th and \
-                                           not self._nsec3_optout(ad) and \
-                                           self._nsec3_interval_check(
-                                               th, oh, ad.next):
-                                            # M4 修复：NSEC3 区间覆盖目标即目标
-                                            # NXDOMAIN 的合法签名证明（RFC 5155 §8.4，
-                                            # opt-out 已排除；同 zone signer 已校验），
-                                            # 直接认可；原 CE+*.CE 双证明对负应答过严，
-                                            # 误拒标准 NSEC3 覆盖证明。
-                                            target_nsec_nodata = True
-                                            break
-                        except Exception:
-                            pass
-                    if not target_nsec_nodata:
-                        # CNAME 目标区**未签名**时，NODATA 本来就不会有
-                        # NSEC/NSEC3（未签名区不发布否定证明）。此时缺 NSEC
-                        # 是合法的，不能按“删除攻击”拒绝——实测
-                        # ocsp.pki.goog AAAA → pki-goog.l.google.com
-                        # （pki.goog 签名区 CNAME 到 google.com 未签名区），
-                        # 8.8.8.8 返回 CNAME+RRSIG+SOA、无 NSEC，被误判。
-                        # 目标区 secure / unknown 时仍保持拒绝（真正的删除
-                        # 攻击或无法证明，不能放）。
-                        tgt_status = await self._zone_signed_status(tgt_name)
-                        if tgt_status in ("insecure", "error"):
-                            self._stats["insecure"] += 1
-                            self._stats["success"] += 1
-                            logger.debug(
-                                "DNSSEC CNAME 目标区未签名（%s），NODATA 无 NSEC "
-                                "合法，放行: %s", tgt_status, _safe_qname(tgt_name),
-                            )
-                            return resp
-                        self._stats["bogus"] += 1
-                        logger.warning(
-                            "DNSSEC answer 含 CNAME 但目标类型 %s 缺失且无签名 "
-                            "NSEC NODATA 证明（删除攻击）: %s", qtype, _safe_qname(qname),
-                        )
-                        return None
-                self._stats["secure"] += 1
-                self._stats["success"] += 1
-                # 本地链验证通过 → 置 AD 位，客户端可区分 secure/insecure
-                resp.flags |= dns.flags.AD
-                return resp
-
-            # 负应答（NXDOMAIN/NODATA）场景：answer 空，验证 authority 段签名
-            # （SOA/NSEC 由权威签名，数学验证其真实性；任一无签名即拒绝，
-            #  防止攻击者剥离 NSEC/NSEC3 的 RRSIG 放行伪造否定应答）
-            # 关键安全约束：NSEC/NSEC3 必须做区间语义校验（与 _zone_signed_status
-            # 一致），签名只能证明"NSEC 是某区真实签署的"，不能证明区间覆盖本次
-            # qname——防止攻击者重放任意区的有效签名 NSEC 伪造 NXDOMAIN/NODATA。
-            auth_unsigned: List[dns.rrset.RRset] = []
-            nsec_semantic_ok = False
-            # 是否有**任一** NSEC/NSEC3 的区间覆盖了被查名（根区例外判定用）
-            nsec_covers_any = False
-            has_nsec = False
-            # SOA owner 必须是 qname 的权威 zone（qname 或祖先 apex）——
-            # 防重放任意签名区真实 SOA+RRSIG 伪造任意域名 NODATA 空应答
-            soa_owner_valid = False
-            soa_owner_zone: Optional[dns.name.Name] = None
-            qn = dns.name.from_text(qname)
-            # **最终查询名**（2026-10-31）：负应答的 authority 段由**最后一级权威**
-            # 产生。CNAME 跨区时（例：www.foo.com → edge.cdn.net，cdn.net 返回
-            # NXDOMAIN），SOA owner 是 cdn.net，而 `qn` 仍是原始 www.foo.com——
-            # 用 `qn` 找祖先会得到 None，于是后面所有 NSEC 都被判
-            # 「NSEC signer 非 (无SOA) 权威 zone（跨区重放）」而整条拒绝
-            # （实测同一秒刷 14 条 WARNING，对应某个跨区域名的 A/AAAA 反复重试）。
-            # 这里改用 CNAME 链终点做祖先判定；**无 CNAME 时 qn_final == qn，
-            # 与原有行为完全一致**，"重放任意区 SOA" 的防护仍然成立
-            # （SOA owner 必须是 qn_final 的祖先）。
-            qn_final = qn
-            try:
-                _targets = getattr(resp, "_cname_targets", None) or []
-                if _targets:
-                    qn_final = dns.name.from_text(str(_targets[-1]))
-            except Exception:
-                qn_final = qn
-            # 后续所有 NSEC/NSEC3 否定证明与 closest-encloser 计算都针对
-            # **最终查询名**（CNAME 链终点）——权威证明的是"终点不存在"，
-            # 而不是原始查询名。无 CNAME 时两者相同，行为不变。
-            qn = qn_final
-            # RFC 6604 CNAME+NXDOMAIN：负应答 answer 段可能含 CNAME（指向不存在
-            # 目标的链）——与正应答对称：answer 段 CNAME 有签名必验、无签名按
-            # zone 状态拒绝（防攻击者在签名区负应答注入未签名 CNAME）。
-            for rrset in resp.answer:
-                if rrset.rdtype != dns.rdatatype.CNAME:
-                    continue
-                rrset_sig = self._find_rrsig_for(resp, rrset)
-                if rrset_sig is None:
-                    # 无签名：仅未签名区合法；secure/unknown 一律拒绝。
-                    #
-                    # ★ 这里把 "error"（DS 链查询超时/权威不可达）与正应答分支
-                    #   （`answer_unsigned` 里的 `zs in ("insecure","error")`）
-                    #   对齐：两者同一语义，冷启动第一次 DS 查询失败时若按 bogus
-                    #   拒绝，负应答会被误判成"签名被剥离"（实测 c.pki.goog 这类
-                    #   CNAME 到未签名区的名字，冷启动必然踩到）。
-                    try:
-                        zs_neg = await self._zone_signed_status(rrset.name)
-                    except Exception:
-                        zs_neg = "unknown"
-                    if zs_neg not in ("insecure", "error"):
-                        self._stats["bogus"] += 1
-                        logger.warning(
-                            "DNSSEC 负应答 answer CNAME 无签名（%s）: %s",
-                            zs_neg, _safe_qname(rrset.name),
-                        )
-                        return None
-                    continue
-                try:
-                    dns.dnssec.validate(rrset, rrset_sig, trusted_keys)
-                except (dns.dnssec.ValidationFailure, KeyError) as e:
-                    self._stats["bogus"] += 1
-                    logger.warning("DNSSEC 负应答 answer CNAME 签名验证失败 %s: %s",
-                                   _safe_qname(rrset.name), e)
-                    return None
-            for rrset in resp.authority:
-                if rrset.rdtype == dns.rdatatype.RRSIG:
-                    continue
-                if rrset.rdtype == dns.rdatatype.SOA:
-                    # SOA owner 必须是 qn_final（CNAME 链终点）的祖先**或等于**它。
-                    # 用 is_subdomain 而不是手写 parent() 循环：**必须包含根区**——
-                    # 根区负应答（不存在的 TLD，例如 Firefox 的
-                    # smartblock.firefox.etp / .local / .invalid）的 SOA owner 就是
-                    # 根 "."，原来 `while anc != dns.name.root` 把 root 排除在外，
-                    # 导致 soa_owner_zone 恒为 None → 后面所有 NSEC 都被判
-                    # 「NSEC signer 非 (无SOA) 权威 zone（跨区重放）」整条拒绝
-                    # （实测同一秒刷 14 条 WARNING，对应 .etp 的 A/AAAA/HTTPS 反复重试）。
-                    try:
-                        if qn_final == rrset.name or qn_final.is_subdomain(rrset.name):
-                            soa_owner_valid = True
-                            soa_owner_zone = rrset.name
-                    except Exception:
-                        pass
-                rrsig_set = self._find_rrsig_for(resp, rrset)
-                if rrsig_set is None:
-                    auth_unsigned.append(rrset)
-                    continue
-                try:
-                    dns.dnssec.validate(rrset, rrsig_set, trusted_keys)
-                except (dns.dnssec.ValidationFailure, KeyError) as e:
-                    self._stats["bogus"] += 1
-                    logger.warning("DNSSEC authority 签名验证失败 %s (%s): %s",
-                                   _safe_qname(rrset.name), rrset.rdtype, e)
-                    return None
-                # NSEC/NSEC3 区间语义校验：证明的必须是被查名 qname
-                # NXDOMAIN → 区间覆盖（owner < qname < next）
-                # NODATA  → owner == qname（NSEC 存在但无目标类型）
-                # 权威 zone 归属校验（RFC 4035 §5.4）：NSEC/NSEC3 的 RRSIG
-                # signer 必须属于 SOA owner 表明的权威 zone——防重放跨区 NSEC
-                # （如 com 区 NSEC 冒充 example.com 的 NODATA 证明吞真实 A）
-                if rrset.rdtype in (dns.rdatatype.NSEC, dns.rdatatype.NSEC3):
-                    has_nsec = True
-                    is_nxdomain = (resp.rcode() == dns.rcode.NXDOMAIN)
-                    # 归属校验：rrsig signer 必须 == SOA owner zone（RFC 4035 §5.4）。
-                    # 权威负应答必须含 SOA（SOA owner 即权威 zone）——无 SOA 的
-                    # NSEC 无法绑定 zone 归属，一律拒绝（防跨区重放）。
-                    nsec_zone_ok = False
-                    if soa_owner_zone is not None:
-                        for rrsig in rrsig_set:
-                            if str(rrsig.signer).rstrip(".").lower() == \
-                               str(soa_owner_zone).rstrip(".").lower():
-                                nsec_zone_ok = True
-                                break
-                    if not nsec_zone_ok:
-                        self._stats["bogus"] += 1
-                        logger.warning(
-                            "DNSSEC 负应答 NSEC signer 非 %s 权威 zone（跨区重放）— 拒绝: %s"
-                            "（CNAME 终点 %s）",
-                            soa_owner_zone if soa_owner_zone is not None else "(无SOA)",
-                            _safe_qname(qname),
-                            _safe_qname(str(qn_final)),
-                        )
-                        return None
-                    for rdata in rrset:
-                        if rrset.rdtype == dns.rdatatype.NSEC:
-                            if is_nxdomain:
-                                # closest-encloser 校验（RFC 4035 §5.4 / RFC 8020）：
-                                # NSEC 区间覆盖的 owner 若含 NS/DS（委托点），说明
-                                # qname 可能属于更深委托区，仅凭父区 NSEC 区间覆盖
-                                # 不能证明 NXDOMAIN——需更深 zone 的 NSEC 证明。
-                                # 例：com.ua 区 NSEC(owner=example.com.ua 委托点,
-                                # next=zzz.com.ua) 区间覆盖 foo.example.com.ua——
-                                # 若 example.com.ua 是真实委托，foo 属其子区，
-                                # 此 NSEC 不能证明 foo 不存在。
-                                if self._nsec_covers(rdata, rrset.name, qn):
-                                    nsec_covers_any = True
-                                    # RFC 8020 语义：owner 与被查名同 zone（且非
-                                    # 委托点，见下）即可——真实权威的 next-closer
-                                    # NSEC owner 常为同 zone 前驱兄弟名（如
-                                    # NSEC(bar.example.com→www) 覆盖 foo），非祖先。
-                                    # 跨 zone 重放已由 signer==SOA owner 归属封死。
-                                    if soa_owner_zone is not None and \
-                                       not rrset.name.is_subdomain(soa_owner_zone):
-                                        logger.debug(
-                                            "DNSSEC NXDOMAIN NSEC owner %s 非 %s "
-                                            "同 zone（跨区）— 拒绝",
-                                            _safe_qname(rrset.name), _safe_qname(soa_owner_zone),
-                                        )
-                                        continue
-                                    owner_is_delegation = (
-                                        self._nsec_has_type(rdata, dns.rdatatype.NS)
-                                        and not self._nsec_has_type(
-                                            rdata, dns.rdatatype.SOA)
-                                    ) or self._nsec_has_type(rdata, dns.rdatatype.DS)
-                                    # **qname 不在该委托点之下时，「委托」标记不适用**
-                                    #（2026-10-31）：NSEC(owner=et., next=eu.) 覆盖
-                                    # smartblock.firefox.etp，证明的是"etp. 这个 TLD
-                                    # 不存在"——etp 与 et **同级**，不是 et 的子区。
-                                    # 原实现只要 owner 含 DS/NS 就保守拒绝，导致所有
-                                    # 不存在的 TLD（.etp / .local / .invalid）都被判
-                                    # 「NSEC/NSEC3 区间不覆盖（重放攻击）」整条拒绝
-                                    # （实测 Firefox 的 smartblock.firefox.etp 每秒
-                                    # 刷十几条 WARNING）。仅当被查名**落在委托之下**
-                                    # （可能属于更深 zone）时才需要更深层的证明。
-                                    if owner_is_delegation:
-                                        try:
-                                            if not qn.is_subdomain(rrset.name):
-                                                owner_is_delegation = False
-                                        except Exception:
-                                            pass
-                                    if not owner_is_delegation:
-                                        # wildcard 否定检查（RFC 7129 §5.3.3）：
-                                        # 需证明 *.CE（CE=覆盖 NSEC owner）也不存在。
-                                        # 完整证明需两个 NSEC：qname 区间覆盖 +
-                                        # *.CE 区间覆盖（wildcard 否定）。检查响应
-                                        # authority 中是否有 NSEC 覆盖 *.owner。
-                                        owner_txt = str(rrset.name).lower()
-                                        next_txt = str(rdata.next).lower()
-                                        if "*" in owner_txt or "*" in next_txt:
-                                            logger.debug(
-                                                "DNSSEC NXDOMAIN NSEC 含 wildcard"
-                                                "（%s）— 保守拒绝", _safe_qname(rrset.name),
-                                            )
-                                            continue
-                                        # *.CE wildcard 否定：CE 是 qname 沿祖先链的
-                                        # 最深存在祖先（authority 中某 NSEC owner
-                                        # exact-match），而非覆盖 NSEC 的 owner——
-                                        # 后者构造的 *.owner 因 '*' 是 label 首字符
-                                        # 最小值而恒被同一 NSEC 覆盖（owner < *.owner
-                                        # < next），检查形同虚设。先求 CE 再否定 *.CE。
-                                        ce_nx = None
-                                        anc_nx = qn.parent()
-                                        while anc_nx is not None and \
-                                              anc_nx != dns.name.root:
-                                            # 到达 SOA owner zone 边界即停（显式
-                                            # 分支，避免三元优先级陷阱）
-                                            if soa_owner_zone is not None and \
-                                               not anc_nx.is_subdomain(soa_owner_zone):
-                                                break
-                                            for c_rr in resp.authority:
-                                                if c_rr.rdtype != dns.rdatatype.NSEC:
-                                                    continue
-                                                if c_rr.name == anc_nx:
-                                                    ce_nx = anc_nx
-                                                    break
-                                            if ce_nx is not None:
-                                                break
-                                            anc_nx = anc_nx.parent()
-                                        if ce_nx is None:
-                                            # 无 CE exact-match → 无法证明 wildcard
-                                            # 否定，保守拒绝
-                                            logger.debug(
-                                                "DNSSEC NXDOMAIN 缺 CE exact-match"
-                                                "（%s）— 保守拒绝", _safe_qname(qname),
-                                            )
-                                            continue
-                                        try:
-                                            wc_name = dns.name.from_text(
-                                                "*." + str(ce_nx))
-                                            wc_covered = False
-                                            for w_rr in resp.authority:
-                                                if w_rr.rdtype != dns.rdatatype.NSEC:
-                                                    continue
-                                                w_rrsig = self._find_rrsig_for(
-                                                    resp, w_rr)
-                                                if w_rrsig is None:
-                                                    continue
-                                                # 辅助记录 signer==SOA owner zone
-                                                #（纵深对齐，验签由外层循环兜底）
-                                                if soa_owner_zone is not None:
-                                                    w_sig_ok = False
-                                                    for w_rs in w_rrsig:
-                                                        if str(w_rs.signer).rstrip(
-                                                                ".").lower() == \
-                                                           str(soa_owner_zone).rstrip(
-                                                               ".").lower():
-                                                            w_sig_ok = True
-                                                            break
-                                                    if not w_sig_ok:
-                                                        continue
-                                                for wd in w_rr:
-                                                    if self._nsec_covers(
-                                                            wd, w_rr.name, wc_name):
-                                                        wc_covered = True
-                                                        break
-                                                if wc_covered:
-                                                    break
-                                        except Exception:
-                                            wc_covered = False
-                                        if wc_covered:
-                                            nsec_semantic_ok = True
-                                        else:
-                                            logger.debug(
-                                                "DNSSEC NXDOMAIN 缺 *.CE wildcard "
-                                                "否定证明（%s）— 保守拒绝",
-                                                _safe_qname(ce_nx),
-                                            )
-                                    else:
-                                        # owner 是委托点：需检查 qname 与 owner 之间
-                                        # 是否有更深 zone 存在——无法证明，保守拒绝
-                                        logger.debug(
-                                            "DNSSEC NXDOMAIN NSEC owner %s 是委托点，"
-                                            "qname %s 需更深 zone 证明 — 保守拒绝",
-                                            _safe_qname(rrset.name), _safe_qname(qname),
-                                        )
-                            else:
-                                # NODATA：owner==qname 且位图不含查询类型 qtype
-                                if self._nsec_proves_no_type(
-                                        rdata, rrset.name, qn, qtype):
-                                    nsec_semantic_ok = True
-                        else:
-                            # NSEC3：与 NSEC 分支对称，按 is_nxdomain 分流
-                            # NXDOMAIN → 仅区间覆盖（hash 落在 (owner,next) 开区间）
-                            # NODATA  → 仅 hash==owner 匹配且位图不含 qtype
-                            owner_hash = self._nsec3_owner_hash(rrset.name)
-                            if not owner_hash:
-                                continue
-                            target_hash = self._nsec3_hash(
-                                qn, rdata.salt, rdata.iterations, rdata.algorithm)
-                            if not target_hash:
-                                continue
-                            if is_nxdomain:
-                                # NSEC3 NXDOMAIN：区间覆盖 + closest-encloser
-                                # （RFC 5155 §8.9）。
-                                #
-                                # ★ Opt-Out 不能被排除（RFC 5155 §8.6）：.com / .net
-                                #   这类大区用 opt-out 省略未签名委托的 NSEC3，
-                                #   其区间覆盖正是**标准**的 NXDOMAIN 证明。
-                                #   旧实现用 `not optout` 直接跳过所有 opt-out
-                                #   NSEC3 → `.com` 下任何不存在的域名都判"区间
-                                #   不覆盖"并拒绝（差分测试实测 nonexistent-*.com）。
-                                #   安全性：opt-out 覆盖意味着"该名字不存在**或**是
-                                #   未签名委托"，后者在 DNS 层同样没有该名字的记录，
-                                #   返回 NXDOMAIN 与权威一致（RFC 5155 §9.2）。
-                                if self._nsec3_interval_check(
-                                        target_hash, owner_hash, rdata.next):
-                                    owner_is_deleg = (
-                                        self._nsec_has_type(rdata, dns.rdatatype.NS)
-                                        and not self._nsec_has_type(
-                                            rdata, dns.rdatatype.SOA)
-                                    ) or self._nsec_has_type(rdata, dns.rdatatype.DS)
-                                    if (not owner_is_deleg) or self._nsec3_optout(rdata):
-                                        # RFC 5155 §8.9：NXDOMAIN 需 closest-encloser
-                                        # 存在性证明——qname 覆盖 NSEC3 的 owner hash
-                                        # 应对应 qname 的某祖先（closest-encloser 的
-                                        # hash 由另一 NSEC3 记录的存在性证明）。当前
-                                        # 无法验证 CE 存在性与 wildcard 否定时，
-                                        # 保守要求：区间覆盖的 owner hash 需是 qname
-                                        # 祖先的 hash（若 NSEC3 位图含 NS/DS 已拒）。
-                                        # 此处额外检查：响应中须有覆盖 qname 各级
-                                        # 祖先 hash 的 NSEC3（CE 存在性近似证明）。
-                                        # CE 存在性：真实 CE 的 hash 恰是链中某 NSEC3
-                                        # 的 owner（exact-match）或落在某 NSEC3 区间
-                                        # 内——遍历 qname 全部祖先（至 SOA owner zone
-                                        # 含）并检查 authority 所有 NSEC3 记录。
-                                        ce_covered = False
-                                        ce_found_name: Optional[dns.name.Name] = None
-                                        anc_ce = qn.parent()
-                                        while anc_ce is not None and \
-                                              anc_ce != dns.name.root:
-                                            ce_hash = self._nsec3_hash(
-                                                anc_ce, rdata.salt,
-                                                rdata.iterations, rdata.algorithm)
-                                            if ce_hash:
-                                                if ce_hash == owner_hash:
-                                                    ce_covered = True
-                                                    ce_found_name = anc_ce
-                                                    break
-                                                # 仅 exact-match 证明 CE 存在；
-                                                # 区间覆盖 = 该祖先不存在，不是
-                                                # CE 存在性证明（RFC 5155 §8.9）
-                                                for o_rr in resp.authority:
-                                                    if o_rr.rdtype != dns.rdatatype.NSEC3:
-                                                        continue
-                                                    # 辅助记录 signer==SOA owner zone
-                                                    o_rrsig = self._find_rrsig_for(
-                                                        resp, o_rr)
-                                                    if o_rrsig is None:
-                                                        continue
-                                                    if soa_owner_zone is not None:
-                                                        o_sig_ok = False
-                                                        for o_rs in o_rrsig:
-                                                            if str(o_rs.signer).rstrip(
-                                                                    ".").lower() == \
-                                                               str(soa_owner_zone).rstrip(
-                                                                   ".").lower():
-                                                                o_sig_ok = True
-                                                                break
-                                                        if not o_sig_ok:
-                                                            continue
-                                                    o_oh = self._nsec3_owner_hash(o_rr.name)
-                                                    if o_oh and ce_hash == o_oh:
-                                                        ce_covered = True
-                                                        ce_found_name = anc_ce
-                                                        break
-                                                if ce_covered:
-                                                    break
-                                            # 到达 SOA owner zone 即停
-                                            if soa_owner_zone is not None and \
-                                               anc_ce == soa_owner_zone:
-                                                break
-                                            anc_ce = anc_ce.parent()
-                                        if ce_covered:
-                                            # RFC 5155 §8.9 第三证明项：*.CE wildcard
-                                            # 否定——需有 NSEC3 覆盖 hash(*.CE)（证明
-                                            # wildcard 也不存在），与 NSEC 分支的
-                                            # *.CE 双 NSEC 对称。缺则保守拒绝。
-                                            wc_ce_name = None
-                                            # 用第二项证明找到的 CE（ce_found_name）
-                                            # 构造 *.CE，保持一致性
-                                            if ce_found_name is not None:
-                                                try:
-                                                    wc_ce_name = dns.name.from_text(
-                                                        "*." + str(ce_found_name))
-                                                except Exception:
-                                                    wc_ce_name = None
-                                            if wc_ce_name is None:
-                                                for ce_anc2 in (qn.parent(),
-                                                                qn.parent().parent()):
-                                                    if ce_anc2 is None or \
-                                                       ce_anc2 == dns.name.root:
-                                                        continue
-                                                    try:
-                                                        wc_ce_name = dns.name.from_text(
-                                                            "*." + str(ce_anc2))
-                                                        break
-                                                    except Exception:
-                                                        continue
-                                            wc_ce_negated = False
-                                            if wc_ce_name is not None:
-                                                wc_ce_hash = self._nsec3_hash(
-                                                    wc_ce_name, rdata.salt,
-                                                    rdata.iterations,
-                                                    rdata.algorithm)
-                                                if wc_ce_hash:
-                                                    for w_rr in resp.authority:
-                                                        if w_rr.rdtype != \
-                                                           dns.rdatatype.NSEC3:
-                                                            continue
-                                                        # 辅助记录 signer==SOA owner zone
-                                                        w_rr_sig = self._find_rrsig_for(
-                                                            resp, w_rr)
-                                                        if w_rr_sig is None:
-                                                            continue
-                                                        if soa_owner_zone is not None:
-                                                            w2_sig_ok = False
-                                                            for w2_rs in w_rr_sig:
-                                                                if str(w2_rs.signer).rstrip(
-                                                                        ".").lower() == \
-                                                                   str(soa_owner_zone).rstrip(
-                                                                       ".").lower():
-                                                                    w2_sig_ok = True
-                                                                    break
-                                                            if not w2_sig_ok:
-                                                                continue
-                                                        w_oh = self._nsec3_owner_hash(
-                                                            w_rr.name)
-                                                        if not w_oh:
-                                                            continue
-                                                        for w_rd in w_rr:
-                                                            # ★ Opt-Out 覆盖同样可用于
-                                                            # wildcard 否定（RFC 5155
-                                                            # §8.6）：opt-out 区间被省略
-                                                            # 的是**未签名委托**，不影响
-                                                            # "*.CE 不存在"的判定。旧实现
-                                                            # 排除 opt-out → .com 下的
-                                                            # NXDOMAIN 全部缺"*.CE 证明"
-                                                            # 被判保守拒绝。
-                                                            if self._nsec3_interval_check(
-                                                                    wc_ce_hash,
-                                                                    w_oh,
-                                                                    w_rd.next):
-                                                                wc_ce_negated = True
-                                                                break
-                                                        if wc_ce_negated:
-                                                            break
-                                            if wc_ce_negated:
-                                                nsec_semantic_ok = True
-                                            else:
-                                                logger.debug(
-                                                    "DNSSEC NXDOMAIN NSEC3 缺 *.CE "
-                                                    "wildcard 否定证明 — 保守拒绝",
-                                                )
-                                        else:
-                                            logger.debug(
-                                                "DNSSEC NXDOMAIN NSEC3 缺 closest-"
-                                                "encloser 存在性证明 — 保守拒绝",
-                                            )
-                                    else:
-                                        logger.debug(
-                                            "DNSSEC NXDOMAIN NSEC3 owner %s 是委托点"
-                                            "（opt-out），qname %s 需更深 zone 证明 "
-                                            "— 保守拒绝", _safe_qname(rrset.name), _safe_qname(qname),
-                                        )
-                            else:
-                                # NODATA（RFC 5155 §8.5）：exact-match（hash==owner
-                                # 且位图不含 qtype）或 empty non-terminal 区间证明
-                                # （target hash 落在区间内，需 CE 存在性防降级）。
-                                if target_hash == owner_hash and \
-                                   not self._nsec_has_type(rdata, qtype):
-                                    nsec_semantic_ok = True
-                                elif not self._nsec3_optout(rdata) and \
-                                     self._nsec3_interval_check(
-                                        target_hash, owner_hash, rdata.next) and \
-                                     not self._nsec_has_type(rdata, qtype):
-                                    # opt-out 委托检查（RFC 5155 §8.6，与 NSEC 分支
-                                    # 对称）：区间覆盖 NSEC3 位图含 NS 且不含 SOA，
-                                    # 或含 DS → opt-out 委托点，不能证明 NODATA
-                                    # （qname 可能真实存在于 opt-out 子区）
-                                    n3_nt_deleg = (
-                                        self._nsec_has_type(
-                                            rdata, dns.rdatatype.NS)
-                                        and not self._nsec_has_type(
-                                            rdata, dns.rdatatype.SOA)
-                                    ) or self._nsec_has_type(
-                                        rdata, dns.rdatatype.DS)
-                                    if n3_nt_deleg:
-                                        continue
-                                    # empty non-terminal：target 非 owner 但落在区间
-                                    # 内——该 NSEC3 证明 target 处无直接记录。仅当
-                                    # qname 是某祖先的 non-terminal 才合法；保守
-                                    # 要求 CE（qn 祖先）存在性成立。
-                                    ce_nt = qn.parent()
-                                    while ce_nt is not None and ce_nt != dns.name.root:
-                                        ce_nt_hash = self._nsec3_hash(
-                                            ce_nt, rdata.salt, rdata.iterations,
-                                            rdata.algorithm)
-                                        # 仅 exact-match（CE hash == 某 NSEC3 owner）
-                                        # 证明 CE 存在；区间覆盖 = 祖先不存在（语义
-                                        # 错）——遍历 authority 全部 NSEC3（RFC 5155
-                                        # §8.9，与主 NXDOMAIN 分支对称）
-                                        if ce_nt_hash:
-                                            if ce_nt_hash == owner_hash:
-                                                nsec_semantic_ok = True
-                                                break
-                                            for o_nt_rr in resp.authority:
-                                                if o_nt_rr.rdtype != \
-                                                   dns.rdatatype.NSEC3:
-                                                    continue
-                                                o_nt_oh = self._nsec3_owner_hash(
-                                                    o_nt_rr.name)
-                                                if o_nt_oh and \
-                                                   ce_nt_hash == o_nt_oh:
-                                                    nsec_semantic_ok = True
-                                                    break
-                                            if nsec_semantic_ok:
-                                                break
-                                        ce_nt = ce_nt.parent()
-
-            if auth_unsigned:
-                # authority 段存在任一无签名 RRset（如被剥离 RRSIG 的 NSEC）→ 拒绝
-                self._stats["bogus"] += 1
-                logger.warning(
-                    "DNSSEC authority 段存在无签名 RRset（否定应答伪造）: %s %s",
-                    _safe_qname(qname), [str(r.name) for r in auth_unsigned][:3],
-                )
-                return None
-
-            if has_nsec and not nsec_semantic_ok:
-                # **根区负应答例外**（2026-10-31）：根区的 NSEC 链完整、
-                # **没有任何通配符记录**，也不存在"更深委托区可能掩盖 qname"
-                # 的问题（TLD 的存否由根区唯一决定）。RFC 4035 §5.4 要求补
-                # wildcard 否定证明是为了防"区内通配符合成应答"，对根区不适用。
-                # 因此「NSEC 已验签（上面的循环）+ 区间覆盖被查名」即为完整证明。
-                # 否则所有**不存在的 TLD**（.etp / .local / .invalid …）都会被判
-                # 「区间不覆盖」整条拒绝（实测 Firefox 的
-                # smartblock.firefox.etp 每秒刷十几条 WARNING）。
-                if soa_owner_zone == dns.name.root and nsec_covers_any:
-                    nsec_semantic_ok = True
-                else:
-                    # 有 NSEC/NSEC3 但区间语义不覆盖本次 qname → 重放攻击 → 拒绝
-                    self._stats["bogus"] += 1
-                    logger.warning(
-                        "DNSSEC 负应答 NSEC/NSEC3 区间不覆盖 %s（重放攻击）— 拒绝", _safe_qname(qname),
-                    )
-                    return None
-
-            # SOA owner 校验：负应答（NODATA/NXDOMAIN）authority 含 SOA 时，
-            # SOA owner 必须属于 qname 的权威 zone——防重放任意签名区 SOA。
-            # NXDOMAIN 也必须校验（无 NSEC 时仅 SOA+RRSIG 也可被重放伪造）。
-            # 关键：签名区（SOA owner 有效）负应答必须由 NSEC/NSEC3 证明否定性
-            # （RFC 4035 §5.4 / RFC 6840 §4.3）——否则可重放祖先签名区（如
-            # paypal.com）公开的真实 SOA+RRSIG 对任意子域名伪造 NODATA/NXDOMAIN。
-            has_soa = any(
-                rrset.rdtype == dns.rdatatype.SOA for rrset in resp.authority)
-            if soa_owner_valid:
-                # 签名区负应答：必须有 NSEC/NSEC3 且语义校验通过
-                if not (has_nsec and nsec_semantic_ok):
-                    self._stats["bogus"] += 1
-                    logger.warning(
-                        "DNSSEC 签名区负应答缺 NSEC 证明（SOA-only 重放伪造）— 拒绝: %s",
-                        _safe_qname(qname),
-                    )
-                    return None
-            else:
-                if has_soa:
-                    self._stats["bogus"] += 1
-                    logger.warning(
-                        "DNSSEC 负应答 SOA owner 不属于 %s 权威 zone（重放伪造）— 拒绝",
-                        _safe_qname(qname),
-                    )
-                    return None
-                # 无 SOA 的负应答（仅 NSEC 证明）：NSEC 语义已校验，允许
-                if not has_nsec:
-                    self._stats["bogus"] += 1
-                    logger.warning(
-                        "DNSSEC 负应答无 SOA 且无 NSEC 证明（伪造）— 拒绝: %s", _safe_qname(qname),
-                    )
-                    return None
-
-            if resp.authority:
-                # authority 段全部签名验证通过（或为空）→ 负应答 secure
-                self._stats["secure"] += 1
-                self._stats["success"] += 1
-                resp.flags |= dns.flags.AD
-                return resp
-
-            # 有 RRSIG 但 answer/authority 均无有效验证 → bogus
-            self._stats["bogus"] += 1
-            logger.warning("DNSSEC 响应有 RRSIG 但无 RRset 验证通过: %s", _safe_qname(qname))
-            return None
+            # 统一验证链：解析与验证分离（DNSSEC 验证全部在 dnssec.py）。
+            return await self._resolve_verified_unified(qname, qtype, rdclass)
         except Exception as e:
             logger.debug("迭代解析异常: %s", e)
             self._stats["fail"] += 1

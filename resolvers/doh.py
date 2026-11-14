@@ -107,12 +107,16 @@ class DoHResolver(BaseResolver):
                  ca_path: str = "",
                  shared_session: Optional[aiohttp.ClientSession] = None,
                  shared_resolver: Optional[_MultiHostResolver] = None,
-                 protocols: Optional[Dict[str, bool]] = None):
+                 protocols: Optional[Dict[str, bool]] = None,
+                 ciphers: str = ""):
         super().__init__(url, timeout, concurrency=concurrency)
         self.url = url
         self._ech_enabled = ech_enabled
         self._connection_pool_size = connection_pool_size
         self._ech_config = ech_config
+        # tls.ciphers：所有上游 TLS（DoH/DoT）共用同一份配置；SM2 上游
+        # 例外（必须追加国密套件，否则握手失败）。
+        self._ciphers = str(ciphers or "")
         self._connect_ips = connect_ips or []
         # 地址族顺序：**IPv6 优先**（与迭代解析根服务器、DoH3 目标选择一致）。
         # 不可用的上游（如境外被阻的 DoH）会因连续失败被健康评分排到波次末尾，
@@ -177,7 +181,8 @@ class DoHResolver(BaseResolver):
                        "ECC-SM2-SM4-GCM-SM3:ECDHE-SM2-SM4-GCM-SM3")
             logger.info("DoH %s: 国密SM2密码套件已启用", self.url)
         else:
-            ciphers = "HIGH:!aNULL:!kRSA:!PSK:!SRP:!MD5:!RC4"
+            ciphers = (self._ciphers
+                       or "HIGH:!aNULL:!kRSA:!PSK:!SRP:!MD5:!RC4")
         if self._ca_path:
             # 自定义 CA 模式：创建空上下文，只加载自定义 CA
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)

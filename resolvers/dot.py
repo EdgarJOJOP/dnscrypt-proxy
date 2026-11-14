@@ -230,7 +230,7 @@ class DoTResolver(BaseResolver):
                  connect_ips: Optional[list] = None,
                  ech_enabled: bool = False, ech_config: bytes = b"",
                  concurrency: int = 100, ca_path: str = "",
-                 connection_pool_size: int = 100):
+                 connection_pool_size: int = 100, ciphers: str = ""):
         super().__init__(host, timeout, concurrency=concurrency)
         self.host = host
         self.port = port
@@ -238,6 +238,8 @@ class DoTResolver(BaseResolver):
         self._ech_enabled = ech_enabled
         self._ech_config = ech_config
         self._ca_path = ca_path
+        # tls.ciphers：与 DoH 共用同一份上游密码套件配置；空值回退默认串。
+        self._ciphers = str(ciphers or "")
         self._connection_pool_size = max(1, connection_pool_size)
         self._ssl_context = self._create_ssl_context()
         self._pool: Optional[_TlsConnectionPool] = None
@@ -266,7 +268,8 @@ class DoTResolver(BaseResolver):
 
     def _create_ssl_context(self) -> ssl.SSLContext:
         """创建 SSL 上下文（CA 证书验证 + 自定义 CA + ECH 配置）"""
-        ciphers = "HIGH:!aNULL:!kRSA:!PSK:!SRP:!MD5:!RC4"
+        ciphers = (self._ciphers
+                   or "HIGH:!aNULL:!kRSA:!PSK:!SRP:!MD5:!RC4")
 
         if self._ca_path:
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)

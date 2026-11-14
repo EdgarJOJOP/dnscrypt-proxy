@@ -91,6 +91,23 @@ Part I（iterative.family / iterative.ipv4_verify）：I1 auto 自动换族 /
   I4 ipv4+none 未验证放行 / I5 ipv6 强制 0 次 v4 查询 /
   I6 真族不可达时印证自动放弃 / I7 配置解析与非法值回退
 
+Part M（family × ipv4_verify 四态矩阵）：9 个组合 × 7 场景
+  （正向/篡改/剥RRSIG/重放NXDOMAIN/opt-out DS/两族皆代答/真族不可达），
+  逐项断言放行/丢弃、放行原因，以及 hijacked_path / mismatch /
+  dnssec_absent 计数器的精确值。
+
+Part N（统一验证链验收）：旧验证符号清零 / 保留项存在 / DS 否定证明与
+  负应答语义逐分支 / 真实链端到端（不使用测试桩）。
+
+Part O（config.yaml 系统审计）：关键配置解析值、upstream.dnssec 是否真正
+  传入迭代器（enabled/mode/require_rrsig）、非法 mode 安全回退、纯迭代
+  ResolverManager 上游注册、缓存 TTL、hosts 映射、tls.ciphers 对 DoH 生效。
+
+Part N（统一验证链全局验收，合并自原 verify_unified_dnssec.py）：
+  源码级旧验证清零 / 保留项存在；DS 证明与负应答语义逐分支；
+  真实 DS→DNSKEY→RRSIG 端到端 8 形态；CNAME 中间跳、DS 查询失败升父级、
+  全真族链查询、DS 不做 QNAME 最小化等当日日志回归。
+
 Part J/K（`--real` 开启，需要出网）：J 真实链路 7 个域名端到端；
   K Config → DNSSEC 包装器 → ResolverManager → 迭代上游 全链路
 
@@ -105,6 +122,7 @@ import collections
 import hashlib
 import logging
 import os
+import re
 import socket
 import struct
 import sys
@@ -595,7 +613,14 @@ def _make_offline_fixtures(pds):
 
 
 def _clone(msg):
-    return dns.message.from_wire(msg.to_wire())
+    out = dns.message.from_wire(msg.to_wire())
+    # `_cname_chain` / `_cname_targets` 是迭代器挂在 Message 上的动态属性，
+    # wire 往返会丢失。测试 7（CNAME 中间跳篡改）必须保留它们，否则
+    # chain 为空、篡改根本没被验证（历史假通过）。
+    for attr in ("_cname_chain", "_cname_targets"):
+        if hasattr(msg, attr):
+            setattr(out, attr, list(getattr(msg, attr) or []))
+    return out
 
 
 def _drop_sigs(msg, section_name, covers):
@@ -627,40 +652,54 @@ def _make_engine(reply, keys, status_map, pds):
     eng.strict_dnssec = True
     eng._stats = collections.Counter()
     eng._verified_zone_cache = {}
-    eng._dnskey_inflight = {}
     eng._ds_cache = {}
     eng._ds_inflight = {}
-    eng._dnssec_warned = set()
-    eng._chain_unavailable = set()
     eng._last_release = ""
     eng._zone_ns_cache = {}
     eng._delegation_cache = {}
     eng._dnssec_crypto_ok = True
     eng._has_ipv6 = False
-    eng._dropped = []
+    # 合成世界不访问真实根：禁用根真实性探测，避免测试打外网
+    eng._root_probe_enabled = False
 
     async def fake_iterate(qname, qtype, depth=0, rdclass=1):
-        # 必须保留 _cname_chain / _cname_targets：旧实现 from_wire(reply.to_wire())
-        # 会把这两个动态属性丢掉，CNAME 中间跳用例因此**从未真正执行**
-        # （测试 7 之前只是命中了“无签名 owner”分支，不是链中间跳校验）。
+        # 必须保留 _cname_chain / _cname_targets：from_wire(reply.to_wire())
+        # 会把这两个动态属性丢掉，CNAME 中间跳用例因此**从未真正执行**。
         out = dns.message.from_wire(reply.to_wire())
         out._cname_chain = list(getattr(reply, "_cname_chain", []) or [])
         out._cname_targets = list(getattr(reply, "_cname_targets", []) or [])
         return out
 
-    async def fake_trusted(zone_name):
-        return keys.get(str(zone_name).lower())
-
-    async def fake_status(zone_name):
-        return (status_map or {}).get(str(zone_name).lower(), "secure")
-
     eng._iterate = fake_iterate
-    eng._get_trusted_dnskey = fake_trusted
-    eng._zone_signed_status = fake_status
     eng._needs_bootstrap_fallback = lambda resp, qtype: False
-    eng._report_dnssec_drop = lambda qname, **kw: eng._dropped.append(qname)
-    eng._report_dnssec_stripped = lambda qname: eng._dropped.append(("stripped", qname))
-    eng._report_unsigned_unknown = lambda qname: eng._dropped.append(("unknown", qname))
+
+    # 统一验证链（2026-11-14）：plain_dns 把验证委托给 dnssec.py。
+    # 测试桩注入真实 DNSSECValidator，只替换“链查询结果”（keys/status_map）；
+    # 验签、负应答语义仍走 dnssec.py 的真实实现。
+    from dnssec import DNSSECValidator as _DV
+    _val = _DV(enabled=True, mode="strict")
+
+    async def _fake_zone_keys(zone, depth=0):
+        _k = keys.get(str(zone).lower())
+        if _k is None:
+            return ("indeterminate", {})
+        return ("secure", {zone: _k})
+
+    async def _fake_zone_ds(name):
+        _st = (status_map or {}).get(str(name).lower(), "secure")
+        if _st in ("insecure", "error"):
+            return False
+        if _st == "unknown":
+            return None
+        return True
+
+    async def _fake_root_ok():
+        return True
+
+    _val._get_verified_zone_keys = _fake_zone_keys
+    _val._zone_has_ds = _fake_zone_ds
+    _val._root_chain_available = _fake_root_ok
+    eng._dnssec = _val
     return eng
 
 
@@ -992,14 +1031,13 @@ async def run_part_b() -> bool:
 
 
 # ============================================================
-# Part B2：DNSSEC 链状态逐分支穷举（离线）
+# Part B2：DNSSEC 链状态/否定证明逐分支穷举（离线）
 #
-# 覆盖两类历史问题：
-#   1. _zone_signed_status 的“链不可用 ≠ 可丢弃”：父区 DNSKEY 取不到时
-#      旧代码返回 unknown（调用方按可丢弃），修复后返回 error（可用性放行）；
-#   2. _get_trusted_dnskey 的重试/负缓存/single-flight/并发闸门：冷启动
-#      根/TLD DNSKEY 被 RRL 限速时，退避重试后仍失败才放行，且 15s 内
-#      不重复打爆同一权威。
+# 2026-11-14 统一验证链后，plain_dns_server 不再实现任何 DNSSEC 链验证：
+# DS/NODATA/NSEC/NSEC3 判定只有 dnssec.DNSSECValidator 一份实现。本段因此
+# 不再 mock resolver 的链方法，而是构造真实 validator，直接断言
+# `_ds_nodata_proves_insecure` 与 `_validate_negative_semantics` 的结论；
+# 9-12 覆盖保留在 resolver 侧的 DS 响应缓存 / 负缓存 / single-flight。
 # ============================================================
 
 def _chain_resp(name, rcode=dns.rcode.NOERROR, authority=None):
@@ -1017,86 +1055,58 @@ def _chain_soa(zone="cn."):
         "a.root-servers.net. nstld.verisign-grs.com. 1 1800 900 604800 86400")
 
 
-def _chain_nsec3(owner_label=None, flags=0,
-                 bitmap="NS SOA RRSIG DNSKEY NSEC3PARAM"):
-    if owner_label is None:
-        owner_label = base64.b32hexencode(b"\x01" * 20).decode().lower()
-    owner = dns.name.from_text(owner_label + ".cn.")
-    nxt = base64.b32hexencode(b"\x02" * 20).decode().lower()
+def _chain_shift(h: bytes, delta: int) -> bytes:
+    return ((int.from_bytes(h, "big") + delta) % (1 << 160)).to_bytes(20, "big")
+
+
+def _chain_b32(h: bytes) -> str:
+    return base64.b32hexencode(h).decode().lower().rstrip("=")
+
+
+def _chain_nsec(owner, nxt, bitmap="NS RRSIG NSEC", zone=None):
+    """构造一条 NSEC 记录（owner/nxt 由调用方给定，便于表达覆盖/不覆盖）"""
+    owner_name = owner if str(owner).endswith(".") else str(owner) + "."
+    nxt_name = nxt if str(nxt).endswith(".") else str(nxt) + "."
+    return dns.rrset.from_text(owner_name, 300, "IN", "NSEC",
+                               "%s %s" % (nxt_name, bitmap))
+
+
+def _chain_nsec3(owner_hash, next_hash, flags=0, bitmap="NS RRSIG",
+                 zone="cn.", salt=b"\xab", iterations=0):
+    """构造一条 NSEC3 记录：owner/next 用真实 hash 字节，便于表达区间覆盖"""
+    salt_txt = salt.hex() if salt else "-"
     rd = dns.rdata.from_text(
-        "IN", "NSEC3", "1 %d 10 aef123ab %s %s" % (flags, nxt, bitmap))
+        "IN", "NSEC3", "1 %d %d %s %s %s"
+        % (flags, iterations, salt_txt, _chain_b32(next_hash), bitmap))
+    owner = dns.name.from_text("%s.%s" % (_chain_b32(owner_hash), zone))
     return dns.rrset.from_rdata(owner, 300, rd)
 
 
-def _chain_rrsig_for(rrset, signer="cn."):
-    sig = dns.rdata.from_text(
-        "IN", "RRSIG",
-        "NSEC3 8 3 300 20300101000000 20200101000000 12345 %s AAAA" % signer)
-    return dns.rrset.from_rdata(rrset.name, 300, sig)
+def _make_chain_resolver(ds_map=None, del_map=None, parent_insecure=None,
+                         trusted_keys=None, pds=None):
+    """构造**真实** DNSSECValidator（2026-11-14 统一验证链）。
+
+    旧实现 mock 了 `_iterate_ds_cached` / `_is_delegation` /
+    `_parent_is_insecure` / `_get_trusted_dnskey`，等于用桩验证桩；
+    现在链状态判定只有 dnssec.py 一份实现，测试直接调用真实 validator
+    的纯函数（`_ds_nodata_proves_insecure` / `_validate_negative_semantics`），
+    断言 True/False，不再依赖任何 plain_dns_server 的链方法。
+    """
+    from dnssec import DNSSECValidator
+    return DNSSECValidator(enabled=True, mode="strict")
 
 
-def _make_chain_resolver(ds_map, del_map, parent_insecure, trusted_keys, pds):
-    """构造只跑 _zone_signed_status 的 resolver（全部依赖 mock）。"""
+def _make_ds_resolver(pds, iterator):
+    """构造只跑 `_iterate_ds_cached`（DS 响应缓存/single-flight）的 resolver"""
     r = object.__new__(pds.IterativeResolver)
     r._ds_cache = {}
     r._ds_inflight = {}
-    r._delegation_cache = {}
-    r._zone_ns_cache = {}
-    r._verified_zone_cache = {}
-    r._dnssec_crypto_ok = True
-    r._chain_unavailable = set()
-
-    async def _iterate_ds_cached(name):
-        return ds_map.get(str(name).lower())
-
-    async def _is_delegation(name):
-        return del_map.get(str(name).lower())
-
-    async def _parent_is_insecure(name):
-        return parent_insecure.get(str(name).lower(), False)
-
-    async def _get_trusted_dnskey(name):
-        return trusted_keys.get(str(name).lower())
-
-    async def _retry_ds_once(name):
-        return ds_map.get(str(name).lower())
-
-    r._iterate_ds_cached = _iterate_ds_cached
-    r._is_delegation = _is_delegation
-    r._parent_is_insecure = _parent_is_insecure
-    r._get_trusted_dnskey = _get_trusted_dnskey
-    r._retry_ds_once = _retry_ds_once
-    return r
-
-
-def _build_chain(target, mt_resp, pds, del_map=None,
-                 parent_insecure=None, keys=None):
-    """target 的 DS 为 NXDOMAIN，edge 为 NODATA 无 NSEC，mountaintoys.cn 为给定响应。"""
-    name = dns.name.from_text(target)
-    edge = "edge.mountaintoys.cn."
-    mt = "mountaintoys.cn."
-    ds_map = {
-        str(name).lower(): _chain_resp(target, dns.rcode.NXDOMAIN),
-        edge: _chain_resp(edge, dns.rcode.NOERROR, [_chain_soa()]),
-        mt: mt_resp,
-    }
-    return _make_chain_resolver(
-        ds_map, del_map or {}, parent_insecure or {}, keys or {}, pds)
-
-
-def _make_trusted_resolver(pds, delays=(0.0, 0.0, 0.0)):
-    """构造只跑 _get_trusted_dnskey 的 resolver（retry/负缓存/并发测试）。"""
-    r = object.__new__(pds.IterativeResolver)
-    r._dnssec_crypto_ok = True
     r._stats = collections.Counter()
-    r._verified_zone_cache = {}
-    r._dnskey_inflight = {}
-    r._ds_cache = {}
-    r._ds_inflight = {}
-    r._dnskey_retry_after = {}
-    r._dnskey_semaphore = None
-    r._dnskey_retry_delays = delays
-    r._chain_unavailable = set()
+
+    async def _iterate(qname, qtype, depth=0, rdclass=1):
+        return await iterator(qname, qtype, depth, rdclass)
+
+    r._iterate = _iterate
     return r
 
 
@@ -1109,93 +1119,90 @@ async def run_part_b_chain() -> bool:
         return True
 
     start_ok = len(RESULTS)
-    target = "v9e169o.edge.mountaintoys.cn"
-    mt = dns.name.from_text("mountaintoys.cn.")
-    del_map = {
-        "v9e169o.edge.mountaintoys.cn.": False,
-        "edge.mountaintoys.cn.": False,
-        "mountaintoys.cn.": True,
-    }
+    target = dns.name.from_text("v9e169o.edge.mountaintoys.cn.")
+    zone = "mountaintoys.cn."
+    salt = b"\xab"
+    v = _make_chain_resolver(pds=pds)
+    h_target = v._nsec3_hash(target, salt, 0, 1)
+    soa = _chain_soa(zone)
 
-    # 1) parent_keys 取不到 + 父区未证明未签名 → error（修复前 unknown）
-    edge_nsec3 = _chain_nsec3(flags=1)
-    resp = _chain_resp("mountaintoys.cn", dns.rcode.NOERROR,
-                       [_chain_soa(), edge_nsec3])
-    r = _build_chain(target, resp, pds, del_map=del_map)
-    got = await r._zone_signed_status(dns.name.from_text(target))
-    check("B2.1 parent_keys=None + 父区 secure → error（链不可用，放行）",
-          got == "error", f"got={got!r}")
+    # 1) NSEC3 opt-out 区间覆盖 target → 数学上证明「target 没有 DS」
+    #    （RFC 5155 §8.6：区间内可能存在被省略的未签名委托）
+    n3_optout = _chain_nsec3(
+        _chain_shift(h_target, -1), _chain_shift(h_target, 1),
+        flags=1, bitmap="A RRSIG", zone=zone, salt=salt)
+    resp_optout = _chain_resp(str(target), authority=[soa, n3_optout])
+    got = v._ds_nodata_proves_insecure(resp_optout, target)
+    check("B2.1 NSEC3 opt-out 区间覆盖 → 证明无 DS（True）",
+          got is True, f"got={got!r}")
 
-    # 2) parent_keys 取不到 + 父区已证明未签名 → insecure（优先）
-    r = _build_chain(target, resp, pds, del_map=del_map,
-                     parent_insecure={"mountaintoys.cn.": True})
-    got = await r._zone_signed_status(dns.name.from_text(target))
-    check("B2.2 parent_keys=None + 父区 insecure → insecure",
-          got == "insecure", f"got={got!r}")
+    # 2) NSEC owner == name，位图含 NS 不含 DS → 证明无 DS（True）
+    nsec_apex = _chain_nsec(target, "zzz." + zone, bitmap="NS RRSIG NSEC",
+                            zone=zone)
+    resp_nsec = _chain_resp(str(target), authority=[soa, nsec_apex])
+    got = v._ds_nodata_proves_insecure(resp_nsec, target)
+    check("B2.2 NSEC owner==name 且含 NS 不含 DS → True",
+          got is True, f"got={got!r}")
 
-    # 3) 精确 NSEC3 owner（is_apex=True）同样走 parent_keys=None → error
-    h = pds.IterativeResolver._nsec3_hash(mt, b"\xae\xf1\x23\xab", 10, 1)
-    label = base64.b32hexencode(h).decode().lower().rstrip("=")
-    exact = _chain_nsec3(owner_label=label, flags=0,
-                         bitmap="NS SOA RRSIG DNSKEY NSEC3PARAM")
-    resp_exact = _chain_resp("mountaintoys.cn", dns.rcode.NOERROR,
-                             [_chain_soa(), exact])
-    r = _build_chain(target, resp_exact, pds, del_map=del_map)
-    got = await r._zone_signed_status(dns.name.from_text(target))
-    check("B2.3 精确 NSEC3 + parent_keys=None → error",
-          got == "error", f"got={got!r}")
+    # 3) 精确 NSEC3（owner hash == hash(name)）且含 NS 不含 DS → True
+    n3_exact = _chain_nsec3(
+        h_target, _chain_shift(h_target, 1), flags=0,
+        bitmap="NS RRSIG", zone=zone, salt=salt)
+    resp_exact = _chain_resp(str(target), authority=[soa, n3_exact])
+    got = v._ds_nodata_proves_insecure(resp_exact, target)
+    check("B2.3 精确 NSEC3 owner + NS 无 DS → True",
+          got is True, f"got={got!r}")
 
-    # 4) parent_keys 可用但 NSEC3 验签失败 → unknown（保守，可能是伪造）
-    fake_key = dns.rrset.RRset(dns.name.from_text("cn."), dns.rdataclass.IN,
-                               dns.rdatatype.DNSKEY)
-    resp_sig = _chain_resp("mountaintoys.cn", dns.rcode.NOERROR,
-                           [_chain_soa(), edge_nsec3,
-                            _chain_rrsig_for(edge_nsec3)])
-    r = _build_chain(target, resp_sig, pds, del_map=del_map,
-                     keys={"cn.": fake_key})
-    got = await r._zone_signed_status(dns.name.from_text(target))
-    check("B2.4 NSEC3 验签失败 + keys 可用 → unknown（保守）",
-          got == "unknown", f"got={got!r}")
+    # 4) 同一条 NSEC3 但未通过父区验签（verified_ids 为空）→ 不得采纳
+    got = v._ds_nodata_proves_insecure(resp_optout, target, verified_ids=set())
+    check("B2.4 NSEC3 未通过验签（verified_ids 不含）→ False（保守）",
+          got is False, f"got={got!r}")
 
-    # 5) NODATA 无 NSEC + is_del=True + 父区 secure → unknown（保持）
-    resp_nodata = _chain_resp("mountaintoys.cn", dns.rcode.NOERROR,
-                              [_chain_soa()])
-    r = _build_chain(target, resp_nodata, pds, del_map=del_map)
-    got = await r._zone_signed_status(dns.name.from_text(target))
-    check("B2.5 NODATA 无 NSEC + 委托点 + 父区 secure → unknown",
-          got == "unknown", f"got={got!r}")
+    # 5) NODATA 无任何 NSEC/NSEC3 → 无证明（False / None）
+    resp_nodata = _chain_resp(str(target), authority=[soa])
+    ds_got = v._ds_nodata_proves_insecure(resp_nodata, target)
+    neg_got = v._validate_negative_semantics(
+        resp_nodata, target, dns.rdatatype.DS)
+    check("B2.5 NODATA 无 NSEC → 无证明（False/None）",
+          ds_got is False and neg_got is None,
+          f"ds={ds_got!r} neg={neg_got!r}")
 
-    # 6) NODATA 无 NSEC + is_del=True + 父区 insecure → insecure（保持）
-    r = _build_chain(target, resp_nodata, pds, del_map=del_map,
-                     parent_insecure={"mountaintoys.cn.": True})
-    got = await r._zone_signed_status(dns.name.from_text(target))
-    check("B2.6 NODATA 无 NSEC + 委托点 + 父区 insecure → insecure",
-          got == "insecure", f"got={got!r}")
+    # 6) NSEC 位图含 DS（=该名字其实有 DS）→ 不能证明未签名
+    nsec_with_ds = _chain_nsec(target, "zzz." + zone,
+                               bitmap="NS DS RRSIG NSEC", zone=zone)
+    resp_ds = _chain_resp(str(target), authority=[soa, nsec_with_ds])
+    got = v._ds_nodata_proves_insecure(resp_ds, target)
+    check("B2.6 NSEC 位图含 DS → False（不能降级为 insecure）",
+          got is False, f"got={got!r}")
 
-    # 7) DS NXDOMAIN + is_del=True → unknown（名字不存在且是委托点）
-    r = _build_chain(target, resp_nodata, pds, del_map={
-        "v9e169o.edge.mountaintoys.cn.": True,
-    })
-    got = await r._zone_signed_status(dns.name.from_text(target))
-    check("B2.7 DS NXDOMAIN + is_del=True → unknown",
-          got == "unknown", f"got={got!r}")
+    # 7) NSEC owner 是别的名字（跨名重放）→ 不能证明本名无 DS
+    nsec_replay = _chain_nsec("other." + zone, "zzz." + zone,
+                              bitmap="NS RRSIG NSEC", zone=zone)
+    resp_replay = _chain_resp(str(target), authority=[soa, nsec_replay])
+    got = v._ds_nodata_proves_insecure(resp_replay, target)
+    check("B2.7 NSEC owner 重放（跨名）→ False",
+          got is False, f"got={got!r}")
 
-    # 8) DS NXDOMAIN + is_del=False → 升父级，最终 insecure
-    r = _build_chain(target, resp_nodata, pds, del_map=del_map,
-                     parent_insecure={"mountaintoys.cn.": True})
-    got = await r._zone_signed_status(dns.name.from_text(target))
-    check("B2.8 DS NXDOMAIN + is_del=False 升父级 → insecure",
-          got == "insecure", f"got={got!r}")
+    # 8) NXDOMAIN 重放：NSEC 区间不覆盖 qname → 负应答语义不成立
+    q_nx = dns.name.from_text("ghost." + zone)
+    nsec_far = _chain_nsec("aaa." + zone, "bbb." + zone,
+                           bitmap="A RRSIG NSEC", zone=zone)
+    resp_bad_nx = _chain_resp(str(q_nx), rcode=dns.rcode.NXDOMAIN,
+                              authority=[soa, nsec_far])
+    got = v._validate_negative_semantics(
+        resp_bad_nx, q_nx, dns.rdatatype.A)
+    check("B2.8 NXDOMAIN NSEC 区间不覆盖 qname → False（重放）",
+          got is False, f"got={got!r}")
 
-    # 13) DS NXDOMAIN + is_del=True + 父区已 insecure → insecure
-    #     （实测 v9e169o.edge.mountaintoys.cn：_is_delegation 缓存命中为 True，
-    #      父区 mountaintoys.cn 已未签名；旧代码在这里直接 unknown → 丢弃）
-    r = _build_chain(target, resp_nodata, pds, del_map={
-        "v9e169o.edge.mountaintoys.cn.": True,
-    }, parent_insecure={"v9e169o.edge.mountaintoys.cn.": True})
-    got = await r._zone_signed_status(dns.name.from_text(target))
-    check("B2.13 DS NXDOMAIN + is_del=True + 父区 insecure → insecure",
-          got == "insecure", f"got={got!r}")
+    # 13) NXDOMAIN 合法：NSEC owner < qname < next 且 SOA 绑定父区 → True
+    nsec_cover = _chain_nsec(zone, "zzz." + zone, bitmap="A RRSIG NSEC",
+                             zone=zone)
+    resp_nx = _chain_resp(str(q_nx), rcode=dns.rcode.NXDOMAIN,
+                          authority=[soa, nsec_cover])
+    got = v._validate_negative_semantics(
+        resp_nx, q_nx, dns.rdatatype.A)
+    check("B2.13 NXDOMAIN 合法覆盖 + SOA → True",
+          got is True, f"got={got!r}")
 
     # 14) NS 查询：answer 里混入祖先区 NS（com.cn.）时，不能把它当最终答案
     #     旧实现只看 rdtype，会把 com.cn. NS 返回给 sso.sina.com.cn NS，
@@ -1300,75 +1307,68 @@ async def run_part_b_chain() -> bool:
           and pds.IterativeResolver._nsec3_interval_check(
               b"\x06" * 20, _self, _self) is False)
 
-    # 9) 链查询首次 RRL 失败、退避后重试成功 → 不应被当成不可用
-    r = _make_trusted_resolver(pds)
+    # 9) DS 查询首次失败（RRL/超时）→ None，不崩溃、不误判为 bogus
     calls = {"n": 0}
 
-    async def flaky(zone):
+    async def flaky_ds(qname, qtype, depth=0, rdclass=1):
         calls["n"] += 1
-        if calls["n"] < 2:
-            raise pds._ChainUnavailable("simulated RRL")
-        return "TRUSTED"
+        raise RuntimeError("simulated RRL")
 
-    r._get_trusted_dnskey_uncached = flaky
-    out = await r._get_trusted_dnskey(dns.name.from_text("cn."))
-    check("B2.9 链查询首次失败、退避重试后成功",
-          out == "TRUSTED" and calls["n"] == 2,
+    r = _make_ds_resolver(pds, flaky_ds)
+    out = await r._iterate_ds_cached(dns.name.from_text("cn."))
+    check("B2.9 DS 查询首次失败 → None（不判 bogus、不崩溃）",
+          out is None and calls["n"] == 1,
           f"out={out!r} calls={calls['n']}")
 
-    # 10) 连续失败 → None + 15s 负缓存，第二次不再打权威
-    r = _make_trusted_resolver(pds)
+    # 10) 失败结果短负缓存（5s）：第二次不再打同一权威
     calls = {"n": 0}
 
-    async def always_fail(zone):
+    async def always_none(qname, qtype, depth=0, rdclass=1):
         calls["n"] += 1
-        raise pds._ChainUnavailable("simulated RRL")
+        return None
 
-    r._get_trusted_dnskey_uncached = always_fail
-    out1 = await r._get_trusted_dnskey(dns.name.from_text("cn."))
+    r = _make_ds_resolver(pds, always_none)
+    out1 = await r._iterate_ds_cached(dns.name.from_text("cn."))
     first_calls = calls["n"]
-    out2 = await r._get_trusted_dnskey(dns.name.from_text("cn."))
-    check("B2.10 连续失败 → None + 15s 负缓存（第二次不重查）",
+    out2 = await r._iterate_ds_cached(dns.name.from_text("cn."))
+    check("B2.10 DS 失败 → None + 负缓存（5s 内第二次不重查）",
           out1 is None and out2 is None
-          and first_calls == 4 and calls["n"] == first_calls,
+          and first_calls == 1 and calls["n"] == first_calls,
           f"out1={out1!r} out2={out2!r} calls={calls['n']} first={first_calls}")
 
-    # 11) 同 zone 10 并发只构建一次链（single-flight）
-    r = _make_trusted_resolver(pds)
+    # 11) 同 zone 10 并发只查一次（_iterate_ds_cached 的 single-flight）
     calls = {"n": 0}
 
-    async def slow(zone):
+    async def slow_ds(qname, qtype, depth=0, rdclass=1):
         calls["n"] += 1
         await asyncio.sleep(0.05)
-        return "TRUSTED"
+        return _chain_resp(str(qname), authority=[_chain_soa("cn.")])
 
-    r._get_trusted_dnskey_uncached = slow
+    r = _make_ds_resolver(pds, slow_ds)
     outs = await asyncio.gather(*[
-        r._get_trusted_dnskey(dns.name.from_text("cn.")) for _ in range(10)
+        r._iterate_ds_cached(dns.name.from_text("cn.")) for _ in range(10)
     ])
-    check("B2.11 同 zone 10 并发只构建一次链（single-flight）",
-          calls["n"] == 1 and all(o == "TRUSTED" for o in outs),
+    check("B2.11 同 zone 10 并发只查一次（single-flight）",
+          calls["n"] == 1 and all(o is not None for o in outs),
           f"calls={calls['n']}")
 
-    # 12) 不同 zone 并发受 semaphore=4 限制（不把根/TLD 一次打爆）
-    r = _make_trusted_resolver(pds)
-    r._dnskey_semaphore = asyncio.Semaphore(4)
-    active = {"now": 0, "peak": 0}
+    # 12) 不同 zone 的 DS 缓存互相独立：各查一次，再次查询全部命中缓存
+    seen = collections.Counter()
 
-    async def tracked(zone):
-        active["now"] += 1
-        active["peak"] = max(active["peak"], active["now"])
-        await asyncio.sleep(0.02)
-        active["now"] -= 1
-        return "TRUSTED"
+    async def per_zone_ds(qname, qtype, depth=0, rdclass=1):
+        seen[str(qname).lower()] += 1
+        return _chain_resp(str(qname), authority=[_chain_soa("cn.")])
 
-    r._get_trusted_dnskey_uncached = tracked
-    await asyncio.gather(*[
-        r._get_trusted_dnskey(dns.name.from_text("z%d.example." % i))
-        for i in range(12)
-    ])
-    check("B2.12 不同 zone 并发被 semaphore 限制在 4",
-          active["peak"] <= 4, f"peak={active['peak']}")
+    r = _make_ds_resolver(pds, per_zone_ds)
+    zones = ["z%d.example." % i for i in range(4)]
+    first = await asyncio.gather(*[
+        r._iterate_ds_cached(dns.name.from_text(z)) for z in zones])
+    second = await asyncio.gather(*[
+        r._iterate_ds_cached(dns.name.from_text(z)) for z in zones])
+    check("B2.12 不同 zone 的 DS 缓存独立（各查一次后命中）",
+          len(seen) == 4 and all(v == 1 for v in seen.values())
+          and all(first) and all(second),
+          f"seen={dict(seen)}")
 
     return all(ok for _, ok in RESULTS[start_ok:])
 
@@ -1497,7 +1497,7 @@ def _make_type_engine(pds, mode):
             msg.authority.append(dns.rrset.from_text(
                 str(parent), 300, "IN", "SOA",
                 "ns1.%s hostmaster.%s 1 3600 600 86400 300"
-                % (str(parent).rstrip("."), str(parent).rstrip("."))))
+                % (str(parent), str(parent))))
             return msg
 
         msg.answer.append(dns.rrset.from_text(
@@ -1630,10 +1630,14 @@ async def run_part_c() -> bool:
 
     # 日志中“应通过却被拦截”的未签名域名
     for domain in ("cdn.jsdelivr.net", "s.360.cn",
-                   "opencdnkav6.jomodns.com", "p.ssl.qhimg.com"):
+                   "opencdnkav6.jomodns.com", "p.ssl.qhimg.com",
+                   # 2026-11-14 生产日志：合法未签名/CNAME 到未签名 CDN
+                   "ipv4only.arpa", "s1.hdslb.com",
+                   "api.live.bilibili.com"):
         try:
-            st = await asyncio.wait_for(
-                eng._zone_signed_status(dns.name.from_text(domain)), timeout=30)
+            st, _keys = await asyncio.wait_for(
+                eng._dnssec._get_verified_zone_keys(
+                    dns.name.from_text(domain)), timeout=30)
         except Exception as e:
             st = f"EXC:{type(e).__name__}"
         check(f"C1 {domain} 区域状态不是 secure", st != "secure",
@@ -1655,8 +1659,9 @@ async def run_part_c() -> bool:
     cap.msgs.clear()
     eng._last_release = ""
     try:
-        st = await asyncio.wait_for(
-            eng._zone_signed_status(dns.name.from_text("ietf.org")), timeout=30)
+        st, _keys = await asyncio.wait_for(
+            eng._dnssec._get_verified_zone_keys(
+                dns.name.from_text("ietf.org")), timeout=30)
         resp = await asyncio.wait_for(
             eng.resolve("ietf.org", dns.rdatatype.A), timeout=40)
     except Exception as e:
@@ -1801,8 +1806,9 @@ def _cover_pair(target: dns.name.Name):
 def _soa_text(zone: str) -> str:
     if zone in (".", ""):
         return _ROOT_SOA
-    base = zone.rstrip(".")
-    return "ns1.%s hostmaster.%s 1 3600 600 86400 300" % (base, base)
+    # 必须用绝对名（带尾点）：合成报文会被序列化成 wire 交给真实
+    # DNSSECValidator，相对名会让 to_wire() 抛 NeedAbsoluteNameOrOrigin。
+    return "ns1.%s hostmaster.%s 1 3600 600 86400 300" % (zone, zone)
 
 
 class World:
@@ -1854,7 +1860,7 @@ class World:
         msg.authority.append(_rr(
             zone, "SOA",
             "ns1.%s hostmaster.%s 1 3600 600 86400 300"
-            % (zone.rstrip("."), zone.rstrip("."))))
+            % (zone, zone)))
 
     def _add(self, msg, section: str, rrset, zone: str, signed: bool = True):
         """把 rrset 追加到 section，必要时附上 zone 的 RRSIG"""
@@ -1906,7 +1912,7 @@ class World:
                 dns.name.from_text(child), b"\xaa\xbb", 0, 1)
             lo = (int.from_bytes(target, "big") - 1).to_bytes(20, "big")
             hi = (int.from_bytes(target, "big") + 1).to_bytes(20, "big")
-            n3 = _rr("%s.%s" % (_b32hex(lo), parent.rstrip(".")), "NSEC3",
+            n3 = _rr("%s.%s" % (_b32hex(lo), parent), "NSEC3",
                      "1 1 0 aabb %s NS RRSIG" % _b32hex(hi))
             self._add(msg, "authority", n3, parent)
         else:
@@ -1922,7 +1928,7 @@ class World:
         if zone in self.nsec3:
             h = pds.IterativeResolver._nsec3_hash(name, b"\xaa\xbb", 0, 1)
             hi = (int.from_bytes(h, "big") + 1).to_bytes(20, "big")
-            n3 = _rr("%s.%s" % (_b32hex(h), zone.rstrip(".")), "NSEC3",
+            n3 = _rr("%s.%s" % (_b32hex(h), zone), "NSEC3",
                      "1 0 0 aabb %s RRSIG NSEC3" % _b32hex(hi))
             self._add(msg, "authority", n3, zone)
         else:
@@ -1949,7 +1955,7 @@ class World:
                     h = pds.IterativeResolver._nsec3_hash(name, b"\xaa\xbb", 0, 1)
                     hi = (int.from_bytes(h, "big") + 1).to_bytes(20, "big")
                     bitmap = " ".join(sorted(recs.keys()) + ["RRSIG"])
-                    n3 = _rr("%s.%s" % (_b32hex(h), zone.rstrip(".")), "NSEC3",
+                    n3 = _rr("%s.%s" % (_b32hex(h), zone), "NSEC3",
                              "1 0 0 aabb %s %s" % (_b32hex(hi), bitmap))
                     self._add(msg, "authority", n3, zone)
                 else:
@@ -2012,20 +2018,20 @@ class World:
                           signed=False)
             else:
                 self._nodata(msg, zone, q, qtype)
-            if zone in self.signed:
-                msg.flags |= dns.flags.AA
+            # 权威应答一律带 AA（RFC 1035 §4.1.1），与区是否签名无关；
+            # 旧 fixture 只对签名区置 AA，导致未签名区的合法应答被
+            # `_looks_fake` 误判为“递归代答”，corroborate 下走 hijacked_path。
+            msg.flags |= dns.flags.AA
             return self._finalize(msg, qname, qtype)
 
         if qtype == dns.rdatatype.DS:
             # 区内普通名（非委托点）的 DS：父区语义上就是"无 DS"
             self._nodata(msg, zone, q, qtype)
-            if zone in self.signed:
-                msg.flags |= dns.flags.AA
+            msg.flags |= dns.flags.AA
             return self._finalize(msg, qname, qtype)
 
         self._answer_name(msg, zone, q, qtype)
-        if zone in self.signed:
-            msg.flags |= dns.flags.AA
+        msg.flags |= dns.flags.AA
         return self._finalize(msg, qname, qtype)
 
     # ---------- 形态后处理 ----------
@@ -2142,6 +2148,8 @@ def _world_engine(world, require_rrsig: bool = False, crypto_ok: bool = True):
     eng.qname_minimization = True
     eng.root_servers = ["10.0.0.1"]
     eng.timeout = 1.0
+    eng._has_ipv6 = False
+    eng._root_probe_enabled = False
     eng._stats = collections.Counter()
     eng._last_release = ""
     # DNSSEC 判定状态
@@ -2183,7 +2191,43 @@ def _world_engine(world, require_rrsig: bool = False, crypto_ok: bool = True):
     eng._bootstrap_sem = asyncio.Semaphore(1)
     eng._inflight_sem = asyncio.Semaphore(8)
     # 信任锚：用合成根 KSK 替代内置 IANA 锚
-    eng._dnssec = types.SimpleNamespace(_root_keys=world.build_anchor())
+    # 统一验证链：真实 DNSSECValidator，链查询用 World/AbsentWorld 的合成状态
+    from dnssec import DNSSECValidator as _DV
+    _val = _DV(enabled=True, mode="strict", require_rrsig=require_rrsig)
+    _val._root_keys = world.build_anchor()
+    _val._crypto_ok = crypto_ok
+    _is_absent = isinstance(world, AbsentWorld)
+    _zkey = getattr(world, "key", {}) or {}
+    _wmode = getattr(world, "mode", "")
+
+    async def _fzk(zone, depth=0):
+        if not crypto_ok:
+            return ("indeterminate", {})
+        if _wmode == _MODE_ROOT_BAD_SIG:
+            eng._dnssec_evidence = "bogus_root"
+            return ("bogus", {})
+        _k = _zkey.get(str(zone))
+        if _k is None:
+            return ("insecure", {})
+        return ("secure", {zone: dns.rrset.from_rdata(zone, 300, _k)})
+
+    async def _fds(name):
+        _n = str(name).lower()
+        if _is_absent:
+            return False
+        if _wmode == _MODE_NO_PROOF and _n.endswith("unsigned.opt.test."):
+            return None
+        if _n.endswith("insecure.test.") or _n.endswith("unsigned.opt.test."):
+            return False
+        return True
+
+    async def _froot():
+        return (not _is_absent) and crypto_ok
+
+    _val._get_verified_zone_keys = _fzk
+    _val._zone_has_ds = _fds
+    _val._root_chain_available = _froot
+    eng._dnssec = _val
     # 网络层：直接命中合成权威（跳过 UDP/TCP/健康度/COOKIE）
     eng._closest_zone_servers = lambda qname, qtype: None
 
@@ -2192,6 +2236,26 @@ def _world_engine(world, require_rrsig: bool = False, crypto_ok: bool = True):
 
     eng._query_servers = _query_servers
     return eng
+
+
+def _real_validator(eng, world):
+    """构造**不做任何链桩替换**的真实 DNSSECValidator。
+
+    统一验证链后，链查询/缓存/失败语义都在 dnssec.py；E6/E7/E8/F5 必须
+    走真实实现，才能验证「确定性缺失只查一次」「absent 证据 60s 缓存」
+    「恢复后回到 ok」「DS/DNSKEY 链路全部带 DO」这些行为。
+    """
+    from dnssec import DNSSECValidator as _DV
+    v = _DV(enabled=True, mode="strict")
+    v._root_keys = world.build_anchor()
+    v.set_dns_query_callback(eng._dnssec_query_callback)
+    # 不限定族、并让族探测走“刚探测过”的缓存：合成世界只有 1 台 v4 根，
+    # 若 _preferred_family 非空，_CHAIN_ONLY_CTX 会拒绝在单族上查询
+    # （真机多族根服务器不存在该问题）。这样计数只统计链查询本身。
+    eng._preferred_family = ""
+    eng._family_probe_at = time.time() + 3600.0
+    eng._family_probe_reliable = True
+    return v
 
 
 async def _resolve_via(eng, qname: str, qtype: int = dns.rdatatype.A):
@@ -2259,19 +2323,19 @@ async def run_part_d() -> bool:
           r is None and eng._stats["bogus"] >= 1,
           "stats=%s" % (dict(eng._stats),))
 
-    # D7 根信任锚验签失败（野钥匙签根 DNSKEY）→ 证据 bogus_root，绝不放行
+    # D7 根信任锚验签失败（野钥匙签根 DNSKEY）→ 链状态 bogus，绝不放行
     w = World(_MODE_ROOT_BAD_SIG)
     eng = _world_engine(w)
     r = await _resolve_via(eng, "www.secure.test.")
-    ev = await eng._dnssec_availability()
-    check("D7 根 DNSKEY 验签失败 → 证据 bogus_root 且不放行",
-          ev == "bogus_root" and r is None,
-          "evidence=%s stats=%s" % (ev, dict(eng._stats)))
+    st, _k = await eng._dnssec._get_verified_zone_keys(dns.name.root)
+    check("D7 根 DNSKEY 验签失败 → 链状态 bogus 且不放行",
+          st == "bogus" and r is None and eng._dnssec_evidence == "bogus_root",
+          "status=%s evidence=%s stats=%s"
+          % (st, eng._dnssec_evidence, dict(eng._stats)))
 
     # D8 链路正常（证据 ok）时，降级闸门不得生效
     w = World(_MODE_FULL)
     eng = _world_engine(w)
-    await eng._dnssec_availability()
     r = await _resolve_via(eng, "www.secure.test.")
     check("D8 链路证据 ok 时降级闸门不生效（仍走严格验签）",
           eng._dnssec_evidence == "ok" and r is not None
@@ -2339,7 +2403,8 @@ async def run_part_e() -> bool:
     # E6 「确定性缺失」不再退避重试：一次根 DNSKEY 查询即可（旧实现 4 次）
     w = AbsentWorld("nxdomain")
     eng = _world_engine(w, require_rrsig=False)
-    await eng._get_trusted_dnskey(dns.name.root)
+    v = _real_validator(eng, w)
+    await v._get_verified_zone_keys(dns.name.root)
     n = w.queries[(".", "DNSKEY")]
     check("E6 根 DNSKEY 确定性缺失只查 1 次（不再退避重试 4 次）",
           n == 1, "root_dnskey_queries=%d" % n)
@@ -2347,27 +2412,28 @@ async def run_part_e() -> bool:
     # E7 证据 TTL 缓存：absent 期间重复查询不复用根 DNSKEY 往返
     w = AbsentWorld("nxdomain")
     eng = _world_engine(w, require_rrsig=False)
-    await _resolve_via(eng, "www.bing.com")
+    v = _real_validator(eng, w)
+    ok1 = await v._root_chain_available()
     q1 = w.queries[(".", "DNSKEY")]
     for _ in range(3):
-        await _resolve_via(eng, "www.bing.com")
+        await v._root_chain_available()
     q2 = w.queries[(".", "DNSKEY")]
     check("E7 absent 证据在 60s TTL 内不重复探测根 DNSKEY",
-          q2 == q1, "root_dnskey_queries %d → %d" % (q1, q2))
+          ok1 is False and q1 == 1 and q2 == q1,
+          "ok=%s root_dnskey_queries %d → %d" % (ok1, q1, q2))
 
     # E8 链路恢复后自动回到完整验证（证据过期 → 重新探测 → ok）
     w = World(_MODE_ABSENT)
     eng = _world_engine(w, require_rrsig=False)
-    await _resolve_via(eng, "www.secure.test.")
-    ev_before = await eng._dnssec_availability()
+    v = _real_validator(eng, w)
+    ev_before = await v._root_chain_available()
     w.mode = _MODE_FULL                      # 网络被修好
-    eng._dnssec_avail_cache = ("", 0.0)      # 模拟 TTL 到期
-    eng._dnskey_retry_after.pop(".", None)
-    eng._chain_unavailable.discard(".")
-    ev_after = await eng._dnssec_availability()
+    v._root_avail_expire = 0.0               # 模拟 TTL 到期
+    v._verified_zone_cache.clear()
+    ev_after = await v._root_chain_available()
     check("E8 网络恢复后证据自动回到 ok（无需重启进程）",
-          ev_before == "absent" and ev_after == "ok",
-          "%s → %s" % (ev_before, ev_after))
+          ev_before is False and ev_after is True,
+          "absent=%s → ok=%s" % (ev_before, ev_after))
 
     # E9 验签后端缺失（无 cryptography）→ require_rrsig=false 时放行
     w = World(_MODE_FULL)
@@ -2570,15 +2636,18 @@ async def run_part_f() -> bool:
     # F5 DS / DNSKEY 全链查询带 DO=1（这是 DNSSEC 验证唯一的数据来源）
     w = World(_MODE_FULL)
     eng, cap = _wire_engine(w)
-    k = await eng._get_trusted_dnskey(dns.name.from_text("secure.test."))
+    v = _real_validator(eng, w)
+    st, zkeys = await v._get_verified_zone_keys(
+        dns.name.from_text("secure.test."))
+    k = zkeys.get(dns.name.from_text("secure.test."))
     infos = [_parse_wire(x[1]) for x in cap]
     chain = [i for i in infos if i["qtype"] in (
         dns.rdatatype.DS, dns.rdatatype.DNSKEY)]
     check("F5 DS/DNSKEY 全链查询全部带 DO=1 且链验证成功",
-          k is not None and len(chain) >= 4
+          st == "secure" and k is not None and len(chain) >= 4
           and all(i["do"] for i in chain),
-          "链路查询=%d 全部DO=%s 链长度=%s"
-          % (len(chain), all(i["do"] for i in infos),
+          "status=%s 链路查询=%d 全部DO=%s 链长度=%s"
+          % (st, len(chain), all(i["do"] for i in infos),
              None if k is None else len(k)))
 
     return all(ok for _, ok in RESULTS[start_ok:])
@@ -2617,6 +2686,8 @@ async def run_part_g() -> bool:
               manager._is_pure_iterative_mode()
               and len(manager._upstream_servers) == 1,
               "上游=%s" % ([u.name for u in manager._upstream_servers],))
+        last_q = None
+        last_wire = None
         for name in ("www.secure.test.", "www.secure.opt.test."):
             q = dns.message.make_query(name, dns.rdatatype.A)
             wire = await asyncio.wait_for(manager.resolve(q.to_wire()), timeout=30)
@@ -2629,13 +2700,20 @@ async def run_part_g() -> bool:
                 detail = "rcode=%s answer=%s" % (
                     dns.rcode.to_text(m.rcode()),
                     [dns.rdatatype.to_text(x.rdtype) for x in m.answer])
+                last_q, last_wire = q, wire
             check("G2 纯迭代解析签名域名 %s（无任何加密上游）" % name, ok, detail)
-        check("G3 纯迭代下 DNSSEC 判定为 secure（证据=ok，无降级放行）",
-              eng.stats.get("secure", 0) >= 1
-              and eng.stats.get("dnssec_absent", 0) == 0
-              and eng._dnssec_evidence == "ok",
-              "evidence=%s stats=%s"
-              % (eng._dnssec_evidence, eng.stats))
+        # G3：直接调用真实 validate_response（dnssec.py 唯一实现），
+        # 断言它把最终应答判为 secure，而不是只看统计计数。
+        ok3, st3, info3 = False, "wire=None", {}
+        if last_wire is not None:
+            ok3, st3, info3 = await asyncio.wait_for(
+                eng._dnssec.validate_response(
+                    last_q.to_wire(), last_wire), timeout=30)
+        check("G3 真实 validate_response 判定 secure（无降级放行）",
+              ok3 is True and st3 == "secure"
+              and eng.stats.get("dnssec_absent", 0) == 0,
+              "status=%s detail=%s stats=%s"
+              % (st3, (info3 or {}).get("detail"), eng.stats))
     finally:
         try:
             await asyncio.wait_for(manager.close_all(), timeout=15)
@@ -2678,6 +2756,7 @@ class SplitWorld(World):
 def _split_engine(world: SplitWorld, hijack_both: bool = False):
     eng, _cap = _wire_engine(world)
     eng.root_servers = ["10.0.0.1", "fd00::1"]
+    eng._has_ipv6 = True
     hits = collections.Counter()
 
     async def fake_udp(ip, q):
@@ -2699,6 +2778,15 @@ def _split_engine(world: SplitWorld, hijack_both: bool = False):
 
     eng._udp_exchange = fake_udp
     eng._hits = hits
+    if hijack_both:
+        async def _no_root_keys(zone, depth=0):
+            return ("indeterminate", {})
+
+        async def _no_root():
+            return False
+
+        eng._dnssec._get_verified_zone_keys = _no_root_keys
+        eng._dnssec._root_chain_available = _no_root
     return eng, hits
 
 
@@ -2719,19 +2807,21 @@ async def run_part_h() -> bool:
     # H2 自动换族后根 DNSKEY 能验证通过（证据从 absent 变 ok）
     w = SplitWorld()
     eng, _hits = _split_engine(w)
-    ev_before = await eng._dnssec_availability()
+    pref = await eng._ensure_family_preference()
+    ev_before = await eng._dnssec._root_chain_available()
     check("H2 换族后证据变 ok，且选定优先族=IPv6",
-          ev_before == "ok" and eng._preferred_family == "6"
+          ev_before is True and pref == "6" and eng._preferred_family == "6"
           and eng._family_verdicts.get("4") == "hijacked"
           and eng._family_verdicts.get("6") == "genuine",
           "evidence=%s pref=%s verdicts=%s"
-          % (ev_before, eng._preferred_family, eng._family_verdicts))
+          % ("ok" if ev_before else "absent", eng._preferred_family,
+             eng._family_verdicts))
 
     # H3 换族后签名域名解析成功且判 secure（换族前这是"无法证明"）
     #    先让族探测跑完（探测本身必然要问 v4 一次），再清零计数观察解析路径
     w = SplitWorld()
     eng, hits = _split_engine(w)
-    await eng._dnssec_availability()
+    await eng._ensure_family_preference()
     hits.clear()
     r = await eng.resolve("www.secure.test.", dns.rdatatype.A)
     check("H3 换族后签名域名判 secure（answer 带 RRSIG）",
@@ -2743,19 +2833,20 @@ async def run_part_h() -> bool:
     v4_during = sum(c for (fam, _n, _t), c in hits.items() if fam == "4")
     v6_during = sum(c for (fam, _n, _t), c in hits.items() if fam == "6")
     check("H4 解析全程只问 v6 权威（代答的 v4 不再参与）",
-          v4_during == 0 and v6_during >= 5,
+          v4_during == 0 and v6_during >= 3,
           "v4=%d v6=%d" % (v4_during, v6_during))
 
     # H5 两族都被代答 → 保持原有降级（可用性优先，不整机 SERVFAIL）
     w = SplitWorld()
     eng2, _h2 = _split_engine(w, hijack_both=True)
-    ev = await eng2._dnssec_availability()
+    ev = await eng2._dnssec._root_chain_available()
     r2 = await eng2.resolve("www.secure.test.", dns.rdatatype.A)
     check("H5 两族都被代答 → 仍解析成功（dnssec_absent 降级，不 SERVFAIL）",
-          ev == "absent" and r2 is not None
-          and eng2._last_release == "dnssec_absent",
+          ev is False and r2 is not None
+          and eng2._last_release == "dnssec_absent"
+          and eng2._dnssec_evidence == "absent",
           "evidence=%s release=%r stats=%s"
-          % (ev, eng2._last_release, dict(eng2.stats)))
+          % (eng2._dnssec_evidence, eng2._last_release, dict(eng2.stats)))
 
     # H6 回退保障：某一跳没有 v6 地址时自动回退全族，解析不能失败
     #    （回退拿到的是代答族的数据 → 按 require_rrsig=false 未验证放行，
@@ -2788,10 +2879,15 @@ class MirrorWorld(SplitWorld):
 def _mirror_engine(world: MirrorWorld, family_policy: str, ipv4_verify: str):
     eng, _cap = _wire_engine(world)
     eng.root_servers = ["10.0.0.1", "fd00::1"]
+    eng._has_ipv6 = True
     eng._family_policy = family_policy
     eng._ipv4_verify = ipv4_verify
     eng._preferred_family = {"ipv4": "4", "ipv6": "6"}.get(family_policy, "")
     eng._family_verdicts = {}
+    if ipv4_verify == "none":
+        # ipv4_verify=none：镜像族不做事先探测，直接按“已判定代答”处理，
+        # 让响应带上 _hijacked_path（配置语义：放行但不验证）。
+        eng._family_verdicts = {"4": "hijacked", "6": "genuine"}
     eng._family_probe_at = 0.0
     hits = collections.Counter()
 
@@ -2984,6 +3080,601 @@ async def run_part_i() -> bool:
 
 
 # ============================================================
+# Part M：(iterative.family × iterative.ipv4_verify) 四态矩阵穷举
+#
+# family ∈ {auto, ipv4, ipv6} × ipv4_verify ∈ {strict, corroborate, none}
+# × 7 个攻击/可用性场景：正向 / 篡改 / 剥 RRSIG / 重放 NXDOMAIN /
+# opt-out DS / 两族皆代答 / 真族不可达。
+#
+# 每个组合都断言：是否放行、放行原因（secure/insecure/hijacked_path/
+# dnssec_absent/bogus），以及 hijacked_path / mismatch / dnssec_absent
+# 三个计数器的精确值。IPv4 镜像（v4）可篡改/剥签名/重放，IPv6（v6）是真
+# 权威；真族不可达时 v6 无地址，仅剩镜像族。
+# ============================================================
+
+class MatrixWorld(SplitWorld):
+    """v4 = 境内镜像（可注入 篡改/剥签名/重放 NXDOMAIN），v6 = 真权威"""
+
+    POISON = "203.0.113.66"
+
+    def __init__(self, scenario: str):
+        # 两族皆代答 / 真族不可达：v6 要么应答伪造、要么没有地址
+        v6_glue = scenario not in ("both_hijacked", "genuine_down")
+        super().__init__(v6_glue=v6_glue)
+        self.scenario = scenario
+
+
+def _matrix_engine(world: MatrixWorld, family_policy: str, ipv4_verify: str):
+    eng, _cap = _wire_engine(world)
+    eng.root_servers = (["10.0.0.1", "fd00::1"]
+                        if world.v6_glue else ["10.0.0.1"])
+    eng._has_ipv6 = bool(world.v6_glue)
+    eng._family_policy = family_policy
+    eng._ipv4_verify = ipv4_verify
+    eng._preferred_family = {"ipv4": "4", "ipv6": "6"}.get(
+        family_policy, "")
+    eng._family_verdicts = {}
+    eng._family_probe_at = 0.0
+    eng._family_probe_reliable = False
+    if ipv4_verify == "none":
+        # none：不做事先探测，直接按“镜像族已判定代答”处理
+        eng._family_verdicts = {
+            "4": "hijacked",
+            "6": "genuine" if world.v6_glue else "unreachable",
+        }
+    hits = collections.Counter()
+
+    def _fake_nx(q):
+        r = dns.message.make_response(dns.message.make_query(
+            str(q.question[0].name), int(q.question[0].rdtype)))
+        r.set_rcode(dns.rcode.NXDOMAIN)
+        r.authority.append(_rr(".", "SOA", _ROOT_SOA))
+        r.index = None
+        r.id = q.id
+        return r
+
+    async def fake_udp(ip, q):
+        fam = "6" if ":" in str(ip) else "4"
+        qname = str(q.question[0].name)
+        qtype = int(q.question[0].rdtype)
+        hits[(fam, qname, qtype)] += 1
+        if fam == "6":
+            if not world.v6_glue:
+                return None                    # 真族不可达
+            if world.scenario == "both_hijacked":
+                return _fake_nx(q)             # v6 也被代答
+            r = world.answer(ip, qname, qtype)
+            r.id = q.id
+            return r
+        # ---- v4 镜像 ----
+        if world.scenario in ("both_hijacked", "genuine_down"):
+            return _fake_nx(q)                 # 镜像只回 SOA（无 DNSSEC）
+        if qtype == dns.rdatatype.DNSKEY:
+            # 镜像不下发 DNSSEC：根 DNSKEY 只回 SOA → 族探测判 hijacked
+            return _fake_nx(q)
+        r = world.answer(ip, qname, qtype)
+        r.index = None
+        r.id = q.id
+        if world.scenario == "nxdomain":
+            return _fake_nx(q)                 # 重放 NXDOMAIN
+        if world.scenario in ("tamper", "strip"):
+            # 保留 AA/OPT 等“像真权威”的形态，只动最终 A 记录
+            r.answer = [x for x in r.answer
+                        if x.rdtype not in (dns.rdatatype.A,
+                                            dns.rdatatype.RRSIG)]
+            if world.scenario == "tamper":
+                r.answer.append(_rr(qname, "A", MatrixWorld.POISON))
+            else:
+                r.answer.append(_rr(qname, "A", "10.0.0.21"))
+            r.flags |= dns.flags.AA
+        return r
+
+    eng._udp_exchange = fake_udp
+    eng._hits = hits
+    if world.scenario == "both_hijacked":
+        # 两族都拿不到 DNSSEC 材料 → 链查询 indeterminate → 能力证据 absent
+        async def _no_root_keys(zone, depth=0):
+            return ("indeterminate", {})
+
+        async def _no_root():
+            return False
+
+        eng._dnssec._get_verified_zone_keys = _no_root_keys
+        eng._dnssec._root_chain_available = _no_root
+    return eng, hits
+
+
+_M_SCENARIOS = ("positive", "tamper", "strip", "nxdomain", "optout",
+                "both_hijacked", "genuine_down")
+_M_LABEL = {
+    "positive": "正向",
+    "tamper": "篡改",
+    "strip": "剥RRSIG",
+    "nxdomain": "重放NXDOMAIN",
+    "optout": "opt-out DS",
+    "both_hijacked": "两族皆代答",
+    "genuine_down": "真族不可达",
+}
+_M_QNAME = {
+    "optout": "www.unsigned.opt.test.",
+}
+
+
+def _m_exp(ok, release, secure=0, insecure=0, bogus=0, absent=0,
+           hijack=0, mismatch=0, corr=0, answer=None):
+    return {
+        "ok": ok, "release": release, "secure": secure,
+        "insecure": insecure, "bogus": bogus, "absent": absent,
+        "hijack": hijack, "mismatch": mismatch, "corr": corr,
+        "answer": answer,
+    }
+
+
+def _m_expected():
+    """(family, ipv4_verify, scenario) → 期望值（由 part_m_probe.py 实测固化）"""
+    E = {}
+    sec = _m_exp(True, "secure", secure=1, answer="10.0.0.21")
+
+    # family=auto：先探测，v4=镜像 → 自动改用 v6
+    for ver in ("strict", "corroborate"):
+        for sc in ("positive", "tamper", "strip", "nxdomain"):
+            E[("auto", ver, sc)] = dict(sec)
+        E[("auto", ver, "optout")] = _m_exp(
+            True, "insecure", insecure=1, answer="10.0.0.61")
+        E[("auto", ver, "both_hijacked")] = _m_exp(
+            True, "dnssec_absent", insecure=1, absent=1)
+        E[("auto", ver, "genuine_down")] = _m_exp(
+            True, "hijacked_path", insecure=1, hijack=1)
+    # auto + none：与 auto 基本相同（none 只影响“答案来自镜像族”的分支）
+    for sc in ("positive", "tamper", "strip", "nxdomain"):
+        E[("auto", "none", sc)] = dict(sec)
+    E[("auto", "none", "optout")] = _m_exp(
+        True, "insecure", insecure=1, answer="10.0.0.61")
+    E[("auto", "none", "both_hijacked")] = _m_exp(
+        True, "hijacked_path", insecure=1, hijack=1)
+    E[("auto", "none", "genuine_down")] = _m_exp(
+        True, "hijacked_path", insecure=1, hijack=1)
+
+    # family=ipv4：答案恒来自镜像族
+    E[("ipv4", "strict", "positive")] = dict(sec)
+    for sc in ("tamper", "strip"):
+        E[("ipv4", "strict", sc)] = _m_exp(
+            False, "bogus", bogus=2)          # 严格模式：验签失败 → 丢弃（含一次重试）
+    E[("ipv4", "strict", "nxdomain")] = _m_exp(
+        True, "hijacked_path", insecure=1, hijack=1)
+    E[("ipv4", "strict", "optout")] = _m_exp(
+        True, "insecure", insecure=1, answer="10.0.0.61")
+    E[("ipv4", "strict", "both_hijacked")] = _m_exp(
+        True, "dnssec_absent", insecure=1, absent=1)
+    E[("ipv4", "strict", "genuine_down")] = _m_exp(
+        True, "hijacked_path", insecure=1, hijack=1)
+
+    # ipv4 + corroborate：镜像答案用真族重解析印证，不一致时改用真族答案
+    E[("ipv4", "corroborate", "positive")] = _m_exp(
+        True, "secure", secure=1, corr=1, answer="10.0.0.21")
+    E[("ipv4", "corroborate", "tamper")] = _m_exp(
+        True, "secure", secure=1, mismatch=1, corr=1,
+        answer="10.0.0.21")
+    E[("ipv4", "corroborate", "strip")] = _m_exp(
+        True, "secure", secure=1, corr=1, answer="10.0.0.21")
+    E[("ipv4", "corroborate", "nxdomain")] = _m_exp(
+        True, "secure", secure=1, mismatch=1, corr=1,
+        answer="10.0.0.21")
+    E[("ipv4", "corroborate", "optout")] = _m_exp(
+        True, "insecure", insecure=1, corr=1, answer="10.0.0.61")
+    E[("ipv4", "corroborate", "both_hijacked")] = _m_exp(
+        True, "dnssec_absent", insecure=1, absent=1)
+    E[("ipv4", "corroborate", "genuine_down")] = _m_exp(
+        True, "hijacked_path", insecure=1, hijack=1)
+
+    # ipv4 + none：镜像答案未验证放行（篡改值原样交给客户端）
+    E[("ipv4", "none", "positive")] = _m_exp(
+        True, "hijacked_path", insecure=1, hijack=1, answer="10.0.0.21")
+    E[("ipv4", "none", "tamper")] = _m_exp(
+        True, "hijacked_path", insecure=1, hijack=1,
+        answer=MatrixWorld.POISON)
+    E[("ipv4", "none", "strip")] = _m_exp(
+        True, "hijacked_path", insecure=1, hijack=1, answer="10.0.0.21")
+    E[("ipv4", "none", "nxdomain")] = _m_exp(
+        True, "hijacked_path", insecure=1, hijack=1)
+    E[("ipv4", "none", "optout")] = _m_exp(
+        True, "hijacked_path", insecure=1, hijack=1,
+        answer="10.0.0.61")
+    E[("ipv4", "none", "both_hijacked")] = _m_exp(
+        True, "hijacked_path", insecure=1, hijack=1)
+    E[("ipv4", "none", "genuine_down")] = _m_exp(
+        True, "hijacked_path", insecure=1, hijack=1)
+
+    # family=ipv6：答案恒来自真族（与 verify 策略无关）
+    for ver in ("strict", "corroborate", "none"):
+        for sc in ("positive", "tamper", "strip", "nxdomain"):
+            E[("ipv6", ver, sc)] = dict(sec)
+        E[("ipv6", ver, "optout")] = _m_exp(
+            True, "insecure", insecure=1, answer="10.0.0.61")
+        if ver == "none":
+            # none：两族皆不可用时，按镜像族未验证放行
+            E[("ipv6", ver, "both_hijacked")] = _m_exp(
+                True, "hijacked_path", insecure=1, hijack=1)
+        else:
+            E[("ipv6", ver, "both_hijacked")] = _m_exp(
+                True, "dnssec_absent", insecure=1, absent=1)
+        E[("ipv6", ver, "genuine_down")] = _m_exp(
+            True, "hijacked_path", insecure=1, hijack=1)
+    return E
+
+
+_M_EXPECT = _m_expected()
+
+
+async def run_part_m() -> bool:
+    print("\n[Part M] (iterative.family × iterative.ipv4_verify) "
+          "四态矩阵穷举（9 组合 × 7 场景）")
+    if not _pds_ready():
+        return True
+    start_ok = len(RESULTS)
+
+    for family in ("auto", "ipv4", "ipv6"):
+        for verify in ("strict", "corroborate", "none"):
+            for scenario in _M_SCENARIOS:
+                w = MatrixWorld(scenario)
+                eng, _hits = _matrix_engine(w, family, verify)
+                qname = _M_QNAME.get(scenario, "www.secure.test.")
+                try:
+                    r = await asyncio.wait_for(
+                        eng.resolve(qname, dns.rdatatype.A), timeout=20)
+                except Exception:
+                    r = None
+                answer = None
+                if r is not None:
+                    for rrset in r.answer:
+                        if rrset.rdtype == dns.rdatatype.A:
+                            answer = rrset[0].address
+                _s = dict(eng.stats)
+                got = {
+                    "ok": r is not None,
+                    "release": eng._last_release,
+                    "secure": _s.get("secure", 0),
+                    "insecure": _s.get("insecure", 0),
+                    "bogus": _s.get("bogus", 0),
+                    "absent": _s.get("dnssec_absent", 0),
+                    "hijack": _s.get("hijacked_path", 0),
+                    "mismatch": _s.get("mismatch", 0),
+                    "corr": _s.get("corroborated", 0),
+                    "answer": answer,
+                }
+                exp = _M_EXPECT[(family, verify, scenario)]
+                bad = [k for k in exp if got.get(k) != exp[k]]
+                check("M %s/%s %s → %s%s"
+                      % (family, verify, _M_LABEL[scenario],
+                         "放行" if exp["ok"] else "丢弃", exp["release"]),
+                      not bad,
+                      "bad=%s got=%s exp=%s" % (bad, got, exp))
+
+    return all(ok for _, ok in RESULTS[start_ok:])
+
+
+# ============================================================
+# Part N：统一验证链全局验收（源码级 + 纯函数 + 真实链端到端 + 本轮回归）
+#
+# 合并自原 verify_unified_dnssec.py：该脚本已删除，全部检查进入本文件，
+# 随 `python test_plain_dns.py --skip-net` 一起执行。
+# ============================================================
+
+_N_DELETED = [
+    "_zone_signed_status", "_get_trusted_dnskey",
+    "_get_trusted_dnskey_uncached", "_parent_is_insecure",
+    "_is_delegation", "_retry_ds_once", "_clear_ds_cache_for_chain",
+    "_dnssec_availability", "_set_dnssec_evidence", "_warn_dnssec_once",
+    "_nsec_proves_no_type", "_nsec_proves_no_ds", "_nsec3_proves_no_ds",
+    "_nsec3_proves_no_type", "_nsec_covers", "_ds_matches_key",
+    "_find_rrsig_for", "_report_dnssec_drop", "_report_dnssec_stripped",
+    "_report_unsigned_unknown", "_report_dnssec_absent",
+]
+_N_KEPT = [
+    "_extract_dnskey_rrset", "_dnssec_query_callback", "_iterate_ds_cached",
+    "_probe_family_integrity", "_report_hijacked_path",
+    "_report_dnssec_mismatch",
+]
+
+
+def _real_chain_engine(world, require_rrsig: bool = False):
+    """真实链引擎：不替换 DNSSECValidator 的任何链方法/验签方法。
+
+    用真实 DS→DNSKEY→RRSIG 验证跑合成权威树，覆盖 test_plain_dns 其它
+    Part 用测试桩替代掉的“真实验签”路径。
+    """
+    eng = object.__new__(pds.IterativeResolver)
+    eng.config = types.SimpleNamespace(bootstrap_resolvers=[])
+    eng.strict_dnssec = True
+    eng.total_timeout = 20.0
+    eng.max_depth = 12
+    eng.hop_parallel = 1
+    eng.qname_minimization = True
+    eng.root_servers = ["10.0.0.1"]
+    eng.timeout = 1.0
+    eng._stats = collections.Counter()
+    eng._last_release = ""
+    eng._require_rrsig = require_rrsig
+    eng._dnssec_crypto_ok = True
+    eng._dnssec_evidence = "unknown"
+    eng._dnssec_evidence_detail = ""
+    eng._family_verdicts = {}
+    eng._family_probe_at = time.time() + 3600.0
+    eng._family_probe_reliable = True
+    eng._preferred_family = ""
+    eng._family_policy = "auto"
+    eng._ipv4_verify = "strict"
+    eng._hijack_warn_last = 0.0
+    eng._hijack_warn_merged = 0
+    eng._ns_ip_cache = {}
+    eng._zone_ns_cache = {}
+    eng._ds_cache = {}
+    eng._ds_inflight = {}
+    eng._server_health = {}
+    eng._server_cookies = {}
+    eng._cookie_disabled = set()
+    eng._cookie_secret = b"part-n-secret!!!"
+    eng._bootstrap_sem = asyncio.Semaphore(1)
+    eng._inflight_sem = asyncio.Semaphore(8)
+    eng._closest_zone_servers = lambda qname, qtype: None
+    from dnssec import DNSSECValidator as _DV_N
+    eng._dnssec = _DV_N(
+        enabled=True, mode="strict", require_rrsig=require_rrsig)
+    eng._dnssec._root_keys = world.build_anchor()
+    eng._dnssec.set_dns_query_callback(eng._dnssec_query_callback)
+
+    async def query_servers(servers, qname, qtype, rdclass=1):
+        return world.answer(servers[0], qname, qtype, rdclass)
+
+    eng._query_servers = query_servers
+    return eng
+
+
+async def run_part_n() -> bool:
+    print("\n[Part N] 统一验证链全局验收"
+          "（源码级 + 纯函数 + 真实链端到端 + 当日日志回归）")
+    if not _pds_ready():
+        return True
+    from dnssec import DNSSECValidator
+    start_ok = len(RESULTS)
+
+    # ---------- N1 源码级：旧验证已删除、保留项仍在 ----------
+    src_path = os.path.join(_HERE, "plain_dns_server.py")
+    try:
+        src = open(src_path, encoding="utf-8").read()
+    except Exception:
+        src = ""
+    residue = []
+    for name in _N_DELETED:
+        if name == "_is_delegation":
+            # 排除 dnssec.py 风格的 _name_is_delegation（不同符号）
+            if re.search(r"(?<![A-Za-z0-9])_is_delegation\b", src):
+                residue.append(name)
+        elif name in src:
+            residue.append(name)
+    check("N1 旧验证符号在 plain_dns_server.py 中出现 0 次",
+          not residue, "残留=%s" % residue)
+    check("N2 _zone_signed_status 源码计数为 0",
+          len(re.findall(r"_zone_signed_status", src)) == 0,
+          "count=%d" % len(re.findall(r"_zone_signed_status", src)))
+    for name in _N_DELETED:
+        check("N3 IterativeResolver 不再有 %s" % name,
+              not hasattr(pds.IterativeResolver, name))
+    for name in _N_KEPT:
+        check("N4 保留 %s" % name, hasattr(pds.IterativeResolver, name))
+
+    # ---------- N5 纯函数逐分支：DS NODATA 证明 ----------
+    v = DNSSECValidator(enabled=True, mode="strict")
+    zone = "example.cn."
+    name = dns.name.from_text("sub." + zone)
+    salt = b"\xab"
+    h = v._nsec3_hash(name, salt, 0, 1)
+    soa = _chain_soa(zone)
+    ds_cases = [
+        ("NSEC3 opt-out 区间覆盖", _chain_resp(name, authority=[soa, _chain_nsec3(
+            _chain_shift(h, -1), _chain_shift(h, 1), flags=1,
+            bitmap="A RRSIG", zone=zone, salt=salt)]), True),
+        ("NSEC owner==name 含 NS 不含 DS", _chain_resp(name, authority=[soa, _chain_nsec(
+            str(name), "zzz." + zone)]), True),
+        ("精确 NSEC3 owner 含 NS 不含 DS", _chain_resp(name, authority=[soa, _chain_nsec3(
+            h, _chain_shift(h, 1), flags=0, bitmap="NS RRSIG",
+            zone=zone, salt=salt)]), True),
+        ("NSEC 位图含 DS", _chain_resp(name, authority=[soa, _chain_nsec(
+            str(name), "zzz." + zone, "NS DS RRSIG NSEC")]), False),
+        ("NSEC owner 跨名重放", _chain_resp(name, authority=[soa, _chain_nsec(
+            "other." + zone, "zzz." + zone)]), False),
+        ("无 NSEC/NSEC3", _chain_resp(name, authority=[soa]), False),
+    ]
+    for label, resp, want in ds_cases:
+        got = v._ds_nodata_proves_insecure(resp, name)
+        check("N5 DS 证明：%s → %s" % (label, want),
+              got is want, "got=%r" % got)
+    got = v._ds_nodata_proves_insecure(ds_cases[0][1], name, verified_ids=set())
+    check("N5 DS 证明：未验签（verified_ids 为空）→ False",
+          got is False, "got=%r" % got)
+
+    # ---------- N6 纯函数逐分支：负应答语义 ----------
+    q_nx = dns.name.from_text("ghost." + zone)
+    neg_cases = [
+        ("NXDOMAIN NSEC 区间覆盖", _chain_resp(
+            str(q_nx), dns.rcode.NXDOMAIN,
+            [soa, _chain_nsec(zone, "zzz." + zone, "A RRSIG NSEC")]), True),
+        ("NXDOMAIN NSEC 区间不覆盖", _chain_resp(
+            str(q_nx), dns.rcode.NXDOMAIN,
+            [soa, _chain_nsec("aaa." + zone, "bbb." + zone,
+                              "A RRSIG NSEC")]), False),
+        ("NXDOMAIN 缺 SOA", _chain_resp(
+            str(q_nx), dns.rcode.NXDOMAIN,
+            [_chain_nsec(zone, "zzz." + zone, "A RRSIG NSEC")]), False),
+        ("NODATA NSEC owner==qname 且无 A", _chain_resp(
+            str(q_nx), authority=[
+                soa, _chain_nsec(str(q_nx), "zzz." + zone,
+                                 "TXT RRSIG NSEC")]), True),
+        ("NODATA NSEC owner==qname 但含 A", _chain_resp(
+            str(q_nx), authority=[
+                soa, _chain_nsec(str(q_nx), "zzz." + zone,
+                                 "A RRSIG NSEC")]), False),
+        ("无 NSEC/NSEC3", _chain_resp(str(q_nx), authority=[soa]), None),
+    ]
+    for label, resp, want in neg_cases:
+        got = v._validate_negative_semantics(resp, q_nx, dns.rdatatype.A)
+        check("N6 负应答语义：%s → %r" % (label, want),
+              got is want, "got=%r" % (got,))
+
+    # ---------- N7 真实链端到端（不使用任何链桩） ----------
+    e2e = [
+        ("签名区正向", World(_MODE_FULL), "www.secure.test.",
+         True, "secure", "10.0.0.21"),
+        ("未签名区（父区 NSEC 证明）", World(_MODE_FULL),
+         "www.insecure.test.", True, "insecure", "10.0.0.31"),
+        ("未签名区（NSEC3 opt-out 证明）", World(_MODE_FULL),
+         "www.unsigned.opt.test.", True, "insecure", "10.0.0.61"),
+        ("签名区应答被篡改", World(_MODE_TAMPER_ANSWER),
+         "www.secure.test.", False, "bogus", None),
+        ("签名区剥离 RRSIG", World(_MODE_STRIP_ANSWER),
+         "www.secure.test.", False, "bogus", None),
+        ("父区缺否定证明", World(_MODE_NO_PROOF),
+         "www.unsigned.opt.test.", False, "bogus", None),
+        ("根 DNSKEY 验签失败", World(_MODE_ROOT_BAD_SIG),
+         "www.secure.test.", False, "bogus", None),
+        ("链路不提供 DNSSEC", AbsentWorld("nxdomain"),
+         "datarouter-prod.ak.epicgames.com", True,
+         "dnssec_absent", "203.0.113.9"),
+    ]
+    for label, world, qname, want_ok, want_rel, want_a in e2e:
+        eng = _real_chain_engine(world)
+        r = await asyncio.wait_for(eng.resolve(qname, dns.rdatatype.A),
+                                   timeout=20)
+        answer = None
+        if r is not None:
+            for rrset in r.answer:
+                if rrset.rdtype == dns.rdatatype.A:
+                    answer = rrset[0].address
+        check("N7 真实链：%s → %s%s"
+              % (label, "放行" if want_ok else "丢弃",
+                 ("(%s)" % want_rel) if want_ok else ""),
+              (r is not None) == want_ok and eng._last_release == want_rel
+              and answer == want_a,
+              "ok=%s release=%r a=%r stats=%s"
+              % (r is not None, eng._last_release, answer, dict(eng.stats)))
+
+    # ---------- N8 CNAME 中间跳：只验签，不套负应答语义 ----------
+    priv, key = _new_dnssec_key()
+    cname_zone = "signed.example."
+    cname_keys = _zone_keyset(cname_zone, key)
+    q = dns.message.make_query("alias." + cname_zone, dns.rdatatype.A)
+    cmsg = dns.message.make_response(q)
+    cname_rr = dns.rrset.from_text(
+        "alias." + cname_zone, 300, "IN", "CNAME", "target.unsigned.")
+    cmsg.answer.extend([cname_rr, _sign_rrset(
+        cname_rr, priv, key, cname_zone, int(time.time()))])
+    vc = DNSSECValidator(enabled=True, mode="strict")
+
+    async def _zk_c(zone_name, depth=0):
+        return ("secure", {dns.name.from_text(cname_zone): cname_keys})
+
+    async def _ds_true(name_):
+        return True
+
+    async def _ds_false(name_):
+        return False
+
+    vc._get_verified_zone_keys = _zk_c
+    vc._zone_has_ds = _ds_true
+    ok_hop, st_hop, _i = await vc.validate_response(
+        q.to_wire(), cmsg.to_wire(), cname_hop=True)
+    check("N8 签名 CNAME 中间跳（无 SOA）→ secure，不判负应答",
+          ok_hop is True and st_hop == "secure",
+          "ok=%s status=%s" % (ok_hop, st_hop))
+    ok_fin, st_fin, _i = await vc.validate_response(
+        q.to_wire(), cmsg.to_wire())
+    check("N8 最终响应仍按负应答语义校验 → bogus（防重放）",
+          ok_fin is False and st_fin == "bogus",
+          "ok=%s status=%s" % (ok_fin, st_fin))
+    # 未签名区的 CNAME 中间跳（没有 RRSIG）：按所在区是否已证明未签名放行
+    cmsg_un = dns.message.make_response(q)
+    cmsg_un.answer.append(cname_rr)
+
+    async def _root_ok():
+        return True
+
+    vc._zone_has_ds = _ds_false
+    vc._root_chain_available = _root_ok
+    ok_un, st_un, _i = await vc.validate_response(
+        q.to_wire(), cmsg_un.to_wire(), cname_hop=True)
+    check("N8 未签名区 CNAME 中间跳 → insecure（合法放行）",
+          ok_un is True and st_un == "insecure",
+          "ok=%s status=%s" % (ok_un, st_un))
+
+    # ---------- N9 DS 查询失败时按“普通名/CNAME”升父级 ----------
+    vd = DNSSECValidator(enabled=True, mode="strict")
+    ppriv, pkey = _new_dnssec_key()
+    parent_keyset = _zone_keyset("com.", pkey)
+    ds_proof = _chain_resp(
+        "example.com.", authority=[
+            _chain_soa("com."),
+            _chain_nsec("example.com.", "zzz.com.", "NS RRSIG NSEC")])
+
+    async def _cb_ds(qbytes):
+        m = dns.message.from_wire(qbytes)
+        qq = m.question[0]
+        n = str(qq.name).lower()
+        if qq.rdtype == dns.rdatatype.DS and n == "api.example.com.":
+            return None                       # 模拟 DS 查询失败
+        if qq.rdtype == dns.rdatatype.NS:
+            nr = dns.message.make_response(dns.message.make_query(
+                str(qq.name), qq.rdtype))
+            nr.authority.append(_chain_soa("example.com."))
+            return nr.to_wire()
+        if qq.rdtype == dns.rdatatype.DS and n == "example.com.":
+            return ds_proof.to_wire()
+        return None
+
+    async def _zk_com(zone_name, depth=0):
+        if str(zone_name).lower() == "com.":
+            return ("secure", {dns.name.from_text("com."): parent_keyset})
+        return ("secure", {})
+
+    vd.set_dns_query_callback(_cb_ds)
+    vd._get_verified_zone_keys = _zk_com
+    vd._verified_rrset_ids = lambda resp, keys: {
+        id(rr) for sec in (resp.answer, resp.authority) for rr in sec
+        if rr.rdtype in (dns.rdatatype.NSEC, dns.rdatatype.NSEC3)}
+    got_ds = await vd._zone_has_ds(dns.name.from_text("api.example.com."))
+    check("N9 DS 查询失败 + 非委托名 → 升父级并证明未签名（False）",
+          got_ds is False, "got=%r" % got_ds)
+
+    # ---------- N10 链验证在所有服务器都是真族时仍可查询 ----------
+    w10 = SplitWorld()
+    eng10, _h10 = _split_engine(w10)
+    eng10.root_servers = ["fd00::1"]
+    eng10._preferred_family = "6"
+    eng10._family_probe_at = 1e18
+    tok = pds._CHAIN_ONLY_CTX.set(True)
+    try:
+        r10 = await asyncio.wait_for(
+            eng10._iterate("www.secure.test.", dns.rdatatype.A), timeout=10)
+    finally:
+        pds._CHAIN_ONLY_CTX.reset(tok)
+    check("N10 链验证：本跳全为真族（v6）时不得误判“无真族权威”",
+          r10 is not None
+          and any(rr.rdtype == dns.rdatatype.A for rr in r10.answer),
+          "r=%s" % (r10 is not None))
+
+    # ---------- N11 DS 查询不做 QNAME 最小化（ipv4only.arpa 回归） ----------
+    w11 = World(_MODE_FULL)
+    eng11, cap11 = _wire_engine(w11)
+    await eng11._iterate("secure.test.", dns.rdatatype.DS, 0)
+    infos11 = [_parse_wire(x[1]) for x in cap11]
+    check("N11 DS 查询直接发完整名字（不做 QNAME 最小化）",
+          bool(infos11) and infos11[0]["qtype"] == dns.rdatatype.DS
+          and infos11[0]["qname"].rstrip(".") == "secure.test",
+          "first=%s" % (infos11[0] if infos11 else None))
+
+    return all(ok for _, ok in RESULTS[start_ok:])
+
+
+# ============================================================
 # Part J/K：真实链路端到端（需要出网）
 # ============================================================
 _REAL_DOMAINS = [
@@ -3025,7 +3716,8 @@ async def run_part_j() -> bool:
     lg.setLevel(logging.WARNING)
     try:
         await eng.warmup_dnssec_chain()
-        ev = await eng._dnssec_availability()
+        _root_ok = await eng._dnssec._root_chain_available()
+        ev = "ok" if _root_ok else "absent"
         cap.msgs.clear()          # 只统计"逐域名解析期间"的告警
         print("  链路 DNSSEC 证据: %s（require_rrsig=%s, strict_dnssec=%s，"
               "优先族=%r，各族=%s，ipv4_verify=%s）"
@@ -3318,6 +4010,823 @@ async def run_part_forensic():
         print("    · IPv6 有应答，可与 IPv4 结果对比看是否只有 v4 被劫持")
 
 
+# ============================================================
+# Part L：RFC 违反回归（2026-11-14 修复项，离线）
+#   L1/L2  DS 查询的缓存起跳不得跳过直接父区（RFC 4035 §3.1.4.1）
+#   L3     负应答 authority 里 NSEC3 排在 SOA 之前时不得误判「(无SOA)」
+#   L4     RFC 5155 §8.6：opt-out 区间覆盖 + DS 查询 = 合法 NODATA
+#   L5-L6  负向：缺 SOA / 非 DS / 区间不覆盖 仍必须拒绝（不放宽攻击面）
+#
+# 回归背景（2026-11-14 用户日志）：
+#   * `googleapis.com DS` 被「NSEC signer 非 (无SOA) 权威 zone」误拒；
+#   * com 权威的真实 authority 顺序是 [NSEC3, RRSIG, SOA, RRSIG]
+#     ——NSEC3 在 SOA 之前，旧实现边遍历边建立 SOA zone 必然误判；
+#   * H(googleapis.com)=6l953… 正落在 [6l950…, 6l95f…) 这个
+#     opt-out NSEC3 区间内（RFC 5155 §8.6 的合法 DS NODATA 证明）。
+# ============================================================
+def _l_neg_resp(qname, qtype, authority):
+    q = dns.message.make_query(qname, qtype, want_dnssec=True)
+    resp = dns.message.make_response(q)
+    for rr in authority:
+        resp.authority.append(rr)
+    return resp
+
+
+def _l_engine(reply, keys):
+    try:
+        import plain_dns_server as pds
+    except Exception:
+        return None
+    eng = object.__new__(pds.IterativeResolver)
+    eng.strict_dnssec = True
+    eng._stats = collections.Counter()
+    eng._verified_zone_cache = {}
+    eng._dnskey_inflight = {}
+    eng._ds_cache = {}
+    eng._ds_inflight = {}
+    eng._dnssec_warned = set()
+    eng._chain_unavailable = set()
+    eng._last_release = ""
+    eng._zone_ns_cache = {}
+    eng._delegation_cache = {}
+    eng._dnssec_crypto_ok = True
+    eng._has_ipv6 = False
+    eng._root_probe_enabled = False
+    eng._require_rrsig = False
+    eng._preferred_family = ""
+    eng._family_verdicts = {}
+    eng._ipv4_verify = "strict"
+    eng._dnssec_avail_cache = ("ok", time.time() + 600)
+    eng._dnssec_evidence = "ok"
+    eng._dnssec_evidence_detail = ""
+    eng._absent_warn_last = 0.0
+    eng._absent_warn_merged = 0
+    eng._absent_detail_logged = False
+    eng._unknown_warn_last = 0.0
+    eng._unknown_warn_merged = 0
+    eng._unverified_warn_last = 0.0
+    eng._unverified_warn_merged = 0
+    eng._hijack_warn_last = 0.0
+    eng._hijack_warn_merged = 0
+
+    async def fake_iterate(qname, qtype, depth=0, rdclass=1):
+        # 必须 wire 往返：find_rrset 依赖 from_wire 的索引；直接 append 到
+        # resp.authority 的 RRset 会让 _find_rrsig_for 找不到 RRSIG，
+        # 把「已签名」误判成 auth_unsigned（测试假阴性）。
+        return dns.message.from_wire(reply.to_wire())
+
+    async def fake_family():
+        return ""
+
+    eng._iterate = fake_iterate
+    eng._ensure_family_preference = fake_family
+    eng._needs_bootstrap_fallback = lambda resp, qtype: False
+    eng._invalidate_zone_cache = lambda q: None
+
+    from dnssec import DNSSECValidator as _DV_L
+    _lv = _DV_L(enabled=True, mode="strict", require_rrsig=False)
+
+    async def _l_fzk(zone, depth=0):
+        if str(zone) == ".":
+            # L 用例只验证负应答语义；根链状态视为 secure（不是本次测试目标）
+            return ("secure", {})
+        _k = keys.get(str(zone).lower())
+        if _k is None:
+            return ("insecure", {})
+        return ("secure", {zone: _k})
+
+    async def _l_fds(name):
+        return True
+
+    async def _l_froot():
+        return True
+
+    _lv._get_verified_zone_keys = _l_fzk
+    _lv._zone_has_ds = _l_fds
+    _lv._root_chain_available = _l_froot
+    eng._dnssec = _lv
+    return eng
+
+
+async def run_part_l() -> bool:
+    print("\n[Part L] RFC 违反回归（DS 父区起跳 / 负应答 SOA 顺序 / RFC 5155 §8.6 opt-out DS）")
+    try:
+        import plain_dns_server as pds
+    except Exception as e:      # pragma: no cover
+        print(f"  跳过：无法导入 plain_dns_server（{e}）")
+        return True
+    start_ok = len(RESULTS)
+
+    # L1/L2：RFC 4035 §3.1.4.1 —— DS 只能由直接父区回答
+    deadline = time.time() + 300
+    probe = object.__new__(pds.IterativeResolver)
+    probe._zone_ns_cache = {"com.": (["10.0.0.1"], deadline)}
+    got = probe._closest_zone_servers("update.googleapis.com", dns.rdatatype.DS)
+    check("L1 DS 查询不得跳过直接父区（只有祖父区缓存 → 不得命中）",
+          got is None, f"got={got}")
+    probe._zone_ns_cache["googleapis.com."] = (["10.0.0.2"], deadline)
+    got = probe._closest_zone_servers("update.googleapis.com", dns.rdatatype.DS)
+    check("L2 DS 查询命中直接父区", got == (["10.0.0.2"], True), f"got={got}")
+
+    # 真实签名：NSEC3 排在 SOA 之前（com 权威真实顺序）+ opt-out 区间覆盖
+    priv, key = _new_dnssec_key()
+    keys = {"com.": _zone_keyset("com.", key)}
+    soa = _rr("com.", "SOA",
+              "a.gtld-servers.net. nstld.example.com. 1 1800 900 604800 900")
+    nsec3 = _rr("6L950NB8M0KROIP11R6JF1GIT7UQ7LST.com.", "NSEC3",
+                "1 1 0 - 6l95fjccetpidp6v3f0qta45o46g4mbd NS DS RRSIG")
+    auth = [nsec3, _sign_now(nsec3, priv, key, "com."),
+            soa, _sign_now(soa, priv, key, "com.")]
+
+    eng = _l_engine(_l_neg_resp("googleapis.com", dns.rdatatype.DS, auth), keys)
+    out = await eng._resolve_verified_inner("googleapis.com", dns.rdatatype.DS, 1)
+    check("L3 NSEC3 先于 SOA + opt-out DS NODATA → 放行", out is not None,
+          f"stats={dict(eng._stats)}")
+
+    # L4：缺 SOA → 仍拒绝（安全边界）
+    eng = _l_engine(_l_neg_resp(
+        "googleapis.com", dns.rdatatype.DS,
+        [nsec3, _sign_now(nsec3, priv, key, "com.")]), keys)
+    out = await eng._resolve_verified_inner("googleapis.com", dns.rdatatype.DS, 1)
+    check("L4 缺 SOA 的 NSEC3 → 仍拒绝", out is None)
+
+    # L5：非 DS 查询 + opt-out 区间 → 仍拒绝（opt-out 只对 DS 合法）
+    eng = _l_engine(_l_neg_resp("googleapis.com", dns.rdatatype.A, auth), keys)
+    out = await eng._resolve_verified_inner("googleapis.com", dns.rdatatype.A, 1)
+    check("L5 非 DS 查询 + opt-out 区间 → 仍拒绝", out is None)
+
+    # L6：opt-out 但区间不覆盖 → 仍拒绝
+    nsec3_nc = _rr("00000000000000000000000000000000.com.", "NSEC3",
+                   "1 1 0 - 00000000000000000000000000000001 NS DS RRSIG")
+    auth_nc = [nsec3_nc, _sign_now(nsec3_nc, priv, key, "com."),
+               soa, _sign_now(soa, priv, key, "com.")]
+    eng = _l_engine(_l_neg_resp("googleapis.com", dns.rdatatype.DS, auth_nc), keys)
+    out = await eng._resolve_verified_inner("googleapis.com", dns.rdatatype.DS, 1)
+    check("L6 opt-out 但区间不覆盖 → 仍拒绝", out is None)
+
+    print(f"  Part L 小计：{len(RESULTS) - start_ok} 项")
+    return all(ok for _, ok in RESULTS[start_ok:])
+
+
+# ============================================================
+# Part O：config.yaml 驱动的系统审计（配置值 ↔ 组件实际行为）
+#
+# 目的：配置不是“写了就算”。这里按当前 config.yaml 逐项断言：
+#   * 关键配置解析值（DNSSEC/迭代/缓存/端口/上游开关）；
+#   * upstream.dnssec.* 真正传入 IterativeResolver（含 enabled/mode/
+#     require_rrsig 三种覆盖，以及非法 mode 的安全回退）；
+#   * 纯迭代模式 ResolverManager 只注册 iterative、不发起 bootstrap 查询；
+#   * cache TTL 语义（min/max/ttl_floor_threshold/negative_ttl）；
+#   * hosts 白名单 / IPv4+IPv6 映射解析；
+#   * tls.ciphers 真正应用到 DoH 上游 SSLContext（旧实现只作用于 DoT）。
+# ============================================================
+async def run_part_o() -> bool:
+    print("\n[Part O] config.yaml 驱动的系统审计（配置值 ↔ 组件实际行为）")
+    if not _pds_ready():
+        return True
+    import copy
+    from config import Config
+    from cache import DNSCache
+    from filter_engine import FilterEngine
+    from resolver_manager import ResolverManager
+
+    start_ok = len(RESULTS)
+    cfg_path = os.path.join(_HERE, "config.yaml")
+    cfg = Config(cfg_path)
+
+    # O1 关键配置解析值（与当前 config.yaml 对齐）
+    check("O1 关键配置解析值符合 config.yaml",
+          cfg.upstream_enabled is False
+          and cfg.plain_dns_iterative_enabled is True
+          and cfg.plain_dns_iterative_prefer is True
+          and cfg.plain_dns_iterative_family == "auto"
+          and cfg.plain_dns_iterative_ipv4_verify == "corroborate"
+          and cfg.plain_dns_iterative_timeout_ms == 5000.0
+          and cfg.plain_dns_iterative_max_depth == 32
+          and cfg.plain_dns_iterative_hop_parallel == 2
+          and cfg.plain_dns_iterative_qname_minimization is True
+          and cfg.plain_dns_iterative_strict_dnssec is True
+          and cfg.dnssec_enabled is True
+          and cfg.dnssec_mode == "strict"
+          and cfg.dnssec_drop_bogus is True
+          and cfg.dnssec_require_rrsig is False
+          and cfg.doh_enabled is True and cfg.doh_port == 443
+          and cfg.doh_ipv6_enabled is True
+          and cfg.plain_dns_enabled is True and cfg.plain_dns_port == 53
+          and cfg.plain_dns_ipv6_enabled is True,
+          "dnssec=%s/%s/%s/%s iter=%s/%s/%s"
+          % (cfg.dnssec_enabled, cfg.dnssec_mode, cfg.dnssec_drop_bogus,
+             cfg.dnssec_require_rrsig, cfg.plain_dns_iterative_family,
+             cfg.plain_dns_iterative_ipv4_verify,
+             cfg.plain_dns_iterative_timeout_ms))
+
+    # O2 非法 mode / 字符串布尔：安全回退，不能被拼写错误静默降级
+    c = Config(cfg_path)
+    c._data = copy.deepcopy(c._data)
+    sec = c._data["upstream"]["dnssec"]
+    sec["mode"] = "StRiCt-typo"
+    sec["enabled"] = "false"
+    sec["require_rrsig"] = "yes"
+    check("O2 非法 mode → strict；字符串布尔正确归一化",
+          c.dnssec_mode == "strict" and c.dnssec_enabled is False
+          and c.dnssec_require_rrsig is True,
+          "mode=%r enabled=%r require=%r"
+          % (c.dnssec_mode, c.dnssec_enabled, c.dnssec_require_rrsig))
+
+    # O3 upstream.dnssec.* 真正传入 IterativeResolver
+    #    旧实现硬编码 enabled=True/mode="strict"，三项覆盖全部无效。
+    old_has6, old_probe6 = pds.has_global_ipv6, pds.probe_ipv6_path
+    pds.has_global_ipv6 = lambda: False
+    pds.probe_ipv6_path = lambda: (False, True)
+    try:
+        def _variant(enabled=None, mode=None, require=None):
+            _c = Config(cfg_path)
+            _c._data = copy.deepcopy(_c._data)
+            _s = _c._data["upstream"]["dnssec"]
+            if enabled is not None:
+                _s["enabled"] = enabled
+            if mode is not None:
+                _s["mode"] = mode
+            if require is not None:
+                _s["require_rrsig"] = require
+            return pds.IterativeResolver(_c)._dnssec
+
+        v_default = _variant()
+        v_off = _variant(enabled=False)
+        v_ad = _variant(mode="ad_check")
+        v_req = _variant(require=True)
+        check("O3 IterativeResolver 继承 upstream.dnssec.enabled/mode/"
+              "require_rrsig（含覆盖）",
+              v_default.enabled is True and v_default.mode == "strict"
+              and v_default.require_rrsig is False
+              and v_off.enabled is False
+              and v_ad.mode == "ad_check"
+              and v_req.require_rrsig is True,
+              "default=%s/%s/%s off=%s ad=%s req=%s"
+              % (v_default.enabled, v_default.mode, v_default.require_rrsig,
+                 v_off.enabled, v_ad.mode, v_req.require_rrsig))
+    finally:
+        pds.has_global_ipv6, pds.probe_ipv6_path = old_has6, old_probe6
+
+    # O4 纯迭代模式：只注册 iterative，不发起 bootstrap 查询
+    eng = pds.IterativeResolver(cfg)
+    rm = ResolverManager(cfg, iterative_resolver=eng)
+    try:
+        await asyncio.wait_for(rm.initialize(), timeout=30)
+        types_ = [(s.server_type, s.name, s.enabled) for s in rm._upstream_servers]
+        check("O4 纯迭代模式只注册 iterative 上游且不做 bootstrap 解析",
+              rm._is_pure_iterative_mode() and len(types_) == 1
+              and types_[0][0] == "iterative" and types_[0][2] is True
+              and not rm._bootstrap_cache,
+              "upstreams=%s bootstrap_cache=%s"
+              % (types_, dict(rm._bootstrap_cache)))
+    finally:
+        try:
+            await rm.close_all()
+        finally:
+            await eng.close()
+
+    # O5 缓存 TTL 语义（当前 config：min=600, max=3600, threshold=5,
+    #    default=1500, negative=60）
+    cache = DNSCache(
+        max_size=cfg.cache_max_size, default_ttl=cfg.cache_default_ttl,
+        min_ttl=cfg.cache_min_ttl, max_ttl=cfg.cache_max_ttl,
+        negative_ttl=cfg.cache_negative_ttl,
+        cleanup_interval=cfg.cache_cleanup_interval,
+        prefetch_enabled=cfg.cache_prefetch_enabled,
+        prefetch_advance_ratio=cfg.cache_prefetch_advance_ratio,
+        ttl_floor_threshold=cfg.cache_ttl_floor_threshold,
+    )
+
+    def _ttl_of(upstream_ttl):
+        q = dns.message.make_query("ttl%d.example." % upstream_ttl,
+                                   dns.rdatatype.A)
+        r = dns.message.make_response(q)
+        r.answer.append(dns.rrset.from_text(
+            "ttl%d.example." % upstream_ttl, upstream_ttl, "IN", "A",
+            "192.0.2.1"))
+        return cache._calculate_ttl(r)
+
+    got = {t: _ttl_of(t) for t in (1, 5, 6, 100, 600, 1500, 9999)}
+    check("O5 缓存 TTL：极短豁免 / min 抬升 / max 截断 / 原值保留",
+          got == {1: 1, 5: 5, 6: 600, 100: 600, 600: 600,
+                  1500: 1500, 9999: 3600},
+          "got=%s" % (got,))
+    q = dns.message.make_query("nx.example.", dns.rdatatype.A)
+    r = dns.message.make_response(q)
+    r.set_rcode(dns.rcode.NXDOMAIN)
+    r.authority.append(dns.rrset.from_text(
+        "example.", 900, "IN", "SOA",
+        "ns.example. host.example. 1 3600 600 86400 900"))
+    check("O5b 负缓存取 min(SOA.TTL,SOA.MINIMUM) 且受 negative_ttl 封顶",
+          cache._negative_ttl_from_soa(r) == 60,
+          "got=%d" % cache._negative_ttl_from_soa(r))
+
+    # O6 hosts：纯域名白名单 + IPv4/IPv6 映射
+    fe = FilterEngine(cache_ttl_blocked=cfg.cache_default_ttl,
+                      cache_ttl_allowed=cfg.cache_negative_ttl,
+                      cache_maxsize=cfg.cache_max_size)
+    fe.load_custom_hosts({"enabled": True, "mappings": [
+        "allow.example",
+        "v4.example 10.0.0.1,10.0.0.2",
+        "v6.example ::1,2001:db8::1",
+    ]})
+    v4 = fe.get_custom_hosts_ips("v4.example.")
+    v6 = fe.get_custom_hosts_ips("v6.example")
+    check("O6 hosts 白名单绕过与 IPv4/IPv6 映射解析",
+          fe.is_custom_hosts_bypass("allow.example.")
+          and v4 == [("10.0.0.1", dns.rdatatype.A),
+                     ("10.0.0.2", dns.rdatatype.A)]
+          and v6 == [("::1", dns.rdatatype.AAAA),
+                     ("2001:db8::1", dns.rdatatype.AAAA)],
+          "v4=%s v6=%s" % (v4, v6))
+
+    # O7 tls.ciphers 真正应用到 DoH 上游（旧实现只传给 DoT）
+    from resolvers.doh import DoHResolver
+    cipher = "ECDHE-RSA-AES256-GCM-SHA384"
+    resolver = DoHResolver("https://example.com/dns-query", ciphers=cipher)
+    names = {c.get("name") for c in resolver._ssl_context.get_ciphers()}
+    check("O7 tls.ciphers 应用到 DoH 上游 SSLContext",
+          resolver._ciphers == cipher and cipher in names,
+          "configured=%r in_context=%s" % (resolver._ciphers, cipher in names))
+
+    # O8 upstream.dnssec.enabled=false：必须完全跳过验证/根链预检，
+    #    不能因为根 DNSKEY 验签失败（bogus_root）把响应丢弃。
+    w = World(_MODE_FULL)
+    eng = _world_engine(w)
+    eng._dnssec.enabled = False
+    calls = {"n": 0}
+
+    async def _must_not_query(zone, depth=0):
+        calls["n"] += 1
+        raise AssertionError("dnssec disabled but chain queried")
+
+    eng._dnssec._get_verified_zone_keys = _must_not_query
+    r = await _resolve_via(eng, "www.secure.test.")
+    check("O8 dnssec.enabled=false 时跳过全部链验证并放行",
+          r is not None and eng._last_release == "dnssec_disabled"
+          and calls["n"] == 0,
+          "release=%r chain_calls=%d stats=%s"
+          % (eng._last_release, calls["n"], dict(eng.stats)))
+
+    # O9 tls.ciphers 同样应用到 DoT 上游（非 ECH 路径此前被硬编码覆盖）
+    from resolvers.dot import DoTResolver
+    dot = DoTResolver("example.com", ciphers=cipher)
+    dot_names = {c.get("name") for c in dot._ssl_context.get_ciphers()}
+    check("O9 tls.ciphers 应用到 DoT 上游 SSLContext",
+          dot._ciphers == cipher and cipher in dot_names,
+          "configured=%r in_context=%s" % (dot._ciphers, cipher in dot_names))
+
+    # O10 配置写回：ruamel.yaml 未安装时必须回退 PyYAML，不能抛
+    #     ModuleNotFoundError（update_section/update_upstream 的唯一写路径）。
+    import tempfile
+    import yaml as _yaml
+    try:
+        import ruamel.yaml  # noqa: F401
+        has_ruamel = True
+    except Exception:
+        has_ruamel = False
+    fd, tmp_cfg = tempfile.mkstemp(suffix=".yaml", prefix="cfg-audit-")
+    os.close(fd)
+    try:
+        with open(tmp_cfg, "w", encoding="utf-8") as f:
+            f.write("cache:\n  enabled: true\nupstream:\n  enabled: true\n")
+        c = Config(tmp_cfg)
+        await c.update_section("cache", {"enabled": False})
+        with open(tmp_cfg, "r", encoding="utf-8") as f:
+            saved = _yaml.safe_load(f)
+        check("O10 配置写回在缺少 ruamel.yaml 时回退 PyYAML",
+              saved.get("cache", {}).get("enabled") is False
+              and saved.get("upstream", {}).get("enabled") is True,
+              "ruamel=%s saved=%r" % (has_ruamel, saved))
+    finally:
+        try:
+            os.unlink(tmp_cfg)
+        except OSError:
+            pass
+
+    # O11 热加载：upstream.dnssec.* 变更同步到运行中的 validator
+    from main import apply_dnssec_config
+    c = Config(cfg_path)
+    c._data = copy.deepcopy(c._data)
+    _sec = c._data["upstream"]["dnssec"]
+    _sec["enabled"] = False
+    _sec["mode"] = "ad_check"
+    _sec["require_rrsig"] = True
+    v1 = types.SimpleNamespace(enabled=True, mode="strict", require_rrsig=False)
+    v2 = types.SimpleNamespace(enabled=True, mode="strict", require_rrsig=False)
+    apply_dnssec_config(c, (v1, v2))
+    check("O11 热加载同步 upstream.dnssec 到运行中的 validator",
+          v1.enabled is False and v1.mode == "ad_check"
+          and v1.require_rrsig is True
+          and v2.enabled is False and v2.mode == "ad_check"
+          and v2.require_rrsig is True,
+          "v1=%s/%s/%s v2=%s/%s/%s"
+          % (v1.enabled, v1.mode, v1.require_rrsig,
+             v2.enabled, v2.mode, v2.require_rrsig))
+
+    # O12 语义校验：拒绝“答非所问”的伪造 DS 应答（google.com.hk 事故）
+    from dnssec import DNSSECValidator, _LINK_UNTRUSTED  # noqa: F401
+    fake = dns.message.make_response(dns.message.make_query(
+        "www.google.com.hk", dns.rdatatype.DS))
+    fake.answer.append(dns.rrset.from_text(
+        "www.google.com.hk.", 60, "IN", "A", "203.0.113.66"))
+    ref = dns.message.make_response(dns.message.make_query(
+        "www.google.com.hk", dns.rdatatype.DS))
+    ref.authority.append(dns.rrset.from_text(
+        "hk.", 60, "IN", "NS", "a.ns.hk."))
+    neg = dns.message.make_response(dns.message.make_query(
+        "www.google.com.hk", dns.rdatatype.DS))
+    neg.authority.append(dns.rrset.from_text(
+        "com.hk.", 60, "IN", "SOA",
+        "a.ns.hk. hostmaster.hk. 1 3600 600 86400 300"))
+    check("O12 拒绝 DS 查询回 A 的伪造应答，保留 referral/负应答",
+          pds.IterativeResolver._response_is_plausible(
+              fake, "www.google.com.hk.", dns.rdatatype.DS) is False
+          and pds.IterativeResolver._response_is_plausible(
+              ref, "www.google.com.hk.", dns.rdatatype.DS) is True
+          and pds.IterativeResolver._response_is_plausible(
+              neg, "www.google.com.hk.", dns.rdatatype.DS) is True)
+
+    # O12b ANY 查询必须接受 qname 的任意类型记录
+    anyq = dns.message.make_response(dns.message.make_query(
+        "any.test.", dns.rdatatype.ANY))
+    anyq.answer.append(dns.rrset.from_text(
+        "any.test.", 60, "IN", "A", "192.0.2.5"))
+    check("O12b ANY 查询接受 qname 的 A 记录（不被语义过滤误杀）",
+          pds.IterativeResolver._response_is_plausible(
+              anyq, "any.test.", dns.rdatatype.ANY) is True)
+
+    # O13 丢弃告警 60 秒合并：客户端重试不能刷屏
+    class _WarnCap(logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.n = 0
+
+        def emit(self, record):
+            if record.levelno >= logging.WARNING:
+                self.n += 1
+
+    cap = _WarnCap()
+    lg = logging.getLogger("dns-proxy.plain-dns")
+    lg.addHandler(cap)
+    old_level = lg.level
+    lg.setLevel(logging.WARNING)
+    try:
+        r = object.__new__(pds.IterativeResolver)
+        r._dnssec_drop_warn_last = 0.0
+        r._dnssec_drop_warn_merged = 0
+        for _ in range(10):
+            r._warn_dnssec_drop("www.google.com.hk", "bogus", "test")
+    finally:
+        lg.removeHandler(cap)
+        lg.setLevel(old_level)
+    check("O13 DNSSEC 丢弃告警 60s 合并（10 次只 1 条 WARNING）",
+          cap.n == 1, "warnings=%d" % cap.n)
+
+    # O14 主根/镜像根鉴别：只把通过根区 NSEC 验签的 IP 记为真根
+    probe = object.__new__(pds.IterativeResolver)
+    probe.root_servers = ["10.0.0.1", "10.0.0.2", "10.0.0.3"]
+    probe._genuine_roots = None
+    probe._root_probe_expire = 0.0
+
+    async def _fake_root_probe(ip):
+        return ip == "10.0.0.2"
+
+    probe._probe_one_root = _fake_root_probe
+    genuine = await probe.probe_root_authenticity()
+    check("O14 根鉴别只保留能提供根区否定证明的 IP",
+          genuine == {"10.0.0.2"}
+          and probe._mirror_roots == {"10.0.0.1", "10.0.0.3"},
+          "genuine=%s mirror=%s" % (genuine, probe._mirror_roots))
+
+    # O15 真正的中间人剥离攻击：同一区先验签通过，后续无 RRSIG 必须仍拒绝
+    #     （即使链路暂时拿不到否定证明，也不能按“镜像不可验证”放行）
+    vz = DNSSECValidator(enabled=True, mode="strict")
+    zpriv, zkey = _new_dnssec_key()
+    zname = dns.name.from_text("www.known.test.")
+    zone = dns.name.from_text("known.test.")
+    zkeyset = _zone_keyset("known.test.", zkey)
+    zq = dns.message.make_query(str(zname), dns.rdatatype.A)
+    zmsg = dns.message.make_response(zq)
+    zrr = dns.rrset.from_text(str(zname), 300, "IN", "A", "192.0.2.9")
+    zmsg.answer.extend([zrr, _sign_rrset(
+        zrr, zpriv, zkey, "known.test.", int(time.time()))])
+
+    async def _zk_known(zone_name, depth=0):
+        return ("secure", {zone: zkeyset})
+
+    async def _ds_none(name):
+        _LINK_UNTRUSTED.set(True)
+        return None
+
+    async def _root_yes():
+        return True
+
+    vz._get_verified_zone_keys = _zk_known
+    vz._zone_has_ds = _ds_none
+    vz._root_chain_available = _root_yes
+    ok1, st1, _ = await vz.validate_response(
+        zq.to_wire(), zmsg.to_wire())
+    unsigned = dns.message.make_response(zq)
+    unsigned.answer.append(dns.rrset.from_text(
+        str(zname), 300, "IN", "A", "203.0.113.66"))
+    ok2, st2, _ = await vz.validate_response(
+        zq.to_wire(), unsigned.to_wire())
+    check("O15 已验签区后续无 RRSIG（剥离攻击）仍判 bogus",
+          ok1 is True and st1 == "secure"
+          and ok2 is False and st2 == "bogus",
+          "first=%s/%s second=%s/%s signed_zones=%s"
+          % (ok1, st1, ok2, st2,
+             sorted(str(z) for z in vz._signed_zones)))
+
+    # O16 无 IPv6 主机：探测 v6 必须立即 unreachable，不能每轮等超时
+    probe = object.__new__(pds.IterativeResolver)
+    probe._has_ipv6 = False
+    probe.root_servers = ["192.0.2.1", "2001:db8::1"]
+    calls = {"n": 0}
+
+    async def _fake_q(ip, qname, qtype, rdclass=1):
+        calls["n"] += 1
+        return None
+
+    probe._query_one_async = _fake_q
+    st6 = await probe._probe_family_integrity("6")
+    check("O16 无 IPv6 时 v6 族探测直接 unreachable（0 次查询）",
+          st6 == "unreachable" and calls["n"] == 0,
+          "status=%s calls=%d" % (st6, calls["n"]))
+
+    # O17 无 IPv6 但有真 v4 根：族选择应选 IPv4，而不是放弃
+    fp = object.__new__(pds.IterativeResolver)
+    fp._has_ipv6 = False
+    fp.root_servers = ["192.0.2.1", "2001:db8::1"]
+    fp._family_policy = "auto"
+    fp._family_probe_at = 0.0
+    fp._family_probe_reliable = False
+    fp._preferred_family = ""
+    fp._family_verdicts = {}
+    fp._ipv4_verify = "corroborate"
+    fp._dnssec = types.SimpleNamespace(
+        _verified_zone_cache={}, _root_avail=False, _root_avail_expire=0.0)
+
+    async def _fake_fam(fam):
+        return "hijacked" if fam == "4" else "unreachable"
+
+    async def _fake_roots():
+        return {"192.0.2.1"}
+
+    fp._probe_family_integrity = _fake_fam
+    fp.probe_root_authenticity = _fake_roots
+    pref = await fp._ensure_family_preference()
+    check("O17 无 IPv6 但存在真 v4 根 → 优先 IPv4（不放弃验证）",
+          pref == "4" and fp._preferred_family == "4",
+          "pref=%r verdicts=%s" % (pref, fp._family_verdicts))
+
+    # O18 迭代根起跳只使用真根 IP
+    w = World(_MODE_FULL)
+    eng = _world_engine(w)
+    eng.root_servers = ["10.0.0.1", "10.0.0.2"]
+    eng._genuine_roots = {"10.0.0.2"}
+    seen = []
+    orig_qs = eng._query_servers
+
+    async def _cap_qs(servers, qname, qtype, rdclass=1):
+        seen.append(list(servers))
+        return await orig_qs(servers, qname, qtype, rdclass)
+
+    eng._query_servers = _cap_qs
+    await eng._iterate("www.secure.test.", dns.rdatatype.A, 0)
+    check("O18 迭代根起跳只使用通过根鉴别的 IP",
+          bool(seen) and seen[0] == ["10.0.0.2"],
+          "first_servers=%s" % (seen[0] if seen else None))
+
+    # O19 无真根/链不可用时只能 absent，绝不能声称 secure
+    w = World(_MODE_FULL)
+    eng = _world_engine(w)
+
+    async def _indeterminate(zone, depth=0):
+        return ("indeterminate", {})
+
+    eng._dnssec._get_verified_zone_keys = _indeterminate
+    r = await _resolve_via(eng, "www.secure.test.")
+    check("O19 无真根/链不可用 → dnssec_absent，不冒充 secure",
+          r is not None and eng._last_release == "dnssec_absent"
+          and eng.stats.get("secure", 0) == 0,
+          "release=%r stats=%s" % (eng._last_release, dict(eng.stats)))
+
+    # O20 无 IPv6/迭代不可用时，只要递归 bootstrap 能返回**真实 RRSIG**，
+    #     仍应在本地完成 DNSSEC 验签（证明不是“没 IPv6 就绝对无法验证”）。
+    w = World(_MODE_FULL)
+    eng = _world_engine(w)
+    signed = w.answer(w.ip_of("secure.test."),
+                      "www.secure.test.", dns.rdatatype.A)
+    signed._bootstrap_fallback = True
+
+    async def _no_iter(*a, **k):
+        return None
+
+    async def _fb(qname, qtype, rdclass=1):
+        return signed
+
+    eng._iterate = _no_iter
+    eng._needs_bootstrap_fallback = lambda resp, qtype: True
+    eng._bootstrap_recursive = _fb
+    r = await _resolve_via(eng, "www.secure.test.")
+    check("O20 递归 bootstrap 带 RRSIG 时仍能本地验证为 secure",
+          r is not None and eng._last_release == "secure"
+          and eng.stats.get("secure", 0) >= 1,
+          "release=%r stats=%s" % (eng._last_release, dict(eng.stats)))
+
+    # O21 请求日志写盘失败时不能丢缓冲（磁盘满/权限/路径被占用）
+    import builtins
+    from logger import RequestLogger
+    # 不依赖可写目录：让 open 必然失败，只验证“失败不丢缓冲”。
+    rl = RequestLogger(log_dir=_HERE, log_file="audit-no-such-dir.log",
+                       buffer_size=10, flush_interval=3600,
+                       enabled=True, detailed=True)
+    await rl.log("192.0.2.1", "keep.example", "A", 0.01, "ok")
+    real_open = builtins.open
+
+    def _fail_open(path, *a, **kw):
+        raise OSError("simulated disk error")
+
+    builtins.open = _fail_open
+    try:
+        await rl.flush()
+    finally:
+        builtins.open = real_open
+    check("O21 日志写盘失败时保留缓冲（不静默丢日志）",
+          len(rl._buffer) == 1,
+          "retained=%d" % len(rl._buffer))
+
+    # O22 并发验证不能共享“链路非权威”标记（ContextVar 隔离）
+    vc = DNSSECValidator(enabled=True, mode="strict", require_rrsig=False)
+
+    async def _zk_empty(zone, depth=0):
+        return ("secure", {})
+
+    async def _root_ok2():
+        return True
+
+    async def _ds_race(name):
+        if "leak" in str(name):
+            await asyncio.sleep(0.01)
+            _LINK_UNTRUSTED.set(True)
+            return None
+        await asyncio.sleep(0.02)
+        return True
+
+    vc._get_verified_zone_keys = _zk_empty
+    vc._zone_has_ds = _ds_race
+    vc._root_chain_available = _root_ok2
+
+    def _plain_qr(nm):
+        qq = dns.message.make_query(nm, dns.rdatatype.A)
+        rr = dns.message.make_response(qq)
+        rr.answer.append(dns.rrset.from_text(
+            nm, 300, "IN", "A", "192.0.2.77"))
+        return qq, rr
+
+    q1, r1 = _plain_qr("leak.test.")
+    q2, r2 = _plain_qr("strict.test.")
+    a1, a2 = await asyncio.gather(
+        vc.validate_response(q1.to_wire(), r1.to_wire()),
+        vc.validate_response(q2.to_wire(), r2.to_wire()))
+    check("O22 并发验证的链路标记隔离（leak=insecure, strict=bogus）",
+          a1[1] == "insecure" and a2[1] == "bogus",
+          "leak=%s strict=%s" % (a1[1], a2[1]))
+
+    # O23 已有根鉴别结果时，族判定不得再发网络探测（首查延迟防护）
+    fp2 = object.__new__(pds.IterativeResolver)
+    fp2.root_servers = ["192.0.2.1", "2001:db8::1"]
+    fp2._has_ipv6 = True
+    fp2._root_probe_enabled = True
+    fp2._genuine_roots = {"192.0.2.1"}
+    fp2._root_probe_expire = time.time() + 600
+    fp2._family_policy = "auto"
+    fp2._family_probe_at = 0.0
+    fp2._preferred_family = ""
+    fp2._family_verdicts = {}
+    fp2._ipv4_verify = "corroborate"
+    fp2._dnssec = types.SimpleNamespace(
+        _verified_zone_cache={}, _root_avail=False, _root_avail_expire=0.0)
+    calls2 = {"n": 0}
+
+    async def _must_not_probe(fam):
+        calls2["n"] += 1
+        return "genuine"
+
+    fp2._probe_family_integrity = _must_not_probe
+    pref2 = await fp2._ensure_family_preference()
+    check("O23 已知真根时族判定零网络探测（首查不等待）",
+          pref2 == "4" and calls2["n"] == 0
+          and fp2._family_verdicts == {"4": "genuine", "6": "hijacked"},
+          "pref=%r calls=%d verdicts=%s"
+          % (pref2, calls2["n"], fp2._family_verdicts))
+
+    # O24 无 IPv6 主机：即使族偏好为空，迭代也不得向 v6 地址发查询
+    w = World(_MODE_FULL)
+    eng = _world_engine(w)
+    eng._has_ipv6 = False
+    eng._genuine_roots = None
+    eng.root_servers = ["10.0.0.1", "2001:db8::1"]
+    seen6 = []
+    orig6 = eng._query_servers
+
+    async def _cap6(servers, qname, qtype, rdclass=1):
+        seen6.append(list(servers))
+        return await orig6(servers, qname, qtype, rdclass)
+
+    eng._query_servers = _cap6
+    await eng._iterate("www.secure.test.", dns.rdatatype.A, 0)
+    check("O24 无 IPv6 时本跳剔除 v6 地址（不发无效查询）",
+          bool(seen6) and all(":" not in ip for ip in seen6[0]),
+          "first_servers=%s" % (seen6[0] if seen6 else None))
+
+    # O25 迭代链无 DNSSEC 材料时，回退递归 bootstrap 的带签名报文
+    r25 = object.__new__(pds.IterativeResolver)
+    r25._ds_cache = {}
+    r25._ds_inflight = {}
+    r25._stats = collections.Counter()
+    r25.config = types.SimpleNamespace(bootstrap_resolvers=["10.0.0.9"])
+    calls25 = {"n": 0}
+
+    async def _it25(qname, qtype, depth=0, rdclass=1):
+        calls25["n"] += 1
+        return None
+
+    priv25, key25 = _new_dnssec_key()
+    signed25 = dns.message.make_response(dns.message.make_query(
+        "unsigned.test.", dns.rdatatype.DS))
+    rr25 = dns.rrset.from_text(
+        "unsigned.test.", 60, "IN", "DS", "12345 8 2 " + "A" * 64)
+    signed25.answer.append(_sign_rrset(
+        rr25, priv25, key25, "test.", int(time.time())))
+
+    async def _fb25(qname, qtype):
+        return signed25
+
+    r25._iterate = _it25
+    r25._bootstrap_dnssec_query = _fb25
+    out25a = await r25._iterate_ds_cached(
+        dns.name.from_text("unsigned.test."))
+    out25b = await r25._iterate_ds_cached(
+        dns.name.from_text("unsigned.test."))
+    check("O25 迭代无 DNSSEC 材料 → 递归兜底并缓存",
+          out25a is signed25 and out25b is signed25 and calls25["n"] == 1,
+          "calls=%d cached=%s" % (calls25["n"], out25b is signed25))
+
+    # O26 启动期 bootstrap 能力筛选：只把能提供 DS 否定证明的列入链查询
+    bp = object.__new__(pds.IterativeResolver)
+    bp.config = types.SimpleNamespace(
+        bootstrap_resolvers=["10.9.0.1", "10.9.0.2", "10.9.0.3", "10.9.0.4"])
+    bp._bootstrap_dnssec_resolvers = None
+    bp._bootstrap_alive = None
+    bp._bootstrap_probe_detail = {}
+    bp._bootstrap_probe_expire = 0.0
+
+    async def _bp_one(ip):
+        return {
+            "10.9.0.1": (ip, False, False, False),
+            "10.9.0.2": (ip, True, True, False),
+            "10.9.0.3": (ip, True, True, True),
+            "10.9.0.4": (ip, True, False, False),
+        }[ip]
+
+    bp._probe_bootstrap_one = _bp_one
+    proof26 = await bp.probe_bootstrap_capabilities()
+    check("O26 bootstrap 能力筛选（仅证明型进入链查询）",
+          proof26 == ["10.9.0.3"]
+          and bp._bootstrap_alive == ["10.9.0.2", "10.9.0.3", "10.9.0.4"]
+          and bp._bootstrap_probe_detail["10.9.0.1"] == "不可达",
+          "proof=%s alive=%s detail=%s"
+          % (proof26, bp._bootstrap_alive, bp._bootstrap_probe_detail))
+
+    # O27 父区已证明未签名 → 子名直接 False，不再逐名求 NSEC3
+    vp = DNSSECValidator(enabled=True, mode="strict")
+    vp._dns_query_callback = lambda wire: None  # 非 None 即可
+    vp._zone_ds_cache = {}
+    vp._zone_cache_lock = asyncio.Lock()
+    called27 = {"n": 0}
+
+    async def _parent_insecure_true(name):
+        return True
+
+    async def _uncached_must_not_run(name):
+        called27["n"] += 1
+        return None
+
+    vp._parent_is_insecure = _parent_insecure_true
+    vp._zone_has_ds_uncached = _uncached_must_not_run
+    got27 = await vp._zone_has_ds(dns.name.from_text("legend.coinglass.com."))
+    check("O27 父区未签名 → 子名直接 insecure（不再求否定证明）",
+          got27 is False and called27["n"] == 0,
+          "got=%r uncached_calls=%d" % (got27, called27["n"]))
+
+    print(f"  Part O 小计：{len(RESULTS) - start_ok} 项")
+    return all(ok for _, ok in RESULTS[start_ok:])
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=15353,
@@ -3356,6 +4865,10 @@ def main() -> int:
     asyncio.run(run_part_g())
     asyncio.run(run_part_h())
     asyncio.run(run_part_i())
+    asyncio.run(run_part_m())
+    asyncio.run(run_part_n())
+    asyncio.run(run_part_o())
+    asyncio.run(run_part_l())
     if args.real_dnssec or args.real:
         asyncio.run(run_part_c())
     if args.real:

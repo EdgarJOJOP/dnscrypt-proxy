@@ -193,16 +193,20 @@ class RequestLogger:
             if not self._buffer:
                 return
 
-            # 取出所有缓冲数据
+            # 取出缓冲数据但**先不清空**：写盘失败时保留，下一次 flush 重试。
+            # 旧实现先 clear 再写，磁盘满/权限错误/路径被占用时整批日志静默丢失。
             entries = list(self._buffer)
-            self._buffer.clear()
-
-        try:
             filepath = self.log_dir / self.log_file
-            with open(filepath, "a", encoding="utf-8") as f:
-                for entry in entries:
-                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            try:
+                with open(filepath, "a", encoding="utf-8") as f:
+                    for entry in entries:
+                        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            except Exception as e:
+                system_logger.error("写入日志文件失败（保留缓冲重试）: %s", e)
+                return
 
+            # 写盘成功才清空（同步写期间没有 await，缓冲区不会变）
+            self._buffer.clear()
             self._total_logged += len(entries)
 
             # 写入后检查文件大小（非每次检查，有最小间隔）
@@ -210,9 +214,6 @@ class RequestLogger:
             if now - self._last_size_check >= self.MIN_CHECK_INTERVAL:
                 self._last_size_check = now
                 await self._maybe_trim_file(filepath)
-
-        except Exception as e:
-            system_logger.error("写入日志文件失败: %s", e)
 
     async def _maybe_trim_file(self, filepath: Path):
         """

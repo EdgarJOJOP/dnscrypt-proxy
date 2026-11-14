@@ -240,10 +240,29 @@ class Config:
 
         只服务于运行中的 update_section/update_upstream；启动加载不再调用它，
         因此这里不再保留“写 CONFIG_TEMPLATE”的自动生成路径。
+
+        ruamel.yaml 是**可选依赖**（用于保留注释/格式）；未安装时回退到
+        PyYAML 的 safe_dump。旧实现无条件 import ruamel，缺失时运行期
+        update_section/update_upstream 直接 ModuleNotFoundError（requirements
+        里也没有它），配置写回功能实际不可用。
         """
-        from ruamel.yaml import YAML
-        ryaml = YAML()
-        ryaml.indent(mapping=2, sequence=4, offset=2)
+        ryaml = None
+        try:
+            from ruamel.yaml import YAML as _YAML
+            ryaml = _YAML()
+            ryaml.indent(mapping=2, sequence=4, offset=2)
+        except Exception:
+            ryaml = None
+
+        if ryaml is None:
+            tmp = self._path.with_suffix(self._path.suffix + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                yaml.safe_dump(self._data, f, allow_unicode=True,
+                               sort_keys=False, default_flow_style=False)
+            os.replace(tmp, self._path)
+            self._last_mtime = self._path.stat().st_mtime
+            return
+
         ryaml_data = None
         if self._path.exists() and self._path.stat().st_size > 0:
             with open(self._path, "r", encoding="utf-8") as f:
@@ -257,8 +276,10 @@ class Config:
                 else:
                     dst[k] = v
         _deep_update(ryaml_data, self._data)
-        with open(self._path, "w", encoding="utf-8") as f:
+        tmp = self._path.with_suffix(self._path.suffix + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
             ryaml.dump(ryaml_data, f)
+        os.replace(tmp, self._path)
         self._last_mtime = self._path.stat().st_mtime
 
     async def check_reload(self) -> set:
@@ -721,15 +742,42 @@ class Config:
             return up
         legacy = self._data.get("dnssec")
         return legacy if isinstance(legacy, dict) else {}
+    @staticmethod
+    def _as_bool(value, default: bool) -> bool:
+        """把 YAML 布尔值/常见字符串写法归一化为 bool（非法值回退 default）。"""
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            v = value.strip().lower()
+            if v in ("1", "true", "yes", "on", "enable", "enabled"):
+                return True
+            if v in ("0", "false", "no", "off", "disable", "disabled", ""):
+                return False
+        return default
+
     @property
     def dnssec_enabled(self) -> bool:
-        return self._dnssec_section().get("enabled", True)
+        return self._as_bool(self._dnssec_section().get("enabled", True), True)
     @property
     def dnssec_mode(self) -> str:
-        return self._dnssec_section().get("mode", "ad_check")
+        """DNSSEC 验证模式：ad_check / strict；非法值安全回退 strict。
+
+        旧实现直接返回原始字符串：把 ``strict`` 拼错成 ``strictt`` 时，
+        DNSSECValidator 内部所有 ``mode == "strict"`` 判断都会变成 False，
+        从而静默退化为 ad_check（无 RRSIG 的应答直接放行）——配置笔误
+        等于悄悄关闭严格验证。这里钳制到合法集合，未知值按安全优先取
+        strict。
+        """
+        try:
+            mode = str(self._dnssec_section().get("mode", "ad_check")).strip().lower()
+        except Exception:
+            return "strict"
+        return mode if mode in ("ad_check", "strict") else "strict"
     @property
     def dnssec_drop_bogus(self) -> bool:
-        return self._dnssec_section().get("drop_bogus", False)
+        return self._as_bool(self._dnssec_section().get("drop_bogus", False), False)
     @property
     def dnssec_require_rrsig(self) -> bool:
         """strict 模式下是否要求响应必须带 RRSIG（否则视为签名被剥离 → bogus）
@@ -737,7 +785,8 @@ class Config:
         默认 False：实测多数国内 DoH 上游（阿里/腾讯等）即使客户端带 DO=1
         也不返回 RRSIG，若强制要求会导致几乎所有域名被丢弃、解析全面失败。
         """
-        return self._dnssec_section().get("require_rrsig", False)
+        return self._as_bool(
+            self._dnssec_section().get("require_rrsig", False), False)
     @property
     def doh_ipv6_enabled(self) -> bool:
         return self._data.get("server", {}).get("doh", {}).get("ipv6", {}).get("enabled", False)
@@ -784,7 +833,9 @@ class Config:
         return self._data.get("server", {}).get("doq", {}).get("host", "127.0.0.1")
     @property
     def local_doq_port(self) -> int:
-        return self._data.get("server", {}).get("doq", {}).get("port", 784)
+        # DoQ 标准端口 = 853（RFC 9250 沿用 DoT 端口）；旧默认 784 是非标准值，
+        # 且与 config.yaml 注释/示例不一致。
+        return self._data.get("server", {}).get("doq", {}).get("port", 853)
     @property
     def local_doq_domain(self) -> str:
         return self._data.get("server", {}).get("doq", {}).get("domain", "")
@@ -804,7 +855,7 @@ class Config:
         return self._data.get("server", {}).get("doq", {}).get("ipv6", {}).get("host", "::1")
     @property
     def local_doq_ipv6_port(self) -> int:
-        return self._data.get("server", {}).get("doq", {}).get("ipv6", {}).get("port", 784)
+        return self._data.get("server", {}).get("doq", {}).get("ipv6", {}).get("port", 853)
     @property
     def plain_dns_enabled(self) -> bool:
         return self._data.get("server", {}).get("plain_dns", {}).get("enabled", False)
