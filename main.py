@@ -762,6 +762,11 @@ class DNSProxyApp:
             logger.info("  拦截索引域名: %d, 白名单域名: %d",
                          self.filter_engine.stats["block_index_domains"],
                          self.filter_engine.stats["allow_index_domains"])
+            # 规则已完整替换：先清掉匹配结果缓存，再做 DNS 缓存对账。
+            # 否则更新前缓存的“allow”结果会让 _sweep_cache_after_filter_load
+            # 仍把新规则命中的域名判为放行（实测 mcdn.bilivideo.cn 规则
+            # 已在列表里，但缓存里旧的 allow 结果导致继续返回 IP）。
+            self.filter_engine.clear_filter_cache()
             # 规则加载完毕后扫描 DNS 缓存，覆写已缓存拦截域名的 IP
             await self._sweep_cache_after_filter_load()
 
@@ -786,10 +791,27 @@ class DNSProxyApp:
 
         使用 asyncio.gather + Semaphore 并行处理，避免阻塞事件循环。
         """
-        if not self.cache or not self.config.cache_enabled or not self.config.filter_enabled:
+        if not self.cache or not self.config.cache_enabled:
             return
 
         logger = logging.getLogger("dns-proxy.app")
+        # 过滤被运行期关闭：旧的拦截占位必须全部删除，否则即使规则已停用，
+        # 客户端仍会继续拿到 NXDOMAIN 直到缓存 TTL 到期（最长 max_ttl）。
+        if not self.config.filter_enabled:
+            cache_keys = await self.cache.get_all_keys()
+            removed = 0
+            for key in cache_keys:
+                if await self.cache.is_blocked_entry(key):
+                    if await self.cache.discard(key):
+                        removed += 1
+            if removed:
+                logger.info("过滤已禁用：清理旧拦截缓存 %d 条", removed)
+            return
+
+        # 规则已变更：先丢弃过滤结果缓存，确保下面逐条对账使用的是新规则；
+        # 否则更新前的 allow 结果会让新规则命中的域名继续被判定为放行。
+        if self.filter_engine is not None:
+            self.filter_engine.clear_filter_cache()
         cache_keys = await self.cache.get_all_keys()
         if not cache_keys:
             return
@@ -891,8 +913,11 @@ class DNSProxyApp:
         filter_cache_changed = "cache" in changed_sections or "filter" in changed_sections or "hosts" in changed_sections
 
         # 0. 始终重新加载自定义 hosts 映射（但只在 hosts 段变化时）
-        if "hosts" in changed_sections and "hosts" in new_config:
-            self.filter_engine.load_custom_hosts(new_config.get("hosts", {}))
+        #    注意：hosts 段被整体删除时 new_config 里没有该 key，也必须用
+        #    空配置重建（清空旧映射），否则旧白名单会永久绕过过滤。
+        if "hosts" in changed_sections:
+            self.filter_engine.load_custom_hosts(
+                new_config.get("hosts", {}) or {})
             logger.info("自定义 hosts 映射已重新加载")
             # 清除 DNS 响应缓存，防止旧 0.0.0.0 拦截结果残留
             if self.cache:
@@ -909,6 +934,12 @@ class DNSProxyApp:
 
         if not self.config.filter_enabled:
             logger.info("过滤规则已禁用，跳过规则重载")
+            # 过滤关闭后必须清掉旧拦截占位，否则域名仍会被缓存里的 NXDOMAIN
+            # 挡到 TTL 到期（_sweep 内部会识别 filter_enabled=False 并只清拦截项）。
+            try:
+                await self._sweep_cache_after_filter_load()
+            except Exception as e:
+                logger.debug("过滤禁用后的缓存清理失败: %s", e)
             return
 
         # ===== 检测 filter 段是否有实质性的规则变更 =====
@@ -1026,6 +1057,18 @@ class DNSProxyApp:
                     # （第 5 项），否则响应形态与源请求不一致；且 set 必须用
                     # 原 key 才能覆写同一条目（否则会新增键、原键照旧过期）。
                     qname, qtype, qclass = cache_key[:3]
+                    # 预刷新绕过前端过滤：规则收紧后，缓存里的旧正向条目
+                    # 仍可能被重新解析出 IP。这里先按当前规则检查，命中则
+                    # 删除缓存条目，绝不再向上游查询。
+                    if (self.filter_engine is not None
+                            and self.config.filter_enabled):
+                        _blocked, _reason = self.filter_engine.check_domain(
+                            str(qname).rstrip("."))
+                        if _blocked:
+                            await self.cache.discard(cache_key)
+                            log.debug("缓存预刷新跳过已拦截域名: %s (%s)",
+                                      qname, _reason[:60])
+                            return False
                     want_dnssec = bool(cache_key[3]) if len(cache_key) > 4 else False
                     cd_bit = bool(cache_key[4]) if len(cache_key) > 4 else False
                     q = dns.message.make_query(qname, qtype, qclass,

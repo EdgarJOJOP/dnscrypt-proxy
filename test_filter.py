@@ -708,6 +708,132 @@ def test_dns_only_loading():
     print(f"  => 只加载 DNS 域名规则: {ok}/{total} 通过")
 
 
+def test_rule_cache_invalidation():
+    """规则重载后必须清空 allow 缓存，否则新拦截规则最多 60s 不生效"""
+    print()
+    print("=" * 60)
+    print("11. 规则重载后的过滤缓存失效")
+    print("=" * 60)
+    e = FilterEngine()
+    d = "xy223x247x68x148xy.mcdn.bilivideo.cn"
+    e.load_rules_from_text("example.com\n", "old")
+    before = e.check_domain(d)
+    e.load_rules_from_text("||mcdn.bilivideo.cn^\n", "new")
+    stale = e.check_domain(d)          # 旧实现：allow 缓存仍命中
+    e.clear_filter_cache()             # main._filter_reload_safe 现在会调用
+    after = e.check_domain(d)
+    ok = (before[0] is False and stale[0] is False and after[0] is True
+          and "mcdn.bilivideo.cn" in after[1])
+    print(("  OK" if ok else "  xx") +
+          f" before={before[0]} stale={stale[0]} after={after[0]} "
+          f"reason={after[1][:40]}")
+    return ok
+
+
+def test_hosts_bypass_invalidation():
+    """hosts 映射删除/关闭后不能继续永久绕过过滤"""
+    print()
+    print("=" * 60)
+    print("12. hosts 白名单删除/关闭后的失效")
+    print("=" * 60)
+    e = FilterEngine()
+    e.load_rules_from_text("||mcdn.bilivideo.cn^\n", "rules")
+    d = "mcdn.bilivideo.cn"
+    e.load_custom_hosts({"enabled": True, "mappings": [d]})
+    added = (e.is_custom_hosts_bypass(d), e.check_domain(d)[0])
+    e.load_custom_hosts({"enabled": True, "mappings": []})
+    removed = (e.is_custom_hosts_bypass(d), e.check_domain(d)[0])
+    e.load_custom_hosts({"enabled": True, "mappings": [d]})
+    e.load_custom_hosts({"enabled": False, "mappings": [d]})
+    disabled = (e.is_custom_hosts_bypass(d), e.check_domain(d)[0])
+    ok = (added == (True, False) and removed == (False, True)
+          and disabled == (False, True))
+    print(("  OK" if ok else "  xx") +
+          f" added={added} removed={removed} disabled={disabled}")
+    return ok
+
+
+def test_cache_sweep_and_prefetch():
+    """缓存清扫/预刷新不能把已拦截域名重新解析或继续返回 IP"""
+    import asyncio
+    import types
+    import dns.message
+    import dns.rrset
+    import dns.rdatatype
+    from cache import DNSCache
+    from main import DNSProxyApp
+
+    print()
+    print("=" * 60)
+    print("13. DNS 缓存清扫/预刷新过滤分支")
+    print("=" * 60)
+
+    async def _run():
+        d = dns.name.from_text("xy223x247x68x148xy.mcdn.bilivideo.cn.")
+        e = FilterEngine()
+        e.load_rules_from_text("||mcdn.bilivideo.cn^\n", "rules")
+        c = DNSCache(max_size=100, default_ttl=300)
+        q = dns.message.make_query(d, dns.rdatatype.A)
+        r = dns.message.make_response(q)
+        r.answer.append(dns.rrset.from_text(
+            str(d), 300, "IN", "A", "1.2.3.4"))
+        keys = [(d, dns.rdatatype.A, 1, False, False),
+                (d, dns.rdatatype.A, 1, False, False, "json")]
+        for k in keys:
+            await c.set(k, r)
+        app = object.__new__(DNSProxyApp)
+        app.cache = c
+        app.filter_engine = e
+        app.config = types.SimpleNamespace(
+            cache_enabled=True, filter_enabled=True,
+            cache_prefetch_concurrency=1, cache_negative_ttl=60)
+        await app._sweep_cache_after_filter_load()
+        variants_left = 0
+        for k in keys:
+            if await c.get(k) is not None:
+                variants_left += 1
+        block = await c.get((d, dns.rdatatype.A, 1))
+        sweep_ok = variants_left == 0 and block is not None \
+            and block.rcode() == dns.rcode.NXDOMAIN
+
+        calls = {"n": 0}
+
+        class RM:
+            async def resolve(self, wire):
+                calls["n"] += 1
+                return None
+
+        c2 = DNSCache(max_size=100, default_ttl=300)
+        await c2.set(keys[0], r)
+        app2 = object.__new__(DNSProxyApp)
+        app2.cache = c2
+        app2.filter_engine = e
+        app2.resolver_manager = RM()
+        app2.config = app.config
+        await app2._prefetch_batch([keys[0]])
+        prefetch_ok = calls["n"] == 0 and await c2.get(keys[0]) is None
+
+        c3 = DNSCache(max_size=100, default_ttl=300)
+        b = dns.message.make_response(q)
+        b.set_rcode(dns.rcode.NXDOMAIN)
+        await c3.set((d, dns.rdatatype.A, 1), b,
+                     is_negative=True, blocked=True)
+        app3 = object.__new__(DNSProxyApp)
+        app3.cache = c3
+        app3.filter_engine = e
+        app3.config = types.SimpleNamespace(
+            cache_enabled=True, filter_enabled=False)
+        await app3._sweep_cache_after_filter_load()
+        disabled_ok = await c3.get((d, dns.rdatatype.A, 1)) is None
+        return sweep_ok, prefetch_ok, disabled_ok
+
+    sweep_ok, prefetch_ok, disabled_ok = asyncio.run(_run())
+    ok = sweep_ok and prefetch_ok and disabled_ok
+    print(("  OK" if ok else "  xx") +
+          f" sweep={sweep_ok} prefetch={prefetch_ok} disabled={disabled_ok}")
+    return ok
+
+
 # ===== 更新 main 入口 =====
 
 if __name__ == "__main__":
@@ -728,3 +854,6 @@ if __name__ == "__main__":
     test_atomic_reload()
     test_boundary()
     test_dns_only_loading()
+    test_rule_cache_invalidation()
+    test_hosts_bypass_invalidation()
+    test_cache_sweep_and_prefetch()

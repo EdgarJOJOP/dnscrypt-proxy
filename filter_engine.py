@@ -3169,12 +3169,24 @@ class FilterEngine:
         self._custom_hosts_bypass.clear()
         # 统一缓存中 priority 标记的自定义 hosts 条目在下次 check_domain 时会自动覆盖
 
+        # 每次应用 hosts 配置都**重建**映射：旧实现只增不减，运行期删除
+        # 一条 hosts 后旧域名仍永久绕过过滤；priority allow 缓存也必须清掉。
+        self._custom_hosts.clear()
+        self._custom_hosts_bypass.clear()
+        self._filter_cache.clear()
+
         if not hosts_config:
             return
 
         enabled = hosts_config.get("enabled", True)
         self._custom_hosts_enabled = enabled
         if not enabled:
+            # hosts.enabled=false 时旧映射必须一并失效，否则前端仍会走
+            # is_custom_hosts_bypass() 跳过过滤规则（运行期关闭 hosts 后
+            # 旧白名单继续放行，属于过滤绕过）。
+            self._custom_hosts.clear()
+            self._custom_hosts_bypass.clear()
+            self._filter_cache.clear()
             return
 
         mappings = hosts_config.get("mappings", [])
@@ -3218,6 +3230,8 @@ class FilterEngine:
 
     def is_custom_hosts_bypass(self, domain: str) -> bool:
         """检查域名是否在纯域名白名单中（无自定义IP，仅跳过过滤规则）"""
+        if not self._custom_hosts_enabled:
+            return False
         domain = domain.lower().rstrip(".")
         return domain in self._custom_hosts_bypass
 
